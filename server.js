@@ -20,41 +20,43 @@ const asana = axios.create({
   }
 });
 
-/* ---------------- MCP SERVER ---------------- */
-
-const server = new McpServer({
-  name: "vip-tools-remote",
-  version: "1.0.0"
-});
-
 function out(data) {
   return {
     content: [{ type: "text", text: JSON.stringify(data, null, 2) }]
   };
 }
 
-/* ---------------- TOOLS ---------------- */
+/* ---------------- MCP SERVER FACTORY ---------------- */
 
-server.tool(
-  "asana_get_my_tasks",
-  "Liest offene Tasks",
-  { limit: z.number().optional().default(20) },
-  async ({ limit }) => {
-    const user = await asana.get("/users/me");
-    const workspace = user.data.data.workspaces[0].gid;
+function createServer() {
+  const server = new McpServer({
+    name: "vip-tools-remote",
+    version: "1.0.0"
+  });
 
-    const res = await asana.get("/tasks", {
-      params: {
-        assignee: "me",
-        workspace,
-        completed_since: "now",
-        limit
-      }
-    });
+  server.tool(
+    "asana_get_my_tasks",
+    "Liest offene Tasks",
+    { limit: z.number().optional().default(20) },
+    async ({ limit }) => {
+      const user = await asana.get("/users/me");
+      const workspace = user.data.data.workspaces[0].gid;
 
-    return out(res.data.data);
-  }
-);
+      const res = await asana.get("/tasks", {
+        params: {
+          assignee: "me",
+          workspace,
+          completed_since: "now",
+          limit
+        }
+      });
+
+      return out(res.data.data);
+    }
+  );
+
+  return server;
+}
 
 /* ---------------- EXPRESS ---------------- */
 
@@ -63,6 +65,8 @@ const app = express();
 app.use(express.json());
 
 app.all("/mcp", async (req, res) => {
+  const server = createServer();
+
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true
