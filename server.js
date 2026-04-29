@@ -8,8 +8,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 /* ---------------- CONFIG ---------------- */
 
-const ASANA_TOKEN = process.env.ASANA_TOKEN;
-if (!ASANA_TOKEN) throw new Error("ASANA_TOKEN fehlt");
+const ASANA_TOKEN = process.env.ASANA_TOKEN_VIP_AI_SALES;
+if (!ASANA_TOKEN) throw new Error("ASANA_TOKEN_VIP_AI_SALES fehlt");
 
 /* ---------------- ASANA ---------------- */
 
