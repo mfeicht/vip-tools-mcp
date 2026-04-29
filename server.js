@@ -56,18 +56,30 @@ server.tool(
   }
 );
 
-/* ---------------- MCP TRANSPORT ---------------- */
-
-const transport = new StreamableHTTPServerTransport({
-  server
-});
-
 /* ---------------- EXPRESS ---------------- */
 
 const app = express();
 
-app.use("/mcp", (req, res) => {
-  transport.handleRequest(req, res);
+app.use(express.json());
+
+app.all("/mcp", async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true
+  });
+
+  try {
+    console.log("MCP REQUEST", req.method, req.body?.method);
+
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("MCP ERROR:", err);
+
+    if (!res.headersSent) {
+      res.status(500).send(err.message);
+    }
+  }
 });
 
 /* ---------------- START ---------------- */
