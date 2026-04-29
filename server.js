@@ -81,9 +81,24 @@ server.tool("asana_complete_task", "Task abschließen", {
 const app = express();
 app.use(express.json());
 
-const transport = new StreamableHTTPServerTransport();
+import express from "express";
 
-await server.connect(transport);
+const app = express();
+app.use(express.json());
+
+app.post("/mcp", async (req, res) => {
+  try {
+    await server.handleRequest(req, res);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send("MCP error");
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("MCP HTTP Server läuft auf Port " + PORT);
+});
 
 app.post("/mcp", async (req, res) => {
   try {
