@@ -54,9 +54,52 @@ function createServer() {
       return out(res.data.data);
     }
   );
+  server.tool(
 
-  return server;
-}
+      "asana_request",
+
+      "Führt einen beliebigen Asana-API-Request mit dem aktuellen Agenten-Token aus.",
+
+      {
+
+        method: z.enum(["GET", "POST", "PUT", "DELETE"]),
+
+        path: z.string(),
+
+        params: z.record(z.any()).optional(),
+
+        data: z.record(z.any()).optional()
+
+      },
+
+      async ({ method, path, params, data }) => {
+
+        if (!path.startsWith("/")) {
+
+          throw new Error("path muss mit / beginnen, z. B. /tasks");
+
+        }
+
+        const res = await asana.request({
+
+          method,
+
+          url: path,
+
+          params,
+
+          data: data ? { data } : undefined
+
+        });
+
+        return out(res.data);
+
+      }
+
+    );
+
+    return server;
+  }
 
 /* ---------------- EXPRESS ---------------- */
 
