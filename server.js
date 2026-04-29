@@ -65,13 +65,21 @@ const transport = new StreamableHTTPServerTransport({
   server
 });
 
-app.all("/mcp", async (req, res) => {
+app.post("/mcp", async (req, res) => {
   try {
-    await transport.handleRequest(req, res);
+    await transport.handleRequest(req, res, req.body);
   } catch (err) {
     console.error(err);
-    res.status(500).send("MCP error");
+    res.status(500).json({ error: err.message });
   }
+});
+
+app.get("/mcp", async (req, res) => {
+  await transport.handleRequest(req, res);
+});
+
+app.delete("/mcp", async (req, res) => {
+  await transport.handleRequest(req, res);
 });
 
 /* ---------------- START ---------------- */
