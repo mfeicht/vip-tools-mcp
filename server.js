@@ -56,48 +56,18 @@ server.tool(
   }
 );
 
-/* ---------------- HTTP MCP ---------------- */
-
-const app = express();
-app.use(express.json());
+/* ---------------- MCP TRANSPORT ---------------- */
 
 const transport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined
+  server
 });
 
-await server.connect(transport);
+/* ---------------- EXPRESS ---------------- */
 
-app.post("/mcp", async (req, res) => {
-  try {
-    console.log("MCP POST", req.body?.method);
-    await transport.handleRequest(req, res, req.body);
-  } catch (err) {
-    console.error("MCP POST ERROR:", err);
-    if (!res.headersSent) {
-      res.status(500).json({
-        error: err.message,
-        stack: err.stack
-      });
-    }
-  }
-});
+const app = express();
 
-app.get("/mcp", async (req, res) => {
-  try {
-    await transport.handleRequest(req, res);
-  } catch (err) {
-    console.error("MCP GET ERROR:", err);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete("/mcp", async (req, res) => {
-  try {
-    await transport.handleRequest(req, res);
-  } catch (err) {
-    console.error("MCP DELETE ERROR:", err);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
-  }
+app.use("/mcp", (req, res) => {
+  transport.handleRequest(req, res);
 });
 
 /* ---------------- START ---------------- */
