@@ -66,9 +66,9 @@ function createServer() {
 
         path: z.string(),
 
-        params: z.record(z.any()).optional(),
+        params: z.record(z.string(), z.any()).optional(),
 
-        data: z.record(z.any()).optional()
+        data: z.record(z.string(), z.any()).optional()
 
       },
 
