@@ -98,6 +98,22 @@ function createServer() {
 
     );
 
+  server.tool(
+    "asana_assign_task",
+    "Weist eine Asana-Aufgabe einem konkreten Asana-User per GID zu. Aendert keine weiteren Felder.",
+    {
+      task_gid: z.string(),
+      assignee_gid: z.string()
+    },
+    async ({ task_gid, assignee_gid }) => {
+      const res = await asana.put(`/tasks/${task_gid}`, {
+        data: { assignee: assignee_gid }
+      });
+
+      return out(res.data.data);
+    }
+  );
+
     return server;
   }
 
