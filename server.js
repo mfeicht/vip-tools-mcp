@@ -1,7 +1,9 @@
 import "dotenv/config";
 import express from "express";
 import axios from "axios";
-import { createSign } from "crypto";
+import net from "net";
+import tls from "tls";
+import { createHash, createSign } from "crypto";
 import { z } from "zod";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -29,6 +31,7 @@ const ASANA_TOKEN_ENVS = {
 };
 
 const agentIdSchema = z.enum(Object.keys(ASANA_TOKEN_ENVS)).optional().default(DEFAULT_AGENT_ID);
+const sheetCellValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const GOOGLE_AGENT_FOLDER_ID =
   process.env.GOOGLE_DRIVE_AGENT_FOLDER_ID || "16BPopNsMWrI-FkvQtLkpYwb_cMFDpMRr";
 const GOOGLE_ALLOWED_FOLDER_IDS = new Set(
@@ -42,6 +45,27 @@ const GOOGLE_SCOPES = [
 ];
 const WP_IMPORT_URL =
   process.env.WORDPRESS_GK_IMPORT_URL || "https://app.goklever.de/wp-json/gk-mailpoet/v1/import-csv";
+const RS_REDAKTIONSPLAN_SPREADSHEET_ID =
+  process.env.RS_REDAKTIONSPLAN_SPREADSHEET_ID || "17BbIPRBGxcNUAYPNd6AD3wnvik6s26P8fnvPDeH1UrM";
+const RS_REDAKTIONSPLAN_SHEET_NAME = process.env.RS_REDAKTIONSPLAN_SHEET_NAME || "Redaktionsplan";
+const DEFAULT_EMAIL_ALLOWED_RECIPIENTS = "n8n-top10@reise-stories.de";
+
+const AGENT_EMAIL_DEFAULTS = {
+  "vip-ai-sales": "sales-agent@vip-studios.de",
+  "vip-ai-operations": "operations-agent@vip-studios.de",
+  "vip-ai-content": "content-agent@vip-studios.de",
+  "vip-ai-support": "support-agent@vip-studios.de",
+  "vip-ai-developer": "developer-agent@vip-studios.de",
+  "vip-ai-marketing": "marketing-agent@vip-studios.de",
+  "vip-ai-office": "office-agent@vip-studios.de",
+  "vip-ai-design": "design-agent@vip-studios.de",
+  "vip-ai-social-media": "social-media-agent@vip-studios.de",
+  "rs-ai-sales": "sales-agent@reise-stories.de",
+  "rs-ai-content": "content-agent@reise-stories.de",
+  "rs-ai-support": "support-agent@reise-stories.de",
+  "rs-ai-marketing": "marketing-agent@reise-stories.de",
+  "rs-ai-office": "office-agent@reise-stories.de"
+};
 
 let googleTokenCache = { accessToken: null, expiresAt: 0 };
 
@@ -257,6 +281,229 @@ async function getSheetIdByName(spreadsheetId, sheetName) {
   const sheet = (res.data.sheets || []).find((item) => item.properties?.title === sheetName);
   if (!sheet) throw new Error(`Sheet nicht gefunden: ${sheetName}`);
   return sheet.properties.sheetId;
+}
+
+function buildSheetRange(sheetName, range) {
+  return `${sheetName}!${range}`;
+}
+
+async function getSheetValues(spreadsheetId, range, valueRenderOption = "FORMATTED_VALUE") {
+  const res = await googleRequest({
+    method: "GET",
+    url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
+      spreadsheetId
+    )}/values/${encodeURIComponent(range)}`,
+    params: { valueRenderOption }
+  });
+  return res.data.values || [];
+}
+
+function cleanCell(value) {
+  return String(value ?? "").trim();
+}
+
+function envSuffixForAgent(agentId) {
+  const asanaEnv = ASANA_TOKEN_ENVS[agentId];
+  if (!asanaEnv) throw new Error(`Unbekannter agent_id: ${agentId}`);
+  return asanaEnv.replace(/^ASANA_TOKEN_/, "");
+}
+
+function getEnvWithAgentFallback(baseName, agentId) {
+  const suffix = envSuffixForAgent(agentId);
+  return process.env[`${baseName}_${suffix}`] || process.env[baseName];
+}
+
+function parseBooleanEnv(value, defaultValue = false) {
+  if (value === undefined || value === null || value === "") return defaultValue;
+  return ["1", "true", "yes", "ja"].includes(String(value).trim().toLowerCase());
+}
+
+function parseRecipients(value) {
+  const recipients = String(value || "")
+    .split(/[;,]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!recipients.length) throw new Error("Mindestens ein E-Mail-Empfaenger ist erforderlich.");
+  for (const recipient of recipients) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+      throw new Error(`Ungueltige E-Mail-Adresse: ${recipient}`);
+    }
+  }
+  return recipients;
+}
+
+function assertAllowedEmailRecipients(recipients) {
+  const rawAllowed = process.env.EMAIL_ALLOWED_RECIPIENTS || DEFAULT_EMAIL_ALLOWED_RECIPIENTS;
+  if (rawAllowed.trim() === "*") return;
+
+  const allowed = new Set(parseRecipients(rawAllowed).map((item) => item.toLowerCase()));
+  const blocked = recipients.filter((recipient) => !allowed.has(recipient.toLowerCase()));
+  if (blocked.length) {
+    throw new Error(
+      `E-Mail-Empfaenger nicht erlaubt: ${blocked.join(", ")}. Erlaubt per EMAIL_ALLOWED_RECIPIENTS: ${rawAllowed}`
+    );
+  }
+}
+
+function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
+  const suffix = envSuffixForAgent(agentId);
+  const fromAddress =
+    process.env[`EMAIL_ADDRESS_${suffix}`] || getEnvWithAgentFallback("EMAIL_ADDRESS", agentId) || AGENT_EMAIL_DEFAULTS[agentId];
+  const host = getEnvWithAgentFallback("SMTP_HOST", agentId);
+  const port = Number(getEnvWithAgentFallback("SMTP_PORT", agentId) || 465);
+  const secure = parseBooleanEnv(getEnvWithAgentFallback("SMTP_SECURE", agentId), port === 465);
+  const user = process.env[`SMTP_USER_${suffix}`] || fromAddress;
+  const password =
+    process.env[`SMTP_PASSWORD_${suffix}`] ||
+    process.env[`EMAIL_PASSWORD_${suffix}`] ||
+    process.env.SMTP_PASSWORD ||
+    process.env.EMAIL_PASSWORD;
+
+  if (!fromAddress) throw new Error(`E-Mail-Adresse fuer agent_id ${agentId} fehlt.`);
+  if (requireCredentials) {
+    if (!host) throw new Error(`SMTP_HOST oder SMTP_HOST_${suffix} fehlt im MCP-Environment.`);
+    if (!password) {
+      throw new Error(`SMTP_PASSWORD_${suffix} oder EMAIL_PASSWORD_${suffix} fehlt im MCP-Environment.`);
+    }
+  }
+
+  return { fromAddress, host, port, secure, user, password };
+}
+
+function createSmtpReader(socket) {
+  let buffer = "";
+  const waiters = [];
+
+  socket.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    for (let index = waiters.length - 1; index >= 0; index -= 1) {
+      waiters[index]();
+      waiters.splice(index, 1);
+    }
+  });
+
+  return async function readResponse() {
+    for (;;) {
+      const lines = buffer.split(/\r?\n/);
+      for (let index = 0; index < lines.length; index += 1) {
+        if (/^\d{3} /.test(lines[index])) {
+          const responseLines = lines.slice(0, index + 1);
+          buffer = lines.slice(index + 1).join("\r\n");
+          const code = Number(lines[index].slice(0, 3));
+          return { code, text: responseLines.join("\n") };
+        }
+      }
+      await new Promise((resolve) => waiters.push(resolve));
+    }
+  };
+}
+
+function writeSmtp(socket, command) {
+  socket.write(`${command}\r\n`);
+}
+
+async function expectSmtp(readResponse, expectedCodes, label) {
+  const response = await readResponse();
+  if (!expectedCodes.includes(response.code)) {
+    throw new Error(`SMTP ${label} fehlgeschlagen (${response.code}): ${response.text}`);
+  }
+  return response;
+}
+
+async function createSmtpSocket(config) {
+  if (config.secure) {
+    return new Promise((resolve, reject) => {
+      const socket = tls.connect(
+        {
+          host: config.host,
+          port: config.port,
+          servername: config.host,
+          rejectUnauthorized: !parseBooleanEnv(process.env.SMTP_TLS_ALLOW_UNAUTHORIZED, false)
+        },
+        () => resolve(socket)
+      );
+      socket.once("error", reject);
+    });
+  }
+
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host: config.host, port: config.port }, () => resolve(socket));
+    socket.once("error", reject);
+  });
+}
+
+function encodeHeader(value) {
+  if (/^[\x20-\x7E]*$/.test(value)) return value;
+  return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
+
+function dotStuff(value) {
+  return String(value).replace(/\r?\n/g, "\r\n").replace(/^\./gm, "..");
+}
+
+function buildEmailMessage({ from, to, subject, body }) {
+  const now = new Date().toUTCString();
+  const messageIdHash = createHash("sha256").update(`${Date.now()}-${from}-${to.join(",")}`).digest("hex").slice(0, 24);
+  const headers = [
+    `From: <${from}>`,
+    `To: ${to.map((recipient) => `<${recipient}>`).join(", ")}`,
+    `Subject: ${encodeHeader(subject)}`,
+    `Date: ${now}`,
+    `Message-ID: <${messageIdHash}@vip-tools-mcp>`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=utf-8",
+    "Content-Transfer-Encoding: 8bit"
+  ];
+  return `${headers.join("\r\n")}\r\n\r\n${dotStuff(body)}`;
+}
+
+async function sendSmtpEmail(config, { to, subject, body }) {
+  let socket = await createSmtpSocket(config);
+  let readResponse = createSmtpReader(socket);
+
+  await expectSmtp(readResponse, [220], "connect");
+  writeSmtp(socket, "EHLO vip-tools-mcp");
+  await expectSmtp(readResponse, [250], "ehlo");
+
+  if (!config.secure && config.port === 587) {
+    writeSmtp(socket, "STARTTLS");
+    await expectSmtp(readResponse, [220], "starttls");
+    socket = await new Promise((resolve, reject) => {
+      const tlsSocket = tls.connect(
+        {
+          socket,
+          servername: config.host,
+          rejectUnauthorized: !parseBooleanEnv(process.env.SMTP_TLS_ALLOW_UNAUTHORIZED, false)
+        },
+        () => resolve(tlsSocket)
+      );
+      tlsSocket.once("error", reject);
+    });
+    readResponse = createSmtpReader(socket);
+    writeSmtp(socket, "EHLO vip-tools-mcp");
+    await expectSmtp(readResponse, [250], "ehlo after starttls");
+  }
+
+  writeSmtp(socket, "AUTH LOGIN");
+  await expectSmtp(readResponse, [334], "auth login");
+  writeSmtp(socket, Buffer.from(config.user, "utf8").toString("base64"));
+  await expectSmtp(readResponse, [334], "auth user");
+  writeSmtp(socket, Buffer.from(config.password, "utf8").toString("base64"));
+  await expectSmtp(readResponse, [235], "auth password");
+
+  writeSmtp(socket, `MAIL FROM:<${config.fromAddress}>`);
+  await expectSmtp(readResponse, [250], "mail from");
+  for (const recipient of to) {
+    writeSmtp(socket, `RCPT TO:<${recipient}>`);
+    await expectSmtp(readResponse, [250, 251], `rcpt to ${recipient}`);
+  }
+  writeSmtp(socket, "DATA");
+  await expectSmtp(readResponse, [354], "data");
+  socket.write(`${buildEmailMessage({ from: config.fromAddress, to, subject, body })}\r\n.\r\n`);
+  await expectSmtp(readResponse, [250], "send data");
+  writeSmtp(socket, "QUIT");
+  await expectSmtp(readResponse, [221], "quit");
+  socket.end();
 }
 
 function assertAsanaConfirmed(confirmedByAsana, asanaTaskGid, actionName) {
@@ -480,7 +727,7 @@ function createServer() {
       agent_id: agentIdSchema,
       spreadsheet_id: z.string(),
       sheet_name: z.string(),
-      values: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))),
+      values: z.array(z.array(sheetCellValueSchema)),
       value_input_option: z.enum(["RAW", "USER_ENTERED"]).optional().default("USER_ENTERED")
     },
     async ({ agent_id, spreadsheet_id, sheet_name, values, value_input_option }) => {
@@ -500,6 +747,212 @@ function createServer() {
       });
 
       return out({ agent_id, response: res.data });
+    }
+  );
+
+  server.tool(
+    "google_sheets_read_range",
+    "Liest Werte aus einem bestehenden Google Sheet. Read-only; fuer gezielte Checks vor Sheet-Updates.",
+    {
+      agent_id: agentIdSchema,
+      spreadsheet_id: z.string(),
+      sheet_name: z.string(),
+      range: z.string(),
+      value_render_option: z
+        .enum(["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"])
+        .optional()
+        .default("FORMATTED_VALUE")
+    },
+    async ({ agent_id, spreadsheet_id, sheet_name, range, value_render_option }) => {
+      const a1Range = buildSheetRange(sheet_name, range);
+      const values = await getSheetValues(spreadsheet_id, a1Range, value_render_option);
+      return out({ agent_id, spreadsheet_id, sheet_name, range, values });
+    }
+  );
+
+  server.tool(
+    "google_sheets_update_range",
+    "Aktualisiert eine explizite A1-Range in einem bestehenden Google Sheet und verifiziert optional per Readback. Live-Ausfuehrung nur mit klarer Asana-Freigabe.",
+    {
+      agent_id: agentIdSchema,
+      spreadsheet_id: z.string(),
+      sheet_name: z.string(),
+      range: z.string(),
+      values: z.array(z.array(sheetCellValueSchema)),
+      value_input_option: z.enum(["RAW", "USER_ENTERED"]).optional().default("USER_ENTERED"),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      verify_after: z.boolean().optional().default(true)
+    },
+    async ({
+      agent_id,
+      spreadsheet_id,
+      sheet_name,
+      range,
+      values,
+      value_input_option,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      verify_after
+    }) => {
+      if (!values.length) throw new Error("values darf nicht leer sein.");
+      const a1Range = buildSheetRange(sheet_name, range);
+
+      if (dry_run) {
+        return out({ agent_id, dry_run: true, spreadsheet_id, sheet_name, range, values });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "google_sheets_update_range");
+
+      const res = await googleRequest({
+        method: "PUT",
+        url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
+          spreadsheet_id
+        )}/values/${encodeURIComponent(a1Range)}`,
+        params: { valueInputOption: value_input_option },
+        data: { values }
+      });
+
+      const verified_values = verify_after ? await getSheetValues(spreadsheet_id, a1Range) : undefined;
+      return out({ agent_id, response: res.data, verified_values });
+    }
+  );
+
+  server.tool(
+    "rs_redaktionsplan_find_next_top10_row",
+    "Findet im Reise-Stories-Redaktionsplan die naechste TOP-10-Zeile: Seitentyp TOP 10, Status Offline, Live-URL leer; Prioritaet Hoch vor Mittel vor Gering.",
+    {
+      agent_id: agentIdSchema,
+      spreadsheet_id: z.string().optional().default(RS_REDAKTIONSPLAN_SPREADSHEET_ID),
+      sheet_name: z.string().optional().default(RS_REDAKTIONSPLAN_SHEET_NAME),
+      max_rows: z.number().int().positive().optional().default(12000)
+    },
+    async ({ agent_id, spreadsheet_id, sheet_name, max_rows }) => {
+      const range = buildSheetRange(sheet_name, `A1:J${max_rows}`);
+      const values = await getSheetValues(spreadsheet_id, range);
+      const candidates = [];
+
+      for (let rowIndex = 2; rowIndex < values.length; rowIndex += 1) {
+        const row = values[rowIndex] || [];
+        const liveUrl = cleanCell(row[0]);
+        const seitentyp = cleanCell(row[2]);
+        const prioritaet = cleanCell(row[3]);
+        const notiz = cleanCell(row[4]);
+        const status = cleanCell(row[8]);
+        const fokusKeyword = cleanCell(row[9]);
+
+        if (seitentyp !== "TOP 10" || status !== "Offline" || liveUrl || !fokusKeyword) continue;
+        candidates.push({
+          row_number: rowIndex + 1,
+          priority: prioritaet || "Gering",
+          focus_keyword: fokusKeyword,
+          notes: notiz,
+          values: row
+        });
+      }
+
+      const priorityOrder = ["Hoch", "Mittel", "Gering"];
+      const selected =
+        priorityOrder
+          .map((priority) => candidates.find((candidate) => candidate.priority === priority))
+          .find(Boolean) || candidates[0];
+
+      return out({
+        agent_id,
+        spreadsheet_id,
+        sheet_name,
+        checked_range: range,
+        candidate_count: candidates.length,
+        selected: selected || null
+      });
+    }
+  );
+
+  server.tool(
+    "rs_redaktionsplan_update_row",
+    "Aktualisiert eine gefundene Reise-Stories-Redaktionsplan-Zeile fuer einen TOP-10-Artikel und verifiziert A:J danach. Live-Ausfuehrung nur mit klarer Asana-Freigabe.",
+    {
+      agent_id: agentIdSchema,
+      spreadsheet_id: z.string().optional().default(RS_REDAKTIONSPLAN_SPREADSHEET_ID),
+      sheet_name: z.string().optional().default(RS_REDAKTIONSPLAN_SHEET_NAME),
+      row_number: z.number().int().min(3),
+      live_url: z.string(),
+      title: z.string(),
+      publication_date: z.string(),
+      region: z.string(),
+      author: z.string().optional().default("Reise-Redaktion"),
+      status: z.enum(["Online", "Entwurf", "Offline"]).optional().default("Online"),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      enforce_current_selection: z.boolean().optional().default(true)
+    },
+    async ({
+      agent_id,
+      spreadsheet_id,
+      sheet_name,
+      row_number,
+      live_url,
+      title,
+      publication_date,
+      region,
+      author,
+      status,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      enforce_current_selection
+    }) => {
+      if (!/^https:\/\/reise-stories\.de\/[a-z0-9-]+\/$/.test(live_url)) {
+        throw new Error("live_url muss dem Format https://reise-stories.de/<slug>/ entsprechen.");
+      }
+      if (!/^\d{2}\.\d{2}\.\d{4}$/.test(publication_date)) {
+        throw new Error("publication_date muss im Format TT.MM.JJJJ sein.");
+      }
+
+      const rowRange = buildSheetRange(sheet_name, `A${row_number}:J${row_number}`);
+      const before = (await getSheetValues(spreadsheet_id, rowRange))[0] || [];
+
+      if (enforce_current_selection) {
+        const liveUrlBefore = cleanCell(before[0]);
+        const seitentyp = cleanCell(before[2]);
+        const currentStatus = cleanCell(before[8]);
+        if (liveUrlBefore || seitentyp !== "TOP 10" || currentStatus !== "Offline") {
+          throw new Error(
+            `Zeile ${row_number} ist nicht mehr die erwartete Offline-TOP-10-Zeile mit leerer Live-URL.`
+          );
+        }
+      }
+
+      const updates = [
+        { range: buildSheetRange(sheet_name, `A${row_number}:B${row_number}`), values: [[live_url, title]] },
+        {
+          range: buildSheetRange(sheet_name, `F${row_number}:I${row_number}`),
+          values: [[publication_date, region, author, status]]
+        }
+      ];
+
+      if (dry_run) {
+        return out({ agent_id, dry_run: true, spreadsheet_id, sheet_name, row_number, before, updates });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "rs_redaktionsplan_update_row");
+
+      const res = await googleRequest({
+        method: "POST",
+        url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
+          spreadsheet_id
+        )}/values:batchUpdate`,
+        data: {
+          valueInputOption: "USER_ENTERED",
+          data: updates
+        }
+      });
+
+      const verified = (await getSheetValues(spreadsheet_id, rowRange))[0] || [];
+      return out({ agent_id, response: res.data, verified_row_range: rowRange, verified_values: verified });
     }
   );
 
@@ -585,6 +1038,62 @@ function createServer() {
       });
 
       return out({ agent_id, response: res.data });
+    }
+  );
+
+  server.tool(
+    "agent_email_send",
+    "Sendet eine Plain-Text-E-Mail aus dem Agentenpostfach per SMTP. Live-Versand nur mit klarer Asana-Freigabe; Empfaenger sind per EMAIL_ALLOWED_RECIPIENTS begrenzt.",
+    {
+      agent_id: agentIdSchema,
+      to: z.string(),
+      subject: z.string(),
+      body: z.string(),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional()
+    },
+    async ({ agent_id, to, subject, body, dry_run, confirmed_by_asana, asana_task_gid }) => {
+      const recipients = parseRecipients(to);
+      assertAllowedEmailRecipients(recipients);
+
+      const trimmedSubject = subject.trim();
+      if (!trimmedSubject) throw new Error("subject darf nicht leer sein.");
+      if (Buffer.byteLength(trimmedSubject, "utf8") > 300) {
+        throw new Error("subject ist zu lang (>300 Bytes).");
+      }
+      if (!body.trim()) throw new Error("body darf nicht leer sein.");
+      if (Buffer.byteLength(body, "utf8") > 2_000_000) {
+        throw new Error("body ist zu gross fuer agent_email_send (>2 MB).");
+      }
+
+      const config = getSmtpConfig(agent_id, { requireCredentials: !dry_run });
+      const bodyHash = createHash("sha256").update(body, "utf8").digest("hex");
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          from: config.fromAddress,
+          to: recipients,
+          subject: trimmedSubject,
+          body_bytes: Buffer.byteLength(body, "utf8"),
+          body_sha256: bodyHash
+        });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "agent_email_send");
+      await sendSmtpEmail(config, { to: recipients, subject: trimmedSubject, body });
+
+      return out({
+        agent_id,
+        sent: true,
+        from: config.fromAddress,
+        to: recipients,
+        subject: trimmedSubject,
+        body_bytes: Buffer.byteLength(body, "utf8"),
+        body_sha256: bodyHash
+      });
     }
   );
 
@@ -698,6 +1207,12 @@ app.all("/mcp", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log("MCP läuft auf Port " + PORT);
+});
+const keepAlive = setInterval(() => {}, 1 << 30);
+
+process.on("SIGTERM", () => {
+  clearInterval(keepAlive);
+  httpServer.close(() => process.exit(0));
 });
