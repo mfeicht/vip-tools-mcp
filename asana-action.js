@@ -37,9 +37,15 @@ function containsPlainMention(value) {
 function toHtmlText(value) {
   const trimmed = value.trim();
   if (trimmed.startsWith("<body")) {
+    if (/<br\b/i.test(trimmed)) {
+      throw new Error("Asana html_text darf kein <br/> enthalten. Nutze <ul>/<ol>/<li> oder kurze Abschnitte ohne br-Tags.");
+    }
+    if (/&lt;\s*\/?\s*(body|strong|em|ul|ol|li|code|a)\b/i.test(trimmed)) {
+      throw new Error("Asana html_text enthaelt bereits escaped HTML. Sende echtes Asana-Rich-Text-Markup.");
+    }
     return trimmed;
   }
-  return `<body>${escapeHtml(value).replace(/\n/g, "<br/>")}</body>`;
+  return `<body>${escapeHtml(value).replace(/\n+/g, " ")}</body>`;
 }
 
 if (action === "comment") {

@@ -56,11 +56,12 @@ function containsPlainMention(value) {
 
 function assertSafeAsanaRequest(method, path, data) {
   const isStoryCreate = method === "POST" && /^\/tasks\/[^/]+\/stories\/?$/.test(path);
-  if (!isStoryCreate) return;
+  const isStoryUpdate = method === "PUT" && /^\/stories\/[^/]+\/?$/.test(path);
+  if (!isStoryCreate && !isStoryUpdate) return;
 
   if (!data || typeof data !== "object") return;
 
-  if (typeof data.text === "string" && !data.html_text) {
+  if (typeof data.text === "string") {
     throw new Error(
       "Asana-Kommentare muessen als html_text gesendet werden. data.text ist fuer Task-Stories in diesem MCP blockiert, damit Mentions/Rich-Text nicht als Plain Text rausgehen."
     );
@@ -70,6 +71,19 @@ function assertSafeAsanaRequest(method, path, data) {
     const html = data.html_text.trim();
     if (!html.startsWith("<body")) {
       throw new Error("Asana html_text muss mit <body> beginnen.");
+    }
+    if (!html.endsWith("</body>")) {
+      throw new Error("Asana html_text muss mit </body> enden.");
+    }
+    if (/<br\b/i.test(html)) {
+      throw new Error(
+        "Asana html_text darf kein <br/> enthalten. Nutze Asana-kompatible Abschnitte mit <strong>, <em>, <ul>/<ol>/<li>, <code> und echte Mentions."
+      );
+    }
+    if (/&lt;\s*\/?\s*(body|strong|em|ul|ol|li|code|a)\b/i.test(html)) {
+      throw new Error(
+        "Asana html_text enthaelt bereits escaped HTML. Sende echtes Asana-Rich-Text-Markup, nicht HTML als Text."
+      );
     }
     if (containsPlainMention(html)) {
       throw new Error(
