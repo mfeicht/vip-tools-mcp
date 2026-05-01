@@ -8,17 +8,41 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 /* ---------------- CONFIG ---------------- */
 
-const ASANA_TOKEN = process.env.ASANA_TOKEN_VIP_AI_SALES;
-if (!ASANA_TOKEN) throw new Error("ASANA_TOKEN_VIP_AI_SALES fehlt");
+const DEFAULT_AGENT_ID = "vip-ai-sales";
 
-/* ---------------- ASANA ---------------- */
+const ASANA_TOKEN_ENVS = {
+  "vip-ai-sales": "ASANA_TOKEN_VIP_AI_SALES",
+  "vip-ai-operations": "ASANA_TOKEN_VIP_AI_OPERATIONS",
+  "vip-ai-content": "ASANA_TOKEN_VIP_AI_CONTENT",
+  "vip-ai-support": "ASANA_TOKEN_VIP_AI_SUPPORT",
+  "vip-ai-developer": "ASANA_TOKEN_VIP_AI_DEVELOPER",
+  "vip-ai-marketing": "ASANA_TOKEN_VIP_AI_MARKETING",
+  "vip-ai-office": "ASANA_TOKEN_VIP_AI_OFFICE",
+  "vip-ai-design": "ASANA_TOKEN_VIP_AI_DESIGN",
+  "vip-ai-social-media": "ASANA_TOKEN_VIP_AI_SOCIAL_MEDIA",
+  "rs-ai-sales": "ASANA_TOKEN_RS_AI_SALES",
+  "rs-ai-content": "ASANA_TOKEN_RS_AI_CONTENT",
+  "rs-ai-support": "ASANA_TOKEN_RS_AI_SUPPORT",
+  "rs-ai-marketing": "ASANA_TOKEN_RS_AI_MARKETING",
+  "rs-ai-office": "ASANA_TOKEN_RS_AI_OFFICE"
+};
 
-const asana = axios.create({
-  baseURL: "https://app.asana.com/api/1.0",
-  headers: {
-    Authorization: `Bearer ${ASANA_TOKEN}`
-  }
-});
+const agentIdSchema = z.enum(Object.keys(ASANA_TOKEN_ENVS)).optional().default(DEFAULT_AGENT_ID);
+
+function getAsana(agentId = DEFAULT_AGENT_ID) {
+  const envName = ASANA_TOKEN_ENVS[agentId];
+  if (!envName) throw new Error(`Unbekannter agent_id: ${agentId}`);
+
+  const token = process.env[envName];
+  if (!token) throw new Error(`Asana-Token fehlt fuer agent_id ${agentId} (${envName})`);
+
+  return axios.create({
+    baseURL: "https://app.asana.com/api/1.0",
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  });
+}
 
 function out(data) {
   return {
@@ -35,10 +59,40 @@ function createServer() {
   });
 
   server.tool(
+    "asana_list_agents",
+    "Listet die im Remote-MCP bekannten Agenten und ob ein Token konfiguriert ist. Gibt keine Secret-Werte aus.",
+    {},
+    async () => {
+      return out(
+        Object.entries(ASANA_TOKEN_ENVS).map(([agent_id, env_name]) => ({
+          agent_id,
+          env_name,
+          token_configured: Boolean(process.env[env_name])
+        }))
+      );
+    }
+  );
+
+  server.tool(
+    "asana_whoami",
+    "Prueft den Asana-Token eines Agenten und gibt den zugehoerigen User ohne Secret-Werte aus.",
+    { agent_id: agentIdSchema },
+    async ({ agent_id }) => {
+      const asana = getAsana(agent_id);
+      const res = await asana.get("/users/me");
+      return out({ agent_id, user: res.data.data });
+    }
+  );
+
+  server.tool(
     "asana_get_my_tasks",
     "Liest offene Tasks",
-    { limit: z.number().optional().default(20) },
-    async ({ limit }) => {
+    {
+      agent_id: agentIdSchema,
+      limit: z.number().optional().default(20)
+    },
+    async ({ agent_id, limit }) => {
+      const asana = getAsana(agent_id);
       const user = await asana.get("/users/me");
       const workspace = user.data.data.workspaces[0].gid;
 
@@ -51,16 +105,18 @@ function createServer() {
         }
       });
 
-      return out(res.data.data);
+      return out({ agent_id, tasks: res.data.data });
     }
   );
   server.tool(
 
       "asana_request",
 
-      "Führt einen beliebigen Asana-API-Request mit dem aktuellen Agenten-Token aus.",
+      "Führt einen beliebigen Asana-API-Request mit dem Token des angegebenen Agenten aus. Ohne agent_id wird VIP AI-Sales verwendet.",
 
       {
+
+        agent_id: agentIdSchema,
 
         method: z.enum(["GET", "POST", "PUT", "DELETE"]),
 
@@ -72,13 +128,15 @@ function createServer() {
 
       },
 
-      async ({ method, path, params, data }) => {
+      async ({ agent_id, method, path, params, data }) => {
 
         if (!path.startsWith("/")) {
 
           throw new Error("path muss mit / beginnen, z. B. /tasks");
 
         }
+
+        const asana = getAsana(agent_id);
 
         const res = await asana.request({
 
@@ -92,7 +150,7 @@ function createServer() {
 
         });
 
-        return out(res.data);
+        return out({ agent_id, response: res.data });
 
       }
 
@@ -100,17 +158,19 @@ function createServer() {
 
   server.tool(
     "asana_assign_task",
-    "Weist eine Asana-Aufgabe einem konkreten Asana-User per GID zu. Aendert keine weiteren Felder.",
+    "Weist eine Asana-Aufgabe mit dem Token des angegebenen Agenten einem konkreten Asana-User per GID zu. Aendert keine weiteren Felder.",
     {
+      agent_id: agentIdSchema,
       task_gid: z.string(),
       assignee_gid: z.string()
     },
-    async ({ task_gid, assignee_gid }) => {
+    async ({ agent_id, task_gid, assignee_gid }) => {
+      const asana = getAsana(agent_id);
       const res = await asana.put(`/tasks/${task_gid}`, {
         data: { assignee: assignee_gid }
       });
 
-      return out(res.data.data);
+      return out({ agent_id, task: res.data.data });
     }
   );
 
