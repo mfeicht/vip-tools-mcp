@@ -1,0 +1,15 @@
+{
+  "agentId": "vip-ai-design",
+  "name": "VIP AI-Design",
+  "asanaTokenEnv": "ASANA_TOKEN_VIP_AI_DESIGN",
+  "asana": {
+    "mode": "assigned_to_me"
+  },
+  "permissions": {
+    "asanaReadMyTasks": true,
+    "asanaReadTaskDetails": true,
+    "asanaAddComments": true,
+    "asanaCompleteTasks": true,
+    "asanaGenericRequest": true
+  }
+}

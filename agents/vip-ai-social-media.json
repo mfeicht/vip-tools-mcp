@@ -1,0 +1,15 @@
+{
+  "agentId": "vip-ai-social-media",
+  "name": "VIP AI-Social Media",
+  "asanaTokenEnv": "ASANA_TOKEN_VIP_AI_SOCIAL_MEDIA",
+  "asana": {
+    "mode": "assigned_to_me"
+  },
+  "permissions": {
+    "asanaReadMyTasks": true,
+    "asanaReadTaskDetails": true,
+    "asanaAddComments": true,
+    "asanaCompleteTasks": true,
+    "asanaGenericRequest": true
+  }
+}

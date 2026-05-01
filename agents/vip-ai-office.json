@@ -1,0 +1,15 @@
+{
+  "agentId": "vip-ai-office",
+  "name": "VIP AI-Office",
+  "asanaTokenEnv": "ASANA_TOKEN_VIP_AI_OFFICE",
+  "asana": {
+    "mode": "assigned_to_me"
+  },
+  "permissions": {
+    "asanaReadMyTasks": true,
+    "asanaReadTaskDetails": true,
+    "asanaAddComments": true,
+    "asanaCompleteTasks": true,
+    "asanaGenericRequest": true
+  }
+}

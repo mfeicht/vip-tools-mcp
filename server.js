@@ -50,6 +50,35 @@ function out(data) {
   };
 }
 
+function containsPlainMention(value) {
+  return /(^|[\s(])@[A-Za-zÄÖÜäöüß]/.test(value);
+}
+
+function assertSafeAsanaRequest(method, path, data) {
+  const isStoryCreate = method === "POST" && /^\/tasks\/[^/]+\/stories\/?$/.test(path);
+  if (!isStoryCreate) return;
+
+  if (!data || typeof data !== "object") return;
+
+  if (typeof data.text === "string" && !data.html_text) {
+    throw new Error(
+      "Asana-Kommentare muessen als html_text gesendet werden. data.text ist fuer Task-Stories in diesem MCP blockiert, damit Mentions/Rich-Text nicht als Plain Text rausgehen."
+    );
+  }
+
+  if (typeof data.html_text === "string") {
+    const html = data.html_text.trim();
+    if (!html.startsWith("<body")) {
+      throw new Error("Asana html_text muss mit <body> beginnen.");
+    }
+    if (containsPlainMention(html)) {
+      throw new Error(
+        "Plain-Text-Mention blockiert. Nutze echte Asana-Mentions mit <a data-asana-gid=\"USER_GID\"/> statt @Name."
+      );
+    }
+  }
+}
+
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
 function createServer() {
@@ -137,6 +166,8 @@ function createServer() {
         }
 
         const asana = getAsana(agent_id);
+
+        assertSafeAsanaRequest(method, path, data);
 
         const res = await asana.request({
 

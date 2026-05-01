@@ -2,7 +2,12 @@ import "dotenv/config";
 import axios from "axios";
 import fs from "fs";
 
-const agent = JSON.parse(fs.readFileSync("./agents/vip-ai-sales.json", "utf-8"));
+const args = process.argv.slice(2);
+const agentArg = args[0]?.startsWith("--agent=")
+  ? args.shift().replace("--agent=", "")
+  : "vip-ai-sales";
+const agentFile = agentArg.endsWith(".json") ? agentArg : `./agents/${agentArg}.json`;
+const agent = JSON.parse(fs.readFileSync(agentFile, "utf-8"));
 const token = process.env[agent.asanaTokenEnv];
 
 if (!token) throw new Error(`Token fehlt: ${agent.asanaTokenEnv}`);
@@ -12,18 +17,42 @@ const asana = axios.create({
   headers: { Authorization: `Bearer ${token}` },
 });
 
-const [action, taskGid, ...rest] = process.argv.slice(2);
+const [action, taskGid, ...rest] = args;
 
 if (!action || !taskGid) {
-  throw new Error("Nutzung: node asana-action.js comment|complete|update TASK_GID ...");
+  throw new Error("Nutzung: node asana-action.js [--agent=vip-ai-sales] comment|complete|update TASK_GID ...");
+}
+
+function escapeHtml(value) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function containsPlainMention(value) {
+  return /(^|[\s(])@[A-Za-zÄÖÜäöüß]/.test(value);
+}
+
+function toHtmlText(value) {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("<body")) {
+    return trimmed;
+  }
+  return `<body>${escapeHtml(value).replace(/\n/g, "<br/>")}</body>`;
 }
 
 if (action === "comment") {
   const text = rest.join(" ");
   if (!text) throw new Error("Kommentartext fehlt");
+  if (containsPlainMention(text)) {
+    throw new Error(
+      "Plain-Text-Mention blockiert. Asana-Kommentare mit Erwaehnung muessen html_text und echte Mentions nutzen, z. B. <a data-asana-gid=\"1108801330389276\"/>."
+    );
+  }
 
   const res = await asana.post(`/tasks/${taskGid}/stories`, {
-    data: { text },
+    data: { html_text: toHtmlText(text) },
   });
 
   console.log(JSON.stringify({ ok: true, action, result: res.data.data }, null, 2));

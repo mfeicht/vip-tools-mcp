@@ -1,0 +1,15 @@
+{
+  "agentId": "vip-ai-marketing",
+  "name": "VIP AI-Marketing",
+  "asanaTokenEnv": "ASANA_TOKEN_VIP_AI_MARKETING",
+  "asana": {
+    "mode": "assigned_to_me"
+  },
+  "permissions": {
+    "asanaReadMyTasks": true,
+    "asanaReadTaskDetails": true,
+    "asanaAddComments": true,
+    "asanaCompleteTasks": true,
+    "asanaGenericRequest": true
+  }
+}

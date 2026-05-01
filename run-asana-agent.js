@@ -2,7 +2,9 @@ import "dotenv/config";
 import axios from "axios";
 import fs from "fs";
 
-const agent = JSON.parse(fs.readFileSync("./agents/vip-ai-sales.json", "utf-8"));
+const agentArg = process.argv[2] || "vip-ai-sales";
+const agentFile = agentArg.endsWith(".json") ? agentArg : `./agents/${agentArg}.json`;
+const agent = JSON.parse(fs.readFileSync(agentFile, "utf-8"));
 const token = process.env[agent.asanaTokenEnv];
 
 if (!token) throw new Error(`Token fehlt: ${agent.asanaTokenEnv}`);
