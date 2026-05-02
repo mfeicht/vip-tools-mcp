@@ -473,11 +473,18 @@ function validateEmailPayload({ to, subject, body }) {
   };
 }
 
+function defaultSmtpHostForAddress(fromAddress) {
+  if (/@vip-studios\.de$/i.test(fromAddress || "")) {
+    return "vip-studios.vip-studios.de";
+  }
+  return "";
+}
+
 function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
   const suffix = envSuffixForAgent(agentId);
   const fromAddress =
     process.env[`EMAIL_ADDRESS_${suffix}`] || AGENT_EMAIL_DEFAULTS[agentId];
-  const host = getEnvWithAgentFallback("SMTP_HOST", agentId);
+  const host = getEnvWithAgentFallback("SMTP_HOST", agentId) || defaultSmtpHostForAddress(fromAddress);
   const port = Number(getEnvWithAgentFallback("SMTP_PORT", agentId) || 465);
   const secure = parseBooleanEnv(getEnvWithAgentFallback("SMTP_SECURE", agentId), port === 465);
   const user = process.env[`SMTP_USER_${suffix}`] || fromAddress;
