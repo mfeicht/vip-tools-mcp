@@ -3,7 +3,7 @@ import express from "express";
 import axios from "axios";
 import net from "net";
 import tls from "tls";
-import { createHash, createSign } from "crypto";
+import { createHash, createSign, randomUUID } from "crypto";
 import { z } from "zod";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -49,6 +49,7 @@ const RS_REDAKTIONSPLAN_SPREADSHEET_ID =
   process.env.RS_REDAKTIONSPLAN_SPREADSHEET_ID || "17BbIPRBGxcNUAYPNd6AD3wnvik6s26P8fnvPDeH1UrM";
 const RS_REDAKTIONSPLAN_SHEET_NAME = process.env.RS_REDAKTIONSPLAN_SHEET_NAME || "Redaktionsplan";
 const DEFAULT_EMAIL_ALLOWED_RECIPIENTS = "*";
+const EMAIL_DRAFT_TTL_MS = Number(process.env.EMAIL_DRAFT_TTL_MS || 60 * 60 * 1000);
 
 const AGENT_EMAIL_DEFAULTS = {
   "vip-ai-sales": "sales-agent@vip-studios.de",
@@ -68,6 +69,7 @@ const AGENT_EMAIL_DEFAULTS = {
 };
 
 let googleTokenCache = { accessToken: null, expiresAt: 0 };
+const emailDraftCache = new Map();
 
 function getAsana(agentId = DEFAULT_AGENT_ID) {
   const envName = ASANA_TOKEN_ENVS[agentId];
@@ -345,6 +347,28 @@ function assertAllowedEmailRecipients(recipients) {
   }
 }
 
+function validateEmailPayload({ to, subject, body }) {
+  const recipients = parseRecipients(to);
+  assertAllowedEmailRecipients(recipients);
+
+  const trimmedSubject = subject.trim();
+  if (!trimmedSubject) throw new Error("subject darf nicht leer sein.");
+  if (Buffer.byteLength(trimmedSubject, "utf8") > 300) {
+    throw new Error("subject ist zu lang (>300 Bytes).");
+  }
+  if (!body.trim()) throw new Error("body darf nicht leer sein.");
+  if (Buffer.byteLength(body, "utf8") > 2_000_000) {
+    throw new Error("body ist zu gross fuer agent_email_send (>2 MB).");
+  }
+
+  return {
+    recipients,
+    subject: trimmedSubject,
+    body_bytes: Buffer.byteLength(body, "utf8"),
+    body_sha256: createHash("sha256").update(body, "utf8").digest("hex")
+  };
+}
+
 function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
   const suffix = envSuffixForAgent(agentId);
   const fromAddress =
@@ -366,6 +390,42 @@ function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
   }
 
   return { fromAddress, host, port, secure, user, password };
+}
+
+function cleanupExpiredEmailDrafts() {
+  const now = Date.now();
+  for (const [draftId, draft] of emailDraftCache.entries()) {
+    if (draft.expires_at_ms <= now) {
+      emailDraftCache.delete(draftId);
+    }
+  }
+}
+
+function storeEmailDraft({ agent_id, from, to, subject, body, body_bytes, body_sha256 }) {
+  cleanupExpiredEmailDrafts();
+  const draft_id = randomUUID();
+  const expires_at_ms = Date.now() + EMAIL_DRAFT_TTL_MS;
+  emailDraftCache.set(draft_id, {
+    agent_id,
+    from,
+    to,
+    subject,
+    body,
+    body_bytes,
+    body_sha256,
+    expires_at_ms
+  });
+  return { draft_id, expires_at_ms };
+}
+
+function getEmailDraft(draftId, agentId) {
+  cleanupExpiredEmailDrafts();
+  const draft = emailDraftCache.get(draftId);
+  if (!draft) throw new Error("E-Mail-Draft nicht gefunden oder abgelaufen.");
+  if (draft.agent_id !== agentId) {
+    throw new Error("E-Mail-Draft gehoert zu einer anderen agent_id.");
+  }
+  return draft;
 }
 
 function createSmtpReader(socket) {
@@ -1040,6 +1100,76 @@ function createServer() {
   );
 
   server.tool(
+    "agent_email_prepare",
+    "Bereitet eine Plain-Text-E-Mail serverseitig vor und gibt eine Draft-ID zurueck. Sendet nichts; empfohlen fuer grosse Payloads vor agent_email_send_prepared.",
+    {
+      agent_id: agentIdSchema,
+      to: z.string(),
+      subject: z.string(),
+      body: z.string()
+    },
+    async ({ agent_id, to, subject, body }) => {
+      const validated = validateEmailPayload({ to, subject, body });
+      const config = getSmtpConfig(agent_id, { requireCredentials: false });
+      const stored = storeEmailDraft({
+        agent_id,
+        from: config.fromAddress,
+        to: validated.recipients,
+        subject: validated.subject,
+        body,
+        body_bytes: validated.body_bytes,
+        body_sha256: validated.body_sha256
+      });
+
+      return out({
+        agent_id,
+        prepared: true,
+        draft_id: stored.draft_id,
+        expires_at: new Date(stored.expires_at_ms).toISOString(),
+        from: config.fromAddress,
+        to: validated.recipients,
+        subject: validated.subject,
+        body_bytes: validated.body_bytes,
+        body_sha256: validated.body_sha256
+      });
+    }
+  );
+
+  server.tool(
+    "agent_email_send_prepared",
+    "Sendet eine zuvor mit agent_email_prepare vorbereitete E-Mail per SMTP. Live-Versand nur mit klarer Asana-Freigabe; Payload wird per Draft-ID referenziert.",
+    {
+      agent_id: agentIdSchema,
+      draft_id: z.string(),
+      body_sha256: z.string().optional(),
+      confirmed_by_asana: z.boolean(),
+      asana_task_gid: z.string()
+    },
+    async ({ agent_id, draft_id, body_sha256, confirmed_by_asana, asana_task_gid }) => {
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "agent_email_send_prepared");
+      const draft = getEmailDraft(draft_id, agent_id);
+      if (body_sha256 && body_sha256 !== draft.body_sha256) {
+        throw new Error("body_sha256 stimmt nicht mit dem vorbereiteten E-Mail-Draft ueberein.");
+      }
+
+      const config = getSmtpConfig(agent_id, { requireCredentials: true });
+      await sendSmtpEmail(config, { to: draft.to, subject: draft.subject, body: draft.body });
+      emailDraftCache.delete(draft_id);
+
+      return out({
+        agent_id,
+        sent: true,
+        draft_id,
+        from: config.fromAddress,
+        to: draft.to,
+        subject: draft.subject,
+        body_bytes: draft.body_bytes,
+        body_sha256: draft.body_sha256
+      });
+    }
+  );
+
+  server.tool(
     "agent_email_send",
     "Sendet eine Plain-Text-E-Mail aus dem Agentenpostfach per SMTP. Live-Versand nur mit klarer Asana-Freigabe; Empfaenger sind standardmaessig frei, optional per EMAIL_ALLOWED_RECIPIENTS begrenzbar.",
     {
@@ -1052,45 +1182,32 @@ function createServer() {
       asana_task_gid: z.string().optional()
     },
     async ({ agent_id, to, subject, body, dry_run, confirmed_by_asana, asana_task_gid }) => {
-      const recipients = parseRecipients(to);
-      assertAllowedEmailRecipients(recipients);
-
-      const trimmedSubject = subject.trim();
-      if (!trimmedSubject) throw new Error("subject darf nicht leer sein.");
-      if (Buffer.byteLength(trimmedSubject, "utf8") > 300) {
-        throw new Error("subject ist zu lang (>300 Bytes).");
-      }
-      if (!body.trim()) throw new Error("body darf nicht leer sein.");
-      if (Buffer.byteLength(body, "utf8") > 2_000_000) {
-        throw new Error("body ist zu gross fuer agent_email_send (>2 MB).");
-      }
-
+      const validated = validateEmailPayload({ to, subject, body });
       const config = getSmtpConfig(agent_id, { requireCredentials: !dry_run });
-      const bodyHash = createHash("sha256").update(body, "utf8").digest("hex");
 
       if (dry_run) {
         return out({
           agent_id,
           dry_run: true,
           from: config.fromAddress,
-          to: recipients,
-          subject: trimmedSubject,
-          body_bytes: Buffer.byteLength(body, "utf8"),
-          body_sha256: bodyHash
+          to: validated.recipients,
+          subject: validated.subject,
+          body_bytes: validated.body_bytes,
+          body_sha256: validated.body_sha256
         });
       }
 
       assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "agent_email_send");
-      await sendSmtpEmail(config, { to: recipients, subject: trimmedSubject, body });
+      await sendSmtpEmail(config, { to: validated.recipients, subject: validated.subject, body });
 
       return out({
         agent_id,
         sent: true,
         from: config.fromAddress,
-        to: recipients,
-        subject: trimmedSubject,
-        body_bytes: Buffer.byteLength(body, "utf8"),
-        body_sha256: bodyHash
+        to: validated.recipients,
+        subject: validated.subject,
+        body_bytes: validated.body_bytes,
+        body_sha256: validated.body_sha256
       });
     }
   );
