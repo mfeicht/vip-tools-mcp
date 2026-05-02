@@ -96,42 +96,146 @@ function containsPlainMention(value) {
   return /(^|[\s(])@[A-Za-zÄÖÜäöüß]/.test(value);
 }
 
+function containsRawHtmlTag(value) {
+  return /<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*)?>/.test(String(value || ""));
+}
+
+function containsEscapedHtmlTag(value) {
+  return /&lt;\s*\/?\s*[A-Za-z][A-Za-z0-9:-]*(?:\s|&gt;|>)/i.test(String(value || ""));
+}
+
 function assertSafeAsanaRequest(method, path, data) {
   const isStoryCreate = method === "POST" && /^\/tasks\/[^/]+\/stories\/?$/.test(path);
   const isStoryUpdate = method === "PUT" && /^\/stories\/[^/]+\/?$/.test(path);
   if (!isStoryCreate && !isStoryUpdate) return;
 
-  if (!data || typeof data !== "object") return;
+  throw new Error(
+    "Asana-Kommentare duerfen nicht mehr ueber asana_request erstellt oder geaendert werden. Nutze das enge Tool asana_comment; es baut valides Asana-Rich-Text-Markup und prueft den Readback."
+  );
+}
 
-  if (typeof data.text === "string") {
-    throw new Error(
-      "Asana-Kommentare muessen als html_text gesendet werden. data.text ist fuer Task-Stories in diesem MCP blockiert, damit Mentions/Rich-Text nicht als Plain Text rausgehen."
+function escapeAsanaXml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function ensureNoUnsafeAsanaText(value, label) {
+  const text = String(value ?? "");
+  if (!text.trim()) return;
+  if (containsPlainMention(text)) {
+    throw new Error(`${label} enthaelt eine Plain-Text-Mention. Nutze mention_user_gid statt @Name.`);
+  }
+  if (containsRawHtmlTag(text) || containsEscapedHtmlTag(text)) {
+    throw new Error(`${label} enthaelt HTML oder escaped HTML. Uebergib nur Klartext; asana_comment baut das Markup selbst.`);
+  }
+}
+
+function validateAsanaGid(value, label) {
+  if (value && !/^\d+$/.test(String(value))) {
+    throw new Error(`${label} muss eine Asana-GID sein.`);
+  }
+}
+
+function asanaParagraph(text) {
+  ensureNoUnsafeAsanaText(text, "Asana-Kommentarabsatz");
+  return `<p>${escapeAsanaXml(text)}</p>`;
+}
+
+function asanaSection(section) {
+  const parts = [];
+  if (section.title) {
+    ensureNoUnsafeAsanaText(section.title, "Asana-Kommentarueberschrift");
+    parts.push(`<p><strong>${escapeAsanaXml(section.title)}</strong></p>`);
+  }
+  for (const paragraph of section.paragraphs || []) {
+    parts.push(asanaParagraph(paragraph));
+  }
+  if (section.bullets?.length) {
+    parts.push(
+      `<ul>${section.bullets
+        .map((bullet) => {
+          ensureNoUnsafeAsanaText(bullet, "Asana-Kommentarlistenpunkt");
+          return `<li>${escapeAsanaXml(bullet)}</li>`;
+        })
+        .join("")}</ul>`
     );
   }
+  for (const codeBlock of section.code_blocks || []) {
+    parts.push(`<p><code>${escapeAsanaXml(codeBlock)}</code></p>`);
+  }
+  return parts.join("");
+}
 
-  if (typeof data.html_text === "string") {
-    const html = data.html_text.trim();
-    if (!html.startsWith("<body")) {
-      throw new Error("Asana html_text muss mit <body> beginnen.");
-    }
-    if (!html.endsWith("</body>")) {
-      throw new Error("Asana html_text muss mit </body> enden.");
-    }
-    if (/<br\b/i.test(html)) {
-      throw new Error(
-        "Asana html_text darf kein <br/> enthalten. Nutze Asana-kompatible Abschnitte mit <strong>, <em>, <ul>/<ol>/<li>, <code> und echte Mentions."
-      );
-    }
-    if (/&lt;\s*\/?\s*(body|strong|em|ul|ol|li|code|a)\b/i.test(html)) {
-      throw new Error(
-        "Asana html_text enthaelt bereits escaped HTML. Sende echtes Asana-Rich-Text-Markup, nicht HTML als Text."
-      );
-    }
-    if (containsPlainMention(html)) {
-      throw new Error(
-        "Plain-Text-Mention blockiert. Nutze echte Asana-Mentions mit <a data-asana-gid=\"USER_GID\"/> statt @Name."
-      );
-    }
+function collectAsanaCodeBlocks(sections = []) {
+  return sections.flatMap((section) => section.code_blocks || []).filter((value) => String(value).trim());
+}
+
+function buildAsanaCommentHtml({ greeting, sections, mention_user_gid, mention_text, effort_note }) {
+  validateAsanaGid(mention_user_gid, "mention_user_gid");
+  const parts = [];
+
+  if (greeting) {
+    parts.push(asanaParagraph(greeting));
+  }
+  for (const section of sections || []) {
+    parts.push(asanaSection(section));
+  }
+  if (mention_user_gid || mention_text) {
+    ensureNoUnsafeAsanaText(mention_text, "Asana-Kommentar-Mentiontext");
+    const mention = mention_user_gid ? `<a data-asana-gid="${mention_user_gid}"/>` : "";
+    const text = mention_text ? ` ${escapeAsanaXml(mention_text)}` : "";
+    parts.push(`<p>${mention}${text}</p>`);
+  }
+  if (effort_note) {
+    ensureNoUnsafeAsanaText(effort_note, "Asana-Kommentar-Aufwandshinweis");
+    parts.push(`<p><em>${escapeAsanaXml(effort_note)}</em></p>`);
+  }
+
+  if (!parts.length) {
+    throw new Error("asana_comment braucht mindestens greeting, sections, mention_text oder effort_note.");
+  }
+
+  const html = `<body>${parts.join("")}</body>`;
+  assertGeneratedAsanaHtml(html);
+  return html;
+}
+
+function assertGeneratedAsanaHtml(html) {
+  if (!/^<body>(?:<p>(?:<strong>[^<>]*<\/strong>|<em>[^<>]*<\/em>|<code>[^<>]*<\/code>|<a data-asana-gid="\d+"\/>(?: [^<>]*)?|[^<>]*)<\/p>|<ul>(?:<li>[^<>]*<\/li>)+<\/ul>)+<\/body>$/.test(html)) {
+    throw new Error("Generierter Asana-Kommentar entspricht nicht dem engen Rich-Text-Format.");
+  }
+  if (/<body><strong/i.test(html) || /<body><ul/i.test(html)) {
+    throw new Error("Asana-Kommentar darf keine Inline-/Listen-Tags direkt unter <body> starten.");
+  }
+  const htmlWithoutCode = html.replace(/<code>[\s\S]*?<\/code>/gi, "");
+  if (/<br\b/i.test(htmlWithoutCode) || containsPlainMention(htmlWithoutCode) || containsEscapedHtmlTag(htmlWithoutCode)) {
+    throw new Error("Generierter Asana-Kommentar enthaelt blockierte Tags, Mentions oder escaped HTML.");
+  }
+}
+
+function stripExpectedCodeSnippets(text, snippets = []) {
+  let cleaned = String(text || "");
+  for (const snippet of snippets) {
+    const raw = String(snippet || "");
+    if (!raw) continue;
+    cleaned = cleaned.split(raw).join("");
+    cleaned = cleaned.split(escapeAsanaXml(raw)).join("");
+  }
+  return cleaned;
+}
+
+function assertAsanaStoryReadbackLooksSafe(story, expectedCodeSnippets = []) {
+  const visibleText = stripExpectedCodeSnippets(story?.text || "", expectedCodeSnippets);
+  const richText = String(story?.html_text || "");
+  const richTextWithoutCode = richText.replace(/<code>[\s\S]*?<\/code>/gi, "");
+  if (containsRawHtmlTag(visibleText) || containsEscapedHtmlTag(visibleText)) {
+    throw new Error("Asana-Readback enthaelt sichtbares body/html-Markup. Kommentar muss manuell geprueft/korrigiert werden.");
+  }
+  if (containsEscapedHtmlTag(richTextWithoutCode) || /<br\b/i.test(richTextWithoutCode)) {
+    throw new Error("Asana-Readback enthaelt escaped oder inkompatibles Rich-Text-Markup. Kommentar muss manuell geprueft/korrigiert werden.");
   }
 }
 
@@ -641,6 +745,91 @@ function createServer() {
       return out({ agent_id, tasks: res.data.data });
     }
   );
+
+  server.tool(
+    "asana_comment",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut <body><p>...</p></body>, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      greeting: z.string().optional(),
+      sections: z
+        .array(
+          z.object({
+            title: z.string().optional(),
+            paragraphs: z.array(z.string()).optional().default([]),
+            bullets: z.array(z.string()).optional().default([]),
+            code_blocks: z.array(z.string()).optional().default([])
+          })
+        )
+        .optional()
+        .default([]),
+      mention_user_gid: z.string().optional(),
+      mention_text: z.string().optional(),
+      effort_note: z.string().optional(),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    async ({
+      agent_id,
+      task_gid,
+      greeting,
+      sections,
+      mention_user_gid,
+      mention_text,
+      effort_note,
+      dry_run,
+      verify_after
+    }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      const html_text = buildAsanaCommentHtml({
+        greeting,
+        sections,
+        mention_user_gid,
+        mention_text,
+        effort_note
+      });
+      const expectedCodeSnippets = collectAsanaCodeBlocks(sections);
+      const html_sha256 = createHash("sha256").update(html_text, "utf8").digest("hex");
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          task_gid,
+          html_text,
+          html_bytes: Buffer.byteLength(html_text, "utf8"),
+          html_sha256
+        });
+      }
+
+      const asana = getAsana(agent_id);
+      const res = await asana.post(
+        `/tasks/${task_gid}/stories`,
+        { data: { html_text } },
+        { params: { opt_fields: "gid,text,html_text,created_at,created_by" } }
+      );
+
+      let verified_story;
+      if (verify_after && res.data.data?.gid) {
+        const verify = await asana.get(`/stories/${res.data.data.gid}`, {
+          params: { opt_fields: "gid,text,html_text,created_at,created_by" }
+        });
+        verified_story = verify.data.data;
+        assertAsanaStoryReadbackLooksSafe(verified_story, expectedCodeSnippets);
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        story: res.data.data,
+        verified_story,
+        html_bytes: Buffer.byteLength(html_text, "utf8"),
+        html_sha256
+      });
+    }
+  );
+
   server.tool(
 
       "asana_request",
@@ -669,9 +858,9 @@ function createServer() {
 
         }
 
-        const asana = getAsana(agent_id);
-
         assertSafeAsanaRequest(method, path, data);
+
+        const asana = getAsana(agent_id);
 
         const res = await asana.request({
 
