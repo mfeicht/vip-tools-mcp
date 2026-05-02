@@ -81,7 +81,8 @@ function getAsana(agentId = DEFAULT_AGENT_ID) {
   return axios.create({
     baseURL: "https://app.asana.com/api/1.0",
     headers: {
-      Authorization: `Bearer ${token}`
+      Authorization: `Bearer ${token}`,
+      "Asana-Enable": "new_rich_text"
     }
   });
 }
@@ -175,6 +176,9 @@ function collectAsanaCodeBlocks(sections = []) {
 
 function buildAsanaCommentHtml({ greeting, sections, mention_user_gid, mention_text, effort_note }) {
   validateAsanaGid(mention_user_gid, "mention_user_gid");
+  if (mention_text && !mention_user_gid) {
+    throw new Error("mention_text braucht mention_user_gid, damit die Person in Asana korrekt verlinkt wird.");
+  }
   const parts = [];
 
   if (greeting) {
@@ -480,27 +484,57 @@ function defaultSmtpHostForAddress(fromAddress) {
   return "";
 }
 
-function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
+function getSmtpConfigDetails(agentId) {
   const suffix = envSuffixForAgent(agentId);
   const fromAddress =
     process.env[`EMAIL_ADDRESS_${suffix}`] || AGENT_EMAIL_DEFAULTS[agentId];
-  const host = getEnvWithAgentFallback("SMTP_HOST", agentId) || defaultSmtpHostForAddress(fromAddress);
-  const port = Number(getEnvWithAgentFallback("SMTP_PORT", agentId) || 465);
-  const secure = parseBooleanEnv(getEnvWithAgentFallback("SMTP_SECURE", agentId), port === 465);
-  const user = process.env[`SMTP_USER_${suffix}`] || fromAddress;
-  const password =
-    process.env[`SMTP_PASSWORD_${suffix}`] ||
-    process.env[`EMAIL_PASSWORD_${suffix}`];
+  const configuredHost = getEnvWithAgentFallback("SMTP_HOST", agentId);
+  const defaultHost = defaultSmtpHostForAddress(fromAddress);
+  const host = configuredHost || defaultHost;
+  const rawPort = getEnvWithAgentFallback("SMTP_PORT", agentId);
+  const port = Number(rawPort || 465);
+  const rawSecure = getEnvWithAgentFallback("SMTP_SECURE", agentId);
+  const secure = parseBooleanEnv(rawSecure, port === 465);
+  const configuredUser = process.env[`SMTP_USER_${suffix}`];
+  const user = configuredUser || fromAddress;
+  const passwordEnvName = process.env[`SMTP_PASSWORD_${suffix}`]
+    ? `SMTP_PASSWORD_${suffix}`
+    : process.env[`EMAIL_PASSWORD_${suffix}`]
+      ? `EMAIL_PASSWORD_${suffix}`
+      : "";
+  const password = passwordEnvName ? process.env[passwordEnvName] : "";
 
-  if (!fromAddress) throw new Error(`E-Mail-Adresse fuer agent_id ${agentId} fehlt.`);
+  return {
+    suffix,
+    config: { fromAddress, host, port, secure, user, password },
+    summary: {
+      agent_id: agentId,
+      from: fromAddress,
+      host_configured: Boolean(host),
+      host_source: configuredHost ? "env" : defaultHost ? "default_vip_studios_domain" : "missing",
+      port,
+      secure,
+      user_configured: Boolean(configuredUser),
+      user,
+      password_configured: Boolean(password),
+      password_env_name: passwordEnvName || null,
+      ready_for_send: Boolean(fromAddress && host && password)
+    }
+  };
+}
+
+function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
+  const { suffix, config } = getSmtpConfigDetails(agentId);
+
+  if (!config.fromAddress) throw new Error(`E-Mail-Adresse fuer agent_id ${agentId} fehlt.`);
   if (requireCredentials) {
-    if (!host) throw new Error(`SMTP_HOST oder SMTP_HOST_${suffix} fehlt im MCP-Environment.`);
-    if (!password) {
+    if (!config.host) throw new Error(`SMTP_HOST oder SMTP_HOST_${suffix} fehlt im MCP-Environment.`);
+    if (!config.password) {
       throw new Error(`SMTP_PASSWORD_${suffix} oder EMAIL_PASSWORD_${suffix} fehlt im MCP-Environment.`);
     }
   }
 
-  return { fromAddress, host, port, secure, user, password };
+  return config;
 }
 
 function cleanupExpiredEmailDrafts() {
@@ -626,7 +660,7 @@ function buildEmailMessage({ from, to, subject, body }) {
   return `${headers.join("\r\n")}\r\n\r\n${dotStuff(body)}`;
 }
 
-async function sendSmtpEmail(config, { to, subject, body }) {
+async function openAuthenticatedSmtpSession(config) {
   let socket = await createSmtpSocket(config);
   let readResponse = createSmtpReader(socket);
 
@@ -660,6 +694,24 @@ async function sendSmtpEmail(config, { to, subject, body }) {
   writeSmtp(socket, Buffer.from(config.password, "utf8").toString("base64"));
   await expectSmtp(readResponse, [235], "auth password");
 
+  return { socket, readResponse };
+}
+
+async function closeSmtpSession(socket, readResponse) {
+  if (!socket || socket.destroyed) return;
+  writeSmtp(socket, "QUIT");
+  await expectSmtp(readResponse, [221], "quit");
+  socket.end();
+}
+
+async function checkSmtpAuth(config) {
+  const { socket, readResponse } = await openAuthenticatedSmtpSession(config);
+  await closeSmtpSession(socket, readResponse);
+}
+
+async function sendSmtpEmail(config, { to, subject, body }) {
+  const { socket, readResponse } = await openAuthenticatedSmtpSession(config);
+
   writeSmtp(socket, `MAIL FROM:<${config.fromAddress}>`);
   await expectSmtp(readResponse, [250], "mail from");
   for (const recipient of to) {
@@ -670,9 +722,7 @@ async function sendSmtpEmail(config, { to, subject, body }) {
   await expectSmtp(readResponse, [354], "data");
   socket.write(`${buildEmailMessage({ from: config.fromAddress, to, subject, body })}\r\n.\r\n`);
   await expectSmtp(readResponse, [250], "send data");
-  writeSmtp(socket, "QUIT");
-  await expectSmtp(readResponse, [221], "quit");
-  socket.end();
+  await closeSmtpSession(socket, readResponse);
 }
 
 function assertAsanaConfirmed(confirmedByAsana, asanaTaskGid, actionName) {
@@ -1292,6 +1342,31 @@ function createServer() {
       });
 
       return out({ agent_id, response: res.data });
+    }
+  );
+
+  server.tool(
+    "agent_email_check_config",
+    "Prueft die SMTP-Konfiguration eines Agenten ohne E-Mail-Versand. Optional wird nur die SMTP-Anmeldung getestet; es werden keine Empfaenger, kein MAIL FROM und kein DATA gesendet.",
+    {
+      agent_id: agentIdSchema,
+      check_smtp_auth: z.boolean().optional().default(false)
+    },
+    async ({ agent_id, check_smtp_auth }) => {
+      const { config, summary } = getSmtpConfigDetails(agent_id);
+      const result = {
+        ...summary,
+        check_smtp_auth,
+        smtp_auth_ok: null
+      };
+
+      if (check_smtp_auth) {
+        getSmtpConfig(agent_id, { requireCredentials: true });
+        await checkSmtpAuth(config);
+        result.smtp_auth_ok = true;
+      }
+
+      return out(result);
     }
   );
 

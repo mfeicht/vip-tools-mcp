@@ -14,7 +14,10 @@ if (!token) throw new Error(`Token fehlt: ${agent.asanaTokenEnv}`);
 
 const asana = axios.create({
   baseURL: "https://app.asana.com/api/1.0",
-  headers: { Authorization: `Bearer ${token}` },
+  headers: {
+    Authorization: `Bearer ${token}`,
+    "Asana-Enable": "new_rich_text",
+  },
 });
 
 const [action, taskGid, ...rest] = args;
@@ -37,15 +40,9 @@ function containsPlainMention(value) {
 function toHtmlText(value) {
   const trimmed = value.trim();
   if (trimmed.startsWith("<body")) {
-    if (/<br\b/i.test(trimmed)) {
-      throw new Error("Asana html_text darf kein <br/> enthalten. Nutze <ul>/<ol>/<li> oder kurze Abschnitte ohne br-Tags.");
-    }
-    if (/&lt;\s*\/?\s*(body|strong|em|ul|ol|li|code|a)\b/i.test(trimmed)) {
-      throw new Error("Asana html_text enthaelt bereits escaped HTML. Sende echtes Asana-Rich-Text-Markup.");
-    }
-    return trimmed;
+    throw new Error("Rohes Asana-html_text ist in asana-action.js blockiert. Nutze das MCP-Tool asana_comment.");
   }
-  return `<body>${escapeHtml(value).replace(/\n+/g, " ")}</body>`;
+  return `<body><p>${escapeHtml(value).replace(/\n+/g, " ")}</p></body>`;
 }
 
 if (action === "comment") {
