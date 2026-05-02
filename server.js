@@ -51,6 +51,7 @@ const RS_REDAKTIONSPLAN_SHEET_NAME = process.env.RS_REDAKTIONSPLAN_SHEET_NAME ||
 const DEFAULT_EMAIL_ALLOWED_RECIPIENTS = "*";
 const EMAIL_DRAFT_TTL_MS = Number(process.env.EMAIL_DRAFT_TTL_MS || 60 * 60 * 1000);
 const SMTP_TIMEOUT_MS = Number(process.env.SMTP_TIMEOUT_MS || 15_000);
+const EMAIL_HTTP_TIMEOUT_MS = Number(process.env.EMAIL_HTTP_TIMEOUT_MS || 20_000);
 
 const AGENT_EMAIL_DEFAULTS = {
   "vip-ai-sales": "sales-agent@vip-studios.de",
@@ -576,6 +577,143 @@ function getSmtpConfigCandidates(agentId, { requireCredentials = true } = {}) {
 
 function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
   return getSmtpConfigCandidates(agentId, { requireCredentials }).primaryConfig;
+}
+
+function normalizeEmailHttpProvider(value) {
+  const provider = String(value || "").trim().toLowerCase();
+  if (!provider || provider === "none" || provider === "smtp") return "";
+  if (["resend", "brevo"].includes(provider)) return provider;
+  throw new Error(`Unbekannter EMAIL_HTTP_PROVIDER: ${provider}. Erlaubt: resend, brevo.`);
+}
+
+function getEmailHttpConfigDetails(agentId, { requireCredentials = true } = {}) {
+  const suffix = envSuffixForAgent(agentId);
+  const fromAddress =
+    process.env[`EMAIL_ADDRESS_${suffix}`] || AGENT_EMAIL_DEFAULTS[agentId];
+  const provider = normalizeEmailHttpProvider(
+    getEnvWithAgentFallback("EMAIL_HTTP_PROVIDER", agentId) ||
+      getEnvWithAgentFallback("EMAIL_PROVIDER", agentId)
+  );
+  const fromName = getEnvWithAgentFallback("EMAIL_FROM_NAME", agentId) || "";
+  const genericApiKey = getEnvWithAgentFallback("EMAIL_HTTP_API_KEY", agentId);
+  let apiKeyEnvName = "";
+  let apiKey = "";
+
+  if (provider === "resend") {
+    apiKeyEnvName = process.env[`RESEND_API_KEY_${suffix}`]
+      ? `RESEND_API_KEY_${suffix}`
+      : process.env.RESEND_API_KEY
+        ? "RESEND_API_KEY"
+        : genericApiKey
+          ? process.env[`EMAIL_HTTP_API_KEY_${suffix}`]
+            ? `EMAIL_HTTP_API_KEY_${suffix}`
+            : "EMAIL_HTTP_API_KEY"
+          : "";
+    apiKey = apiKeyEnvName ? process.env[apiKeyEnvName] : "";
+  } else if (provider === "brevo") {
+    apiKeyEnvName = process.env[`BREVO_API_KEY_${suffix}`]
+      ? `BREVO_API_KEY_${suffix}`
+      : process.env.BREVO_API_KEY
+        ? "BREVO_API_KEY"
+        : genericApiKey
+          ? process.env[`EMAIL_HTTP_API_KEY_${suffix}`]
+            ? `EMAIL_HTTP_API_KEY_${suffix}`
+            : "EMAIL_HTTP_API_KEY"
+          : "";
+    apiKey = apiKeyEnvName ? process.env[apiKeyEnvName] : "";
+  }
+
+  if (requireCredentials && provider && !apiKey) {
+    throw new Error(`API-Key fuer EMAIL_HTTP_PROVIDER=${provider} fehlt im MCP-Environment.`);
+  }
+
+  return {
+    config: { provider, apiKey, fromAddress, fromName },
+    summary: {
+      email_http_provider: provider || null,
+      email_http_provider_configured: Boolean(provider),
+      email_http_api_key_configured: Boolean(apiKey),
+      email_http_api_key_env_name: apiKeyEnvName || null,
+      email_http_from_name: fromName || null,
+      email_http_ready_for_send: Boolean(provider && apiKey && fromAddress),
+      email_http_timeout_ms: EMAIL_HTTP_TIMEOUT_MS
+    }
+  };
+}
+
+function formatHttpFrom(config) {
+  if (!config.fromName) return config.fromAddress;
+  return `${config.fromName} <${config.fromAddress}>`;
+}
+
+function sanitizeEmailHttpResponse(provider, response) {
+  if (provider === "resend") {
+    return { provider, id: response?.data?.id || null };
+  }
+  if (provider === "brevo") {
+    return { provider, messageId: response?.data?.messageId || null };
+  }
+  return { provider };
+}
+
+function formatEmailHttpError(provider, error) {
+  const status = error.response?.status;
+  const data = error.response?.data;
+  const message = typeof data === "string" ? data : data?.message || data?.error || error.message;
+  return `${provider} HTTP send failed${status ? ` (${status})` : ""}: ${message}`;
+}
+
+async function sendEmailViaHttpProvider(config, { to, subject, body, idempotencyKey }) {
+  if (config.provider === "resend") {
+    const response = await axios.post(
+      "https://api.resend.com/emails",
+      {
+        from: formatHttpFrom(config),
+        to,
+        subject,
+        text: body
+      },
+      {
+        timeout: EMAIL_HTTP_TIMEOUT_MS,
+        headers: {
+          Authorization: `Bearer ${config.apiKey}`,
+          "Content-Type": "application/json",
+          ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {})
+        }
+      }
+    ).catch((error) => {
+      throw new Error(formatEmailHttpError("resend", error));
+    });
+    return sanitizeEmailHttpResponse("resend", response);
+  }
+
+  if (config.provider === "brevo") {
+    const response = await axios.post(
+      "https://api.brevo.com/v3/smtp/email",
+      {
+        sender: {
+          email: config.fromAddress,
+          ...(config.fromName ? { name: config.fromName } : {})
+        },
+        to: to.map((email) => ({ email })),
+        subject,
+        textContent: body
+      },
+      {
+        timeout: EMAIL_HTTP_TIMEOUT_MS,
+        headers: {
+          accept: "application/json",
+          "api-key": config.apiKey,
+          "content-type": "application/json"
+        }
+      }
+    ).catch((error) => {
+      throw new Error(formatEmailHttpError("brevo", error));
+    });
+    return sanitizeEmailHttpResponse("brevo", response);
+  }
+
+  throw new Error("Kein EMAIL_HTTP_PROVIDER konfiguriert.");
 }
 
 function cleanupExpiredEmailDrafts() {
@@ -1496,8 +1634,20 @@ function createServer() {
     },
     async ({ agent_id, check_smtp_auth }) => {
       const { configs, summary } = getSmtpConfigCandidates(agent_id, { requireCredentials: check_smtp_auth });
+      const { summary: httpSummary } = getEmailHttpConfigDetails(agent_id, { requireCredentials: false });
+      const smtpReady = summary.ready_for_send;
       const result = {
         ...summary,
+        ...httpSummary,
+        smtp_ready_for_send: smtpReady,
+        ready_for_send: httpSummary.email_http_provider_configured ? httpSummary.email_http_ready_for_send : smtpReady,
+        active_email_transport: httpSummary.email_http_provider_configured
+          ? httpSummary.email_http_ready_for_send
+            ? httpSummary.email_http_provider
+            : null
+          : smtpReady
+            ? "smtp"
+            : null,
         check_smtp_auth,
         smtp_auth_ok: null,
         smtp_auth: null,
@@ -1579,8 +1729,27 @@ function createServer() {
         throw new Error("body_sha256 stimmt nicht mit dem vorbereiteten E-Mail-Draft ueberein.");
       }
 
-      const { configs, primaryConfig } = getSmtpConfigCandidates(agent_id, { requireCredentials: true });
-      const smtp = await sendSmtpEmail(configs, { to: draft.to, subject: draft.subject, body: draft.body });
+      const { config: httpConfig } = getEmailHttpConfigDetails(agent_id, { requireCredentials: false });
+      const { primaryConfig } = getSmtpConfigCandidates(agent_id, { requireCredentials: false });
+      let transport;
+      if (httpConfig.provider) {
+        const { config: requiredHttpConfig } = getEmailHttpConfigDetails(agent_id, { requireCredentials: true });
+        transport = {
+          type: "http",
+          ...(await sendEmailViaHttpProvider(requiredHttpConfig, {
+            to: draft.to,
+            subject: draft.subject,
+            body: draft.body,
+            idempotencyKey: draft_id
+          }))
+        };
+      } else {
+        const { configs } = getSmtpConfigCandidates(agent_id, { requireCredentials: true });
+        transport = {
+          type: "smtp",
+          ...(await sendSmtpEmail(configs, { to: draft.to, subject: draft.subject, body: draft.body }))
+        };
+      }
       emailDraftCache.delete(draft_id);
 
       return out({
@@ -1592,7 +1761,7 @@ function createServer() {
         subject: draft.subject,
         body_bytes: draft.body_bytes,
         body_sha256: draft.body_sha256,
-        smtp
+        transport
       });
     }
   );
@@ -1611,7 +1780,10 @@ function createServer() {
     },
     async ({ agent_id, to, subject, body, dry_run, confirmed_by_asana, asana_task_gid }) => {
       const validated = validateEmailPayload({ to, subject, body });
-      const { configs, primaryConfig, summary } = getSmtpConfigCandidates(agent_id, { requireCredentials: !dry_run });
+      const { config: httpConfig, summary: httpSummary } = getEmailHttpConfigDetails(agent_id, { requireCredentials: false });
+      const { configs, primaryConfig, summary } = getSmtpConfigCandidates(agent_id, {
+        requireCredentials: !dry_run && !httpConfig.provider
+      });
 
       if (dry_run) {
         return out({
@@ -1622,12 +1794,38 @@ function createServer() {
           subject: validated.subject,
           body_bytes: validated.body_bytes,
           body_sha256: validated.body_sha256,
+          active_email_transport: httpSummary.email_http_provider_configured
+            ? httpSummary.email_http_ready_for_send
+              ? httpSummary.email_http_provider
+              : null
+            : summary.ready_for_send
+              ? "smtp"
+              : null,
+          email_http_provider: httpSummary.email_http_provider,
+          email_http_ready_for_send: httpSummary.email_http_ready_for_send,
+          smtp_ready_for_send: summary.ready_for_send,
           smtp_candidates: summary.smtp_candidates
         });
       }
 
       assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "agent_email_send");
-      const smtp = await sendSmtpEmail(configs, { to: validated.recipients, subject: validated.subject, body });
+      let transport;
+      if (httpConfig.provider) {
+        const { config: requiredHttpConfig } = getEmailHttpConfigDetails(agent_id, { requireCredentials: true });
+        transport = {
+          type: "http",
+          ...(await sendEmailViaHttpProvider(requiredHttpConfig, {
+            to: validated.recipients,
+            subject: validated.subject,
+            body
+          }))
+        };
+      } else {
+        transport = {
+          type: "smtp",
+          ...(await sendSmtpEmail(configs, { to: validated.recipients, subject: validated.subject, body }))
+        };
+      }
 
       return out({
         agent_id,
@@ -1637,7 +1835,7 @@ function createServer() {
         subject: validated.subject,
         body_bytes: validated.body_bytes,
         body_sha256: validated.body_sha256,
-        smtp
+        transport
       });
     }
   );
