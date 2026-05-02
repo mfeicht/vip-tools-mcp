@@ -144,14 +144,14 @@ function validateAsanaGid(value, label) {
 
 function asanaParagraph(text) {
   ensureNoUnsafeAsanaText(text, "Asana-Kommentarabsatz");
-  return `<p>${escapeAsanaXml(text)}</p>`;
+  return `${escapeAsanaXml(text)}\n\n`;
 }
 
 function asanaSection(section) {
   const parts = [];
   if (section.title) {
     ensureNoUnsafeAsanaText(section.title, "Asana-Kommentarueberschrift");
-    parts.push(`<p><strong>${escapeAsanaXml(section.title)}</strong></p>`);
+    parts.push(`<strong>${escapeAsanaXml(section.title)}</strong>\n`);
   }
   for (const paragraph of section.paragraphs || []) {
     parts.push(asanaParagraph(paragraph));
@@ -163,11 +163,11 @@ function asanaSection(section) {
           ensureNoUnsafeAsanaText(bullet, "Asana-Kommentarlistenpunkt");
           return `<li>${escapeAsanaXml(bullet)}</li>`;
         })
-        .join("")}</ul>`
+        .join("")}</ul>\n`
     );
   }
   for (const codeBlock of section.code_blocks || []) {
-    parts.push(`<p><code>${escapeAsanaXml(codeBlock)}</code></p>`);
+    parts.push(`<code>${escapeAsanaXml(codeBlock)}</code>\n\n`);
   }
   return parts.join("");
 }
@@ -193,11 +193,11 @@ function buildAsanaCommentHtml({ greeting, sections, mention_user_gid, mention_t
     ensureNoUnsafeAsanaText(mention_text, "Asana-Kommentar-Mentiontext");
     const mention = mention_user_gid ? `<a data-asana-gid="${mention_user_gid}"/>` : "";
     const text = mention_text ? ` ${escapeAsanaXml(mention_text)}` : "";
-    parts.push(`<p>${mention}${text}</p>`);
+    parts.push(`${mention}${text}\n\n`);
   }
   if (effort_note) {
     ensureNoUnsafeAsanaText(effort_note, "Asana-Kommentar-Aufwandshinweis");
-    parts.push(`<p><em>${escapeAsanaXml(effort_note)}</em></p>`);
+    parts.push(`<em>${escapeAsanaXml(effort_note)}</em>`);
   }
 
   if (!parts.length) {
@@ -210,12 +210,29 @@ function buildAsanaCommentHtml({ greeting, sections, mention_user_gid, mention_t
 }
 
 function assertGeneratedAsanaHtml(html) {
-  if (!/^<body>(?:<p>(?:<strong>[^<>]*<\/strong>|<em>[^<>]*<\/em>|<code>[^<>]*<\/code>|<a data-asana-gid="\d+"\/>(?: [^<>]*)?|[^<>]*)<\/p>|<ul>(?:<li>[^<>]*<\/li>)+<\/ul>)+<\/body>$/.test(html)) {
+  if (!html.startsWith("<body>") || !html.endsWith("</body>")) {
     throw new Error("Generierter Asana-Kommentar entspricht nicht dem engen Rich-Text-Format.");
   }
-  if (/<body><strong/i.test(html) || /<body><ul/i.test(html)) {
-    throw new Error("Asana-Kommentar darf keine Inline-/Listen-Tags direkt unter <body> starten.");
+  if (/<\/?p\b/i.test(html)) {
+    throw new Error("Asana-Kommentar darf keine <p>-Tags verwenden; Asana-Stories escapen sie sichtbar.");
   }
+
+  const allowedTags = new Set(["body", "strong", "em", "code", "ul", "li", "a"]);
+  for (const tagMatch of html.matchAll(/<\/?([A-Za-z][A-Za-z0-9:-]*)(?:\s[^<>]*)?\/?>/g)) {
+    const tag = tagMatch[1];
+    const raw = tagMatch[0];
+    if (!allowedTags.has(tag)) {
+      throw new Error(`Generierter Asana-Kommentar enthaelt nicht erlaubtes Tag <${tag}>.`);
+    }
+    if (tag === "a") {
+      if (!/^<a data-asana-gid="\d+"\/>$/.test(raw)) {
+        throw new Error("Asana-Mention muss exakt als <a data-asana-gid=\"...\"/> erzeugt werden.");
+      }
+    } else if (/\s[^<>]*=/.test(raw)) {
+      throw new Error(`Asana-Kommentar enthaelt Attribute auf nicht erlaubtem Tag <${tag}>.`);
+    }
+  }
+
   const htmlWithoutCode = html.replace(/<code>[\s\S]*?<\/code>/gi, "");
   if (/<br\b/i.test(htmlWithoutCode) || containsPlainMention(htmlWithoutCode) || containsEscapedHtmlTag(htmlWithoutCode)) {
     throw new Error("Generierter Asana-Kommentar enthaelt blockierte Tags, Mentions oder escaped HTML.");
@@ -1148,12 +1165,20 @@ function createServer() {
       );
 
       let verified_story;
+      let verification_status = "not_requested";
+      let verification_error;
       if (verify_after && res.data.data?.gid) {
-        const verify = await asana.get(`/stories/${res.data.data.gid}`, {
-          params: { opt_fields: "gid,text,html_text,created_at,created_by" }
-        });
-        verified_story = verify.data.data;
-        assertAsanaStoryReadbackLooksSafe(verified_story, expectedCodeSnippets);
+        try {
+          const verify = await asana.get(`/stories/${res.data.data.gid}`, {
+            params: { opt_fields: "gid,text,html_text,created_at,created_by" }
+          });
+          verified_story = verify.data.data;
+          assertAsanaStoryReadbackLooksSafe(verified_story, expectedCodeSnippets);
+          verification_status = "ok";
+        } catch (error) {
+          verification_status = "posted_but_verification_failed_do_not_retry";
+          verification_error = error?.message || String(error);
+        }
       }
 
       return out({
@@ -1161,6 +1186,9 @@ function createServer() {
         task_gid,
         story: res.data.data,
         verified_story,
+        verification_status,
+        verification_error,
+        must_not_retry_comment: verification_status === "posted_but_verification_failed_do_not_retry",
         html_bytes: Buffer.byteLength(html_text, "utf8"),
         html_sha256
       });

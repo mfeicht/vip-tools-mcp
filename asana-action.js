@@ -42,7 +42,7 @@ function toHtmlText(value) {
   if (trimmed.startsWith("<body")) {
     throw new Error("Rohes Asana-html_text ist in asana-action.js blockiert. Nutze das MCP-Tool asana_comment.");
   }
-  return `<body><p>${escapeHtml(value).replace(/\n+/g, " ")}</p></body>`;
+  return `<body>${escapeHtml(value).replace(/\n{3,}/g, "\n\n")}</body>`;
 }
 
 if (action === "comment") {
