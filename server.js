@@ -50,6 +50,7 @@ const RS_REDAKTIONSPLAN_SPREADSHEET_ID =
 const RS_REDAKTIONSPLAN_SHEET_NAME = process.env.RS_REDAKTIONSPLAN_SHEET_NAME || "Redaktionsplan";
 const DEFAULT_EMAIL_ALLOWED_RECIPIENTS = "*";
 const EMAIL_DRAFT_TTL_MS = Number(process.env.EMAIL_DRAFT_TTL_MS || 60 * 60 * 1000);
+const SMTP_TIMEOUT_MS = Number(process.env.SMTP_TIMEOUT_MS || 15_000);
 
 const AGENT_EMAIL_DEFAULTS = {
   "vip-ai-sales": "sales-agent@vip-studios.de",
@@ -484,6 +485,15 @@ function defaultSmtpHostForAddress(fromAddress) {
   return "";
 }
 
+function publicSmtpConfig(config) {
+  return {
+    host: config.host,
+    port: config.port,
+    secure: config.secure,
+    label: config.label || "primary"
+  };
+}
+
 function getSmtpConfigDetails(agentId) {
   const suffix = envSuffixForAgent(agentId);
   const fromAddress =
@@ -513,7 +523,9 @@ function getSmtpConfigDetails(agentId) {
       host_configured: Boolean(host),
       host_source: configuredHost ? "env" : defaultHost ? "default_vip_studios_domain" : "missing",
       port,
+      port_source: rawPort ? "env" : "default",
       secure,
+      secure_source: rawSecure ? "env" : "default",
       user_configured: Boolean(configuredUser),
       user,
       password_configured: Boolean(password),
@@ -523,8 +535,8 @@ function getSmtpConfigDetails(agentId) {
   };
 }
 
-function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
-  const { suffix, config } = getSmtpConfigDetails(agentId);
+function getSmtpConfigCandidates(agentId, { requireCredentials = true } = {}) {
+  const { suffix, config, summary } = getSmtpConfigDetails(agentId);
 
   if (!config.fromAddress) throw new Error(`E-Mail-Adresse fuer agent_id ${agentId} fehlt.`);
   if (requireCredentials) {
@@ -534,7 +546,36 @@ function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
     }
   }
 
-  return config;
+  const candidates = [{ ...config, label: "primary" }];
+  const hasExplicitPort = summary.port_source === "env";
+  const isVipStudiosHost = /^vip-studios\.vip-studios\.de$/i.test(config.host || "");
+  if (!hasExplicitPort && isVipStudiosHost && config.port === 465) {
+    candidates.push({ ...config, port: 587, secure: false, label: "vip_studios_587_starttls_fallback" });
+  }
+
+  const uniqueCandidates = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = `${candidate.host}:${candidate.port}:${candidate.secure}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueCandidates.push(candidate);
+  }
+
+  return {
+    suffix,
+    configs: uniqueCandidates,
+    primaryConfig: uniqueCandidates[0],
+    summary: {
+      ...summary,
+      smtp_timeout_ms: SMTP_TIMEOUT_MS,
+      smtp_candidates: uniqueCandidates.map(publicSmtpConfig)
+    }
+  };
+}
+
+function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
+  return getSmtpConfigCandidates(agentId, { requireCredentials }).primaryConfig;
 }
 
 function cleanupExpiredEmailDrafts() {
@@ -596,7 +637,16 @@ function createSmtpReader(socket) {
           return { code, text: responseLines.join("\n") };
         }
       }
-      await new Promise((resolve) => waiters.push(resolve));
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`SMTP response timeout after ${SMTP_TIMEOUT_MS}ms`)),
+          SMTP_TIMEOUT_MS
+        );
+        waiters.push(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
     }
   };
 }
@@ -616,6 +666,15 @@ async function expectSmtp(readResponse, expectedCodes, label) {
 async function createSmtpSocket(config) {
   if (config.secure) {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer;
+      const done = (error, socket) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error);
+        else resolve(socket);
+      };
       const socket = tls.connect(
         {
           host: config.host,
@@ -623,15 +682,59 @@ async function createSmtpSocket(config) {
           servername: config.host,
           rejectUnauthorized: !parseBooleanEnv(process.env.SMTP_TLS_ALLOW_UNAUTHORIZED, false)
         },
-        () => resolve(socket)
+        () => done(null, socket)
       );
-      socket.once("error", reject);
+      timer = setTimeout(() => {
+        socket.destroy();
+        done(new Error(`SMTP connect timeout after ${SMTP_TIMEOUT_MS}ms (${config.host}:${config.port})`));
+      }, SMTP_TIMEOUT_MS);
+      socket.once("error", (error) => done(error));
     });
   }
 
   return new Promise((resolve, reject) => {
-    const socket = net.connect({ host: config.host, port: config.port }, () => resolve(socket));
-    socket.once("error", reject);
+    let settled = false;
+    let timer;
+    const done = (error, socket) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(socket);
+    };
+    const socket = net.connect({ host: config.host, port: config.port }, () => done(null, socket));
+    timer = setTimeout(() => {
+      socket.destroy();
+      done(new Error(`SMTP connect timeout after ${SMTP_TIMEOUT_MS}ms (${config.host}:${config.port})`));
+    }, SMTP_TIMEOUT_MS);
+    socket.once("error", (error) => done(error));
+  });
+}
+
+function upgradeSmtpSocketToTls(socket, config) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const done = (error, tlsSocket) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(tlsSocket);
+    };
+    const tlsSocket = tls.connect(
+      {
+        socket,
+        servername: config.host,
+        rejectUnauthorized: !parseBooleanEnv(process.env.SMTP_TLS_ALLOW_UNAUTHORIZED, false)
+      },
+      () => done(null, tlsSocket)
+    );
+    timer = setTimeout(() => {
+      tlsSocket.destroy();
+      done(new Error(`SMTP STARTTLS timeout after ${SMTP_TIMEOUT_MS}ms (${config.host}:${config.port})`));
+    }, SMTP_TIMEOUT_MS);
+    tlsSocket.once("error", (error) => done(error));
   });
 }
 
@@ -661,68 +764,107 @@ function buildEmailMessage({ from, to, subject, body }) {
 }
 
 async function openAuthenticatedSmtpSession(config) {
-  let socket = await createSmtpSocket(config);
-  let readResponse = createSmtpReader(socket);
+  let socket;
+  try {
+    socket = await createSmtpSocket(config);
+    let readResponse = createSmtpReader(socket);
 
-  await expectSmtp(readResponse, [220], "connect");
-  writeSmtp(socket, "EHLO vip-tools-mcp");
-  await expectSmtp(readResponse, [250], "ehlo");
-
-  if (!config.secure && config.port === 587) {
-    writeSmtp(socket, "STARTTLS");
-    await expectSmtp(readResponse, [220], "starttls");
-    socket = await new Promise((resolve, reject) => {
-      const tlsSocket = tls.connect(
-        {
-          socket,
-          servername: config.host,
-          rejectUnauthorized: !parseBooleanEnv(process.env.SMTP_TLS_ALLOW_UNAUTHORIZED, false)
-        },
-        () => resolve(tlsSocket)
-      );
-      tlsSocket.once("error", reject);
-    });
-    readResponse = createSmtpReader(socket);
+    await expectSmtp(readResponse, [220], "connect");
     writeSmtp(socket, "EHLO vip-tools-mcp");
-    await expectSmtp(readResponse, [250], "ehlo after starttls");
+    await expectSmtp(readResponse, [250], "ehlo");
+
+    if (!config.secure && config.port === 587) {
+      writeSmtp(socket, "STARTTLS");
+      await expectSmtp(readResponse, [220], "starttls");
+      socket = await upgradeSmtpSocketToTls(socket, config);
+      readResponse = createSmtpReader(socket);
+      writeSmtp(socket, "EHLO vip-tools-mcp");
+      await expectSmtp(readResponse, [250], "ehlo after starttls");
+    }
+
+    writeSmtp(socket, "AUTH LOGIN");
+    await expectSmtp(readResponse, [334], "auth login");
+    writeSmtp(socket, Buffer.from(config.user, "utf8").toString("base64"));
+    await expectSmtp(readResponse, [334], "auth user");
+    writeSmtp(socket, Buffer.from(config.password, "utf8").toString("base64"));
+    await expectSmtp(readResponse, [235], "auth password");
+
+    return { socket, readResponse };
+  } catch (error) {
+    if (socket && !socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function openAuthenticatedSmtpSessionWithFallback(configs) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const session = await openAuthenticatedSmtpSession(config);
+      attempts.push({ ...publicSmtpConfig(config), ok: true });
+      return { ...session, config, attempts };
+    } catch (error) {
+      attempts.push({ ...publicSmtpConfig(config), ok: false, error: String(error?.message || error) });
+    }
   }
 
-  writeSmtp(socket, "AUTH LOGIN");
-  await expectSmtp(readResponse, [334], "auth login");
-  writeSmtp(socket, Buffer.from(config.user, "utf8").toString("base64"));
-  await expectSmtp(readResponse, [334], "auth user");
-  writeSmtp(socket, Buffer.from(config.password, "utf8").toString("base64"));
-  await expectSmtp(readResponse, [235], "auth password");
+  const error = new Error(
+    `SMTP-Authentifizierung fehlgeschlagen: ${attempts
+      .map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} secure=${attempt.secure}: ${attempt.error}`)
+      .join(" | ")}`
+  );
+  error.smtp_attempts = attempts;
+  throw error;
+}
 
-  return { socket, readResponse };
+function publicSmtpSessionResult(config, attempts) {
+  return {
+    host: config.host,
+    port: config.port,
+    secure: config.secure,
+    label: config.label,
+    attempts
+  };
 }
 
 async function closeSmtpSession(socket, readResponse) {
   if (!socket || socket.destroyed) return;
-  writeSmtp(socket, "QUIT");
-  await expectSmtp(readResponse, [221], "quit");
-  socket.end();
-}
-
-async function checkSmtpAuth(config) {
-  const { socket, readResponse } = await openAuthenticatedSmtpSession(config);
-  await closeSmtpSession(socket, readResponse);
-}
-
-async function sendSmtpEmail(config, { to, subject, body }) {
-  const { socket, readResponse } = await openAuthenticatedSmtpSession(config);
-
-  writeSmtp(socket, `MAIL FROM:<${config.fromAddress}>`);
-  await expectSmtp(readResponse, [250], "mail from");
-  for (const recipient of to) {
-    writeSmtp(socket, `RCPT TO:<${recipient}>`);
-    await expectSmtp(readResponse, [250, 251], `rcpt to ${recipient}`);
+  try {
+    writeSmtp(socket, "QUIT");
+    await expectSmtp(readResponse, [221], "quit");
+  } catch {
+    // The SMTP work is already done; a QUIT timeout must not turn a successful auth/send into a failure.
+  } finally {
+    socket.end();
   }
-  writeSmtp(socket, "DATA");
-  await expectSmtp(readResponse, [354], "data");
-  socket.write(`${buildEmailMessage({ from: config.fromAddress, to, subject, body })}\r\n.\r\n`);
-  await expectSmtp(readResponse, [250], "send data");
+}
+
+async function checkSmtpAuth(configs) {
+  const { socket, readResponse, config, attempts } = await openAuthenticatedSmtpSessionWithFallback(configs);
   await closeSmtpSession(socket, readResponse);
+  return publicSmtpSessionResult(config, attempts);
+}
+
+async function sendSmtpEmail(configs, { to, subject, body }) {
+  const { socket, readResponse, config, attempts } = await openAuthenticatedSmtpSessionWithFallback(configs);
+
+  try {
+    writeSmtp(socket, `MAIL FROM:<${config.fromAddress}>`);
+    await expectSmtp(readResponse, [250], "mail from");
+    for (const recipient of to) {
+      writeSmtp(socket, `RCPT TO:<${recipient}>`);
+      await expectSmtp(readResponse, [250, 251], `rcpt to ${recipient}`);
+    }
+    writeSmtp(socket, "DATA");
+    await expectSmtp(readResponse, [354], "data");
+    socket.write(`${buildEmailMessage({ from: config.fromAddress, to, subject, body })}\r\n.\r\n`);
+    await expectSmtp(readResponse, [250], "send data");
+    await closeSmtpSession(socket, readResponse);
+    return publicSmtpSessionResult(config, attempts);
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
 }
 
 function assertAsanaConfirmed(confirmedByAsana, asanaTaskGid, actionName) {
@@ -1353,17 +1495,31 @@ function createServer() {
       check_smtp_auth: z.boolean().optional().default(false)
     },
     async ({ agent_id, check_smtp_auth }) => {
-      const { config, summary } = getSmtpConfigDetails(agent_id);
+      const { configs, summary } = getSmtpConfigCandidates(agent_id, { requireCredentials: check_smtp_auth });
       const result = {
         ...summary,
         check_smtp_auth,
-        smtp_auth_ok: null
+        smtp_auth_ok: null,
+        smtp_auth: null,
+        smtp_auth_attempts: []
       };
 
       if (check_smtp_auth) {
-        getSmtpConfig(agent_id, { requireCredentials: true });
-        await checkSmtpAuth(config);
-        result.smtp_auth_ok = true;
+        try {
+          const auth = await checkSmtpAuth(configs);
+          result.smtp_auth_ok = true;
+          result.smtp_auth = {
+            host: auth.host,
+            port: auth.port,
+            secure: auth.secure,
+            label: auth.label
+          };
+          result.smtp_auth_attempts = auth.attempts;
+        } catch (error) {
+          result.smtp_auth_ok = false;
+          result.smtp_auth_error = String(error?.message || error);
+          result.smtp_auth_attempts = error.smtp_attempts || [];
+        }
       }
 
       return out(result);
@@ -1423,19 +1579,20 @@ function createServer() {
         throw new Error("body_sha256 stimmt nicht mit dem vorbereiteten E-Mail-Draft ueberein.");
       }
 
-      const config = getSmtpConfig(agent_id, { requireCredentials: true });
-      await sendSmtpEmail(config, { to: draft.to, subject: draft.subject, body: draft.body });
+      const { configs, primaryConfig } = getSmtpConfigCandidates(agent_id, { requireCredentials: true });
+      const smtp = await sendSmtpEmail(configs, { to: draft.to, subject: draft.subject, body: draft.body });
       emailDraftCache.delete(draft_id);
 
       return out({
         agent_id,
         sent: true,
         draft_id,
-        from: config.fromAddress,
+        from: primaryConfig.fromAddress,
         to: draft.to,
         subject: draft.subject,
         body_bytes: draft.body_bytes,
-        body_sha256: draft.body_sha256
+        body_sha256: draft.body_sha256,
+        smtp
       });
     }
   );
@@ -1454,31 +1611,33 @@ function createServer() {
     },
     async ({ agent_id, to, subject, body, dry_run, confirmed_by_asana, asana_task_gid }) => {
       const validated = validateEmailPayload({ to, subject, body });
-      const config = getSmtpConfig(agent_id, { requireCredentials: !dry_run });
+      const { configs, primaryConfig, summary } = getSmtpConfigCandidates(agent_id, { requireCredentials: !dry_run });
 
       if (dry_run) {
         return out({
           agent_id,
           dry_run: true,
-          from: config.fromAddress,
+          from: primaryConfig.fromAddress,
           to: validated.recipients,
           subject: validated.subject,
           body_bytes: validated.body_bytes,
-          body_sha256: validated.body_sha256
+          body_sha256: validated.body_sha256,
+          smtp_candidates: summary.smtp_candidates
         });
       }
 
       assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "agent_email_send");
-      await sendSmtpEmail(config, { to: validated.recipients, subject: validated.subject, body });
+      const smtp = await sendSmtpEmail(configs, { to: validated.recipients, subject: validated.subject, body });
 
       return out({
         agent_id,
         sent: true,
-        from: config.fromAddress,
+        from: primaryConfig.fromAddress,
         to: validated.recipients,
         subject: validated.subject,
         body_bytes: validated.body_bytes,
-        body_sha256: validated.body_sha256
+        body_sha256: validated.body_sha256,
+        smtp
       });
     }
   );
