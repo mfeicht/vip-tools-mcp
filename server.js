@@ -48,7 +48,7 @@ const WP_IMPORT_URL =
 const RS_REDAKTIONSPLAN_SPREADSHEET_ID =
   process.env.RS_REDAKTIONSPLAN_SPREADSHEET_ID || "17BbIPRBGxcNUAYPNd6AD3wnvik6s26P8fnvPDeH1UrM";
 const RS_REDAKTIONSPLAN_SHEET_NAME = process.env.RS_REDAKTIONSPLAN_SHEET_NAME || "Redaktionsplan";
-const DEFAULT_EMAIL_ALLOWED_RECIPIENTS = "n8n-top10@reise-stories.de";
+const DEFAULT_EMAIL_ALLOWED_RECIPIENTS = "*";
 
 const AGENT_EMAIL_DEFAULTS = {
   "vip-ai-sales": "sales-agent@vip-studios.de",
@@ -348,16 +348,14 @@ function assertAllowedEmailRecipients(recipients) {
 function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
   const suffix = envSuffixForAgent(agentId);
   const fromAddress =
-    process.env[`EMAIL_ADDRESS_${suffix}`] || getEnvWithAgentFallback("EMAIL_ADDRESS", agentId) || AGENT_EMAIL_DEFAULTS[agentId];
+    process.env[`EMAIL_ADDRESS_${suffix}`] || AGENT_EMAIL_DEFAULTS[agentId];
   const host = getEnvWithAgentFallback("SMTP_HOST", agentId);
   const port = Number(getEnvWithAgentFallback("SMTP_PORT", agentId) || 465);
   const secure = parseBooleanEnv(getEnvWithAgentFallback("SMTP_SECURE", agentId), port === 465);
   const user = process.env[`SMTP_USER_${suffix}`] || fromAddress;
   const password =
     process.env[`SMTP_PASSWORD_${suffix}`] ||
-    process.env[`EMAIL_PASSWORD_${suffix}`] ||
-    process.env.SMTP_PASSWORD ||
-    process.env.EMAIL_PASSWORD;
+    process.env[`EMAIL_PASSWORD_${suffix}`];
 
   if (!fromAddress) throw new Error(`E-Mail-Adresse fuer agent_id ${agentId} fehlt.`);
   if (requireCredentials) {
@@ -1043,7 +1041,7 @@ function createServer() {
 
   server.tool(
     "agent_email_send",
-    "Sendet eine Plain-Text-E-Mail aus dem Agentenpostfach per SMTP. Live-Versand nur mit klarer Asana-Freigabe; Empfaenger sind per EMAIL_ALLOWED_RECIPIENTS begrenzt.",
+    "Sendet eine Plain-Text-E-Mail aus dem Agentenpostfach per SMTP. Live-Versand nur mit klarer Asana-Freigabe; Empfaenger sind standardmaessig frei, optional per EMAIL_ALLOWED_RECIPIENTS begrenzbar.",
     {
       agent_id: agentIdSchema,
       to: z.string(),
