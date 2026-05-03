@@ -110,6 +110,19 @@ function containsEscapedHtmlTag(value) {
 function assertSafeAsanaRequest(method, path, data) {
   const isStoryCreate = method === "POST" && /^\/tasks\/[^/]+\/stories\/?$/.test(path);
   const isStoryUpdate = method === "PUT" && /^\/stories\/[^/]+\/?$/.test(path);
+  const isTaskComplete =
+    method === "PUT" &&
+    /^\/tasks\/[^/]+\/?$/.test(path) &&
+    data &&
+    Object.prototype.hasOwnProperty.call(data, "completed") &&
+    data.completed === true;
+
+  if (isTaskComplete) {
+    throw new Error(
+      "Asana-Aufgaben duerfen nicht per rohem asana_request abgeschlossen werden. Nutze asana_complete_task; es prueft Assignee, finalen Kommentar und Readback."
+    );
+  }
+
   if (!isStoryCreate && !isStoryUpdate) return;
 
   throw new Error(
@@ -1102,7 +1115,7 @@ function createServer() {
 
   server.tool(
     "asana_comment",
-    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut <body><p>...</p></body>, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback.",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -1191,6 +1204,121 @@ function createServer() {
         must_not_retry_comment: verification_status === "posted_but_verification_failed_do_not_retry",
         html_bytes: Buffer.byteLength(html_text, "utf8"),
         html_sha256
+      });
+    }
+  );
+
+  server.tool(
+    "asana_complete_task",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar und Readback.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      completion_basis: z.string().min(20),
+      final_comment_story_gid: z.string().optional(),
+      require_final_comment: z.boolean().optional().default(true),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    async ({
+      agent_id,
+      task_gid,
+      completion_basis,
+      final_comment_story_gid,
+      require_final_comment,
+      dry_run,
+      verify_after
+    }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      if (final_comment_story_gid) validateAsanaGid(final_comment_story_gid, "final_comment_story_gid");
+      if (require_final_comment && !final_comment_story_gid) {
+        throw new Error(
+          "asana_complete_task braucht final_comment_story_gid, wenn require_final_comment=true ist. Poste zuerst einen Abschlusskommentar mit asana_comment."
+        );
+      }
+
+      const asana = getAsana(agent_id);
+      const me = await asana.get("/users/me");
+      const meGid = me.data.data.gid;
+
+      const taskRes = await asana.get(`/tasks/${task_gid}`, {
+        params: {
+          opt_fields: "gid,name,completed,completed_at,assignee.gid,assignee.name,tags.name,permalink_url"
+        }
+      });
+      const task = taskRes.data.data;
+
+      if (!task.assignee?.gid) {
+        throw new Error("Asana-Aufgabe hat keinen Assignee; automatischer Abschluss ist nicht erlaubt.");
+      }
+      if (task.assignee.gid !== meGid) {
+        throw new Error(
+          `Asana-Aufgabe ist ${task.assignee.name || task.assignee.gid} zugewiesen, nicht dem ausfuehrenden Agenten ${meGid}.`
+        );
+      }
+
+      let final_comment;
+      if (final_comment_story_gid) {
+        const storyRes = await asana.get(`/stories/${final_comment_story_gid}`, {
+          params: { opt_fields: "gid,text,html_text,created_at,created_by.gid,created_by.name" }
+        });
+        final_comment = storyRes.data.data;
+        if (!final_comment.created_by?.gid) {
+          throw new Error("Finaler Asana-Kommentar hat keinen erkennbaren Autor.");
+        }
+        if (final_comment.created_by.gid !== meGid) {
+          throw new Error("Finaler Asana-Kommentar wurde nicht vom ausfuehrenden Agenten erstellt.");
+        }
+        assertAsanaStoryReadbackLooksSafe(final_comment);
+      }
+
+      const basis_sha256 = createHash("sha256").update(completion_basis, "utf8").digest("hex");
+
+      if (dry_run || task.completed) {
+        return out({
+          agent_id,
+          dry_run,
+          already_completed: Boolean(task.completed),
+          allowed_to_complete: !task.completed,
+          task,
+          final_comment,
+          completion_basis,
+          completion_basis_sha256: basis_sha256
+        });
+      }
+
+      const completeRes = await asana.put(
+        `/tasks/${task_gid}`,
+        { data: { completed: true } },
+        { params: { opt_fields: "gid,name,completed,completed_at,assignee.gid,assignee.name,permalink_url" } }
+      );
+
+      let verified_task;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verify = await asana.get(`/tasks/${task_gid}`, {
+          params: { opt_fields: "gid,name,completed,completed_at,assignee.gid,assignee.name,permalink_url" }
+        });
+        verified_task = verify.data.data;
+        if (!verified_task.completed) {
+          throw new Error("Asana-Readback zeigt completed=false nach Abschlussversuch.");
+        }
+        if (verified_task.assignee?.gid !== meGid) {
+          throw new Error("Asana-Readback zeigt veraenderten Assignee nach Abschlussversuch.");
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        completed: true,
+        task: completeRes.data.data,
+        verified_task,
+        verification_status,
+        final_comment,
+        completion_basis,
+        completion_basis_sha256: basis_sha256
       });
     }
   );
