@@ -52,6 +52,11 @@ const DEFAULT_EMAIL_ALLOWED_RECIPIENTS = "*";
 const EMAIL_DRAFT_TTL_MS = Number(process.env.EMAIL_DRAFT_TTL_MS || 60 * 60 * 1000);
 const SMTP_TIMEOUT_MS = Number(process.env.SMTP_TIMEOUT_MS || 15_000);
 const EMAIL_HTTP_TIMEOUT_MS = Number(process.env.EMAIL_HTTP_TIMEOUT_MS || 20_000);
+const DATAFORSEO_API_BASE = (process.env.DATAFORSEO_API_BASE || "https://api.dataforseo.com/v3").replace(/\/$/, "");
+const DATAFORSEO_TIMEOUT_MS = Number(process.env.DATAFORSEO_TIMEOUT_MS || 30_000);
+const DATAFORSEO_DEFAULT_LOCATION_CODE = Number(process.env.DATAFORSEO_DEFAULT_LOCATION_CODE || 2276);
+const DATAFORSEO_DEFAULT_LANGUAGE_CODE = process.env.DATAFORSEO_DEFAULT_LANGUAGE_CODE || "de";
+const DATAFORSEO_MAX_RESULTS = Math.min(Number(process.env.DATAFORSEO_MAX_RESULTS || 100), 1000);
 
 const AGENT_EMAIL_DEFAULTS = {
   "vip-ai-sales": "sales-agent@vip-studios.de",
@@ -1054,6 +1059,155 @@ function isRetryableAxiosError(error) {
   return Boolean(error.code && ["ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN"].includes(error.code));
 }
 
+function getDataForSeoConfigDetails(agentId, { requireCredentials = true } = {}) {
+  const suffix = envSuffixForAgent(agentId);
+  const loginEnvName = process.env[`DATAFORSEO_LOGIN_${suffix}`] ? `DATAFORSEO_LOGIN_${suffix}` : "DATAFORSEO_LOGIN";
+  const passwordEnvName = process.env[`DATAFORSEO_PASSWORD_${suffix}`]
+    ? `DATAFORSEO_PASSWORD_${suffix}`
+    : "DATAFORSEO_PASSWORD";
+  const login = process.env[loginEnvName] || "";
+  const password = process.env[passwordEnvName] || "";
+
+  if (requireCredentials) {
+    if (!login) throw new Error(`DataForSEO Login fehlt im MCP-Environment (${loginEnvName}).`);
+    if (!password) throw new Error(`DataForSEO Passwort fehlt im MCP-Environment (${passwordEnvName}).`);
+  }
+
+  return {
+    config: { login, password },
+    summary: {
+      agent_id: agentId,
+      dataforseo_api_base: DATAFORSEO_API_BASE,
+      login_configured: Boolean(login),
+      login_env_name: loginEnvName,
+      password_configured: Boolean(password),
+      password_env_name: password ? passwordEnvName : null,
+      ready_for_live_calls: Boolean(login && password),
+      default_location_code: DATAFORSEO_DEFAULT_LOCATION_CODE,
+      default_language_code: DATAFORSEO_DEFAULT_LANGUAGE_CODE,
+      max_results: DATAFORSEO_MAX_RESULTS,
+      timeout_ms: DATAFORSEO_TIMEOUT_MS
+    }
+  };
+}
+
+function normalizeDataForSeoKeyword(value, { maxLength = 80, maxWords = 10 } = {}) {
+  const keyword = String(value || "").trim();
+  if (!keyword) throw new Error("Keyword darf nicht leer sein.");
+  if (keyword.length > maxLength) {
+    throw new Error(`Keyword ist zu lang (${keyword.length}/${maxLength} Zeichen): ${keyword.slice(0, 80)}`);
+  }
+  if (keyword.split(/\s+/).filter(Boolean).length > maxWords) {
+    throw new Error(`Keyword hat zu viele Woerter (> ${maxWords}): ${keyword}`);
+  }
+  return keyword;
+}
+
+function normalizeDataForSeoKeywords(keywords, { maxCount, maxLength = 80, maxWords = 10 } = {}) {
+  if (!Array.isArray(keywords) || !keywords.length) {
+    throw new Error("keywords muss mindestens ein Keyword enthalten.");
+  }
+  if (keywords.length > maxCount) {
+    throw new Error(`Zu viele Keywords: ${keywords.length}/${maxCount}.`);
+  }
+  const normalized = keywords.map((keyword) => normalizeDataForSeoKeyword(keyword, { maxLength, maxWords }));
+  return [...new Set(normalized)];
+}
+
+function resolveDataForSeoTarget({ location_code, language_code }) {
+  return {
+    location_code: location_code || DATAFORSEO_DEFAULT_LOCATION_CODE,
+    language_code: language_code || DATAFORSEO_DEFAULT_LANGUAGE_CODE
+  };
+}
+
+function trimDataForSeoValue(value, maxItems) {
+  if (Array.isArray(value)) {
+    return value.slice(0, maxItems).map((item) => trimDataForSeoValue(item, maxItems));
+  }
+  if (!value || typeof value !== "object") return value;
+
+  const output = {};
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (Array.isArray(nestedValue)) {
+      output[key] = nestedValue.slice(0, maxItems).map((item) => trimDataForSeoValue(item, maxItems));
+      if (nestedValue.length > maxItems) output[`${key}_truncated_count`] = nestedValue.length - maxItems;
+    } else if (nestedValue && typeof nestedValue === "object") {
+      output[key] = trimDataForSeoValue(nestedValue, maxItems);
+    } else {
+      output[key] = nestedValue;
+    }
+  }
+  return output;
+}
+
+function maskSensitiveDataForSeoValue(value) {
+  if (Array.isArray(value)) return value.map(maskSensitiveDataForSeoValue);
+  if (!value || typeof value !== "object") return value;
+
+  const output = {};
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (/password|token|secret|api[_-]?key/i.test(key)) {
+      output[key] = nestedValue ? "[redacted]" : nestedValue;
+    } else if (/login|email/i.test(key)) {
+      output[key] = nestedValue ? "[configured]" : nestedValue;
+    } else {
+      output[key] = maskSensitiveDataForSeoValue(nestedValue);
+    }
+  }
+  return output;
+}
+
+function compactDataForSeoResponse(response, { maxResults = DATAFORSEO_MAX_RESULTS } = {}) {
+  return {
+    version: response.version,
+    status_code: response.status_code,
+    status_message: response.status_message,
+    time: response.time,
+    cost: response.cost,
+    tasks_count: response.tasks_count,
+    tasks_error: response.tasks_error,
+    tasks: (response.tasks || []).map((task) => ({
+      id: task.id,
+      status_code: task.status_code,
+      status_message: task.status_message,
+      time: task.time,
+      cost: task.cost,
+      result_count: task.result_count,
+      path: task.path,
+      data: task.data,
+      result: trimDataForSeoValue(task.result || [], maxResults)
+    }))
+  };
+}
+
+function assertDataForSeoOk(response) {
+  if (response.status_code !== 20000) {
+    throw new Error(`DataForSEO Fehler ${response.status_code}: ${response.status_message}`);
+  }
+  const failedTask = (response.tasks || []).find((task) => task.status_code && task.status_code !== 20000);
+  if (failedTask) {
+    throw new Error(`DataForSEO Task-Fehler ${failedTask.status_code}: ${failedTask.status_message}`);
+  }
+}
+
+async function dataForSeoRequest(agentId, { method = "POST", path, data }) {
+  const { config } = getDataForSeoConfigDetails(agentId, { requireCredentials: true });
+  const res = await axios.request({
+    method,
+    url: `${DATAFORSEO_API_BASE}${path}`,
+    auth: {
+      username: config.login,
+      password: config.password
+    },
+    headers: { "Content-Type": "application/json" },
+    timeout: DATAFORSEO_TIMEOUT_MS,
+    data
+  });
+  assertDataForSeoOk(res.data);
+  return res.data;
+}
+
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
 function createServer() {
@@ -1388,6 +1542,201 @@ function createServer() {
       });
 
       return out({ agent_id, task: res.data.data });
+    }
+  );
+
+  server.tool(
+    "dataforseo_check_config",
+    "Prueft die DataForSEO-Konfiguration ohne kostenpflichtige Keyword-Abfrage. Optional wird der kostenlose User-Data-Endpunkt abgefragt.",
+    {
+      agent_id: agentIdSchema,
+      fetch_user_data: z.boolean().optional().default(false)
+    },
+    async ({ agent_id, fetch_user_data }) => {
+      const { summary } = getDataForSeoConfigDetails(agent_id, { requireCredentials: fetch_user_data });
+      if (!fetch_user_data) {
+        return out({ ...summary, fetch_user_data: false });
+      }
+
+      const response = await dataForSeoRequest(agent_id, {
+        method: "GET",
+        path: "/appendix/user_data"
+      });
+
+      return out({
+        ...summary,
+        fetch_user_data: true,
+        user_data: maskSensitiveDataForSeoValue(compactDataForSeoResponse(response, { maxResults: 20 }))
+      });
+    }
+  );
+
+  server.tool(
+    "dataforseo_google_keyword_overview",
+    "Ruft DataForSEO Labs Google Keyword Overview fuer konkrete Keywords ab. Live-Calls nur mit klarer Asana-Freigabe, da DataForSEO abrechnet.",
+    {
+      agent_id: agentIdSchema,
+      keywords: z.array(z.string()).min(1).max(100),
+      location_code: z.number().int().positive().optional(),
+      language_code: z.string().min(2).max(10).optional(),
+      include_serp_info: z.boolean().optional().default(false),
+      include_clickstream_data: z.boolean().optional().default(false),
+      max_results: z.number().int().positive().max(DATAFORSEO_MAX_RESULTS).optional().default(DATAFORSEO_MAX_RESULTS),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional()
+    },
+    async ({
+      agent_id,
+      keywords,
+      location_code,
+      language_code,
+      include_serp_info,
+      include_clickstream_data,
+      max_results,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid
+    }) => {
+      const normalizedKeywords = normalizeDataForSeoKeywords(keywords, { maxCount: 100 });
+      const target = resolveDataForSeoTarget({ location_code, language_code });
+      const payload = [
+        {
+          keywords: normalizedKeywords,
+          ...target,
+          include_serp_info,
+          include_clickstream_data
+        }
+      ];
+
+      if (dry_run) {
+        const { summary } = getDataForSeoConfigDetails(agent_id, { requireCredentials: false });
+        return out({ agent_id, dry_run: true, endpoint: "/dataforseo_labs/google/keyword_overview/live", summary, payload });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "dataforseo_google_keyword_overview");
+      const response = await dataForSeoRequest(agent_id, {
+        path: "/dataforseo_labs/google/keyword_overview/live",
+        data: payload
+      });
+      return out({ agent_id, endpoint: "/dataforseo_labs/google/keyword_overview/live", response: compactDataForSeoResponse(response, { maxResults: max_results }) });
+    }
+  );
+
+  server.tool(
+    "dataforseo_google_keyword_ideas",
+    "Ruft DataForSEO Labs Google Keyword Ideas aus Seed-Keywords ab. Live-Calls nur mit klarer Asana-Freigabe, da DataForSEO abrechnet.",
+    {
+      agent_id: agentIdSchema,
+      keywords: z.array(z.string()).min(1).max(20),
+      location_code: z.number().int().positive().optional(),
+      language_code: z.string().min(2).max(10).optional(),
+      limit: z.number().int().positive().max(DATAFORSEO_MAX_RESULTS).optional().default(Math.min(50, DATAFORSEO_MAX_RESULTS)),
+      offset: z.number().int().nonnegative().optional().default(0),
+      include_serp_info: z.boolean().optional().default(false),
+      include_seed_keyword: z.boolean().optional().default(true),
+      filters: z.array(z.any()).optional(),
+      order_by: z.array(z.string()).optional(),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional()
+    },
+    async ({
+      agent_id,
+      keywords,
+      location_code,
+      language_code,
+      limit,
+      offset,
+      include_serp_info,
+      include_seed_keyword,
+      filters,
+      order_by,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid
+    }) => {
+      const normalizedKeywords = normalizeDataForSeoKeywords(keywords, { maxCount: 20 });
+      const target = resolveDataForSeoTarget({ location_code, language_code });
+      const payload = [
+        {
+          keywords: normalizedKeywords,
+          ...target,
+          limit,
+          offset,
+          include_serp_info,
+          include_seed_keyword,
+          ...(filters ? { filters } : {}),
+          ...(order_by ? { order_by } : {})
+        }
+      ];
+
+      if (dry_run) {
+        const { summary } = getDataForSeoConfigDetails(agent_id, { requireCredentials: false });
+        return out({ agent_id, dry_run: true, endpoint: "/dataforseo_labs/google/keyword_ideas/live", summary, payload });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "dataforseo_google_keyword_ideas");
+      const response = await dataForSeoRequest(agent_id, {
+        path: "/dataforseo_labs/google/keyword_ideas/live",
+        data: payload
+      });
+      return out({ agent_id, endpoint: "/dataforseo_labs/google/keyword_ideas/live", response: compactDataForSeoResponse(response, { maxResults: limit }) });
+    }
+  );
+
+  server.tool(
+    "dataforseo_google_search_volume",
+    "Ruft DataForSEO Google Ads Search Volume fuer Keywordlisten ab. Live-Calls nur mit klarer Asana-Freigabe, da DataForSEO abrechnet.",
+    {
+      agent_id: agentIdSchema,
+      keywords: z.array(z.string()).min(1).max(700),
+      location_code: z.number().int().positive().optional(),
+      language_code: z.string().min(2).max(10).optional(),
+      search_partners: z.boolean().optional().default(false),
+      date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      date_to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      max_results: z.number().int().positive().max(DATAFORSEO_MAX_RESULTS).optional().default(DATAFORSEO_MAX_RESULTS),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional()
+    },
+    async ({
+      agent_id,
+      keywords,
+      location_code,
+      language_code,
+      search_partners,
+      date_from,
+      date_to,
+      max_results,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid
+    }) => {
+      const normalizedKeywords = normalizeDataForSeoKeywords(keywords, { maxCount: 700 });
+      const target = resolveDataForSeoTarget({ location_code, language_code });
+      const payload = [
+        {
+          keywords: normalizedKeywords,
+          ...target,
+          search_partners,
+          ...(date_from ? { date_from } : {}),
+          ...(date_to ? { date_to } : {})
+        }
+      ];
+
+      if (dry_run) {
+        const { summary } = getDataForSeoConfigDetails(agent_id, { requireCredentials: false });
+        return out({ agent_id, dry_run: true, endpoint: "/keywords_data/google_ads/search_volume/live", summary, payload });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "dataforseo_google_search_volume");
+      const response = await dataForSeoRequest(agent_id, {
+        path: "/keywords_data/google_ads/search_volume/live",
+        data: payload
+      });
+      return out({ agent_id, endpoint: "/keywords_data/google_ads/search_volume/live", response: compactDataForSeoResponse(response, { maxResults: max_results }) });
     }
   );
 
