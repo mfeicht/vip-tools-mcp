@@ -58,6 +58,33 @@ const DATAFORSEO_DEFAULT_LOCATION_CODE = Number(process.env.DATAFORSEO_DEFAULT_L
 const DATAFORSEO_DEFAULT_LANGUAGE_CODE = process.env.DATAFORSEO_DEFAULT_LANGUAGE_CODE || "de";
 const DATAFORSEO_MAX_RESULTS = Math.min(Number(process.env.DATAFORSEO_MAX_RESULTS || 100), 1000);
 
+const TOOL_READ_ONLY = Object.freeze({ readOnlyHint: true, openWorldHint: false });
+const TOOL_EXTERNAL_READ = Object.freeze({ readOnlyHint: true, openWorldHint: true });
+const TOOL_SAFE_WRITE = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false
+});
+const TOOL_IDEMPOTENT_SAFE_WRITE = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false
+});
+const TOOL_EXTERNAL_WRITE = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true
+});
+const TOOL_DESTRUCTIVE_IDEMPOTENT_WRITE = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: false
+});
+
 const AGENT_EMAIL_DEFAULTS = {
   "vip-ai-sales": "sales-agent@vip-studios.de",
   "vip-ai-operations": "operations-agent@vip-studios.de",
@@ -121,10 +148,21 @@ function assertSafeAsanaRequest(method, path, data) {
     data &&
     Object.prototype.hasOwnProperty.call(data, "completed") &&
     data.completed === true;
+  const isTaskAssign =
+    method === "PUT" &&
+    /^\/tasks\/[^/]+\/?$/.test(path) &&
+    data &&
+    Object.prototype.hasOwnProperty.call(data, "assignee");
 
   if (isTaskComplete) {
     throw new Error(
       "Asana-Aufgaben duerfen nicht per rohem asana_request abgeschlossen werden. Nutze asana_complete_task; es prueft Assignee, finalen Kommentar und Readback."
+    );
+  }
+
+  if (isTaskAssign) {
+    throw new Error(
+      "Asana-Aufgaben duerfen nicht per rohem asana_request umgewiesen werden. Nutze asana_assign_task; es prueft Tags, blockiert Routine-Re-Assigns und verifiziert den Readback."
     );
   }
 
@@ -1276,6 +1314,7 @@ function createServer() {
     "asana_list_agents",
     "Listet die im Remote-MCP bekannten Agenten und ob ein Token konfiguriert ist. Gibt keine Secret-Werte aus.",
     {},
+    TOOL_READ_ONLY,
     async () => {
       return out(
         Object.entries(ASANA_TOKEN_ENVS).map(([agent_id, env_name]) => ({
@@ -1291,6 +1330,7 @@ function createServer() {
     "asana_whoami",
     "Prueft den Asana-Token eines Agenten und gibt den zugehoerigen User ohne Secret-Werte aus.",
     { agent_id: agentIdSchema },
+    TOOL_READ_ONLY,
     async ({ agent_id }) => {
       const asana = getAsana(agent_id);
       const res = await asana.get("/users/me");
@@ -1305,6 +1345,7 @@ function createServer() {
       agent_id: agentIdSchema,
       limit: z.number().optional().default(20)
     },
+    TOOL_READ_ONLY,
     async ({ agent_id, limit }) => {
       const asana = getAsana(agent_id);
       const user = await asana.get("/users/me");
@@ -1347,6 +1388,7 @@ function createServer() {
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
     },
+    TOOL_SAFE_WRITE,
     async ({
       agent_id,
       task_gid,
@@ -1430,6 +1472,7 @@ function createServer() {
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
     },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
     async ({
       agent_id,
       task_gid,
@@ -1585,19 +1628,70 @@ function createServer() {
 
   server.tool(
     "asana_assign_task",
-    "Weist eine Asana-Aufgabe mit dem Token des angegebenen Agenten einem konkreten Asana-User per GID zu. Aendert keine weiteren Felder.",
+    "Weist eine Asana-Aufgabe kontrolliert einem konkreten Asana-User per GID zu. Blockiert Routine-Aufgaben und verifiziert den Readback.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
-      assignee_gid: z.string()
+      assignee_gid: z.string(),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
     },
-    async ({ agent_id, task_gid, assignee_gid }) => {
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({ agent_id, task_gid, assignee_gid, dry_run, verify_after }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      validateAsanaGid(assignee_gid, "assignee_gid");
       const asana = getAsana(agent_id);
-      const res = await asana.put(`/tasks/${task_gid}`, {
-        data: { assignee: assignee_gid }
-      });
 
-      return out({ agent_id, task: res.data.data });
+      const beforeRes = await asana.get(`/tasks/${task_gid}`, {
+        params: { opt_fields: "gid,name,completed,assignee.gid,assignee.name,tags.name,permalink_url" }
+      });
+      const before_task = beforeRes.data.data;
+      const tagNames = (before_task.tags || []).map((tag) => tag.name);
+      if (tagNames.includes("Routine")) {
+        throw new Error(
+          "Routine-Aufgaben duerfen nicht umgewiesen werden. Assignee unveraendert lassen und Rueckfragen per asana_comment mit echter Mention klaeren."
+        );
+      }
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          task_gid,
+          assignee_gid,
+          before_task,
+          allowed_to_assign: true
+        });
+      }
+
+      const res = await asana.put(
+        `/tasks/${task_gid}`,
+        { data: { assignee: assignee_gid } },
+        { params: { opt_fields: "gid,name,completed,assignee.gid,assignee.name,tags.name,permalink_url" } }
+      );
+
+      let verified_task;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verify = await asana.get(`/tasks/${task_gid}`, {
+          params: { opt_fields: "gid,name,completed,assignee.gid,assignee.name,tags.name,permalink_url" }
+        });
+        verified_task = verify.data.data;
+        if (verified_task.assignee?.gid !== assignee_gid) {
+          throw new Error("Asana-Readback zeigt nicht den erwarteten Assignee nach Re-Assign.");
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        assignee_gid,
+        before_task,
+        task: res.data.data,
+        verified_task,
+        verification_status
+      });
     }
   );
 
@@ -1608,6 +1702,7 @@ function createServer() {
       agent_id: agentIdSchema,
       fetch_user_data: z.boolean().optional().default(false)
     },
+    TOOL_EXTERNAL_READ,
     async ({ agent_id, fetch_user_data }) => {
       const { summary } = getDataForSeoConfigDetails(agent_id, { requireCredentials: fetch_user_data });
       if (!fetch_user_data) {
@@ -1642,6 +1737,7 @@ function createServer() {
       confirmed_by_asana: z.boolean().optional().default(false),
       asana_task_gid: z.string().optional()
     },
+    TOOL_EXTERNAL_READ,
     async ({
       agent_id,
       keywords,
@@ -1697,6 +1793,7 @@ function createServer() {
       confirmed_by_asana: z.boolean().optional().default(false),
       asana_task_gid: z.string().optional()
     },
+    TOOL_EXTERNAL_READ,
     async ({
       agent_id,
       keywords,
@@ -1757,6 +1854,7 @@ function createServer() {
       confirmed_by_asana: z.boolean().optional().default(false),
       asana_task_gid: z.string().optional()
     },
+    TOOL_EXTERNAL_READ,
     async ({
       agent_id,
       keywords,
@@ -1821,6 +1919,7 @@ function createServer() {
       confirmed_by_asana: z.boolean().optional().default(false),
       asana_task_gid: z.string().optional()
     },
+    TOOL_EXTERNAL_READ,
     async ({
       agent_id,
       seed_keywords,
@@ -1966,6 +2065,7 @@ function createServer() {
       ]),
       target_folder_id: z.string().optional().default(GOOGLE_AGENT_FOLDER_ID)
     },
+    TOOL_SAFE_WRITE,
     async ({ agent_id, title, mime_type, target_folder_id }) => {
       await assertAllowedGoogleFolder(target_folder_id);
 
@@ -1996,6 +2096,7 @@ function createServer() {
       target_folder_id: z.string().optional().default(GOOGLE_AGENT_FOLDER_ID),
       remove_previous_parents: z.boolean().optional().default(true)
     },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
     async ({ agent_id, file_id, target_folder_id, remove_previous_parents }) => {
       await assertAllowedGoogleFolder(target_folder_id);
 
@@ -2031,6 +2132,7 @@ function createServer() {
       values: z.array(z.array(sheetCellValueSchema)),
       value_input_option: z.enum(["RAW", "USER_ENTERED"]).optional().default("USER_ENTERED")
     },
+    TOOL_SAFE_WRITE,
     async ({ agent_id, spreadsheet_id, sheet_name, values, value_input_option }) => {
       if (!values.length) throw new Error("values darf nicht leer sein.");
 
@@ -2064,6 +2166,7 @@ function createServer() {
         .optional()
         .default("FORMATTED_VALUE")
     },
+    TOOL_READ_ONLY,
     async ({ agent_id, spreadsheet_id, sheet_name, range, value_render_option }) => {
       const a1Range = buildSheetRange(sheet_name, range);
       const values = await getSheetValues(spreadsheet_id, a1Range, value_render_option);
@@ -2086,6 +2189,7 @@ function createServer() {
       asana_task_gid: z.string().optional(),
       verify_after: z.boolean().optional().default(true)
     },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
     async ({
       agent_id,
       spreadsheet_id,
@@ -2130,6 +2234,7 @@ function createServer() {
       sheet_name: z.string().optional().default(RS_REDAKTIONSPLAN_SHEET_NAME),
       max_rows: z.number().int().positive().optional().default(12000)
     },
+    TOOL_READ_ONLY,
     async ({ agent_id, spreadsheet_id, sheet_name, max_rows }) => {
       const range = buildSheetRange(sheet_name, `A1:J${max_rows}`);
       const values = await getSheetValues(spreadsheet_id, range);
@@ -2190,6 +2295,7 @@ function createServer() {
       asana_task_gid: z.string().optional(),
       enforce_current_selection: z.boolean().optional().default(true)
     },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
     async ({
       agent_id,
       spreadsheet_id,
@@ -2274,6 +2380,7 @@ function createServer() {
       confirmed_by_asana: z.boolean().optional().default(false),
       asana_task_gid: z.string().optional()
     },
+    TOOL_DESTRUCTIVE_IDEMPOTENT_WRITE,
     async ({
       agent_id,
       spreadsheet_id,
@@ -2349,6 +2456,7 @@ function createServer() {
       agent_id: agentIdSchema,
       check_smtp_auth: z.boolean().optional().default(false)
     },
+    TOOL_READ_ONLY,
     async ({ agent_id, check_smtp_auth }) => {
       const { configs, summary } = getSmtpConfigCandidates(agent_id, { requireCredentials: check_smtp_auth });
       const { summary: httpSummary } = getEmailHttpConfigDetails(agent_id, { requireCredentials: false });
@@ -2402,6 +2510,7 @@ function createServer() {
       subject: z.string(),
       body: z.string()
     },
+    TOOL_SAFE_WRITE,
     async ({ agent_id, to, subject, body }) => {
       const validated = validateEmailPayload({ to, subject, body });
       const config = getSmtpConfig(agent_id, { requireCredentials: false });
@@ -2439,6 +2548,7 @@ function createServer() {
       confirmed_by_asana: z.boolean(),
       asana_task_gid: z.string()
     },
+    TOOL_EXTERNAL_WRITE,
     async ({ agent_id, draft_id, body_sha256, confirmed_by_asana, asana_task_gid }) => {
       assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "agent_email_send_prepared");
       const draft = getEmailDraft(draft_id, agent_id);
@@ -2495,6 +2605,7 @@ function createServer() {
       confirmed_by_asana: z.boolean().optional().default(false),
       asana_task_gid: z.string().optional()
     },
+    TOOL_EXTERNAL_WRITE,
     async ({ agent_id, to, subject, body, dry_run, confirmed_by_asana, asana_task_gid }) => {
       const validated = validateEmailPayload({ to, subject, body });
       const { config: httpConfig, summary: httpSummary } = getEmailHttpConfigDetails(agent_id, { requireCredentials: false });
@@ -2568,6 +2679,7 @@ function createServer() {
       confirmed_by_asana: z.boolean().optional().default(false),
       asana_task_gid: z.string().optional()
     },
+    TOOL_EXTERNAL_WRITE,
     async ({ agent_id, csv_text, source, dry_run, confirmed_by_asana, asana_task_gid }) => {
       const trimmedCsv = csv_text.trim();
       if (!trimmedCsv) throw new Error("csv_text darf nicht leer sein.");
