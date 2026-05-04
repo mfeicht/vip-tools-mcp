@@ -143,6 +143,49 @@ function escapeAsanaXml(value) {
     .replace(/"/g, "&quot;");
 }
 
+function trimUrlTrailingPunctuation(value) {
+  let url = String(value || "");
+  let suffix = "";
+  while (/[.,;:!?]$/.test(url)) {
+    suffix = url.slice(-1) + suffix;
+    url = url.slice(0, -1);
+  }
+  while (url.endsWith(")") && (url.match(/\)/g) || []).length > (url.match(/\(/g) || []).length) {
+    suffix = ")" + suffix;
+    url = url.slice(0, -1);
+  }
+  return { url, suffix };
+}
+
+function escapeAsanaTextWithLinks(value) {
+  const text = String(value ?? "");
+  const urlRegex = /(?:https?:\/\/|www\.)[^\s<>"']+/gi;
+  let output = "";
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(urlRegex)) {
+    const rawMatch = match[0];
+    const start = match.index ?? 0;
+    const { url, suffix } = trimUrlTrailingPunctuation(rawMatch);
+    const href = url.startsWith("www.") ? `https://${url}` : url;
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(href);
+    } catch {
+      continue;
+    }
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) continue;
+
+    output += escapeAsanaXml(text.slice(lastIndex, start));
+    output += `<a href="${escapeAsanaXml(parsedUrl.href)}">${escapeAsanaXml(url)}</a>${escapeAsanaXml(suffix)}`;
+    lastIndex = start + rawMatch.length;
+  }
+
+  output += escapeAsanaXml(text.slice(lastIndex));
+  return output;
+}
+
 function ensureNoUnsafeAsanaText(value, label) {
   const text = String(value ?? "");
   if (!text.trim()) return;
@@ -162,7 +205,7 @@ function validateAsanaGid(value, label) {
 
 function asanaParagraph(text) {
   ensureNoUnsafeAsanaText(text, "Asana-Kommentarabsatz");
-  return `${escapeAsanaXml(text)}\n\n`;
+  return `${escapeAsanaTextWithLinks(text)}\n\n`;
 }
 
 function asanaSection(section) {
@@ -179,7 +222,7 @@ function asanaSection(section) {
       `<ul>${section.bullets
         .map((bullet) => {
           ensureNoUnsafeAsanaText(bullet, "Asana-Kommentarlistenpunkt");
-          return `<li>${escapeAsanaXml(bullet)}</li>`;
+          return `<li>${escapeAsanaTextWithLinks(bullet)}</li>`;
         })
         .join("")}</ul>\n`
     );
@@ -210,7 +253,7 @@ function buildAsanaCommentHtml({ greeting, sections, mention_user_gid, mention_t
   if (mention_user_gid || mention_text) {
     ensureNoUnsafeAsanaText(mention_text, "Asana-Kommentar-Mentiontext");
     const mention = mention_user_gid ? `<a data-asana-gid="${mention_user_gid}"/>` : "";
-    const text = mention_text ? ` ${escapeAsanaXml(mention_text)}` : "";
+    const text = mention_text ? ` ${escapeAsanaTextWithLinks(mention_text)}` : "";
     parts.push(`${mention}${text}\n\n`);
   }
   if (effort_note) {
@@ -243,9 +286,13 @@ function assertGeneratedAsanaHtml(html) {
       throw new Error(`Generierter Asana-Kommentar enthaelt nicht erlaubtes Tag <${tag}>.`);
     }
     if (tag === "a") {
-      if (!/^<a data-asana-gid="\d+"\/>$/.test(raw)) {
-        throw new Error("Asana-Mention muss exakt als <a data-asana-gid=\"...\"/> erzeugt werden.");
+      if (/^<a data-asana-gid="\d+"\/>$/.test(raw)) {
+        continue;
       }
+      if (/^<a href="https?:\/\/[^"]+">$/.test(raw) || raw === "</a>") {
+        continue;
+      }
+      throw new Error("Asana-Link muss als sichere Mention oder als http(s)-href erzeugt werden.");
     } else if (/\s[^<>]*=/.test(raw)) {
       throw new Error(`Asana-Kommentar enthaelt Attribute auf nicht erlaubtem Tag <${tag}>.`);
     }
