@@ -2088,6 +2088,88 @@ function createServer() {
   );
 
   server.tool(
+    "google_drive_copy_file_to_agent_folder",
+    "Kopiert eine bestehende Google-Drive-Datei als echte Drive-Dateikopie in den erlaubten Agenten-Drive-Ordner. Nutze dies fuer Vorlagen, wenn Formatierung, Tabs, Formeln, Filter, Validierungen oder Layout erhalten bleiben sollen.",
+    {
+      agent_id: agentIdSchema,
+      source_file_id: z.string(),
+      title: z.string().optional(),
+      target_folder_id: z.string().optional().default(GOOGLE_AGENT_FOLDER_ID),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_SAFE_WRITE,
+    async ({
+      agent_id,
+      source_file_id,
+      title,
+      target_folder_id,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      verify_after
+    }) => {
+      await assertAllowedGoogleFolder(target_folder_id);
+
+      const sourceFile = await getDriveFile(source_file_id, "id,name,mimeType,parents,webViewLink");
+      if (sourceFile.mimeType === "application/vnd.google-apps.folder") {
+        throw new Error("Google-Ordner koennen nicht per files.copy kopiert werden. Fuer Ordner braucht es einen separaten rekursiven Kopierprozess.");
+      }
+
+      const copyTitle = title?.trim() || `${sourceFile.name} - Kopie`;
+      const plannedCopy = {
+        source_file: sourceFile,
+        target_folder_id,
+        title: copyTitle,
+        preserves_native_google_formatting: true
+      };
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          ...plannedCopy,
+          requires_for_live: ["dry_run=false", "confirmed_by_asana=true", "asana_task_gid"]
+        });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "google_drive_copy_file_to_agent_folder");
+
+      const res = await googleRequest({
+        method: "POST",
+        url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(source_file_id)}/copy`,
+        params: {
+          fields: "id,name,mimeType,parents,webViewLink",
+          supportsAllDrives: true
+        },
+        data: {
+          name: copyTitle,
+          parents: [target_folder_id]
+        }
+      });
+
+      const verifiedFile = verify_after
+        ? await getDriveFile(res.data.id, "id,name,mimeType,parents,webViewLink")
+        : undefined;
+      const verificationStatus =
+        !verify_after || verifiedFile?.parents?.includes(target_folder_id) ? "verified" : "folder_readback_mismatch";
+
+      return out({
+        agent_id,
+        dry_run: false,
+        asana_task_gid,
+        source_file: sourceFile,
+        copied_file: res.data,
+        verified_file: verifiedFile,
+        verification_status: verificationStatus,
+        preserves_native_google_formatting: true
+      });
+    }
+  );
+
+  server.tool(
     "google_drive_move_file_to_agent_folder",
     "Verschiebt eine bestehende Google-Drive-Datei in den erlaubten Agenten-Drive-Ordner oder einen Unterordner davon. Entfernt standardmaessig alte Parents.",
     {
@@ -2171,6 +2253,62 @@ function createServer() {
       const a1Range = buildSheetRange(sheet_name, range);
       const values = await getSheetValues(spreadsheet_id, a1Range, value_render_option);
       return out({ agent_id, spreadsheet_id, sheet_name, range, values });
+    }
+  );
+
+  server.tool(
+    "google_sheets_format_snapshot",
+    "Liest eine begrenzte Format-/Struktur-Stichprobe aus einem Google Sheet. Read-only; fuer Template-/Kopie-Checks, wenn Formatierung erhalten bleiben muss.",
+    {
+      agent_id: agentIdSchema,
+      spreadsheet_id: z.string(),
+      sheet_name: z.string(),
+      range: z.string().optional().default("A1:Z20")
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id, spreadsheet_id, sheet_name, range }) => {
+      const a1Range = buildSheetRange(sheet_name, range);
+      const res = await googleRequest({
+        method: "GET",
+        url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheet_id)}`,
+        params: {
+          includeGridData: true,
+          ranges: a1Range,
+          fields:
+            "spreadsheetId,properties(title),sheets(properties(sheetId,title,gridProperties),merges,conditionalFormats,protectedRanges,filterViews,basicFilter,data(rowData(values(formattedValue,userEnteredFormat,effectiveFormat,dataValidation,note,hyperlink))))"
+        }
+      });
+
+      const sheet = res.data.sheets?.[0];
+      if (!sheet) throw new Error(`Sheet nicht gefunden oder Range nicht lesbar: ${sheet_name}`);
+
+      const sample_cells = (sheet.data?.[0]?.rowData || []).map((row) =>
+        (row.values || []).map((cell) => ({
+          formattedValue: cell.formattedValue,
+          userEnteredFormat: cell.userEnteredFormat,
+          effectiveFormat: cell.effectiveFormat,
+          dataValidation: cell.dataValidation,
+          note: cell.note,
+          hyperlink: cell.hyperlink
+        }))
+      );
+
+      return out({
+        agent_id,
+        spreadsheet_id,
+        spreadsheet_title: res.data.properties?.title,
+        sheet_name,
+        range,
+        sheet_properties: sheet.properties,
+        structure_summary: {
+          merges_count: sheet.merges?.length || 0,
+          conditional_formats_count: sheet.conditionalFormats?.length || 0,
+          protected_ranges_count: sheet.protectedRanges?.length || 0,
+          filter_views_count: sheet.filterViews?.length || 0,
+          has_basic_filter: Boolean(sheet.basicFilter)
+        },
+        sample_cells
+      });
     }
   );
 
