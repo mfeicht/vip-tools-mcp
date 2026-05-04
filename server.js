@@ -1208,6 +1208,15 @@ async function dataForSeoRequest(agentId, { method = "POST", path, data }) {
   return res.data;
 }
 
+function summarizeDataForSeoRequests(requests) {
+  return requests.map((request) => ({
+    name: request.name,
+    endpoint: request.path,
+    max_results: request.maxResults,
+    payload: request.data
+  }));
+}
+
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
 function createServer() {
@@ -1737,6 +1746,162 @@ function createServer() {
         data: payload
       });
       return out({ agent_id, endpoint: "/keywords_data/google_ads/search_volume/live", response: compactDataForSeoResponse(response, { maxResults: max_results }) });
+    }
+  );
+
+  server.tool(
+    "dataforseo_google_keyword_research",
+    "Fuehrt eine gebuendelte DataForSEO-Keywordrecherche aus, damit Automationen nicht viele einzelne Live-Calls brauchen. Live nur mit klarer Asana-Freigabe.",
+    {
+      agent_id: agentIdSchema,
+      seed_keywords: z.array(z.string()).min(1).max(20),
+      overview_keywords: z.array(z.string()).max(100).optional().default([]),
+      search_volume_keywords: z.array(z.string()).max(700).optional().default([]),
+      location_code: z.number().int().positive().optional(),
+      language_code: z.string().min(2).max(10).optional(),
+      run_ideas: z.boolean().optional().default(true),
+      run_overview: z.boolean().optional().default(true),
+      run_search_volume: z.boolean().optional().default(false),
+      ideas_limit: z.number().int().positive().max(DATAFORSEO_MAX_RESULTS).optional().default(Math.min(50, DATAFORSEO_MAX_RESULTS)),
+      include_serp_info: z.boolean().optional().default(false),
+      include_clickstream_data: z.boolean().optional().default(false),
+      search_partners: z.boolean().optional().default(false),
+      date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      date_to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      max_live_requests: z.number().int().positive().max(3).optional().default(3),
+      max_results: z.number().int().positive().max(DATAFORSEO_MAX_RESULTS).optional().default(DATAFORSEO_MAX_RESULTS),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional()
+    },
+    async ({
+      agent_id,
+      seed_keywords,
+      overview_keywords,
+      search_volume_keywords,
+      location_code,
+      language_code,
+      run_ideas,
+      run_overview,
+      run_search_volume,
+      ideas_limit,
+      include_serp_info,
+      include_clickstream_data,
+      search_partners,
+      date_from,
+      date_to,
+      max_live_requests,
+      max_results,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid
+    }) => {
+      const normalizedSeedKeywords = normalizeDataForSeoKeywords(seed_keywords, { maxCount: 20 });
+      const target = resolveDataForSeoTarget({ location_code, language_code });
+      const requests = [];
+
+      if (run_ideas) {
+        requests.push({
+          name: "keyword_ideas",
+          path: "/dataforseo_labs/google/keyword_ideas/live",
+          maxResults: ideas_limit,
+          data: [
+            {
+              keywords: normalizedSeedKeywords,
+              ...target,
+              limit: ideas_limit,
+              offset: 0,
+              include_serp_info,
+              include_seed_keyword: true
+            }
+          ]
+        });
+      }
+
+      if (run_overview) {
+        const normalizedOverviewKeywords = normalizeDataForSeoKeywords(
+          overview_keywords.length ? overview_keywords : normalizedSeedKeywords,
+          { maxCount: 100 }
+        );
+        requests.push({
+          name: "keyword_overview",
+          path: "/dataforseo_labs/google/keyword_overview/live",
+          maxResults: max_results,
+          data: [
+            {
+              keywords: normalizedOverviewKeywords,
+              ...target,
+              include_serp_info,
+              include_clickstream_data
+            }
+          ]
+        });
+      }
+
+      if (run_search_volume) {
+        const normalizedSearchVolumeKeywords = normalizeDataForSeoKeywords(
+          search_volume_keywords.length ? search_volume_keywords : normalizedSeedKeywords,
+          { maxCount: 700 }
+        );
+        requests.push({
+          name: "search_volume",
+          path: "/keywords_data/google_ads/search_volume/live",
+          maxResults: max_results,
+          data: [
+            {
+              keywords: normalizedSearchVolumeKeywords,
+              ...target,
+              search_partners,
+              ...(date_from ? { date_from } : {}),
+              ...(date_to ? { date_to } : {})
+            }
+          ]
+        });
+      }
+
+      if (!requests.length) {
+        throw new Error("Mindestens einer der Schalter run_ideas, run_overview oder run_search_volume muss true sein.");
+      }
+      if (requests.length > max_live_requests) {
+        throw new Error(`Geplante Live-Requests (${requests.length}) ueberschreiten max_live_requests (${max_live_requests}).`);
+      }
+
+      const planned_requests = summarizeDataForSeoRequests(requests);
+      if (dry_run) {
+        const { summary } = getDataForSeoConfigDetails(agent_id, { requireCredentials: false });
+        return out({
+          agent_id,
+          dry_run: true,
+          summary,
+          target,
+          planned_live_requests_count: requests.length,
+          requires_for_live: ["dry_run=false", "confirmed_by_asana=true", "asana_task_gid"],
+          planned_requests
+        });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "dataforseo_google_keyword_research");
+      const responses = {};
+      let total_cost = 0;
+      for (const request of requests) {
+        const response = await dataForSeoRequest(agent_id, {
+          path: request.path,
+          data: request.data
+        });
+        total_cost += Number(response.cost || 0);
+        responses[request.name] = compactDataForSeoResponse(response, { maxResults: request.maxResults });
+      }
+
+      return out({
+        agent_id,
+        dry_run: false,
+        asana_task_gid,
+        target,
+        live_requests_count: requests.length,
+        live_requests: planned_requests.map(({ name, endpoint, max_results }) => ({ name, endpoint, max_results })),
+        total_cost,
+        responses
+      });
     }
   );
 
