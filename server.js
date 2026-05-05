@@ -52,6 +52,7 @@ const DEFAULT_EMAIL_ALLOWED_RECIPIENTS = "*";
 const EMAIL_DRAFT_TTL_MS = Number(process.env.EMAIL_DRAFT_TTL_MS || 60 * 60 * 1000);
 const SMTP_TIMEOUT_MS = Number(process.env.SMTP_TIMEOUT_MS || 15_000);
 const EMAIL_HTTP_TIMEOUT_MS = Number(process.env.EMAIL_HTTP_TIMEOUT_MS || 20_000);
+const IMAP_TIMEOUT_MS = Number(process.env.IMAP_TIMEOUT_MS || 15_000);
 const DATAFORSEO_API_BASE = (process.env.DATAFORSEO_API_BASE || "https://api.dataforseo.com/v3").replace(/\/$/, "");
 const DATAFORSEO_TIMEOUT_MS = Number(process.env.DATAFORSEO_TIMEOUT_MS || 30_000);
 const DATAFORSEO_DEFAULT_LOCATION_CODE = Number(process.env.DATAFORSEO_DEFAULT_LOCATION_CODE || 2276);
@@ -697,6 +698,313 @@ function getSmtpConfigCandidates(agentId, { requireCredentials = true } = {}) {
 
 function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
   return getSmtpConfigCandidates(agentId, { requireCredentials }).primaryConfig;
+}
+
+function publicImapConfig(config) {
+  return {
+    host: config.host,
+    port: config.port,
+    secure: config.secure,
+    label: config.label || "primary"
+  };
+}
+
+function getImapConfigDetails(agentId) {
+  const suffix = envSuffixForAgent(agentId);
+  const fromAddress =
+    process.env[`EMAIL_ADDRESS_${suffix}`] || AGENT_EMAIL_DEFAULTS[agentId];
+  const configuredHost =
+    getEnvWithAgentFallback("IMAP_HOST", agentId) || getEnvWithAgentFallback("SMTP_HOST", agentId);
+  const defaultHost = defaultSmtpHostForAddress(fromAddress);
+  const host = configuredHost || defaultHost;
+  const rawPort = getEnvWithAgentFallback("IMAP_PORT", agentId);
+  const port = Number(rawPort || 993);
+  const rawSecure = getEnvWithAgentFallback("IMAP_SECURE", agentId);
+  const secure = parseBooleanEnv(rawSecure, port === 993);
+  const configuredUser = process.env[`IMAP_USER_${suffix}`] || process.env[`SMTP_USER_${suffix}`];
+  const user = configuredUser || fromAddress;
+  const passwordEnvName = process.env[`IMAP_PASSWORD_${suffix}`]
+    ? `IMAP_PASSWORD_${suffix}`
+    : process.env[`EMAIL_PASSWORD_${suffix}`]
+      ? `EMAIL_PASSWORD_${suffix}`
+      : process.env[`SMTP_PASSWORD_${suffix}`]
+        ? `SMTP_PASSWORD_${suffix}`
+        : "";
+  const password = passwordEnvName ? process.env[passwordEnvName] : "";
+
+  return {
+    suffix,
+    config: { fromAddress, host, port, secure, user, password },
+    summary: {
+      agent_id: agentId,
+      from: fromAddress,
+      imap_host_configured: Boolean(host),
+      imap_host_source: configuredHost ? "env" : defaultHost ? "default_vip_studios_domain" : "missing",
+      imap_port: port,
+      imap_port_source: rawPort ? "env" : "default",
+      imap_secure: secure,
+      imap_secure_source: rawSecure ? "env" : "default",
+      imap_user_configured: Boolean(configuredUser),
+      imap_user: user,
+      imap_password_configured: Boolean(password),
+      imap_password_env_name: passwordEnvName || null,
+      imap_ready_for_read: Boolean(fromAddress && host && password)
+    }
+  };
+}
+
+function getImapConfigCandidates(agentId, { requireCredentials = true } = {}) {
+  const { suffix, config, summary } = getImapConfigDetails(agentId);
+
+  if (!config.fromAddress) throw new Error(`E-Mail-Adresse fuer agent_id ${agentId} fehlt.`);
+  if (requireCredentials) {
+    if (!config.host) throw new Error(`IMAP_HOST, SMTP_HOST oder Default-Host fuer ${suffix} fehlt im MCP-Environment.`);
+    if (!config.password) {
+      throw new Error(`IMAP_PASSWORD_${suffix}, EMAIL_PASSWORD_${suffix} oder SMTP_PASSWORD_${suffix} fehlt im MCP-Environment.`);
+    }
+  }
+
+  const candidates = [{ ...config, label: "primary" }];
+  const hasExplicitPort = summary.imap_port_source === "env";
+  const isVipStudiosHost = /^vip-studios\.vip-studios\.de$/i.test(config.host || "");
+  if (!hasExplicitPort && isVipStudiosHost && config.port === 993) {
+    candidates.push({ ...config, port: 143, secure: false, label: "vip_studios_143_plain_fallback" });
+  }
+
+  const uniqueCandidates = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = `${candidate.host}:${candidate.port}:${candidate.secure}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueCandidates.push(candidate);
+  }
+
+  return {
+    suffix,
+    configs: uniqueCandidates,
+    summary: {
+      ...summary,
+      imap_timeout_ms: IMAP_TIMEOUT_MS,
+      imap_candidates: uniqueCandidates.map(publicImapConfig)
+    }
+  };
+}
+
+function quoteImapString(value) {
+  return `"${String(value ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function parseImapHeaderBlock(block) {
+  const getHeader = (name) => {
+    const match = new RegExp(`(?:^|\\r?\\n)${name}:\\s*([^\\r\\n]*)`, "i").exec(block);
+    return match ? match[1].trim() : "";
+  };
+  return {
+    from: getHeader("From"),
+    subject: getHeader("Subject"),
+    date: getHeader("Date"),
+    message_id: getHeader("Message-ID")
+  };
+}
+
+function cleanImapPreview(value, maxLength) {
+  const compact = String(value || "")
+    .replace(/\r?\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, Math.max(0, maxLength - 1)).trim()}…`;
+}
+
+async function openImapSocket(config) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (error, socket) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        if (socket && !socket.destroyed) socket.destroy();
+        reject(error);
+      } else {
+        resolve(socket);
+      }
+    };
+
+    const timer = setTimeout(() => {
+      done(new Error(`IMAP connect timeout after ${IMAP_TIMEOUT_MS}ms (${config.host}:${config.port})`), socket);
+    }, IMAP_TIMEOUT_MS);
+
+    const socket = config.secure
+      ? tls.connect({
+          host: config.host,
+          port: config.port,
+          servername: config.host,
+          rejectUnauthorized: !parseBooleanEnv(process.env.IMAP_TLS_ALLOW_UNAUTHORIZED, false)
+        })
+      : net.connect({ host: config.host, port: config.port });
+
+    socket.once("secureConnect", () => done(null, socket));
+    socket.once("connect", () => {
+      if (!config.secure) done(null, socket);
+    });
+    socket.once("error", (error) => done(error, socket));
+  });
+}
+
+async function readImapUntil(socket, state, matcher, label) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("error", onError);
+    };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const check = () => {
+      const match = matcher(state.buffer);
+      if (match) finish(null, match);
+    };
+    const onData = (chunk) => {
+      state.buffer += chunk;
+      check();
+    };
+    const onError = (error) => finish(error);
+    const timer = setTimeout(
+      () => finish(new Error(`IMAP response timeout after ${IMAP_TIMEOUT_MS}ms (${label})`)),
+      IMAP_TIMEOUT_MS
+    );
+    socket.on("data", onData);
+    socket.once("error", onError);
+    check();
+  });
+}
+
+async function runImapReadUnseen(config, { limit, includeSnippets, snippetChars }) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("utf8");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    await command("EXAMINE INBOX");
+    const searchResponse = await command("UID SEARCH UNSEEN");
+    const searchMatch = /^\* SEARCH\s*(.*)$/im.exec(searchResponse);
+    const uids = searchMatch
+      ? searchMatch[1].trim().split(/\s+/).filter(Boolean)
+      : [];
+    const selectedUids = uids.slice(0, limit);
+    let messages = [];
+
+    if (selectedUids.length) {
+      const fetchItems = includeSnippets
+        ? `(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)] BODY.PEEK[TEXT]<0.${snippetChars}>)`
+        : "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])";
+      const fetchResponse = await command(`UID FETCH ${selectedUids.join(",")} ${fetchItems}`);
+      const uidMatches = [...fetchResponse.matchAll(/\bUID\s+(\d+)\b/g)];
+      messages = uidMatches.map((match, index) => {
+        const start = match.index || 0;
+        const end = index + 1 < uidMatches.length ? uidMatches[index + 1].index || fetchResponse.length : fetchResponse.length;
+        const segment = fetchResponse.slice(start, end);
+        const headers = parseImapHeaderBlock(segment);
+        return {
+          uid: match[1],
+          ...headers,
+          preview: includeSnippets ? cleanImapPreview(segment, snippetChars) : undefined
+        };
+      });
+    }
+
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return {
+      unseen_count: uids.length,
+      returned_count: messages.length,
+      messages
+    };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function readUnseenEmailWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapReadUnseen(config, options);
+      return {
+        ...result,
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP read-only fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
 }
 
 function normalizeEmailHttpProvider(value) {
@@ -2636,6 +2944,41 @@ function createServer() {
       }
 
       return out(result);
+    }
+  );
+
+  server.tool(
+    "agent_email_read_unseen",
+    "Liest ungelesene E-Mails eines Agenten read-only per IMAP EXAMINE und BODY.PEEK. Markiert keine Nachrichten als gelesen und sendet nichts.",
+    {
+      agent_id: agentIdSchema,
+      limit: z.number().int().min(0).max(25).optional().default(10),
+      include_snippets: z.boolean().optional().default(false),
+      snippet_chars: z.number().int().min(100).max(1200).optional().default(500)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, limit, include_snippets, snippet_chars }) => {
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const result = await readUnseenEmailWithFallback(configs, {
+        limit,
+        includeSnippets: include_snippets,
+        snippetChars: snippet_chars
+      });
+
+      return out({
+        ...summary,
+        mode: "readonly_unseen_body_peek",
+        connection: {
+          host: result.host,
+          port: result.port,
+          secure: result.secure,
+          label: result.label
+        },
+        unseen_count: result.unseen_count,
+        returned_count: result.returned_count,
+        messages: result.messages,
+        imap_attempts: result.attempts
+      });
     }
   );
 
