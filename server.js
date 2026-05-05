@@ -58,6 +58,24 @@ const DATAFORSEO_TIMEOUT_MS = Number(process.env.DATAFORSEO_TIMEOUT_MS || 30_000
 const DATAFORSEO_DEFAULT_LOCATION_CODE = Number(process.env.DATAFORSEO_DEFAULT_LOCATION_CODE || 2276);
 const DATAFORSEO_DEFAULT_LANGUAGE_CODE = process.env.DATAFORSEO_DEFAULT_LANGUAGE_CODE || "de";
 const DATAFORSEO_MAX_RESULTS = Math.min(Number(process.env.DATAFORSEO_MAX_RESULTS || 100), 1000);
+const WEB_FETCH_TIMEOUT_MS = Number(process.env.WEB_FETCH_TIMEOUT_MS || 20_000);
+const WEB_FETCH_MAX_BYTES = Number(process.env.WEB_FETCH_MAX_BYTES || 2_000_000);
+const WEB_FETCH_USER_AGENT =
+  process.env.WEB_FETCH_USER_AGENT ||
+  "VIP-Tools-MCP/1.0 (+https://vip-studios.de; read-only metadata inspection)";
+const WEB_PAGE_SECTION_VALUES = [
+  "seo",
+  "meta",
+  "headings",
+  "links",
+  "images",
+  "paragraphs",
+  "schema",
+  "text",
+  "html",
+  "all"
+];
+const WEB_PAGE_DEFAULT_SECTIONS = ["seo", "headings", "links", "schema", "text"];
 
 const TOOL_READ_ONLY = Object.freeze({ readOnlyHint: true, openWorldHint: false });
 const TOOL_EXTERNAL_READ = Object.freeze({ readOnlyHint: true, openWorldHint: true });
@@ -1610,6 +1628,438 @@ function summarizeDataForSeoRequests(requests) {
   }));
 }
 
+function truncateString(value, maxChars) {
+  const text = String(value ?? "");
+  if (maxChars <= 0) return "";
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+function decodeHtmlEntities(value) {
+  return String(value ?? "")
+    .replace(/&#(\d+);/g, (match, code) => decodeHtmlCodePoint(Number(code), match))
+    .replace(/&#x([0-9a-f]+);/gi, (match, code) => decodeHtmlCodePoint(parseInt(code, 16), match))
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function decodeHtmlCodePoint(codePoint, fallback) {
+  if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return fallback;
+  try {
+    return String.fromCodePoint(codePoint);
+  } catch {
+    return fallback;
+  }
+}
+
+function stripHtml(value) {
+  return decodeHtmlEntities(
+    String(value ?? "")
+      .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+      .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, " ")
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
+function parseHtmlAttributes(tag) {
+  const attrs = {};
+  const openingTag = String(tag ?? "").match(/^<[^>]*>/)?.[0] || String(tag ?? "");
+  const attrRegex = /([:\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  for (const match of openingTag.matchAll(attrRegex)) {
+    const name = match[1].toLowerCase();
+    if (!name || name === "meta" || name === "link" || name === "script") continue;
+    attrs[name] = decodeHtmlEntities(match[2] ?? match[3] ?? match[4] ?? "");
+  }
+  return attrs;
+}
+
+function firstTagText(html, tagName) {
+  const match = new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "i").exec(html);
+  return match ? stripHtml(match[1]) : "";
+}
+
+function extractMetaTags(html) {
+  const meta = {};
+  const all = [];
+  for (const match of html.matchAll(/<meta\b[^>]*>/gi)) {
+    const attrs = parseHtmlAttributes(match[0]);
+    const key = attrs.name || attrs.property || attrs["http-equiv"] || attrs.itemprop || "";
+    const content = attrs.content || "";
+    if (!key && !content) continue;
+    const item = { key: key || null, content, attributes: attrs };
+    all.push(item);
+    if (key) {
+      const normalizedKey = key.toLowerCase();
+      if (meta[normalizedKey] === undefined) meta[normalizedKey] = content;
+      else if (Array.isArray(meta[normalizedKey])) meta[normalizedKey].push(content);
+      else meta[normalizedKey] = [meta[normalizedKey], content];
+    }
+  }
+  return { meta, all };
+}
+
+function firstMetaValue(value) {
+  if (Array.isArray(value)) return value.find((item) => String(item || "").trim()) || "";
+  return value || "";
+}
+
+function extractLinkTags(html, finalUrl) {
+  const links = [];
+  for (const match of html.matchAll(/<link\b[^>]*>/gi)) {
+    const attrs = parseHtmlAttributes(match[0]);
+    if (!attrs.rel && !attrs.href) continue;
+    links.push({
+      rel: attrs.rel || "",
+      href: absolutizeUrl(attrs.href || "", finalUrl),
+      hreflang: attrs.hreflang || "",
+      type: attrs.type || "",
+      title: attrs.title || ""
+    });
+  }
+  return links;
+}
+
+function extractHeadings(html, maxHeadings) {
+  const headings = [];
+  if (maxHeadings <= 0) return headings;
+  for (const match of html.matchAll(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi)) {
+    headings.push({
+      level: Number(match[1]),
+      text: stripHtml(match[2])
+    });
+    if (headings.length >= maxHeadings) break;
+  }
+  return headings.filter((heading) => heading.text);
+}
+
+function absolutizeUrl(value, baseUrl) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    return new URL(raw, baseUrl).href;
+  } catch {
+    return raw;
+  }
+}
+
+function extractPageLinks(html, finalUrl, maxLinks) {
+  const links = [];
+  if (maxLinks <= 0) return links;
+  for (const match of html.matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi)) {
+    const attrs = parseHtmlAttributes(match[0]);
+    const href = absolutizeUrl(attrs.href || "", finalUrl);
+    if (!href) continue;
+    links.push({
+      href,
+      text: truncateString(stripHtml(match[1]), 140),
+      rel: attrs.rel || ""
+    });
+    if (links.length >= maxLinks) break;
+  }
+  return links;
+}
+
+function extractJsonLd(html) {
+  const scripts = [];
+  for (const match of html.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    const raw = decodeHtmlEntities(match[1]).trim();
+    if (!raw) continue;
+    let parsed = null;
+    let parse_error = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      parse_error = String(error?.message || error);
+    }
+    scripts.push({
+      parsed,
+      parse_error,
+      raw: parsed ? undefined : truncateString(raw, 4000)
+    });
+    if (scripts.length >= 20) break;
+  }
+  return scripts;
+}
+
+function parseSrcset(value, finalUrl, maxItems = 20) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, maxItems)
+    .map((item) => {
+      const [url, descriptor] = item.split(/\s+/, 2);
+      return {
+        url: absolutizeUrl(url, finalUrl),
+        descriptor: descriptor || ""
+      };
+    });
+}
+
+function extractImages(html, finalUrl, maxImages) {
+  const images = [];
+  if (maxImages <= 0) return images;
+  for (const match of html.matchAll(/<img\b[^>]*>/gi)) {
+    const attrs = parseHtmlAttributes(match[0]);
+    const src = absolutizeUrl(attrs.src || attrs["data-src"] || "", finalUrl);
+    const srcset = parseSrcset(attrs.srcset || attrs["data-srcset"] || "", finalUrl);
+    if (!src && !srcset.length && !attrs.alt) continue;
+    images.push({
+      src,
+      srcset,
+      alt: attrs.alt || "",
+      title: attrs.title || "",
+      width: attrs.width || "",
+      height: attrs.height || "",
+      loading: attrs.loading || "",
+      decoding: attrs.decoding || "",
+      fetchpriority: attrs.fetchpriority || "",
+      class: attrs.class || "",
+      id: attrs.id || ""
+    });
+    if (images.length >= maxImages) break;
+  }
+  return images;
+}
+
+function extractParagraphs(html, maxParagraphs, paragraphMaxChars) {
+  const paragraphs = [];
+  if (maxParagraphs <= 0) return paragraphs;
+  for (const match of html.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)) {
+    const text = stripHtml(match[1]);
+    if (!text) continue;
+    paragraphs.push(truncateString(text, paragraphMaxChars));
+    if (paragraphs.length >= maxParagraphs) break;
+  }
+  return paragraphs;
+}
+
+function extractSourceTags(html, finalUrl, maxSources = 40) {
+  const sources = [];
+  if (maxSources <= 0) return sources;
+  for (const match of html.matchAll(/<source\b[^>]*>/gi)) {
+    const attrs = parseHtmlAttributes(match[0]);
+    const src = absolutizeUrl(attrs.src || "", finalUrl);
+    const srcset = parseSrcset(attrs.srcset || "", finalUrl);
+    if (!src && !srcset.length) continue;
+    sources.push({
+      src,
+      srcset,
+      media: attrs.media || "",
+      type: attrs.type || "",
+      sizes: attrs.sizes || ""
+    });
+    if (sources.length >= maxSources) break;
+  }
+  return sources;
+}
+
+function extractMicrodataHints(html, maxItems) {
+  const hints = [];
+  if (maxItems <= 0) return hints;
+  for (const match of html.matchAll(/<([a-z][\w:-]*)\b[^>]*(?:itemscope|itemtype|itemprop)[^>]*>/gi)) {
+    const attrs = parseHtmlAttributes(match[0]);
+    hints.push({
+      tag: match[1].toLowerCase(),
+      itemtype: attrs.itemtype || "",
+      itemprop: attrs.itemprop || "",
+      itemscope: Object.prototype.hasOwnProperty.call(attrs, "itemscope"),
+      content: attrs.content || "",
+      href: attrs.href || "",
+      src: attrs.src || ""
+    });
+    if (hints.length >= maxItems) break;
+  }
+  return hints;
+}
+
+function normalizeWebPageSections({ sections, include_html, include_text }) {
+  const rawSections = Array.isArray(sections) && sections.length ? sections : WEB_PAGE_DEFAULT_SECTIONS;
+  const selected = new Set(rawSections.map((section) => String(section).toLowerCase()));
+  if (selected.has("all")) {
+    selected.clear();
+    for (const section of WEB_PAGE_SECTION_VALUES) {
+      if (section !== "all") selected.add(section);
+    }
+  }
+  if (include_html) selected.add("html");
+  if (!include_text && (!Array.isArray(sections) || !sections.includes("text"))) selected.delete("text");
+  return selected;
+}
+
+function normalizeWebUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) throw new Error("url darf nicht leer sein.");
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : raw.startsWith("www.") ? `https://${raw}` : raw;
+  let parsed;
+  try {
+    parsed = new URL(withProtocol);
+  } catch {
+    throw new Error(`Ungueltige URL: ${raw}`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Nur http(s)-URLs sind erlaubt.");
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname === "metadata.google.internal"
+  ) {
+    throw new Error("Lokale oder interne Hostnamen sind fuer web_page_inspect nicht erlaubt.");
+  }
+  const ipVersion = net.isIP(hostname);
+  if (ipVersion === 4) {
+    const parts = hostname.split(".").map(Number);
+    const [a, b] = parts;
+    if (
+      a === 10 ||
+      a === 127 ||
+      a === 0 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254)
+    ) {
+      throw new Error("Private oder lokale IP-Adressen sind fuer web_page_inspect nicht erlaubt.");
+    }
+  }
+  if (ipVersion === 6 && (hostname === "::1" || hostname.startsWith("fc") || hostname.startsWith("fd"))) {
+    throw new Error("Private oder lokale IP-Adressen sind fuer web_page_inspect nicht erlaubt.");
+  }
+  return parsed.href;
+}
+
+function parseHttpHeaderLinks(headerValue) {
+  const links = [];
+  for (const part of String(headerValue || "").split(",")) {
+    const match = /<([^>]+)>\s*;\s*rel="?([^";]+)"?/i.exec(part.trim());
+    if (match) links.push({ href: match[1], rel: match[2] });
+  }
+  return links;
+}
+
+async function inspectWebPage({
+  url,
+  sections,
+  include_html,
+  html_max_chars,
+  include_text,
+  text_max_chars,
+  max_headings,
+  max_links,
+  max_images,
+  max_paragraphs,
+  paragraph_max_chars,
+  max_schema_items,
+  timeout_ms
+}) {
+  const normalizedUrl = normalizeWebUrl(url);
+  const res = await axios.get(normalizedUrl, {
+    responseType: "text",
+    transformResponse: [(data) => data],
+    timeout: timeout_ms,
+    maxContentLength: WEB_FETCH_MAX_BYTES,
+    maxBodyLength: WEB_FETCH_MAX_BYTES,
+    validateStatus: () => true,
+    headers: {
+      "User-Agent": WEB_FETCH_USER_AGENT,
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5"
+    }
+  });
+
+  const body = typeof res.data === "string" ? res.data : String(res.data || "");
+  const finalUrl = res.request?.res?.responseUrl || normalizedUrl;
+  const contentType = res.headers["content-type"] || "";
+  const isHtml = /html|xml/i.test(contentType) || /<html[\s>]/i.test(body) || /<title[\s>]/i.test(body);
+  const { meta, all } = isHtml ? extractMetaTags(body) : { meta: {}, all: [] };
+  const linkTags = isHtml ? extractLinkTags(body, finalUrl) : [];
+  const canonicalLink = linkTags.find((link) => /\bcanonical\b/i.test(link.rel));
+  const alternateLinks = linkTags.filter((link) => /\balternate\b/i.test(link.rel));
+  const robots = firstMetaValue(meta.robots) || firstMetaValue(meta["googlebot"]);
+  const text = isHtml ? stripHtml(body) : String(body || "").replace(/\s+/g, " ").trim();
+  const selectedSections = normalizeWebPageSections({ sections, include_html, include_text });
+  const result = {
+    requested_url: normalizedUrl,
+    final_url: finalUrl,
+    status: res.status,
+    status_text: res.statusText,
+    ok: res.status >= 200 && res.status < 400,
+    fetched_at: new Date().toISOString(),
+    content_type: contentType,
+    content_length_header: res.headers["content-length"] || null,
+    body_bytes: Buffer.byteLength(body, "utf8"),
+    fetch_limit_bytes: WEB_FETCH_MAX_BYTES,
+    extraction_sections: [...selectedSections],
+    truncated_by_fetch_limit: false
+  };
+
+  if (selectedSections.has("seo")) {
+    result.seo = {
+      title: isHtml ? firstTagText(body, "title") : "",
+      meta_description: firstMetaValue(meta.description),
+      canonical: canonicalLink?.href || "",
+      robots,
+      viewport: firstMetaValue(meta.viewport),
+      charset: /<meta\b[^>]*charset=["']?([^"'\s>]+)/i.exec(body)?.[1] || "",
+      h1: isHtml ? extractHeadings(body, 10).filter((heading) => heading.level === 1).map((heading) => heading.text) : [],
+      og_title: firstMetaValue(meta["og:title"]),
+      og_description: firstMetaValue(meta["og:description"]),
+      og_image: absolutizeUrl(firstMetaValue(meta["og:image"]), finalUrl),
+      twitter_title: firstMetaValue(meta["twitter:title"]),
+      twitter_description: firstMetaValue(meta["twitter:description"])
+    };
+  }
+  if (selectedSections.has("meta")) {
+    result.meta_tags = all;
+    result.link_tags = linkTags.slice(0, 120);
+  }
+  if (selectedSections.has("headings")) {
+    result.headings = isHtml ? extractHeadings(body, max_headings) : [];
+  }
+  if (selectedSections.has("links")) {
+    result.alternates = alternateLinks.slice(0, 60);
+    result.hreflang = alternateLinks.filter((link) => link.hreflang);
+    result.http_link_headers = parseHttpHeaderLinks(res.headers.link);
+    result.page_links = isHtml ? extractPageLinks(body, finalUrl, max_links) : [];
+  }
+  if (selectedSections.has("images")) {
+    result.images = isHtml ? extractImages(body, finalUrl, max_images) : [];
+    result.picture_sources = isHtml ? extractSourceTags(body, finalUrl, Math.min(max_images * 2, 80)) : [];
+  }
+  if (selectedSections.has("paragraphs")) {
+    result.paragraphs = isHtml ? extractParagraphs(body, max_paragraphs, paragraph_max_chars) : [];
+  }
+  if (selectedSections.has("schema")) {
+    const jsonLd = isHtml ? extractJsonLd(body).slice(0, max_schema_items) : [];
+    const microdata = isHtml ? extractMicrodataHints(body, max_schema_items) : [];
+    result.json_ld = jsonLd;
+    result.schema = {
+      json_ld: jsonLd,
+      microdata
+    };
+  }
+  if (selectedSections.has("text")) {
+    result.text_excerpt = truncateString(text, text_max_chars);
+    result.word_count_estimate = text ? text.split(/\s+/).filter(Boolean).length : 0;
+  }
+  if (selectedSections.has("html")) {
+    result.html_source = truncateString(body, html_max_chars);
+    result.html_source_truncated = body.length > html_max_chars;
+  }
+
+  return result;
+}
+
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
 function createServer() {
@@ -2000,6 +2450,59 @@ function createServer() {
         verified_task,
         verification_status
       });
+    }
+  );
+
+  server.tool(
+    "web_page_inspect",
+    "Ruft eine oeffentliche Webseite read-only ab. Der Agent waehlt per sections gezielt aus: SEO/Core, Meta-/Link-Tags, H-Ueberschriften, Links/Hreflang, Bilder/ALT, Paragraphen, Schema/JSON-LD/Microdata, Textauszug oder begrenzten HTML-Quellcode.",
+    {
+      url: z.string(),
+      sections: z.array(z.enum(WEB_PAGE_SECTION_VALUES)).optional(),
+      include_html: z.boolean().optional().default(false),
+      html_max_chars: z.number().int().min(0).max(200_000).optional().default(20_000),
+      include_text: z.boolean().optional().default(true),
+      text_max_chars: z.number().int().min(0).max(30_000).optional().default(5_000),
+      max_headings: z.number().int().min(0).max(100).optional().default(40),
+      max_links: z.number().int().min(0).max(200).optional().default(50),
+      max_images: z.number().int().min(0).max(300).optional().default(80),
+      max_paragraphs: z.number().int().min(0).max(200).optional().default(50),
+      paragraph_max_chars: z.number().int().min(20).max(2000).optional().default(500),
+      max_schema_items: z.number().int().min(0).max(80).optional().default(20),
+      timeout_ms: z.number().int().min(1_000).max(30_000).optional().default(WEB_FETCH_TIMEOUT_MS)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({
+      url,
+      sections,
+      include_html,
+      html_max_chars,
+      include_text,
+      text_max_chars,
+      max_headings,
+      max_links,
+      max_images,
+      max_paragraphs,
+      paragraph_max_chars,
+      max_schema_items,
+      timeout_ms
+    }) => {
+      const result = await inspectWebPage({
+        url,
+        sections,
+        include_html,
+        html_max_chars,
+        include_text,
+        text_max_chars,
+        max_headings,
+        max_links,
+        max_images,
+        max_paragraphs,
+        paragraph_max_chars,
+        max_schema_items,
+        timeout_ms
+      });
+      return out(result);
     }
   );
 
