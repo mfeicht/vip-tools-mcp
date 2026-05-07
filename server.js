@@ -955,10 +955,11 @@ async function runImapReadUnseen(config, { limit, includeSnippets, snippetChars 
     await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
     await command("EXAMINE INBOX");
     const searchResponse = await command("UID SEARCH UNSEEN");
-    const searchMatch = /^\* SEARCH\s*(.*)$/im.exec(searchResponse);
-    const uids = searchMatch
-      ? searchMatch[1].trim().split(/\s+/).filter(Boolean)
-      : [];
+    const searchLine = searchResponse
+      .split(/\r?\n/)
+      .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
+    const uidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
+    const uids = uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
     const selectedUids = uids.slice(0, limit);
     let messages = [];
 
