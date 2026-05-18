@@ -76,6 +76,8 @@ const WEB_PAGE_SECTION_VALUES = [
   "all"
 ];
 const WEB_PAGE_DEFAULT_SECTIONS = ["seo", "headings", "links", "schema", "text"];
+const ASANA_ATTACHMENT_DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+const ASANA_ATTACHMENT_HARD_MAX_BYTES = 8 * 1024 * 1024;
 
 const TOOL_READ_ONLY = Object.freeze({ readOnlyHint: true, openWorldHint: false });
 const TOOL_EXTERNAL_READ = Object.freeze({ readOnlyHint: true, openWorldHint: true });
@@ -143,6 +145,72 @@ function getAsana(agentId = DEFAULT_AGENT_ID) {
 function out(data) {
   return {
     content: [{ type: "text", text: JSON.stringify(data, null, 2) }]
+  };
+}
+
+function isTextLikeAttachment(contentType, fileName) {
+  const type = String(contentType || "").toLowerCase();
+  const name = String(fileName || "").toLowerCase();
+  return (
+    type.startsWith("text/") ||
+    type.includes("json") ||
+    type.includes("xml") ||
+    type.includes("csv") ||
+    /\.(txt|md|csv|json|xml|html?|css|js|ts)$/i.test(name)
+  );
+}
+
+function decodeTextPreview(buffer, maxChars) {
+  return buffer.toString("utf8").replace(/\u0000/g, "").slice(0, maxChars);
+}
+
+async function listAsanaTaskAttachments(asana, taskGid) {
+  const res = await asana.get(`/tasks/${taskGid}/attachments`, {
+    params: {
+      opt_fields:
+        "gid,name,resource_subtype,created_at,download_url,view_url,permanent_url,parent.gid,parent.name"
+    }
+  });
+  return res.data.data || [];
+}
+
+async function downloadAsanaAttachment(asana, attachmentGid, maxBytes) {
+  const metaRes = await asana.get(`/attachments/${attachmentGid}`, {
+    params: {
+      opt_fields:
+        "gid,name,resource_subtype,created_at,download_url,view_url,permanent_url,parent.gid,parent.name"
+    }
+  });
+  const attachment = metaRes.data.data;
+  if (!attachment?.download_url) {
+    throw new Error(
+      "Asana-Anhang hat keine download_url. Pruefe, ob der Anhang noch existiert und fuer den Agenten sichtbar ist."
+    );
+  }
+
+  const downloadRes = await axios.get(attachment.download_url, {
+    responseType: "arraybuffer",
+    timeout: 30000,
+    maxContentLength: maxBytes,
+    maxBodyLength: maxBytes,
+    validateStatus: () => true
+  });
+  if (downloadRes.status < 200 || downloadRes.status >= 300) {
+    throw new Error(`Asana-Anhang-Download fehlgeschlagen: HTTP ${downloadRes.status}`);
+  }
+
+  const bytes = Buffer.from(downloadRes.data);
+  if (bytes.length > maxBytes) {
+    throw new Error(
+      `Asana-Anhang ist zu gross (${bytes.length} Bytes, Limit ${maxBytes} Bytes). max_bytes erhoehen oder Anhang manuell/ueber Drive bereitstellen.`
+    );
+  }
+
+  return {
+    attachment,
+    bytes,
+    content_type: downloadRes.headers["content-type"] || "",
+    content_length_header: downloadRes.headers["content-length"] || null
   };
 }
 
@@ -2384,6 +2452,102 @@ function createServer() {
       }
 
     );
+
+  server.tool(
+    "asana_attachment_fetch",
+    "Liest Asana-Anhaenge read-only ueber den Remote-MCP. Nutzt Asana-API und serverseitigen Download, damit lokale asanausercontent.com-DNS-Blocker nicht den Agentenlauf blockieren.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string().optional(),
+      attachment_gid: z.string().optional(),
+      attachment_name_contains: z.string().optional(),
+      download_first_match: z.boolean().optional().default(false),
+      include_base64: z.boolean().optional().default(true),
+      include_text_preview: z.boolean().optional().default(true),
+      text_preview_chars: z.number().int().min(100).max(20000).optional().default(4000),
+      max_bytes: z
+        .number()
+        .int()
+        .min(1024)
+        .max(ASANA_ATTACHMENT_HARD_MAX_BYTES)
+        .optional()
+        .default(ASANA_ATTACHMENT_DEFAULT_MAX_BYTES)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({
+      agent_id,
+      task_gid,
+      attachment_gid,
+      attachment_name_contains,
+      download_first_match,
+      include_base64,
+      include_text_preview,
+      text_preview_chars,
+      max_bytes
+    }) => {
+      if (!task_gid && !attachment_gid) {
+        throw new Error("task_gid oder attachment_gid ist erforderlich.");
+      }
+      if (task_gid) validateAsanaGid(task_gid, "task_gid");
+      if (attachment_gid) validateAsanaGid(attachment_gid, "attachment_gid");
+
+      const asana = getAsana(agent_id);
+      let attachments = [];
+      let selectedAttachmentGid = attachment_gid;
+
+      if (task_gid) {
+        attachments = await listAsanaTaskAttachments(asana, task_gid);
+        if (attachment_name_contains) {
+          const needle = attachment_name_contains.toLowerCase();
+          attachments = attachments.filter((attachment) =>
+            String(attachment.name || "").toLowerCase().includes(needle)
+          );
+        }
+        if (!selectedAttachmentGid && download_first_match && attachments.length) {
+          selectedAttachmentGid = attachments[0].gid;
+        }
+      }
+
+      if (!selectedAttachmentGid) {
+        return out({
+          agent_id,
+          task_gid,
+          attachment_name_contains: attachment_name_contains || null,
+          returned_count: attachments.length,
+          attachments,
+          downloaded: false,
+          next_step:
+            "Mit attachment_gid erneut aufrufen oder download_first_match=true setzen, wenn der erste Treffer bewusst geladen werden soll."
+        });
+      }
+
+      const { attachment, bytes, content_type, content_length_header } = await downloadAsanaAttachment(
+        asana,
+        selectedAttachmentGid,
+        max_bytes
+      );
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const textPreview =
+        include_text_preview && isTextLikeAttachment(content_type, attachment.name)
+          ? decodeTextPreview(bytes, text_preview_chars)
+          : undefined;
+
+      return out({
+        agent_id,
+        task_gid: task_gid || attachment.parent?.gid || null,
+        attachment,
+        downloaded: true,
+        content_type,
+        content_length_header,
+        byte_length: bytes.length,
+        sha256,
+        text_preview: textPreview,
+        content_base64: include_base64 ? bytes.toString("base64") : undefined,
+        save_hint:
+          "Base64-Inhalt in AGENT_WORKSPACE/temp speichern und danach mit passendem Dokument-/Tabellen-/PDF-Tool auswerten."
+      });
+    }
+  );
 
   server.tool(
     "asana_assign_task",
