@@ -165,8 +165,9 @@ function decodeTextPreview(buffer, maxChars) {
 }
 
 async function listAsanaTaskAttachments(asana, taskGid) {
-  const res = await asana.get(`/tasks/${taskGid}/attachments`, {
+  const res = await asana.get("/attachments", {
     params: {
+      parent: taskGid,
       opt_fields:
         "gid,name,resource_subtype,created_at,download_url,view_url,permanent_url,parent.gid,parent.name"
     }
