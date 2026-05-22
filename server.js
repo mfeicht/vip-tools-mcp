@@ -53,6 +53,11 @@ const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/spreadsheets"
 ];
+const GOOGLE_SEO_OAUTH_PREFIXES = ["GOOGLE_SEO_OAUTH", "GOOGLE_ANALYTICS_SEARCH_OAUTH", "GOOGLE_OAUTH"];
+const GOOGLE_SEO_REQUIRED_SCOPES = [
+  "https://www.googleapis.com/auth/analytics.readonly",
+  "https://www.googleapis.com/auth/webmasters.readonly"
+];
 const WP_IMPORT_URL =
   process.env.WORDPRESS_GK_IMPORT_URL || "https://app.goklever.de/wp-json/gk-mailpoet/v1/import-csv";
 const RS_REDAKTIONSPLAN_SPREADSHEET_ID =
@@ -153,6 +158,7 @@ const AGENT_EMAIL_DEFAULTS = {
 };
 
 let googleTokenCache = { accessToken: null, expiresAt: 0 };
+let googleSeoTokenCache = { accessToken: null, expiresAt: 0, envPrefix: null };
 const emailDraftCache = new Map();
 
 function getAsana(agentId = DEFAULT_AGENT_ID) {
@@ -506,6 +512,62 @@ function parseGoogleServiceAccount() {
   };
 }
 
+function getOAuthConfigFromPrefix(prefix) {
+  const clientId = process.env[`${prefix}_CLIENT_ID`];
+  const clientSecret = process.env[`${prefix}_CLIENT_SECRET`];
+  const refreshToken = process.env[`${prefix}_REFRESH_TOKEN`];
+  if (!clientId || !clientSecret || !refreshToken) return null;
+  return { prefix, clientId, clientSecret, refreshToken };
+}
+
+function getFirstOAuthConfig(prefixes) {
+  for (const prefix of prefixes) {
+    const config = getOAuthConfigFromPrefix(prefix);
+    if (config) return config;
+  }
+  return null;
+}
+
+function oauthEnvSummary(prefixes) {
+  return Object.fromEntries(
+    prefixes.map((prefix) => [
+      prefix,
+      {
+        client_id_configured: Boolean(process.env[`${prefix}_CLIENT_ID`]),
+        client_secret_configured: Boolean(process.env[`${prefix}_CLIENT_SECRET`]),
+        refresh_token_configured: Boolean(process.env[`${prefix}_REFRESH_TOKEN`])
+      }
+    ])
+  );
+}
+
+async function refreshGoogleOAuthAccessToken(oauthConfig, tokenCache) {
+  const now = Math.floor(Date.now() / 1000);
+  if (
+    tokenCache.accessToken &&
+    tokenCache.expiresAt > now + 60 &&
+    (!tokenCache.envPrefix || tokenCache.envPrefix === oauthConfig.prefix)
+  ) {
+    return tokenCache.accessToken;
+  }
+
+  const params = new URLSearchParams({
+    client_id: oauthConfig.clientId,
+    client_secret: oauthConfig.clientSecret,
+    refresh_token: oauthConfig.refreshToken,
+    grant_type: "refresh_token"
+  });
+
+  const res = await axios.post("https://oauth2.googleapis.com/token", params.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" }
+  });
+
+  tokenCache.accessToken = res.data.access_token;
+  tokenCache.expiresAt = now + Number(res.data.expires_in || 3600);
+  tokenCache.envPrefix = oauthConfig.prefix;
+  return tokenCache.accessToken;
+}
+
 async function getGoogleAccessToken() {
   const now = Math.floor(Date.now() / 1000);
   if (googleTokenCache.accessToken && googleTokenCache.expiresAt > now + 60) {
@@ -575,6 +637,43 @@ async function getGoogleAccessToken() {
     expiresAt: now + Number(res.data.expires_in || 3600)
   };
   return googleTokenCache.accessToken;
+}
+
+async function getGoogleSeoAccessToken() {
+  const oauthConfig = getFirstOAuthConfig(GOOGLE_SEO_OAUTH_PREFIXES);
+  if (!oauthConfig) {
+    throw new Error(
+      `Google SEO OAuth-Zugang fehlt. Setze ${GOOGLE_SEO_OAUTH_PREFIXES.map(
+        (prefix) => `${prefix}_CLIENT_ID/${prefix}_CLIENT_SECRET/${prefix}_REFRESH_TOKEN`
+      ).join(" oder ")}.`
+    );
+  }
+  return refreshGoogleOAuthAccessToken(oauthConfig, googleSeoTokenCache);
+}
+
+async function googleSeoRequest(config) {
+  const accessToken = await getGoogleSeoAccessToken();
+  return axios.request({
+    ...config,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...(config.headers || {})
+    }
+  });
+}
+
+async function getGoogleTokenInfo(accessToken) {
+  const res = await axios.get("https://www.googleapis.com/oauth2/v1/tokeninfo", {
+    params: { access_token: accessToken },
+    validateStatus: () => true
+  });
+  return res;
+}
+
+function normalizeGa4PropertyName(property) {
+  const raw = String(property || "").trim();
+  if (!raw) throw new Error("property_id darf nicht leer sein.");
+  return raw.startsWith("properties/") ? raw : `properties/${raw}`;
 }
 
 async function googleRequest(config) {
@@ -3112,6 +3211,209 @@ function createServer() {
         ...summary,
         fetch_user_data: true,
         user_data: maskSensitiveDataForSeoValue(compactDataForSeoResponse(response, { maxResults: 20 }))
+      });
+    }
+  );
+
+  server.tool(
+    "google_seo_oauth_check_config",
+    "Prueft die zentrale Google-OAuth-Konfiguration fuer GA4/Search Console read-only. Erzeugt testweise ein Access Token, gibt aber keine Secrets aus.",
+    {},
+    TOOL_EXTERNAL_READ,
+    async () => {
+      const selectedConfig = getFirstOAuthConfig(GOOGLE_SEO_OAUTH_PREFIXES);
+      const summary = {
+        env_prefix_candidates: GOOGLE_SEO_OAUTH_PREFIXES,
+        env_configured: oauthEnvSummary(GOOGLE_SEO_OAUTH_PREFIXES),
+        selected_env_prefix: selectedConfig?.prefix || null,
+        required_scopes: GOOGLE_SEO_REQUIRED_SCOPES
+      };
+      if (!selectedConfig) {
+        return out({
+          ...summary,
+          token_refresh_ok: false,
+          error: "Kein vollstaendiges OAuth-Env-Set gefunden."
+        });
+      }
+
+      const accessToken = await refreshGoogleOAuthAccessToken(selectedConfig, googleSeoTokenCache);
+      const tokenInfo = await getGoogleTokenInfo(accessToken);
+      const scopes = String(tokenInfo.data?.scope || "")
+        .split(/\s+/)
+        .filter(Boolean);
+      return out({
+        ...summary,
+        token_refresh_ok: true,
+        tokeninfo_status: tokenInfo.status,
+        expires_in: tokenInfo.data?.expires_in,
+        scopes,
+        required_scopes_present: GOOGLE_SEO_REQUIRED_SCOPES.every((scope) => scopes.includes(scope)),
+        audience: tokenInfo.data?.audience || tokenInfo.data?.aud || null
+      });
+    }
+  );
+
+  server.tool(
+    "ga4_list_properties",
+    "Listet GA4-Accounts und Properties, auf die der konfigurierte Google-OAuth-Account read-only Zugriff hat.",
+    {
+      page_size: z.number().int().min(1).max(200).optional().default(200),
+      max_pages: z.number().int().min(1).max(20).optional().default(10)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ page_size, max_pages }) => {
+      const accountSummaries = [];
+      let pageToken;
+      for (let page = 0; page < max_pages; page += 1) {
+        const res = await googleSeoRequest({
+          method: "GET",
+          url: "https://analyticsadmin.googleapis.com/v1beta/accountSummaries",
+          params: {
+            pageSize: page_size,
+            pageToken
+          }
+        });
+        accountSummaries.push(...(res.data.accountSummaries || []));
+        pageToken = res.data.nextPageToken;
+        if (!pageToken) break;
+      }
+
+      return out({
+        account_count: accountSummaries.length,
+        property_count: accountSummaries.reduce(
+          (sum, account) => sum + Number(account.propertySummaries?.length || 0),
+          0
+        ),
+        account_summaries: accountSummaries.map((account) => ({
+          account: account.account,
+          display_name: account.displayName,
+          property_summaries: (account.propertySummaries || []).map((property) => ({
+            property: property.property,
+            display_name: property.displayName,
+            property_type: property.propertyType,
+            parent: property.parent
+          }))
+        }))
+      });
+    }
+  );
+
+  server.tool(
+    "ga4_run_report",
+    "Fuehrt einen GA4 Data API runReport read-only fuer eine Property aus. Nutzt nur Properties, auf die der OAuth-Account Zugriff hat.",
+    {
+      property_id: z.string(),
+      date_start: z.string().optional().default("28daysAgo"),
+      date_end: z.string().optional().default("today"),
+      dimensions: z.array(z.string()).min(0).max(10).optional().default(["sessionDefaultChannelGroup"]),
+      metrics: z.array(z.string()).min(1).max(10).optional().default(["sessions", "totalUsers"]),
+      limit: z.number().int().min(1).max(10000).optional().default(1000),
+      keep_empty_rows: z.boolean().optional().default(false)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ property_id, date_start, date_end, dimensions, metrics, limit, keep_empty_rows }) => {
+      const propertyName = normalizeGa4PropertyName(property_id);
+      const res = await googleSeoRequest({
+        method: "POST",
+        url: `https://analyticsdata.googleapis.com/v1beta/${encodeURIComponent(propertyName)}:runReport`,
+        data: {
+          dateRanges: [{ startDate: date_start, endDate: date_end }],
+          dimensions: dimensions.map((name) => ({ name })),
+          metrics: metrics.map((name) => ({ name })),
+          limit,
+          keepEmptyRows: keep_empty_rows
+        }
+      });
+
+      return out({
+        property: propertyName,
+        row_count: res.data.rowCount || 0,
+        dimension_headers: res.data.dimensionHeaders || [],
+        metric_headers: res.data.metricHeaders || [],
+        rows: res.data.rows || [],
+        totals: res.data.totals || [],
+        metadata: res.data.metadata || null
+      });
+    }
+  );
+
+  server.tool(
+    "gsc_list_sites",
+    "Listet Search-Console-Properties, auf die der konfigurierte Google-OAuth-Account Zugriff hat.",
+    {},
+    TOOL_EXTERNAL_READ,
+    async () => {
+      const res = await googleSeoRequest({
+        method: "GET",
+        url: "https://www.googleapis.com/webmasters/v3/sites"
+      });
+      return out({
+        site_count: res.data.siteEntry?.length || 0,
+        sites: res.data.siteEntry || []
+      });
+    }
+  );
+
+  server.tool(
+    "gsc_search_analytics",
+    "Ruft Search-Console-Search-Analytics-Daten read-only fuer eine Property ab.",
+    {
+      site_url: z.string(),
+      date_start: z.string(),
+      date_end: z.string(),
+      dimensions: z.array(z.string()).min(0).max(5).optional().default(["query", "page"]),
+      row_limit: z.number().int().min(1).max(25000).optional().default(1000),
+      start_row: z.number().int().min(0).optional().default(0),
+      search_type: z.string().optional().default("web")
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ site_url, date_start, date_end, dimensions, row_limit, start_row, search_type }) => {
+      const res = await googleSeoRequest({
+        method: "POST",
+        url: `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(site_url)}/searchAnalytics/query`,
+        data: {
+          startDate: date_start,
+          endDate: date_end,
+          dimensions,
+          rowLimit: row_limit,
+          startRow: start_row,
+          type: search_type
+        }
+      });
+      return out({
+        site_url,
+        date_start,
+        date_end,
+        dimensions,
+        row_count: res.data.rows?.length || 0,
+        rows: res.data.rows || []
+      });
+    }
+  );
+
+  server.tool(
+    "gsc_url_inspection",
+    "Prueft per Search Console URL Inspection API read-only den Indexierungsstatus einer URL innerhalb einer Property.",
+    {
+      site_url: z.string(),
+      inspection_url: z.string(),
+      language_code: z.string().optional().default("de-DE")
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ site_url, inspection_url, language_code }) => {
+      const res = await googleSeoRequest({
+        method: "POST",
+        url: "https://searchconsole.googleapis.com/v1/urlInspection/index:inspect",
+        data: {
+          siteUrl: site_url,
+          inspectionUrl: normalizeWebUrl(inspection_url),
+          languageCode: language_code
+        }
+      });
+      return out({
+        site_url,
+        inspection_url,
+        response: res.data
       });
     }
   );
