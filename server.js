@@ -73,6 +73,15 @@ const WEB_FETCH_MAX_BYTES = Number(process.env.WEB_FETCH_MAX_BYTES || 2_000_000)
 const WEB_FETCH_USER_AGENT =
   process.env.WEB_FETCH_USER_AGENT ||
   "VIP-Tools-MCP/1.0 (+https://vip-studios.de; read-only metadata inspection)";
+const PAGESPEED_API_BASE = (
+  process.env.PAGESPEED_API_BASE || "https://www.googleapis.com/pagespeedonline/v5"
+).replace(/\/$/, "");
+const PAGESPEED_TIMEOUT_MS = Number(process.env.PAGESPEED_TIMEOUT_MS || 90_000);
+const CRUX_API_BASE = (process.env.CRUX_API_BASE || "https://chromeuxreport.googleapis.com/v1").replace(/\/$/, "");
+const CRUX_TIMEOUT_MS = Number(process.env.CRUX_TIMEOUT_MS || 30_000);
+const PAGESPEED_CATEGORY_VALUES = ["performance", "accessibility", "best-practices", "seo", "pwa"];
+const PAGESPEED_STRATEGY_VALUES = ["mobile", "desktop"];
+const CRUX_FORM_FACTOR_VALUES = ["PHONE", "DESKTOP", "TABLET"];
 const WEB_PAGE_SECTION_VALUES = [
   "seo",
   "meta",
@@ -2233,6 +2242,147 @@ async function inspectWebPage({
   return result;
 }
 
+function googleApiKeyFor(kind) {
+  if (kind === "pagespeed") {
+    return (
+      process.env.PAGESPEED_API_KEY ||
+      process.env.GOOGLE_PAGESPEED_API_KEY ||
+      process.env.GOOGLE_API_KEY ||
+      ""
+    );
+  }
+  if (kind === "crux") {
+    return process.env.CRUX_API_KEY || process.env.GOOGLE_CRUX_API_KEY || process.env.GOOGLE_API_KEY || "";
+  }
+  return process.env.GOOGLE_API_KEY || "";
+}
+
+function normalizePageSpeedCategory(category) {
+  return String(category || "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, "-");
+}
+
+function pageSpeedCategoryParam(category) {
+  return normalizePageSpeedCategory(category).toUpperCase().replace(/-/g, "_");
+}
+
+function compactAudit(audit) {
+  if (!audit) return null;
+  return {
+    id: audit.id,
+    title: audit.title,
+    score: audit.score,
+    score_display_mode: audit.scoreDisplayMode,
+    display_value: audit.displayValue,
+    numeric_value: audit.numericValue,
+    numeric_unit: audit.numericUnit,
+    description: truncateString(stripHtml(audit.description || ""), 500),
+    details_type: audit.details?.type || null,
+    overall_savings_ms: audit.details?.overallSavingsMs,
+    overall_savings_bytes: audit.details?.overallSavingsBytes
+  };
+}
+
+function compactPageSpeedResponse(data, { maxAudits = 20 } = {}) {
+  const lighthouse = data?.lighthouseResult || {};
+  const audits = lighthouse.audits || {};
+  const categoryScores = {};
+  for (const [key, category] of Object.entries(lighthouse.categories || {})) {
+    categoryScores[key] = {
+      title: category.title,
+      score: typeof category.score === "number" ? Math.round(category.score * 100) : category.score
+    };
+  }
+
+  const coreAuditIds = [
+    "first-contentful-paint",
+    "largest-contentful-paint",
+    "interaction-to-next-paint",
+    "total-blocking-time",
+    "cumulative-layout-shift",
+    "speed-index",
+    "server-response-time",
+    "render-blocking-resources",
+    "unused-javascript",
+    "unused-css-rules",
+    "uses-optimized-images",
+    "modern-image-formats"
+  ];
+  const coreAudits = coreAuditIds
+    .map((id) => compactAudit({ id, ...(audits[id] || {}) }))
+    .filter((audit) => audit?.title);
+
+  const opportunities = Object.entries(audits)
+    .map(([id, audit]) => compactAudit({ id, ...audit }))
+    .filter((audit) => audit?.details_type === "opportunity")
+    .sort((a, b) => (b.overall_savings_ms || 0) - (a.overall_savings_ms || 0))
+    .slice(0, maxAudits);
+
+  const failedAudits = Object.entries(audits)
+    .map(([id, audit]) => compactAudit({ id, ...audit }))
+    .filter((audit) => audit && audit.score !== null && audit.score !== undefined && audit.score < 1)
+    .slice(0, maxAudits);
+
+  return {
+    requested_url: data?.id || null,
+    final_url: lighthouse.finalUrl || lighthouse.requestedUrl || data?.id || null,
+    analysis_utc: lighthouse.fetchTime || null,
+    lighthouse_version: lighthouse.lighthouseVersion || null,
+    user_agent: lighthouse.userAgent || null,
+    category_scores: categoryScores,
+    field_data: {
+      loading_experience: data?.loadingExperience || null,
+      origin_loading_experience: data?.originLoadingExperience || null
+    },
+    core_audits: coreAudits,
+    opportunities,
+    failed_audits: failedAudits
+  };
+}
+
+function normalizeCruxTarget({ url, origin }) {
+  if (url && origin) throw new Error("Bitte entweder url oder origin angeben, nicht beides.");
+  if (url) return { url: normalizeWebUrl(url) };
+  if (origin) {
+    const normalized = normalizeWebUrl(origin);
+    return { origin: new URL(normalized).origin };
+  }
+  throw new Error("Bitte url oder origin angeben.");
+}
+
+function buildCruxBody({ url, origin, form_factor, metrics, collection_period_count }) {
+  const target = normalizeCruxTarget({ url, origin });
+  const body = { ...target };
+  if (form_factor) body.formFactor = form_factor;
+  if (Array.isArray(metrics) && metrics.length) body.metrics = metrics;
+  if (collection_period_count !== undefined) body.collectionPeriodCount = collection_period_count;
+  return body;
+}
+
+async function callGoogleJsonApi({ method = "GET", url, params, body, timeout }) {
+  const res = await axios.request({
+    method,
+    url,
+    params,
+    data: body,
+    timeout,
+    validateStatus: () => true,
+    headers: {
+      "User-Agent": WEB_FETCH_USER_AGENT,
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    }
+  });
+  return {
+    ok: res.status >= 200 && res.status < 300,
+    status: res.status,
+    status_text: res.statusText,
+    data: res.data
+  };
+}
+
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
 function createServer() {
@@ -2772,6 +2922,170 @@ function createServer() {
         timeout_ms
       });
       return out(result);
+    }
+  );
+
+  server.tool(
+    "seo_google_api_check_config",
+    "Prueft allgemeine Google-SEO-API-Konfigurationen fuer PageSpeed Insights und CrUX ohne URL-Abfrage. Gibt keine Secret-Werte aus.",
+    {},
+    TOOL_EXTERNAL_READ,
+    async () => {
+      return out({
+        pagespeed: {
+          api_base: PAGESPEED_API_BASE,
+          timeout_ms: PAGESPEED_TIMEOUT_MS,
+          key_configured: Boolean(googleApiKeyFor("pagespeed")),
+          key_env_candidates: ["PAGESPEED_API_KEY", "GOOGLE_PAGESPEED_API_KEY", "GOOGLE_API_KEY"],
+          note:
+            "PageSpeed Insights kann je nach Google-Quota auch ohne Key funktionieren; fuer stabile Nutzung ist ein API-Key empfohlen."
+        },
+        crux: {
+          api_base: CRUX_API_BASE,
+          timeout_ms: CRUX_TIMEOUT_MS,
+          key_configured: Boolean(googleApiKeyFor("crux")),
+          key_env_candidates: ["CRUX_API_KEY", "GOOGLE_CRUX_API_KEY", "GOOGLE_API_KEY"],
+          note: "CrUX API und CrUX History API benoetigen einen Google Cloud API-Key mit Chrome UX Report API."
+        }
+      });
+    }
+  );
+
+  server.tool(
+    "seo_pagespeed_api",
+    "Ruft Google PageSpeed Insights fuer oeffentliche URLs ab und liefert kompakte Lighthouse-/CrUX-/Core-Web-Vitals-Daten. Read-only; jede URL wird einzeln analysiert.",
+    {
+      urls: z.array(z.string()).min(1).max(10),
+      strategy: z.enum(PAGESPEED_STRATEGY_VALUES).optional().default("mobile"),
+      categories: z
+        .array(z.enum(PAGESPEED_CATEGORY_VALUES))
+        .min(1)
+        .max(PAGESPEED_CATEGORY_VALUES.length)
+        .optional()
+        .default(["performance", "accessibility", "best-practices", "seo"]),
+      locale: z.string().min(2).max(20).optional().default("de"),
+      timeout_ms: z.number().int().min(10_000).max(120_000).optional().default(PAGESPEED_TIMEOUT_MS),
+      max_audits: z.number().int().min(0).max(100).optional().default(20)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ urls, strategy, categories, locale, timeout_ms, max_audits }) => {
+      const apiKey = googleApiKeyFor("pagespeed");
+      const items = [];
+      for (const inputUrl of urls) {
+        const normalizedUrl = normalizeWebUrl(inputUrl);
+        const params = new URLSearchParams();
+        params.set("url", normalizedUrl);
+        params.set("strategy", strategy);
+        params.set("locale", locale);
+        for (const category of categories) params.append("category", pageSpeedCategoryParam(category));
+        if (apiKey) params.set("key", apiKey);
+
+        const result = await callGoogleJsonApi({
+          url: `${PAGESPEED_API_BASE}/runPagespeed?${params.toString()}`,
+          timeout: timeout_ms
+        });
+
+        items.push({
+          url: normalizedUrl,
+          ok: result.ok,
+          status: result.status,
+          data: result.ok ? compactPageSpeedResponse(result.data, { maxAudits: max_audits }) : undefined,
+          error: result.ok ? undefined : result.data
+        });
+      }
+
+      return out({
+        tool: "seo_pagespeed_api",
+        input: {
+          urls: urls.length,
+          strategy,
+          categories,
+          locale,
+          key_configured: Boolean(apiKey)
+        },
+        summary: {
+          ok_count: items.filter((item) => item.ok).length,
+          error_count: items.filter((item) => !item.ok).length
+        },
+        items
+      });
+    }
+  );
+
+  server.tool(
+    "seo_crux_api",
+    "Ruft die Chrome UX Report API fuer reale Web-Vitals-Felddaten einer oeffentlichen URL oder Origin ab. Benoetigt einen CrUX/Google API-Key.",
+    {
+      url: z.string().optional(),
+      origin: z.string().optional(),
+      form_factor: z.enum(CRUX_FORM_FACTOR_VALUES).optional(),
+      metrics: z.array(z.string()).min(1).max(20).optional(),
+      timeout_ms: z.number().int().min(5_000).max(60_000).optional().default(CRUX_TIMEOUT_MS)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ url, origin, form_factor, metrics, timeout_ms }) => {
+      const apiKey = googleApiKeyFor("crux");
+      if (!apiKey) {
+        throw new Error("CrUX API-Key fehlt. Setze CRUX_API_KEY, GOOGLE_CRUX_API_KEY oder GOOGLE_API_KEY.");
+      }
+      const body = buildCruxBody({ url, origin, form_factor, metrics });
+      const result = await callGoogleJsonApi({
+        method: "POST",
+        url: `${CRUX_API_BASE}/records:queryRecord`,
+        params: { key: apiKey },
+        body,
+        timeout: timeout_ms
+      });
+
+      return out({
+        tool: "seo_crux_api",
+        ok: result.ok,
+        status: result.status,
+        request: { ...body, key_configured: true },
+        response: result.data,
+        note: result.ok
+          ? undefined
+          : "Wenn status 404 oder keine Daten geliefert werden, hat CrUX fuer diese URL/Origin moeglicherweise nicht genug reale Nutzerdaten."
+      });
+    }
+  );
+
+  server.tool(
+    "seo_crux_history",
+    "Ruft die CrUX History API fuer Web-Vitals-Trends einer oeffentlichen URL oder Origin ab. Benoetigt einen CrUX/Google API-Key.",
+    {
+      url: z.string().optional(),
+      origin: z.string().optional(),
+      form_factor: z.enum(CRUX_FORM_FACTOR_VALUES).optional(),
+      metrics: z.array(z.string()).min(1).max(20).optional(),
+      collection_period_count: z.number().int().min(1).max(40).optional().default(25),
+      timeout_ms: z.number().int().min(5_000).max(60_000).optional().default(CRUX_TIMEOUT_MS)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ url, origin, form_factor, metrics, collection_period_count, timeout_ms }) => {
+      const apiKey = googleApiKeyFor("crux");
+      if (!apiKey) {
+        throw new Error("CrUX API-Key fehlt. Setze CRUX_API_KEY, GOOGLE_CRUX_API_KEY oder GOOGLE_API_KEY.");
+      }
+      const body = buildCruxBody({ url, origin, form_factor, metrics, collection_period_count });
+      const result = await callGoogleJsonApi({
+        method: "POST",
+        url: `${CRUX_API_BASE}/records:queryHistoryRecord`,
+        params: { key: apiKey },
+        body,
+        timeout: timeout_ms
+      });
+
+      return out({
+        tool: "seo_crux_history",
+        ok: result.ok,
+        status: result.status,
+        request: { ...body, key_configured: true },
+        response: result.data,
+        note: result.ok
+          ? undefined
+          : "Wenn status 404 oder Luecken geliefert werden, hat CrUX fuer diese URL/Origin moeglicherweise nicht genug reale Nutzerdaten."
+      });
     }
   );
 
