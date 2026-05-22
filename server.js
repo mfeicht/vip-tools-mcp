@@ -58,6 +58,32 @@ const GOOGLE_SEO_REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/analytics.readonly",
   "https://www.googleapis.com/auth/webmasters.readonly"
 ];
+const GOOGLE_ADS_OAUTH_PREFIXES = [
+  "GOOGLE_ADS_OAUTH",
+  "GOOGLE_SEO_OAUTH",
+  "GOOGLE_ANALYTICS_SEARCH_OAUTH",
+  "GOOGLE_OAUTH"
+];
+const GOOGLE_ADS_REQUIRED_SCOPES = ["https://www.googleapis.com/auth/adwords"];
+const GOOGLE_ADS_API_BASE = (process.env.GOOGLE_ADS_API_BASE || "https://googleads.googleapis.com").replace(
+  /\/$/,
+  ""
+);
+const GOOGLE_ADS_API_VERSION = process.env.GOOGLE_ADS_API_VERSION || "v22";
+const GOOGLE_ADS_TIMEOUT_MS = Number(process.env.GOOGLE_ADS_TIMEOUT_MS || 30_000);
+const GOOGLE_ADS_MUTATE_SERVICE_VALUES = [
+  "campaignBudgets",
+  "campaigns",
+  "adGroups",
+  "adGroupAds",
+  "campaignCriteria",
+  "adGroupCriteria",
+  "customerNegativeCriteria",
+  "assets",
+  "campaignAssets",
+  "adGroupAssets"
+];
+const GOOGLE_ADS_RESPONSE_CONTENT_TYPE_VALUES = ["RESOURCE_NAME_ONLY", "MUTABLE_RESOURCE"];
 const WP_IMPORT_URL =
   process.env.WORDPRESS_GK_IMPORT_URL || "https://app.goklever.de/wp-json/gk-mailpoet/v1/import-csv";
 const RS_REDAKTIONSPLAN_SPREADSHEET_ID =
@@ -159,6 +185,7 @@ const AGENT_EMAIL_DEFAULTS = {
 
 let googleTokenCache = { accessToken: null, expiresAt: 0 };
 let googleSeoTokenCache = { accessToken: null, expiresAt: 0, envPrefix: null };
+let googleAdsTokenCache = { accessToken: null, expiresAt: 0, envPrefix: null };
 const emailDraftCache = new Map();
 
 function getAsana(agentId = DEFAULT_AGENT_ID) {
@@ -651,6 +678,18 @@ async function getGoogleSeoAccessToken() {
   return refreshGoogleOAuthAccessToken(oauthConfig, googleSeoTokenCache);
 }
 
+async function getGoogleAdsAccessToken() {
+  const oauthConfig = getFirstOAuthConfig(GOOGLE_ADS_OAUTH_PREFIXES);
+  if (!oauthConfig) {
+    throw new Error(
+      `Google-Ads-OAuth-Zugang fehlt. Setze ${GOOGLE_ADS_OAUTH_PREFIXES.map(
+        (prefix) => `${prefix}_CLIENT_ID/${prefix}_CLIENT_SECRET/${prefix}_REFRESH_TOKEN`
+      ).join(" oder ")}.`
+    );
+  }
+  return refreshGoogleOAuthAccessToken(oauthConfig, googleAdsTokenCache);
+}
+
 async function googleSeoRequest(config) {
   const accessToken = await getGoogleSeoAccessToken();
   return axios.request({
@@ -658,6 +697,56 @@ async function googleSeoRequest(config) {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       ...(config.headers || {})
+    }
+  });
+}
+
+function getGoogleAdsDeveloperToken() {
+  return process.env.GOOGLE_ADS_DEVELOPER_TOKEN || process.env.ADWORDS_DEVELOPER_TOKEN || "";
+}
+
+function normalizeGoogleAdsCustomerId(customerId, fieldName = "customer_id") {
+  const normalized = String(customerId || "").replace(/\D/g, "");
+  if (!normalized) throw new Error(`${fieldName} darf nicht leer sein.`);
+  return normalized;
+}
+
+function getGoogleAdsLoginCustomerId(loginCustomerId) {
+  const raw =
+    loginCustomerId ||
+    process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID ||
+    process.env.GOOGLE_ADS_MANAGER_CUSTOMER_ID ||
+    "";
+  return raw ? normalizeGoogleAdsCustomerId(raw, "login_customer_id") : null;
+}
+
+function compactAxiosError(error) {
+  const responseData = error.response?.data;
+  return {
+    status: error.response?.status || null,
+    message: responseData?.error?.message || responseData?.message || error.message,
+    request_id: error.response?.headers?.["request-id"] || null,
+    response: responseData || null
+  };
+}
+
+async function googleAdsRequest({ method = "GET", path, data, params, login_customer_id, timeout = GOOGLE_ADS_TIMEOUT_MS }) {
+  const developerToken = getGoogleAdsDeveloperToken();
+  if (!developerToken) {
+    throw new Error("Google-Ads-Developer-Token fehlt. Setze GOOGLE_ADS_DEVELOPER_TOKEN.");
+  }
+  const accessToken = await getGoogleAdsAccessToken();
+  const loginCustomerId = getGoogleAdsLoginCustomerId(login_customer_id);
+  return axios.request({
+    method,
+    url: `${GOOGLE_ADS_API_BASE}/${GOOGLE_ADS_API_VERSION}${path}`,
+    data,
+    params,
+    timeout,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "developer-token": developerToken,
+      ...(loginCustomerId ? { "login-customer-id": loginCustomerId } : {})
     }
   });
 }
@@ -3413,6 +3502,304 @@ function createServer() {
       return out({
         site_url,
         inspection_url,
+        response: res.data
+      });
+    }
+  );
+
+  server.tool(
+    "google_ads_check_config",
+    "Prueft die zentrale Google-Ads-API-Konfiguration ohne Secret-Ausgabe. Optional wird ein read-only ListAccessibleCustomers-Test ausgefuehrt.",
+    {
+      fetch_accessible_customers: z.boolean().optional().default(false),
+      login_customer_id: z.string().optional()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ fetch_accessible_customers, login_customer_id }) => {
+      const selectedConfig = getFirstOAuthConfig(GOOGLE_ADS_OAUTH_PREFIXES);
+      const summary = {
+        env_prefix_candidates: GOOGLE_ADS_OAUTH_PREFIXES,
+        env_configured: oauthEnvSummary(GOOGLE_ADS_OAUTH_PREFIXES),
+        selected_env_prefix: selectedConfig?.prefix || null,
+        api_version: GOOGLE_ADS_API_VERSION,
+        developer_token_configured: Boolean(getGoogleAdsDeveloperToken()),
+        default_login_customer_id_configured: Boolean(
+          process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID || process.env.GOOGLE_ADS_MANAGER_CUSTOMER_ID
+        ),
+        requested_login_customer_id: login_customer_id ? normalizeGoogleAdsCustomerId(login_customer_id) : null,
+        required_scopes: GOOGLE_ADS_REQUIRED_SCOPES
+      };
+      if (!selectedConfig) {
+        return out({
+          ...summary,
+          token_refresh_ok: false,
+          error: "Kein vollstaendiges OAuth-Env-Set gefunden."
+        });
+      }
+
+      const accessToken = await refreshGoogleOAuthAccessToken(selectedConfig, googleAdsTokenCache);
+      const tokenInfo = await getGoogleTokenInfo(accessToken);
+      const scopes = String(tokenInfo.data?.scope || "")
+        .split(/\s+/)
+        .filter(Boolean);
+      const requiredScopesPresent = GOOGLE_ADS_REQUIRED_SCOPES.every((scope) => scopes.includes(scope));
+      const result = {
+        ...summary,
+        token_refresh_ok: true,
+        tokeninfo_status: tokenInfo.status,
+        expires_in: tokenInfo.data?.expires_in,
+        scopes,
+        required_scopes_present: requiredScopesPresent,
+        audience: tokenInfo.data?.audience || tokenInfo.data?.aud || null
+      };
+
+      if (!fetch_accessible_customers) return out(result);
+      try {
+        const res = await googleAdsRequest({
+          method: "GET",
+          path: "/customers:listAccessibleCustomers",
+          login_customer_id
+        });
+        return out({
+          ...result,
+          fetch_accessible_customers: true,
+          list_accessible_customers_ok: true,
+          request_id: res.headers?.["request-id"] || null,
+          resource_names: res.data.resourceNames || []
+        });
+      } catch (error) {
+        return out({
+          ...result,
+          fetch_accessible_customers: true,
+          list_accessible_customers_ok: false,
+          error: compactAxiosError(error)
+        });
+      }
+    }
+  );
+
+  server.tool(
+    "google_ads_list_customers",
+    "Listet Google-Ads-Kundenkonten, auf die der konfigurierte OAuth-Account Zugriff hat.",
+    {
+      login_customer_id: z.string().optional()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ login_customer_id }) => {
+      const res = await googleAdsRequest({
+        method: "GET",
+        path: "/customers:listAccessibleCustomers",
+        login_customer_id
+      });
+      return out({
+        api_version: GOOGLE_ADS_API_VERSION,
+        request_id: res.headers?.["request-id"] || null,
+        customer_count: res.data.resourceNames?.length || 0,
+        resource_names: res.data.resourceNames || []
+      });
+    }
+  );
+
+  server.tool(
+    "google_ads_customer_clients",
+    "Liest die Google-Ads-Konto-Hierarchie unter einem Manager- oder Kundenkonto read-only per GAQL aus.",
+    {
+      customer_id: z.string(),
+      login_customer_id: z.string().optional(),
+      level_max: z.number().int().min(0).max(10).optional().default(1),
+      limit: z.number().int().min(1).max(10000).optional().default(1000)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ customer_id, login_customer_id, level_max, limit }) => {
+      const normalizedCustomerId = normalizeGoogleAdsCustomerId(customer_id);
+      const query = `
+        SELECT
+          customer_client.client_customer,
+          customer_client.descriptive_name,
+          customer_client.manager,
+          customer_client.level,
+          customer_client.status,
+          customer_client.currency_code,
+          customer_client.time_zone
+        FROM customer_client
+        WHERE customer_client.level <= ${level_max}
+        LIMIT ${limit}
+      `;
+      const res = await googleAdsRequest({
+        method: "POST",
+        path: `/customers/${normalizedCustomerId}/googleAds:search`,
+        login_customer_id,
+        data: { query, pageSize: Math.min(limit, 10000) }
+      });
+      return out({
+        api_version: GOOGLE_ADS_API_VERSION,
+        customer_id: normalizedCustomerId,
+        login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+        request_id: res.headers?.["request-id"] || null,
+        row_count: res.data.results?.length || 0,
+        next_page_token: res.data.nextPageToken || null,
+        rows: res.data.results || []
+      });
+    }
+  );
+
+  server.tool(
+    "google_ads_search",
+    "Fuehrt eine freie Google-Ads-GAQL-Abfrage read-only aus. Nur fuer SELECT-Queries verwenden.",
+    {
+      customer_id: z.string(),
+      query: z.string().min(1).max(10000),
+      login_customer_id: z.string().optional(),
+      page_size: z.number().int().min(1).max(10000).optional().default(1000),
+      page_token: z.string().optional()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ customer_id, query, login_customer_id, page_size, page_token }) => {
+      const normalizedCustomerId = normalizeGoogleAdsCustomerId(customer_id);
+      const trimmedQuery = query.trim();
+      if (!/^select\s/i.test(trimmedQuery)) {
+        throw new Error("google_ads_search erlaubt nur GAQL-SELECT-Queries.");
+      }
+      const res = await googleAdsRequest({
+        method: "POST",
+        path: `/customers/${normalizedCustomerId}/googleAds:search`,
+        login_customer_id,
+        data: {
+          query: trimmedQuery,
+          pageSize: page_size,
+          ...(page_token ? { pageToken: page_token } : {})
+        }
+      });
+      return out({
+        api_version: GOOGLE_ADS_API_VERSION,
+        customer_id: normalizedCustomerId,
+        login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+        request_id: res.headers?.["request-id"] || null,
+        row_count: res.data.results?.length || 0,
+        total_results_count: res.data.totalResultsCount || null,
+        next_page_token: res.data.nextPageToken || null,
+        field_mask: res.data.fieldMask || null,
+        rows: res.data.results || []
+      });
+    }
+  );
+
+  server.tool(
+    "google_ads_campaign_report",
+    "Ruft einen standardisierten Google-Ads-Kampagnenbericht read-only ab.",
+    {
+      customer_id: z.string(),
+      date_start: z.string(),
+      date_end: z.string(),
+      login_customer_id: z.string().optional(),
+      limit: z.number().int().min(1).max(10000).optional().default(1000)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ customer_id, date_start, date_end, login_customer_id, limit }) => {
+      const normalizedCustomerId = normalizeGoogleAdsCustomerId(customer_id);
+      const query = `
+        SELECT
+          campaign.id,
+          campaign.name,
+          campaign.status,
+          campaign.advertising_channel_type,
+          campaign.optimization_score,
+          metrics.impressions,
+          metrics.clicks,
+          metrics.cost_micros,
+          metrics.conversions,
+          metrics.conversions_value,
+          metrics.ctr,
+          metrics.average_cpc
+        FROM campaign
+        WHERE segments.date BETWEEN '${date_start}' AND '${date_end}'
+        ORDER BY metrics.impressions DESC
+        LIMIT ${limit}
+      `;
+      const res = await googleAdsRequest({
+        method: "POST",
+        path: `/customers/${normalizedCustomerId}/googleAds:search`,
+        login_customer_id,
+        data: { query, pageSize: Math.min(limit, 10000) }
+      });
+      return out({
+        api_version: GOOGLE_ADS_API_VERSION,
+        customer_id: normalizedCustomerId,
+        login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+        date_start,
+        date_end,
+        request_id: res.headers?.["request-id"] || null,
+        row_count: res.data.results?.length || 0,
+        next_page_token: res.data.nextPageToken || null,
+        rows: res.data.results || []
+      });
+    }
+  );
+
+  server.tool(
+    "google_ads_mutate",
+    "Fuehrt kontrollierte Google-Ads-Mutate-Operationen aus. Standard ist dry_run/validateOnly; echte Aenderungen nur mit klarer Asana-Freigabe.",
+    {
+      agent_id: agentIdSchema,
+      customer_id: z.string(),
+      service: z.enum(GOOGLE_ADS_MUTATE_SERVICE_VALUES),
+      operations: z.array(z.record(z.string(), z.any())).min(1).max(50),
+      login_customer_id: z.string().optional(),
+      partial_failure: z.boolean().optional().default(false),
+      response_content_type: z.enum(GOOGLE_ADS_RESPONSE_CONTENT_TYPE_VALUES).optional().default("RESOURCE_NAME_ONLY"),
+      dry_run: z.boolean().optional().default(true),
+      validate_only: z.boolean().optional().default(false),
+      change_summary: z.string().optional(),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      customer_id,
+      service,
+      operations,
+      login_customer_id,
+      partial_failure,
+      response_content_type,
+      dry_run,
+      validate_only,
+      change_summary,
+      confirmed_by_asana,
+      asana_task_gid
+    }) => {
+      const normalizedCustomerId = normalizeGoogleAdsCustomerId(customer_id);
+      const effectiveValidateOnly = dry_run || validate_only;
+      if (!effectiveValidateOnly) {
+        assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "google_ads_mutate");
+        if (!String(change_summary || "").trim()) {
+          throw new Error("google_ads_mutate braucht fuer echte Aenderungen eine change_summary.");
+        }
+      }
+
+      const res = await googleAdsRequest({
+        method: "POST",
+        path: `/customers/${normalizedCustomerId}/${service}:mutate`,
+        login_customer_id,
+        data: {
+          operations,
+          partialFailure: partial_failure,
+          validateOnly: effectiveValidateOnly,
+          responseContentType: response_content_type
+        }
+      });
+
+      return out({
+        agent_id,
+        api_version: GOOGLE_ADS_API_VERSION,
+        customer_id: normalizedCustomerId,
+        login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+        service,
+        dry_run,
+        validate_only: effectiveValidateOnly,
+        live_mutation_executed: !effectiveValidateOnly,
+        change_summary: change_summary || null,
+        request_id: res.headers?.["request-id"] || null,
         response: res.data
       });
     }
