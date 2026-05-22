@@ -1561,34 +1561,75 @@ function isRetryableAxiosError(error) {
 }
 
 function getDataForSeoConfigDetails(agentId, { requireCredentials = true } = {}) {
-  const suffix = envSuffixForAgent(agentId);
-  const loginEnvName = process.env[`DATAFORSEO_LOGIN_${suffix}`] ? `DATAFORSEO_LOGIN_${suffix}` : "DATAFORSEO_LOGIN";
-  const passwordEnvName = process.env[`DATAFORSEO_PASSWORD_${suffix}`]
-    ? `DATAFORSEO_PASSWORD_${suffix}`
-    : "DATAFORSEO_PASSWORD";
-  const login = process.env[loginEnvName] || "";
-  const password = process.env[passwordEnvName] || "";
+  const credentials = getDataForSeoCredentialSets(agentId);
+  const primary = credentials.primary;
+  const fallback = credentials.fallback;
+  const readyCredentialSets = credentials.all.filter((credential) => credential.ready);
 
-  if (requireCredentials) {
-    if (!login) throw new Error(`DataForSEO Login fehlt im MCP-Environment (${loginEnvName}).`);
-    if (!password) throw new Error(`DataForSEO Passwort fehlt im MCP-Environment (${passwordEnvName}).`);
+  if (requireCredentials && !readyCredentialSets.length) {
+    throw new Error(
+      `DataForSEO Zugangsdaten fehlen im MCP-Environment. Primaer: ${primary.loginEnvName}/${primary.passwordEnvName}; Fallback: ${fallback.loginEnvName}/${fallback.passwordEnvName}.`
+    );
   }
 
   return {
-    config: { login, password },
+    config: { login: primary.login, password: primary.password },
+    credentialSets: readyCredentialSets,
     summary: {
       agent_id: agentId,
       dataforseo_api_base: DATAFORSEO_API_BASE,
-      login_configured: Boolean(login),
-      login_env_name: loginEnvName,
-      password_configured: Boolean(password),
-      password_env_name: password ? passwordEnvName : null,
-      ready_for_live_calls: Boolean(login && password),
+      login_configured: primary.loginConfigured,
+      login_env_name: primary.loginEnvName,
+      password_configured: primary.passwordConfigured,
+      password_env_name: primary.passwordConfigured ? primary.passwordEnvName : null,
+      fallback_login_configured: fallback.loginConfigured,
+      fallback_login_env_name: fallback.loginEnvName,
+      fallback_password_configured: fallback.passwordConfigured,
+      fallback_password_env_name: fallback.passwordConfigured ? fallback.passwordEnvName : null,
+      primary_ready_for_live_calls: primary.ready,
+      fallback_ready_for_live_calls: fallback.ready,
+      ready_for_live_calls: Boolean(readyCredentialSets.length),
+      fallback_available: fallback.ready,
+      fallback_behavior: "Primaeren DataForSEO-Zugang nutzen; bei Auth-/Payment-/Limit-/Account-Blockern automatisch Fallback-Zugang versuchen.",
       default_location_code: DATAFORSEO_DEFAULT_LOCATION_CODE,
       default_language_code: DATAFORSEO_DEFAULT_LANGUAGE_CODE,
       max_results: DATAFORSEO_MAX_RESULTS,
       timeout_ms: DATAFORSEO_TIMEOUT_MS
     }
+  };
+}
+
+function resolveDataForSeoCredentialSet(agentId, { fallback = false } = {}) {
+  const suffix = envSuffixForAgent(agentId);
+  const loginBaseName = fallback ? "DATAFORSEO_FALLBACK_LOGIN" : "DATAFORSEO_LOGIN";
+  const passwordBaseName = fallback ? "DATAFORSEO_FALLBACK_PASSWORD" : "DATAFORSEO_PASSWORD";
+  const agentLoginEnvName = `${loginBaseName}_${suffix}`;
+  const agentPasswordEnvName = `${passwordBaseName}_${suffix}`;
+  const loginEnvName = process.env[agentLoginEnvName] ? agentLoginEnvName : loginBaseName;
+  const passwordEnvName = process.env[agentPasswordEnvName] ? agentPasswordEnvName : passwordBaseName;
+  const login = process.env[loginEnvName] || "";
+  const password = process.env[passwordEnvName] || "";
+
+  return {
+    label: fallback ? "fallback" : "primary",
+    fallback,
+    login,
+    password,
+    loginEnvName,
+    passwordEnvName,
+    loginConfigured: Boolean(login),
+    passwordConfigured: Boolean(password),
+    ready: Boolean(login && password)
+  };
+}
+
+function getDataForSeoCredentialSets(agentId) {
+  const primary = resolveDataForSeoCredentialSet(agentId);
+  const fallback = resolveDataForSeoCredentialSet(agentId, { fallback: true });
+  return {
+    primary,
+    fallback,
+    all: [primary, fallback]
   };
 }
 
@@ -1666,6 +1707,8 @@ function compactDataForSeoResponse(response, { maxResults = DATAFORSEO_MAX_RESUL
     status_message: response.status_message,
     time: response.time,
     cost: response.cost,
+    credential_label: response._mcp_credential?.label,
+    fallback_used: Boolean(response._mcp_credential?.fallback_used),
     tasks_count: response.tasks_count,
     tasks_error: response.tasks_error,
     tasks: (response.tasks || []).map((task) => ({
@@ -1684,29 +1727,69 @@ function compactDataForSeoResponse(response, { maxResults = DATAFORSEO_MAX_RESUL
 
 function assertDataForSeoOk(response) {
   if (response.status_code !== 20000) {
-    throw new Error(`DataForSEO Fehler ${response.status_code}: ${response.status_message}`);
+    const error = new Error(`DataForSEO Fehler ${response.status_code}: ${response.status_message}`);
+    error.dataForSeoResponse = response;
+    error.dataForSeoStatusCode = response.status_code;
+    throw error;
   }
   const failedTask = (response.tasks || []).find((task) => task.status_code && task.status_code !== 20000);
   if (failedTask) {
-    throw new Error(`DataForSEO Task-Fehler ${failedTask.status_code}: ${failedTask.status_message}`);
+    const error = new Error(`DataForSEO Task-Fehler ${failedTask.status_code}: ${failedTask.status_message}`);
+    error.dataForSeoResponse = response;
+    error.dataForSeoTaskStatusCode = failedTask.status_code;
+    throw error;
   }
 }
 
 async function dataForSeoRequest(agentId, { method = "POST", path, data }) {
-  const { config } = getDataForSeoConfigDetails(agentId, { requireCredentials: true });
-  const res = await axios.request({
-    method,
-    url: `${DATAFORSEO_API_BASE}${path}`,
-    auth: {
-      username: config.login,
-      password: config.password
-    },
-    headers: { "Content-Type": "application/json" },
-    timeout: DATAFORSEO_TIMEOUT_MS,
-    data
-  });
-  assertDataForSeoOk(res.data);
-  return res.data;
+  const { credentialSets } = getDataForSeoConfigDetails(agentId, { requireCredentials: true });
+  let lastError;
+
+  for (let index = 0; index < credentialSets.length; index += 1) {
+    const credential = credentialSets[index];
+    try {
+      const res = await axios.request({
+        method,
+        url: `${DATAFORSEO_API_BASE}${path}`,
+        auth: {
+          username: credential.login,
+          password: credential.password
+        },
+        headers: { "Content-Type": "application/json" },
+        timeout: DATAFORSEO_TIMEOUT_MS,
+        data
+      });
+      res.data._mcp_credential = {
+        label: credential.label,
+        fallback_used: credential.fallback
+      };
+      assertDataForSeoOk(res.data);
+      return res.data;
+    } catch (error) {
+      lastError = error;
+      const hasFallback = index < credentialSets.length - 1;
+      if (!hasFallback || !shouldRetryDataForSeoWithFallback(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+function shouldRetryDataForSeoWithFallback(error) {
+  const httpStatus = error.response?.status;
+  if ([401, 402, 403, 429].includes(httpStatus)) return true;
+
+  const statusCodes = [error.dataForSeoStatusCode, error.dataForSeoTaskStatusCode]
+    .map((code) => Number(code))
+    .filter(Number.isFinite);
+  if (statusCodes.some((code) => [40100, 40200, 40201, 40202, 40300, 40301, 42900].includes(code))) {
+    return true;
+  }
+
+  const message = `${error.message || ""} ${error.response?.data?.status_message || ""}`.toLowerCase();
+  return /auth|login|credential|payment|required|cost.?limit|quota|paused|blocked|unusual|fraud|temporar/.test(message);
 }
 
 function summarizeDataForSeoRequests(requests) {
