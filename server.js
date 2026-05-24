@@ -106,6 +106,8 @@ const TEMPLATED_TIMEOUT_MS = Number(process.env.TEMPLATED_TIMEOUT_MS || 30_000);
 const FREEPIK_DEFAULT_API_BASE = (process.env.FREEPIK_API_BASE || "https://api.freepik.com").replace(/\/$/, "");
 const MAGNIFIC_API_BASE = (process.env.MAGNIFIC_API_BASE || "https://api.magnific.com").replace(/\/$/, "");
 const FREEPIK_TIMEOUT_MS = Number(process.env.FREEPIK_TIMEOUT_MS || 30_000);
+const UNSPLASH_API_BASE = (process.env.UNSPLASH_API_BASE || "https://api.unsplash.com").replace(/\/$/, "");
+const UNSPLASH_TIMEOUT_MS = Number(process.env.UNSPLASH_TIMEOUT_MS || 20_000);
 const WEB_FETCH_TIMEOUT_MS = Number(process.env.WEB_FETCH_TIMEOUT_MS || 20_000);
 const WEB_FETCH_MAX_BYTES = Number(process.env.WEB_FETCH_MAX_BYTES || 2_000_000);
 const WEB_FETCH_USER_AGENT =
@@ -2873,6 +2875,106 @@ function summarizeFreepikResource(resource) {
   };
 }
 
+function getUnsplashConfigDetails(agentId, { requireCredentials = true } = {}) {
+  const keyDetails = getScopedEnvDetails("UNSPLASH_ACCESS_KEY", agentId);
+  const secretDetails = getScopedEnvDetails("UNSPLASH_SECRET_KEY", agentId);
+  if (requireCredentials && !keyDetails.value) {
+    throw new Error(`Unsplash Access Key fehlt. Setze ${keyDetails.agentEnvName} oder ${keyDetails.globalEnvName}.`);
+  }
+
+  return {
+    config: { accessKey: keyDetails.value, secretKey: secretDetails.value },
+    summary: {
+      agent_id: agentId,
+      unsplash_api_base: UNSPLASH_API_BASE,
+      access_key_configured: keyDetails.configured,
+      access_key_env_name: keyDetails.configured ? keyDetails.selectedEnvName : null,
+      agent_access_key_env_name: keyDetails.agentEnvName,
+      agent_access_key_configured: keyDetails.agentConfigured,
+      global_access_key_env_name: keyDetails.globalEnvName,
+      global_access_key_configured: keyDetails.globalConfigured,
+      secret_key_configured: secretDetails.configured,
+      secret_key_env_name: secretDetails.configured ? secretDetails.selectedEnvName : null,
+      ready_for_read_calls: keyDetails.configured,
+      timeout_ms: UNSPLASH_TIMEOUT_MS
+    }
+  };
+}
+
+async function unsplashRequest(agentId, { method = "GET", path, params, data, timeout = UNSPLASH_TIMEOUT_MS }) {
+  const { config } = getUnsplashConfigDetails(agentId, { requireCredentials: true });
+  const res = await axios.request({
+    method,
+    url: `${UNSPLASH_API_BASE}${path}`,
+    params,
+    data,
+    timeout,
+    validateStatus: () => true,
+    headers: {
+      Authorization: `Client-ID ${config.accessKey}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": WEB_FETCH_USER_AGENT
+    }
+  });
+
+  return {
+    ok: res.status >= 200 && res.status < 300,
+    status: res.status,
+    status_text: res.statusText,
+    rate_limit: {
+      limit: res.headers["x-ratelimit-limit"] || null,
+      remaining: res.headers["x-ratelimit-remaining"] || null
+    },
+    data: res.data
+  };
+}
+
+function summarizeUnsplashPhoto(photo) {
+  return {
+    id: photo?.id,
+    slug: photo?.slug,
+    created_at: photo?.created_at,
+    updated_at: photo?.updated_at,
+    width: photo?.width,
+    height: photo?.height,
+    color: photo?.color,
+    blur_hash: photo?.blur_hash,
+    description: photo?.description,
+    alt_description: photo?.alt_description,
+    urls: photo?.urls
+      ? {
+          raw: photo.urls.raw,
+          full: photo.urls.full,
+          regular: photo.urls.regular,
+          small: photo.urls.small,
+          thumb: photo.urls.thumb
+        }
+      : undefined,
+    links: photo?.links
+      ? {
+          self: photo.links.self,
+          html: photo.links.html,
+          download: photo.links.download,
+          download_location: photo.links.download_location
+        }
+      : undefined,
+    user: photo?.user
+      ? {
+          id: photo.user.id,
+          username: photo.user.username,
+          name: photo.user.name,
+          portfolio_url: photo.user.portfolio_url,
+          links: photo.user.links
+            ? {
+                html: photo.user.links.html
+              }
+            : undefined
+        }
+      : undefined
+  };
+}
+
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
 function createServer() {
@@ -4037,6 +4139,153 @@ function createServer() {
         resource_format: resource_format || null,
         response: response.data,
         usage_note: "Lizenz-/Attribution-Hinweise aus der Aufgabe bzw. Freepik-Ressource bei finaler Uebergabe dokumentieren."
+      });
+    }
+  );
+
+  server.tool(
+    "unsplash_check_config",
+    "Prueft die Unsplash-Konfiguration. Optional wird ein kleiner read-only Suchrequest ausgefuehrt, um den Access Key zu validieren.",
+    {
+      agent_id: agentIdSchema,
+      fetch_test: z.boolean().optional().default(true),
+      query: z.string().min(1).max(120).optional().default("travel")
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, fetch_test, query }) => {
+      const { summary } = getUnsplashConfigDetails(agent_id, { requireCredentials: fetch_test });
+      if (!fetch_test) {
+        return out({ ...summary, fetch_test: false });
+      }
+
+      const response = await unsplashRequest(agent_id, {
+        path: "/search/photos",
+        params: { query, per_page: 1, page: 1 }
+      });
+      const results = response.data?.results || [];
+
+      return out({
+        ...summary,
+        fetch_test: true,
+        ok: response.ok,
+        status: response.status,
+        rate_limit: response.rate_limit,
+        query,
+        returned_count: results.length,
+        sample_photo: results[0] ? summarizeUnsplashPhoto(results[0]) : null,
+        attribution_note:
+          "Bei Verwendung Fotograf und Unsplash-Link dokumentieren; Downloads nach Unsplash-Regeln ueber download_location tracken."
+      });
+    }
+  );
+
+  server.tool(
+    "unsplash_search_photos",
+    "Sucht Unsplash-Fotos fuer Design-/Layout-Arbeit. Gibt Bild-URLs, Fotografen und Download-Location fuer regelkonformes Tracking zurueck.",
+    {
+      agent_id: agentIdSchema,
+      query: z.string().min(1).max(120),
+      page: z.number().int().min(1).max(1000).optional().default(1),
+      per_page: z.number().int().min(1).max(30).optional().default(10),
+      order_by: z.enum(["relevant", "latest"]).optional().default("relevant"),
+      color: z.string().max(40).optional(),
+      orientation: z.enum(["landscape", "portrait", "squarish"]).optional(),
+      content_filter: z.enum(["low", "high"]).optional(),
+      lang: z.string().min(2).max(10).optional()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, query, page, per_page, order_by, color, orientation, content_filter, lang }) => {
+      const params = { query, page, per_page, order_by };
+      maybeSetField(params, "color", color);
+      maybeSetField(params, "orientation", orientation);
+      maybeSetField(params, "content_filter", content_filter);
+      maybeSetField(params, "lang", lang);
+
+      const response = await unsplashRequest(agent_id, {
+        path: "/search/photos",
+        params
+      });
+
+      return out({
+        agent_id,
+        ok: response.ok,
+        status: response.status,
+        rate_limit: response.rate_limit,
+        request: { ...params, access_key_configured: true },
+        total: response.data?.total,
+        total_pages: response.data?.total_pages,
+        photos: (response.data?.results || []).map(summarizeUnsplashPhoto),
+        attribution_note:
+          "Bei Verwendung Fotograf und Unsplash-Link dokumentieren; Downloads nach Unsplash-Regeln ueber download_location tracken."
+      });
+    }
+  );
+
+  server.tool(
+    "unsplash_get_photo",
+    "Ruft Unsplash-Foto-Details read-only ab, inklusive Download-Location fuer regelkonformes Tracking.",
+    {
+      agent_id: agentIdSchema,
+      photo_id: z.string().min(1).max(120)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, photo_id }) => {
+      const response = await unsplashRequest(agent_id, {
+        path: `/photos/${encodeURIComponent(photo_id)}`
+      });
+
+      return out({
+        agent_id,
+        ok: response.ok,
+        status: response.status,
+        rate_limit: response.rate_limit,
+        photo_id,
+        photo: summarizeUnsplashPhoto(response.data),
+        response: response.data,
+        attribution_note:
+          "Bei Verwendung Fotograf und Unsplash-Link dokumentieren; Downloads nach Unsplash-Regeln ueber download_location tracken."
+      });
+    }
+  );
+
+  server.tool(
+    "unsplash_track_download",
+    "Ruft Unsplash download_location auf, um einen Download regelkonform zu tracken. Keine Datei wird heruntergeladen; es wird nur die von Unsplash gelieferte Download-URL zurueckgegeben.",
+    {
+      agent_id: agentIdSchema,
+      download_location: z.string().url(),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      dry_run: z.boolean().optional().default(true)
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({ agent_id, download_location, confirmed_by_asana, asana_task_gid, dry_run }) => {
+      const { summary } = getUnsplashConfigDetails(agent_id, { requireCredentials: !dry_run });
+      if (dry_run) {
+        return out({
+          ...summary,
+          dry_run: true,
+          download_location,
+          note: "Kein Download-Tracking wurde ausgefuehrt. Fuer Nutzung dry_run=false plus confirmed_by_asana=true und asana_task_gid setzen."
+        });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "unsplash_track_download");
+      if (!download_location.startsWith(`${UNSPLASH_API_BASE}/`)) {
+        throw new Error(`download_location muss vom konfigurierten Unsplash API Base kommen: ${UNSPLASH_API_BASE}`);
+      }
+      const path = download_location.slice(UNSPLASH_API_BASE.length);
+      const response = await unsplashRequest(agent_id, { path });
+
+      return out({
+        agent_id,
+        dry_run: false,
+        ok: response.ok,
+        status: response.status,
+        rate_limit: response.rate_limit,
+        download_location,
+        response: response.data,
+        usage_note: "Die gelieferte URL kann fuer den eigentlichen Asset-Download genutzt werden; Attribution dokumentieren."
       });
     }
   );
