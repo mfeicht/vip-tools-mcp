@@ -103,6 +103,9 @@ const PEXELS_API_BASE = (process.env.PEXELS_API_BASE || "https://api.pexels.com"
 const PEXELS_TIMEOUT_MS = Number(process.env.PEXELS_TIMEOUT_MS || 20_000);
 const TEMPLATED_API_BASE = (process.env.TEMPLATED_API_BASE || "https://api.templated.io").replace(/\/$/, "");
 const TEMPLATED_TIMEOUT_MS = Number(process.env.TEMPLATED_TIMEOUT_MS || 30_000);
+const FREEPIK_DEFAULT_API_BASE = (process.env.FREEPIK_API_BASE || "https://api.freepik.com").replace(/\/$/, "");
+const MAGNIFIC_API_BASE = (process.env.MAGNIFIC_API_BASE || "https://api.magnific.com").replace(/\/$/, "");
+const FREEPIK_TIMEOUT_MS = Number(process.env.FREEPIK_TIMEOUT_MS || 30_000);
 const WEB_FETCH_TIMEOUT_MS = Number(process.env.WEB_FETCH_TIMEOUT_MS || 20_000);
 const WEB_FETCH_MAX_BYTES = Number(process.env.WEB_FETCH_MAX_BYTES || 2_000_000);
 const WEB_FETCH_USER_AGENT =
@@ -2767,6 +2770,109 @@ function sha256Json(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+function resolveFreepikKeyDetails(agentId) {
+  const freepik = getScopedEnvDetails("FREEPIK_API_KEY", agentId);
+  if (freepik.value) return { provider: "freepik", ...freepik };
+  const magnific = getScopedEnvDetails("MAGNIFIC_API_KEY", agentId);
+  if (magnific.value) return { provider: "magnific", ...magnific };
+  return { provider: "freepik", ...freepik, magnific };
+}
+
+function getFreepikConfigDetails(agentId, { requireCredentials = true } = {}) {
+  const keyDetails = resolveFreepikKeyDetails(agentId);
+  if (requireCredentials && !keyDetails.value) {
+    throw new Error(
+      `Freepik API-Key fehlt. Setze ${keyDetails.agentEnvName} oder ${keyDetails.globalEnvName}; alternativ MAGNIFIC_API_KEY fuer die aktuelle Magnific/Freepik-Doku.`
+    );
+  }
+
+  const apiBase =
+    keyDetails.provider === "magnific" && !process.env.FREEPIK_API_BASE ? MAGNIFIC_API_BASE : FREEPIK_DEFAULT_API_BASE;
+  const headerName =
+    process.env.FREEPIK_API_HEADER ||
+    process.env.FREEPIK_API_KEY_HEADER ||
+    (keyDetails.provider === "magnific" ? "x-magnific-api-key" : "x-freepik-api-key");
+
+  return {
+    config: { apiKey: keyDetails.value, apiBase, headerName, provider: keyDetails.provider },
+    summary: {
+      agent_id: agentId,
+      provider: keyDetails.provider,
+      freepik_api_base: apiBase,
+      api_key_configured: keyDetails.configured,
+      api_key_env_name: keyDetails.configured ? keyDetails.selectedEnvName : null,
+      api_key_header: headerName,
+      agent_api_key_env_name: keyDetails.agentEnvName,
+      agent_api_key_configured: keyDetails.agentConfigured,
+      global_api_key_env_name: keyDetails.globalEnvName,
+      global_api_key_configured: keyDetails.globalConfigured,
+      magnific_fallback_supported: true,
+      ready_for_read_calls: keyDetails.configured,
+      ready_for_download_calls: keyDetails.configured,
+      timeout_ms: FREEPIK_TIMEOUT_MS
+    }
+  };
+}
+
+async function freepikRequest(agentId, { method = "GET", path, params, data, timeout = FREEPIK_TIMEOUT_MS }) {
+  const { config } = getFreepikConfigDetails(agentId, { requireCredentials: true });
+  const res = await axios.request({
+    method,
+    url: `${config.apiBase}${path}`,
+    params,
+    data,
+    timeout,
+    validateStatus: () => true,
+    headers: {
+      [config.headerName]: config.apiKey,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": WEB_FETCH_USER_AGENT
+    }
+  });
+
+  return {
+    ok: res.status >= 200 && res.status < 300,
+    status: res.status,
+    status_text: res.statusText,
+    data: res.data
+  };
+}
+
+function getFreepikItems(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(data?.resources)) return data.resources;
+  if (Array.isArray(data?.results)) return data.results;
+  return [];
+}
+
+function summarizeFreepikResource(resource) {
+  return {
+    id: resource?.id,
+    title: resource?.title,
+    name: resource?.name,
+    type: resource?.type,
+    url: resource?.url,
+    thumbnail: resource?.thumbnail || resource?.image?.source?.url || resource?.preview?.url,
+    author: resource?.author
+      ? {
+          id: resource.author.id,
+          name: resource.author.name,
+          username: resource.author.username,
+          url: resource.author.url
+        }
+      : undefined,
+    license: resource?.license,
+    premium: resource?.premium,
+    width: resource?.width,
+    height: resource?.height,
+    tags: resource?.tags,
+    available_formats: resource?.available_formats || resource?.formats
+  };
+}
+
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
 function createServer() {
@@ -3777,6 +3883,160 @@ function createServer() {
         status: response.status,
         payload_summary: payloadSummary,
         response: response.data
+      });
+    }
+  );
+
+  server.tool(
+    "freepik_check_config",
+    "Prueft die Freepik/Magnific-API-Konfiguration. Optional wird ein kleiner read-only Ressourcen-Request ausgefuehrt, um den API-Key zu validieren.",
+    {
+      agent_id: agentIdSchema,
+      fetch_test: z.boolean().optional().default(true),
+      term: z.string().min(1).max(120).optional().default("travel")
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, fetch_test, term }) => {
+      const { summary } = getFreepikConfigDetails(agent_id, { requireCredentials: fetch_test });
+      if (!fetch_test) {
+        return out({ ...summary, fetch_test: false });
+      }
+
+      const response = await freepikRequest(agent_id, {
+        path: "/v1/resources",
+        params: { term, limit: 1, page: 1 }
+      });
+      const resources = getFreepikItems(response.data);
+
+      return out({
+        ...summary,
+        fetch_test: true,
+        ok: response.ok,
+        status: response.status,
+        term,
+        returned_count: resources.length,
+        sample_resource: resources[0] ? summarizeFreepikResource(resources[0]) : null,
+        raw_meta:
+          response.data && typeof response.data === "object" && !Array.isArray(response.data)
+            ? Object.fromEntries(Object.entries(response.data).filter(([key]) => !["data", "items", "resources", "results"].includes(key)))
+            : null,
+        usage_note:
+          "Downloads und lizenzrelevante Nutzung nur gemaess Freepik-Lizenz und bei Asana-Aufgaben mit klarer Freigabe."
+      });
+    }
+  );
+
+  server.tool(
+    "freepik_search_resources",
+    "Sucht Freepik-Ressourcen read-only fuer Design-/Asset-Recherche. Gibt Metadaten, Thumbnails und Lizenz-/Autorhinweise zurueck, ohne Assets herunterzuladen.",
+    {
+      agent_id: agentIdSchema,
+      term: z.string().min(1).max(120),
+      page: z.number().int().min(1).max(1000).optional().default(1),
+      limit: z.number().int().min(1).max(100).optional().default(20),
+      order: z.string().max(50).optional(),
+      filters: z.record(z.string(), z.any()).optional().default({}),
+      accept_language: z.string().min(2).max(20).optional()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, term, page, limit, order, filters, accept_language }) => {
+      const params = { term, page, limit, ...filters };
+      maybeSetField(params, "order", order);
+      const response = await freepikRequest(agent_id, {
+        path: "/v1/resources",
+        params,
+        timeout: FREEPIK_TIMEOUT_MS
+      });
+      const resources = getFreepikItems(response.data);
+
+      return out({
+        agent_id,
+        ok: response.ok,
+        status: response.status,
+        request: {
+          ...params,
+          accept_language,
+          api_key_configured: true
+        },
+        returned_count: resources.length,
+        resources: resources.map(summarizeFreepikResource),
+        raw_meta:
+          response.data && typeof response.data === "object" && !Array.isArray(response.data)
+            ? Object.fromEntries(Object.entries(response.data).filter(([key]) => !["data", "items", "resources", "results"].includes(key)))
+            : null,
+        usage_note: "Vor Download/Verwendung Lizenz und Aufgabenfreigabe pruefen."
+      });
+    }
+  );
+
+  server.tool(
+    "freepik_get_resource",
+    "Ruft Freepik-Ressourcen-Details read-only ab, ohne Asset-Download.",
+    {
+      agent_id: agentIdSchema,
+      resource_id: z.union([z.string(), z.number()]),
+      accept_language: z.string().min(2).max(20).optional()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, resource_id, accept_language }) => {
+      const response = await freepikRequest(agent_id, {
+        path: `/v1/resources/${encodeURIComponent(String(resource_id))}`,
+        params: accept_language ? { accept_language } : undefined
+      });
+
+      return out({
+        agent_id,
+        ok: response.ok,
+        status: response.status,
+        resource_id: String(resource_id),
+        resource: response.data?.data ? summarizeFreepikResource(response.data.data) : summarizeFreepikResource(response.data),
+        response: response.data,
+        usage_note: "Vor Download/Verwendung Lizenz und Aufgabenfreigabe pruefen."
+      });
+    }
+  );
+
+  server.tool(
+    "freepik_download_resource",
+    "Bereitet einen Freepik-Ressourcen-Download vor oder fordert ihn an. Standard ist dry_run=true; echte Downloads brauchen klare Asana-Freigabe wegen Lizenz-/Kontonutzung.",
+    {
+      agent_id: agentIdSchema,
+      resource_id: z.union([z.string(), z.number()]),
+      resource_format: z.string().min(1).max(20).optional(),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({ agent_id, resource_id, resource_format, dry_run, confirmed_by_asana, asana_task_gid }) => {
+      const { summary } = getFreepikConfigDetails(agent_id, { requireCredentials: !dry_run });
+      const path = resource_format
+        ? `/v1/resources/${encodeURIComponent(String(resource_id))}/download/${encodeURIComponent(resource_format)}`
+        : `/v1/resources/${encodeURIComponent(String(resource_id))}/download`;
+
+      if (dry_run) {
+        return out({
+          ...summary,
+          dry_run: true,
+          resource_id: String(resource_id),
+          resource_format: resource_format || null,
+          endpoint: `${summary.freepik_api_base}${path}`,
+          note: "Kein Asset wurde heruntergeladen. Fuer Live-Download dry_run=false plus confirmed_by_asana=true und asana_task_gid setzen."
+        });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "freepik_download_resource");
+      const response = await freepikRequest(agent_id, { path });
+
+      return out({
+        agent_id,
+        dry_run: false,
+        ok: response.ok,
+        status: response.status,
+        resource_id: String(resource_id),
+        resource_format: resource_format || null,
+        response: response.data,
+        usage_note: "Lizenz-/Attribution-Hinweise aus der Aufgabe bzw. Freepik-Ressource bei finaler Uebergabe dokumentieren."
       });
     }
   );
