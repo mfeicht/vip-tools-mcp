@@ -99,6 +99,10 @@ const DATAFORSEO_TIMEOUT_MS = Number(process.env.DATAFORSEO_TIMEOUT_MS || 30_000
 const DATAFORSEO_DEFAULT_LOCATION_CODE = Number(process.env.DATAFORSEO_DEFAULT_LOCATION_CODE || 2276);
 const DATAFORSEO_DEFAULT_LANGUAGE_CODE = process.env.DATAFORSEO_DEFAULT_LANGUAGE_CODE || "de";
 const DATAFORSEO_MAX_RESULTS = Math.min(Number(process.env.DATAFORSEO_MAX_RESULTS || 100), 1000);
+const PEXELS_API_BASE = (process.env.PEXELS_API_BASE || "https://api.pexels.com").replace(/\/$/, "");
+const PEXELS_TIMEOUT_MS = Number(process.env.PEXELS_TIMEOUT_MS || 20_000);
+const TEMPLATED_API_BASE = (process.env.TEMPLATED_API_BASE || "https://api.templated.io").replace(/\/$/, "");
+const TEMPLATED_TIMEOUT_MS = Number(process.env.TEMPLATED_TIMEOUT_MS || 30_000);
 const WEB_FETCH_TIMEOUT_MS = Number(process.env.WEB_FETCH_TIMEOUT_MS || 20_000);
 const WEB_FETCH_MAX_BYTES = Number(process.env.WEB_FETCH_MAX_BYTES || 2_000_000);
 const WEB_FETCH_USER_AGENT =
@@ -113,6 +117,23 @@ const CRUX_TIMEOUT_MS = Number(process.env.CRUX_TIMEOUT_MS || 30_000);
 const PAGESPEED_CATEGORY_VALUES = ["performance", "accessibility", "best-practices", "seo", "pwa"];
 const PAGESPEED_STRATEGY_VALUES = ["mobile", "desktop"];
 const CRUX_FORM_FACTOR_VALUES = ["PHONE", "DESKTOP", "TABLET"];
+const PEXELS_ORIENTATION_VALUES = ["landscape", "portrait", "square"];
+const PEXELS_PHOTO_SIZE_VALUES = ["large", "medium", "small"];
+const PEXELS_PHOTO_COLOR_VALUES = [
+  "red",
+  "orange",
+  "yellow",
+  "green",
+  "turquoise",
+  "blue",
+  "violet",
+  "pink",
+  "brown",
+  "black",
+  "gray",
+  "white"
+];
+const TEMPLATED_RENDER_FORMAT_VALUES = ["jpg", "png", "webp", "pdf", "mp4"];
 const WEB_PAGE_SECTION_VALUES = [
   "seo",
   "meta",
@@ -848,6 +869,25 @@ function envSuffixForAgent(agentId) {
 function getEnvWithAgentFallback(baseName, agentId) {
   const suffix = envSuffixForAgent(agentId);
   return process.env[`${baseName}_${suffix}`] || process.env[baseName];
+}
+
+function getScopedEnvDetails(baseName, agentId) {
+  const suffix = envSuffixForAgent(agentId);
+  const agentEnvName = `${baseName}_${suffix}`;
+  const globalEnvName = baseName;
+  const agentValue = process.env[agentEnvName] || "";
+  const globalValue = process.env[globalEnvName] || "";
+  const selectedEnvName = agentValue ? agentEnvName : globalEnvName;
+  const value = agentValue || globalValue;
+  return {
+    value,
+    selectedEnvName,
+    agentEnvName,
+    globalEnvName,
+    configured: Boolean(value),
+    agentConfigured: Boolean(agentValue),
+    globalConfigured: Boolean(globalValue)
+  };
 }
 
 function parseBooleanEnv(value, defaultValue = false) {
@@ -2571,6 +2611,162 @@ async function callGoogleJsonApi({ method = "GET", url, params, body, timeout })
   };
 }
 
+function getPexelsConfigDetails(agentId, { requireCredentials = true } = {}) {
+  const keyDetails = getScopedEnvDetails("PEXELS_API_KEY", agentId);
+  if (requireCredentials && !keyDetails.value) {
+    throw new Error(`Pexels API-Key fehlt. Setze ${keyDetails.agentEnvName} oder ${keyDetails.globalEnvName}.`);
+  }
+
+  return {
+    config: { apiKey: keyDetails.value },
+    summary: {
+      agent_id: agentId,
+      pexels_api_base: PEXELS_API_BASE,
+      api_key_configured: keyDetails.configured,
+      api_key_env_name: keyDetails.configured ? keyDetails.selectedEnvName : null,
+      agent_api_key_env_name: keyDetails.agentEnvName,
+      agent_api_key_configured: keyDetails.agentConfigured,
+      global_api_key_env_name: keyDetails.globalEnvName,
+      global_api_key_configured: keyDetails.globalConfigured,
+      ready_for_read_calls: keyDetails.configured,
+      timeout_ms: PEXELS_TIMEOUT_MS
+    }
+  };
+}
+
+async function pexelsRequest(agentId, { path, params = {}, timeout = PEXELS_TIMEOUT_MS }) {
+  const { config } = getPexelsConfigDetails(agentId, { requireCredentials: true });
+  const res = await axios.request({
+    method: "GET",
+    url: `${PEXELS_API_BASE}${path}`,
+    params,
+    timeout,
+    validateStatus: () => true,
+    headers: {
+      Authorization: config.apiKey,
+      Accept: "application/json",
+      "User-Agent": WEB_FETCH_USER_AGENT
+    }
+  });
+
+  return {
+    ok: res.status >= 200 && res.status < 300,
+    status: res.status,
+    status_text: res.statusText,
+    rate_limit: {
+      limit: res.headers["x-ratelimit-limit"] || null,
+      remaining: res.headers["x-ratelimit-remaining"] || null,
+      reset: res.headers["x-ratelimit-reset"] || null
+    },
+    data: res.data
+  };
+}
+
+function summarizePexelsPhoto(photo) {
+  return {
+    id: photo?.id,
+    width: photo?.width,
+    height: photo?.height,
+    url: photo?.url,
+    photographer: photo?.photographer,
+    photographer_url: photo?.photographer_url,
+    avg_color: photo?.avg_color,
+    alt: photo?.alt,
+    src: photo?.src
+      ? {
+          original: photo.src.original,
+          large2x: photo.src.large2x,
+          large: photo.src.large,
+          medium: photo.src.medium,
+          small: photo.src.small,
+          portrait: photo.src.portrait,
+          landscape: photo.src.landscape,
+          tiny: photo.src.tiny
+        }
+      : undefined
+  };
+}
+
+function getTemplatedConfigDetails(agentId, { requireCredentials = true } = {}) {
+  const keyDetails = getScopedEnvDetails("TEMPLATED_API_KEY", agentId);
+  if (requireCredentials && !keyDetails.value) {
+    throw new Error(`Templated.io API-Key fehlt. Setze ${keyDetails.agentEnvName} oder ${keyDetails.globalEnvName}.`);
+  }
+
+  return {
+    config: { apiKey: keyDetails.value },
+    summary: {
+      agent_id: agentId,
+      templated_api_base: TEMPLATED_API_BASE,
+      api_key_configured: keyDetails.configured,
+      api_key_env_name: keyDetails.configured ? keyDetails.selectedEnvName : null,
+      agent_api_key_env_name: keyDetails.agentEnvName,
+      agent_api_key_configured: keyDetails.agentConfigured,
+      global_api_key_env_name: keyDetails.globalEnvName,
+      global_api_key_configured: keyDetails.globalConfigured,
+      ready_for_read_calls: keyDetails.configured,
+      ready_for_render_calls: keyDetails.configured,
+      timeout_ms: TEMPLATED_TIMEOUT_MS
+    }
+  };
+}
+
+async function templatedRequest(agentId, { method = "GET", path, params, data, timeout = TEMPLATED_TIMEOUT_MS }) {
+  const { config } = getTemplatedConfigDetails(agentId, { requireCredentials: true });
+  const res = await axios.request({
+    method,
+    url: `${TEMPLATED_API_BASE}${path}`,
+    params,
+    data,
+    timeout,
+    validateStatus: () => true,
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": WEB_FETCH_USER_AGENT
+    }
+  });
+
+  return {
+    ok: res.status >= 200 && res.status < 300,
+    status: res.status,
+    status_text: res.statusText,
+    data: res.data
+  };
+}
+
+function getTemplatedItems(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.templates)) return data.templates;
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(data?.results)) return data.results;
+  return [];
+}
+
+function summarizeTemplatedTemplate(template) {
+  return {
+    id: template?.id,
+    name: template?.name,
+    description: template?.description,
+    width: template?.width,
+    height: template?.height,
+    thumbnail: template?.thumbnail,
+    layersCount: template?.layersCount ?? template?.layers_count,
+    folderId: template?.folderId ?? template?.folder_id,
+    tags: template?.tags
+  };
+}
+
+function maybeSetField(target, key, value) {
+  if (value !== undefined) target[key] = value;
+}
+
+function sha256Json(value) {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
 function createServer() {
@@ -3300,6 +3496,287 @@ function createServer() {
         ...summary,
         fetch_user_data: true,
         user_data: maskSensitiveDataForSeoValue(compactDataForSeoResponse(response, { maxResults: 20 }))
+      });
+    }
+  );
+
+  server.tool(
+    "pexels_check_config",
+    "Prueft die Pexels-Konfiguration. Optional wird ein kleiner read-only Suchrequest ausgefuehrt, um den API-Key zu validieren.",
+    {
+      agent_id: agentIdSchema,
+      fetch_test: z.boolean().optional().default(true),
+      query: z.string().min(1).max(80).optional().default("design workspace")
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, fetch_test, query }) => {
+      const { summary } = getPexelsConfigDetails(agent_id, { requireCredentials: fetch_test });
+      if (!fetch_test) {
+        return out({ ...summary, fetch_test: false });
+      }
+
+      const response = await pexelsRequest(agent_id, {
+        path: "/v1/search",
+        params: { query, per_page: 1, page: 1 }
+      });
+
+      return out({
+        ...summary,
+        fetch_test: true,
+        ok: response.ok,
+        status: response.status,
+        rate_limit: response.rate_limit,
+        query,
+        returned_count: Array.isArray(response.data?.photos) ? response.data.photos.length : 0,
+        sample_photo: response.data?.photos?.[0] ? summarizePexelsPhoto(response.data.photos[0]) : null,
+        attribution_note: "Bei Verwendung nach Moeglichkeit Pexels und den Fotografen verlinken."
+      });
+    }
+  );
+
+  server.tool(
+    "pexels_search_photos",
+    "Sucht Pexels-Fotos fuer Design-/Layout-Arbeit. Gibt Bild-URLs, Fotografen und Attribution-Hinweise zurueck.",
+    {
+      agent_id: agentIdSchema,
+      query: z.string().min(1).max(120),
+      orientation: z.enum(PEXELS_ORIENTATION_VALUES).optional(),
+      size: z.enum(PEXELS_PHOTO_SIZE_VALUES).optional(),
+      color: z.enum(PEXELS_PHOTO_COLOR_VALUES).optional(),
+      locale: z.string().min(2).max(10).optional(),
+      page: z.number().int().min(1).max(1000).optional().default(1),
+      per_page: z.number().int().min(1).max(30).optional().default(10)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, query, orientation, size, color, locale, page, per_page }) => {
+      const params = { query, page, per_page };
+      maybeSetField(params, "orientation", orientation);
+      maybeSetField(params, "size", size);
+      maybeSetField(params, "color", color);
+      maybeSetField(params, "locale", locale);
+
+      const response = await pexelsRequest(agent_id, {
+        path: "/v1/search",
+        params
+      });
+
+      return out({
+        agent_id,
+        ok: response.ok,
+        status: response.status,
+        rate_limit: response.rate_limit,
+        request: { ...params, api_key_configured: true },
+        page: response.data?.page,
+        per_page: response.data?.per_page,
+        total_results: response.data?.total_results,
+        next_page: response.data?.next_page,
+        prev_page: response.data?.prev_page,
+        photos: (response.data?.photos || []).map(summarizePexelsPhoto),
+        attribution_note: "Bei Verwendung nach Moeglichkeit Pexels und den Fotografen verlinken."
+      });
+    }
+  );
+
+  server.tool(
+    "templated_check_config",
+    "Prueft die Templated.io-Konfiguration. Optional wird read-only eine Vorlage abgefragt, um den API-Key zu validieren.",
+    {
+      agent_id: agentIdSchema,
+      fetch_templates: z.boolean().optional().default(true)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, fetch_templates }) => {
+      const { summary } = getTemplatedConfigDetails(agent_id, { requireCredentials: fetch_templates });
+      if (!fetch_templates) {
+        return out({ ...summary, fetch_templates: false });
+      }
+
+      const response = await templatedRequest(agent_id, {
+        path: "/v1/templates",
+        params: { page: 0, limit: 1, includeLayers: false, includePages: false }
+      });
+      const templates = getTemplatedItems(response.data);
+
+      return out({
+        ...summary,
+        fetch_templates: true,
+        ok: response.ok,
+        status: response.status,
+        template_count_returned: templates.length,
+        sample_template: templates[0] ? summarizeTemplatedTemplate(templates[0]) : null
+      });
+    }
+  );
+
+  server.tool(
+    "templated_list_templates",
+    "Listet Templated.io-Vorlagen read-only, optional gefiltert nach Name, Dimensionen, Tags oder externer ID.",
+    {
+      agent_id: agentIdSchema,
+      query: z.string().max(120).optional(),
+      page: z.number().int().min(0).max(1000).optional().default(0),
+      limit: z.number().int().min(1).max(50).optional().default(10),
+      width: z.number().int().min(1).max(5000).optional(),
+      height: z.number().int().min(1).max(5000).optional(),
+      tags: z.string().max(300).optional(),
+      external_id: z.string().max(200).optional(),
+      include_layers: z.boolean().optional().default(false),
+      include_pages: z.boolean().optional().default(false)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, query, page, limit, width, height, tags, external_id, include_layers, include_pages }) => {
+      const params = {
+        page,
+        limit,
+        includeLayers: include_layers,
+        includePages: include_pages
+      };
+      maybeSetField(params, "query", query);
+      maybeSetField(params, "width", width);
+      maybeSetField(params, "height", height);
+      maybeSetField(params, "tags", tags);
+      maybeSetField(params, "externalId", external_id);
+
+      const response = await templatedRequest(agent_id, {
+        path: "/v1/templates",
+        params
+      });
+      const templates = getTemplatedItems(response.data);
+
+      return out({
+        agent_id,
+        ok: response.ok,
+        status: response.status,
+        request: { ...params, api_key_configured: true },
+        returned_count: templates.length,
+        templates: include_layers || include_pages ? templates : templates.map(summarizeTemplatedTemplate),
+        raw_meta:
+          response.data && typeof response.data === "object" && !Array.isArray(response.data)
+            ? Object.fromEntries(Object.entries(response.data).filter(([key]) => !["data", "templates", "items", "results"].includes(key)))
+            : null
+      });
+    }
+  );
+
+  server.tool(
+    "templated_render",
+    "Erstellt einen Templated.io-Render aus einer Vorlage. Standard ist dry_run=true; echte Render brauchen klare Asana-Freigabe, weil Credits/Kosten entstehen koennen.",
+    {
+      agent_id: agentIdSchema,
+      template: z.string().optional(),
+      templates: z.array(z.string()).min(1).max(25).optional(),
+      layers: z.record(z.string(), z.any()).optional().default({}),
+      pages: z.array(z.record(z.string(), z.any())).optional(),
+      format: z.enum(TEMPLATED_RENDER_FORMAT_VALUES).optional().default("jpg"),
+      transparent: z.boolean().optional(),
+      duration: z.number().int().min(1).max(90_000).optional(),
+      fps: z.number().int().min(1).max(60).optional(),
+      flatten: z.boolean().optional(),
+      cmyk: z.boolean().optional(),
+      name: z.string().max(200).optional(),
+      background: z.string().max(80).optional(),
+      width: z.number().int().min(100).max(5000).optional(),
+      height: z.number().int().min(100).max(5000).optional(),
+      scale: z.number().min(0.1).max(2).optional(),
+      external_id: z.string().max(200).optional(),
+      render_async: z.boolean().optional(),
+      webhook_url: z.string().url().optional(),
+      merge: z.boolean().optional(),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      template,
+      templates,
+      layers,
+      pages,
+      format,
+      transparent,
+      duration,
+      fps,
+      flatten,
+      cmyk,
+      name,
+      background,
+      width,
+      height,
+      scale,
+      external_id,
+      render_async,
+      webhook_url,
+      merge,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid
+    }) => {
+      if (!template && !templates?.length) {
+        throw new Error("templated_render braucht entweder template oder templates.");
+      }
+      if (template && templates?.length) {
+        throw new Error("Bitte entweder template oder templates setzen, nicht beides.");
+      }
+
+      const body = {};
+      maybeSetField(body, "template", template);
+      maybeSetField(body, "templates", templates);
+      maybeSetField(body, "format", format);
+      if (pages) maybeSetField(body, "pages", pages);
+      else maybeSetField(body, "layers", layers || {});
+      maybeSetField(body, "transparent", transparent);
+      maybeSetField(body, "duration", duration);
+      maybeSetField(body, "fps", fps);
+      maybeSetField(body, "flatten", flatten);
+      maybeSetField(body, "cmyk", cmyk);
+      maybeSetField(body, "name", name);
+      maybeSetField(body, "background", background);
+      maybeSetField(body, "width", width);
+      maybeSetField(body, "height", height);
+      maybeSetField(body, "scale", scale);
+      maybeSetField(body, "external_id", external_id);
+      maybeSetField(body, "async", render_async);
+      maybeSetField(body, "webhook_url", webhook_url);
+      maybeSetField(body, "merge", merge);
+
+      const { summary } = getTemplatedConfigDetails(agent_id, { requireCredentials: !dry_run });
+      const payloadSummary = {
+        has_template: Boolean(template),
+        template_count: templates?.length || (template ? 1 : 0),
+        format,
+        layer_keys: pages ? [] : Object.keys(layers || {}),
+        page_count: pages?.length || 0,
+        payload_bytes: Buffer.byteLength(JSON.stringify(body), "utf8"),
+        payload_sha256: sha256Json(body)
+      };
+
+      if (dry_run) {
+        return out({
+          ...summary,
+          dry_run: true,
+          endpoint: `${TEMPLATED_API_BASE}/v1/render`,
+          payload_summary: payloadSummary,
+          payload: body,
+          note: "Kein Render wurde erstellt. Fuer Live-Render dry_run=false plus confirmed_by_asana=true und asana_task_gid setzen."
+        });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "templated_render");
+      const response = await templatedRequest(agent_id, {
+        method: "POST",
+        path: "/v1/render",
+        data: body,
+        timeout: format === "mp4" ? Math.max(TEMPLATED_TIMEOUT_MS, 120_000) : TEMPLATED_TIMEOUT_MS
+      });
+
+      return out({
+        agent_id,
+        dry_run: false,
+        ok: response.ok,
+        status: response.status,
+        payload_summary: payloadSummary,
+        response: response.data
       });
     }
   );
