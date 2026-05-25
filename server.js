@@ -71,6 +71,9 @@ const GOOGLE_ADS_API_BASE = (process.env.GOOGLE_ADS_API_BASE || "https://googlea
 );
 const GOOGLE_ADS_API_VERSION = process.env.GOOGLE_ADS_API_VERSION || "v22";
 const GOOGLE_ADS_TIMEOUT_MS = Number(process.env.GOOGLE_ADS_TIMEOUT_MS || 30_000);
+const GOOGLE_ADS_BUDGET_EXTRA_APPROVAL_PERCENT = Number(
+  process.env.GOOGLE_ADS_BUDGET_EXTRA_APPROVAL_PERCENT || 12
+);
 const GOOGLE_ADS_MUTATE_SERVICE_VALUES = [
   "campaignBudgets",
   "campaigns",
@@ -753,6 +756,234 @@ function compactAxiosError(error) {
     message: responseData?.error?.message || responseData?.message || error.message,
     request_id: error.response?.headers?.["request-id"] || null,
     response: responseData || null
+  };
+}
+
+function escapeGaqlString(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function normalizeObjectKey(key) {
+  return String(key || "").replace(/[_-]/g, "").toLowerCase();
+}
+
+function findByNormalizedKey(value, wantedKeys) {
+  if (!value || typeof value !== "object") return undefined;
+  const wanted = new Set(wantedKeys.map(normalizeObjectKey));
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (wanted.has(normalizeObjectKey(key))) return nestedValue;
+  }
+  return undefined;
+}
+
+function collectNormalizedKeys(value, prefix = "") {
+  if (!value || typeof value !== "object") return [];
+  const keys = [];
+  for (const [key, nestedValue] of Object.entries(value)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    keys.push({ raw: path, normalized: normalizeObjectKey(path), value: nestedValue });
+    if (nestedValue && typeof nestedValue === "object" && !Array.isArray(nestedValue)) {
+      keys.push(...collectNormalizedKeys(nestedValue, path));
+    }
+  }
+  return keys;
+}
+
+function googleAdsOperationType(operation) {
+  if (!operation || typeof operation !== "object") return "unknown";
+  if (operation.create) return "create";
+  if (operation.update) return "update";
+  if (operation.remove) return "remove";
+  return "unknown";
+}
+
+function googleAdsOperationPayload(operation) {
+  const type = googleAdsOperationType(operation);
+  if (type === "create") return operation.create;
+  if (type === "update") return operation.update;
+  if (type === "remove") return operation.remove;
+  return operation;
+}
+
+function numericMicros(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function hasAnyNormalizedKey(payload, names) {
+  const wanted = new Set(names.map(normalizeObjectKey));
+  return collectNormalizedKeys(payload).some((item) => wanted.has(item.normalized));
+}
+
+function findNormalizedValue(payload, names) {
+  const wanted = new Set(names.map(normalizeObjectKey));
+  return collectNormalizedKeys(payload).find((item) => wanted.has(item.normalized))?.value;
+}
+
+function pushGoogleAdsRisk(risks, risk) {
+  risks.push({
+    severity: risk.severity || "high",
+    code: risk.code,
+    message: risk.message,
+    operation_index: risk.operation_index,
+    details: risk.details || {}
+  });
+}
+
+async function lookupCampaignBudgetAmountMicros({ customerId, resourceName, loginCustomerId }) {
+  const normalizedCustomerId = normalizeGoogleAdsCustomerId(customerId);
+  const res = await googleAdsRequest({
+    method: "POST",
+    path: `/customers/${normalizedCustomerId}/googleAds:search`,
+    login_customer_id: loginCustomerId,
+    data: {
+      query: `
+        SELECT
+          campaign_budget.resource_name,
+          campaign_budget.amount_micros
+        FROM campaign_budget
+        WHERE campaign_budget.resource_name = '${escapeGaqlString(resourceName)}'
+        LIMIT 1
+      `,
+      pageSize: 1
+    }
+  });
+  return numericMicros(res.data.results?.[0]?.campaignBudget?.amountMicros);
+}
+
+async function assessGoogleAdsMutateSafety({ customerId, service, operations, loginCustomerId }) {
+  const risks = [];
+  const thresholdPercent = GOOGLE_ADS_BUDGET_EXTRA_APPROVAL_PERCENT;
+  const highRiskCreateServices = new Set(["campaignBudgets", "campaigns", "adGroups", "adGroupAds"]);
+
+  for (const [index, operation] of operations.entries()) {
+    const type = googleAdsOperationType(operation);
+    const payload = googleAdsOperationPayload(operation);
+
+    if (type === "unknown") {
+      pushGoogleAdsRisk(risks, {
+        code: "unknown_operation_type",
+        operation_index: index,
+        message: "Operationstyp konnte nicht eindeutig erkannt werden."
+      });
+      continue;
+    }
+
+    if (type === "remove") {
+      pushGoogleAdsRisk(risks, {
+        code: "remove_operation",
+        operation_index: index,
+        message: "Entfernende Google-Ads-Operationen brauchen Extra-Freigabe."
+      });
+    }
+
+    if (type === "create" && highRiskCreateServices.has(service)) {
+      pushGoogleAdsRisk(risks, {
+        code: "high_risk_create",
+        operation_index: index,
+        message: "Neue Budgets, Kampagnen, Anzeigengruppen oder Anzeigen brauchen Extra-Freigabe."
+      });
+    }
+
+    const status = String(findNormalizedValue(payload, ["status"]) || "").toUpperCase();
+    if (status === "ENABLED" || status === "REMOVED") {
+      pushGoogleAdsRisk(risks, {
+        code: "status_change_high_risk",
+        operation_index: index,
+        message: "Aktivieren oder Entfernen von Ads-Objekten braucht Extra-Freigabe.",
+        details: { status }
+      });
+    }
+
+    if (
+      hasAnyNormalizedKey(payload, [
+        "biddingStrategy",
+        "biddingStrategyType",
+        "targetCpaMicros",
+        "targetRoas",
+        "maximizeConversions",
+        "maximizeConversionValue",
+        "manualCpc",
+        "cpcBidMicros",
+        "percentCpcBidMicros"
+      ])
+    ) {
+      pushGoogleAdsRisk(risks, {
+        code: "bidding_or_bid_change",
+        operation_index: index,
+        message: "Gebots-, Ziel-CPA-/ROAS- oder Bidding-Strategie-Aenderungen brauchen Extra-Freigabe."
+      });
+    }
+
+    if (hasAnyNormalizedKey(payload, ["finalUrls", "finalUrlSuffix", "trackingUrlTemplate"])) {
+      pushGoogleAdsRisk(risks, {
+        code: "landing_page_or_tracking_change",
+        operation_index: index,
+        message: "Aenderungen an Ziel-URLs oder Tracking-Templates brauchen Extra-Freigabe."
+      });
+    }
+
+    const keyword = findByNormalizedKey(payload, ["keyword"]);
+    const matchType = String(findByNormalizedKey(keyword, ["matchType"]) || "").toUpperCase();
+    if (matchType === "BROAD") {
+      pushGoogleAdsRisk(risks, {
+        code: "broad_match_keyword",
+        operation_index: index,
+        message: "Broad-Match-Keyword-Aenderungen brauchen Extra-Freigabe."
+      });
+    }
+
+    if (service === "campaignBudgets" && type === "update") {
+      const newAmountMicros = numericMicros(findNormalizedValue(payload, ["amountMicros", "amount_micros"]));
+      if (newAmountMicros !== null) {
+        const resourceName = findNormalizedValue(payload, ["resourceName", "resource_name"]);
+        let currentAmountMicros = null;
+        let lookupError = null;
+        if (resourceName) {
+          try {
+            currentAmountMicros = await lookupCampaignBudgetAmountMicros({
+              customerId,
+              resourceName,
+              loginCustomerId
+            });
+          } catch (error) {
+            lookupError = compactAxiosError(error);
+          }
+        }
+
+        if (currentAmountMicros === null || currentAmountMicros <= 0) {
+          pushGoogleAdsRisk(risks, {
+            code: "budget_change_current_unknown",
+            operation_index: index,
+            message: "Budgetaenderung erkannt, aber aktuelles Budget konnte nicht sicher verglichen werden.",
+            details: { resource_name: resourceName || null, new_amount_micros: newAmountMicros, lookup_error: lookupError }
+          });
+        } else {
+          const increasePercent = ((newAmountMicros - currentAmountMicros) / currentAmountMicros) * 100;
+          if (increasePercent > thresholdPercent) {
+            pushGoogleAdsRisk(risks, {
+              code: "budget_increase_over_threshold",
+              operation_index: index,
+              message: `Budgeterhoehung ueber ${thresholdPercent}% braucht Extra-Freigabe.`,
+              details: {
+                resource_name: resourceName,
+                current_amount_micros: currentAmountMicros,
+                new_amount_micros: newAmountMicros,
+                increase_percent: Number(increasePercent.toFixed(2)),
+                threshold_percent: thresholdPercent
+              }
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    requires_extra_approval: risks.length > 0,
+    budget_extra_approval_threshold_percent: thresholdPercent,
+    risks
   };
 }
 
@@ -1788,6 +2019,13 @@ function assertAsanaConfirmed(confirmedByAsana, asanaTaskGid, actionName) {
     throw new Error(
       `${actionName} braucht eine klare Asana-Freigabe. Setze confirmed_by_asana=true und asana_task_gid.`
     );
+  }
+}
+
+function assertMoritzAsanaConfirmed({ confirmedByAsana, asanaTaskGid, approvedBy, actionName }) {
+  assertAsanaConfirmed(confirmedByAsana, asanaTaskGid, actionName);
+  if (!/moritz\s+feichtmeyer/i.test(String(approvedBy || ""))) {
+    throw new Error(`${actionName} braucht eine Asana-Freigabe von Moritz Feichtmeyer. Setze approved_by entsprechend.`);
   }
 }
 
@@ -4724,7 +4962,7 @@ function createServer() {
 
   server.tool(
     "google_ads_mutate",
-    "Fuehrt kontrollierte Google-Ads-Mutate-Operationen aus. Standard ist dry_run/validateOnly; echte Aenderungen nur mit klarer Asana-Freigabe.",
+    "Fuehrt kontrollierte Google-Ads-Mutate-Operationen aus. Standard ist dry_run/validateOnly; echte Aenderungen brauchen Moritz-Asana-Freigabe, Hochrisiko-Aenderungen eine Extra-Freigabe.",
     {
       agent_id: agentIdSchema,
       customer_id: z.string(),
@@ -4737,7 +4975,11 @@ function createServer() {
       validate_only: z.boolean().optional().default(false),
       change_summary: z.string().optional(),
       confirmed_by_asana: z.boolean().optional().default(false),
-      asana_task_gid: z.string().optional()
+      asana_task_gid: z.string().optional(),
+      approved_by: z.string().optional(),
+      extra_confirmed_by_asana: z.boolean().optional().default(false),
+      extra_asana_task_gid: z.string().optional(),
+      extra_approval_note: z.string().optional()
     },
     TOOL_EXTERNAL_WRITE,
     async ({
@@ -4752,14 +4994,42 @@ function createServer() {
       validate_only,
       change_summary,
       confirmed_by_asana,
-      asana_task_gid
+      asana_task_gid,
+      approved_by,
+      extra_confirmed_by_asana,
+      extra_asana_task_gid,
+      extra_approval_note
     }) => {
       const normalizedCustomerId = normalizeGoogleAdsCustomerId(customer_id);
       const effectiveValidateOnly = dry_run || validate_only;
+      const safety = await assessGoogleAdsMutateSafety({
+        customerId: normalizedCustomerId,
+        service,
+        operations,
+        loginCustomerId: login_customer_id
+      });
       if (!effectiveValidateOnly) {
-        assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "google_ads_mutate");
+        assertMoritzAsanaConfirmed({
+          confirmedByAsana: confirmed_by_asana,
+          asanaTaskGid: asana_task_gid,
+          approvedBy: approved_by,
+          actionName: "google_ads_mutate"
+        });
         if (!String(change_summary || "").trim()) {
           throw new Error("google_ads_mutate braucht fuer echte Aenderungen eine change_summary.");
+        }
+        if (safety.requires_extra_approval) {
+          assertMoritzAsanaConfirmed({
+            confirmedByAsana: extra_confirmed_by_asana,
+            asanaTaskGid: extra_asana_task_gid,
+            approvedBy: approved_by,
+            actionName: "google_ads_mutate Hochrisiko-Aenderung"
+          });
+          if (!String(extra_approval_note || "").trim()) {
+            throw new Error(
+              "google_ads_mutate braucht fuer Hochrisiko-Aenderungen eine extra_approval_note mit Bezug auf die Extra-Freigabe."
+            );
+          }
         }
       }
 
@@ -4785,6 +5055,14 @@ function createServer() {
         validate_only: effectiveValidateOnly,
         live_mutation_executed: !effectiveValidateOnly,
         change_summary: change_summary || null,
+        approved_by: approved_by || null,
+        safety,
+        extra_approval: {
+          required: safety.requires_extra_approval,
+          confirmed: Boolean(extra_confirmed_by_asana && extra_asana_task_gid),
+          asana_task_gid: extra_asana_task_gid || null,
+          note: extra_approval_note || null
+        },
         request_id: res.headers?.["request-id"] || null,
         response: res.data
       });
