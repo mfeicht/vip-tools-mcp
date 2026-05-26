@@ -13,6 +13,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 const DEFAULT_AGENT_ID = "vip-ai-sales";
 const ASANA_TIMEOUT_MS = Number(process.env.ASANA_TIMEOUT_MS || 12_000);
+const ASANA_WRITE_TIMEOUT_MS = Number(process.env.ASANA_WRITE_TIMEOUT_MS || 30_000);
 const ASANA_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ASANA_RETRY_ATTEMPTS || 2));
 const ASANA_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ASANA_RETRY_BASE_DELAY_MS || 250));
 
@@ -3480,13 +3481,17 @@ function createServer() {
       const completeRes = await asana.put(
         `/tasks/${task_gid}`,
         { data: { completed: true } },
-        { params: { opt_fields: "gid,name,completed,completed_at,assignee.gid,assignee.name,permalink_url" } }
+        {
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          params: { opt_fields: "gid,name,completed,completed_at,assignee.gid,assignee.name,permalink_url" }
+        }
       );
 
       let verified_task;
       let verification_status = "not_requested";
       if (verify_after) {
         const verify = await asana.get(`/tasks/${task_gid}`, {
+          timeout: ASANA_WRITE_TIMEOUT_MS,
           params: { opt_fields: "gid,name,completed,completed_at,assignee.gid,assignee.name,permalink_url" }
         });
         verified_task = verify.data.data;
