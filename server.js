@@ -12,6 +12,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 /* ---------------- CONFIG ---------------- */
 
 const DEFAULT_AGENT_ID = "vip-ai-sales";
+const ASANA_TIMEOUT_MS = Number(process.env.ASANA_TIMEOUT_MS || 12_000);
+const ASANA_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ASANA_RETRY_ATTEMPTS || 2));
+const ASANA_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ASANA_RETRY_BASE_DELAY_MS || 250));
 
 const ASANA_TOKEN_ENVS = {
   "vip-ai-sales": "ASANA_TOKEN_VIP_AI_SALES",
@@ -226,11 +229,37 @@ function getAsana(agentId = DEFAULT_AGENT_ID) {
 
   return axios.create({
     baseURL: "https://app.asana.com/api/1.0",
+    timeout: ASANA_TIMEOUT_MS,
     headers: {
       Authorization: `Bearer ${token}`,
       "Asana-Enable": "new_rich_text"
     }
   });
+}
+
+function isRetryableAsanaError(error) {
+  const status = error?.response?.status;
+  if (status && [408, 409, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+  const code = error?.code;
+  if (code && ["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "EAI_AGAIN", "ENOTFOUND"].includes(code)) return true;
+  return !error?.response;
+}
+
+async function asanaRequestWithRetry(asana, requestConfig, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts || ASANA_RETRY_ATTEMPTS));
+  const baseDelayMs = Math.max(0, Number(options.baseDelayMs || ASANA_RETRY_BASE_DELAY_MS));
+
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await asana.request(requestConfig);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !isRetryableAsanaError(error)) throw error;
+      await sleep(baseDelayMs * attempt);
+    }
+  }
+  throw lastError;
 }
 
 function out(data) {
@@ -3244,7 +3273,7 @@ function createServer() {
     TOOL_READ_ONLY,
     async ({ agent_id }) => {
       const asana = getAsana(agent_id);
-      const res = await asana.get("/users/me");
+      const res = await asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" });
       return out({ agent_id, user: res.data.data });
     }
   );
@@ -3259,16 +3288,13 @@ function createServer() {
     TOOL_READ_ONLY,
     async ({ agent_id, limit }) => {
       const asana = getAsana(agent_id);
-      const user = await asana.get("/users/me");
+      const user = await asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" });
       const workspace = user.data.data.workspaces[0].gid;
 
-      const res = await asana.get("/tasks", {
-        params: {
-          assignee: "me",
-          workspace,
-          completed_since: "now",
-          limit
-        }
+      const res = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: "/tasks",
+        params: { assignee: "me", workspace, completed_since: "now", limit }
       });
 
       return out({ agent_id, tasks: res.data.data });
@@ -3519,17 +3545,13 @@ function createServer() {
 
         const asana = getAsana(agent_id);
 
-        const res = await asana.request({
-
+        const requestConfig = {
           method,
-
           url: path,
-
           params,
-
           data: data ? { data } : undefined
-
-        });
+        };
+        const res = method === "GET" ? await asanaRequestWithRetry(asana, requestConfig) : await asana.request(requestConfig);
 
         return out({ agent_id, response: res.data });
 
