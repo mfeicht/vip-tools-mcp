@@ -14,6 +14,7 @@ const logPath = path.join(BetriebDir, "Watcher-Log.md");
 
 const DEFAULT_MCP_URL = "https://vip-tools-mcp.onrender.com/mcp";
 const AGENT_PREFIX = "vip-ai-";
+const LOCAL_TIME_ZONE = "Europe/Berlin";
 const TASK_FIELDS = [
   "gid",
   "name",
@@ -131,7 +132,7 @@ function nowIso() {
 
 function berlinDateString(date = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Berlin",
+    timeZone: LOCAL_TIME_ZONE,
     year: "numeric",
     month: "2-digit",
     day: "2-digit"
@@ -210,21 +211,59 @@ function getAgentState(state, agentId) {
   return state.agents[agentId];
 }
 
-function getDueSignal(task) {
-  const due = task.due_on || (task.due_at ? task.due_at.slice(0, 10) : null);
-  if (!due) return null;
-  const today = berlinDateString();
+function getDueInfo(task, now = new Date()) {
+  const today = berlinDateString(now);
   const tomorrow = addDays(today, 1);
-  if (due < today) return "overdue";
-  if (due === today) return "due_today";
-  if (due === tomorrow) return "due_tomorrow";
+
+  if (task.due_at) {
+    const dueAt = new Date(task.due_at);
+    if (!Number.isFinite(dueAt.getTime())) return null;
+
+    const dueDate = berlinDateString(dueAt);
+    let signalType = null;
+    if (dueAt.getTime() <= now.getTime()) {
+      signalType = "overdue";
+    } else if (dueDate === today) {
+      signalType = "due_later_today";
+    } else if (dueDate === tomorrow) {
+      signalType = "due_tomorrow";
+    }
+
+    if (!signalType) return null;
+    return {
+      signal_type: signalType,
+      due_on: task.due_on || dueDate,
+      due_at: task.due_at,
+      exact_time: true
+    };
+  }
+
+  const due = task.due_on || null;
+  if (!due) return null;
+  if (due < today) {
+    return { signal_type: "overdue", due_on: due, due_at: null, exact_time: false };
+  }
+  if (due === today) {
+    return { signal_type: "due_today", due_on: due, due_at: null, exact_time: false };
+  }
+  if (due === tomorrow) {
+    return { signal_type: "due_tomorrow", due_on: due, due_at: null, exact_time: false };
+  }
   return null;
+}
+
+function getDueSignal(task) {
+  return getDueInfo(task)?.signal_type || null;
 }
 
 function signalPriority(type, task) {
   if (type === "overdue" || type === "due_today") return "high";
-  if (type === "due_tomorrow" || type === "new_attachment") return "medium";
-  if (type === "new_task" && getDueSignal(task)) return "high";
+  if (type === "due_later_today" || type === "due_tomorrow" || type === "new_attachment") return "medium";
+  if (type === "new_task") {
+    const dueSignal = getDueSignal(task);
+    if (dueSignal === "overdue" || dueSignal === "due_today") return "high";
+    if (dueSignal === "due_later_today" || dueSignal === "due_tomorrow") return "medium";
+  }
   return "normal";
 }
 
@@ -236,7 +275,8 @@ function makeSignal(input) {
     input.story_gid || "",
     input.attachment_gid || "",
     input.modified_at || "",
-    input.due_on || ""
+    input.due_on || "",
+    input.due_at || ""
   ].join("|");
 
   return {
@@ -249,6 +289,7 @@ function makeSignal(input) {
     signal_type: input.signal_type,
     priority: input.priority,
     due_on: input.due_on || null,
+    due_at: input.due_at || null,
     modified_at: input.modified_at || null,
     story_gid: input.story_gid || null,
     attachment_gid: input.attachment_gid || null,
@@ -322,7 +363,8 @@ function updateTaskState(agentState, task, details) {
 
 function buildSignalsForTask(agentId, task, previousTaskState, details, detectedAt) {
   const signals = [];
-  const dueSignal = getDueSignal(task);
+  const dueInfo = getDueInfo(task);
+  const dueSignal = dueInfo?.signal_type || null;
 
   if (!previousTaskState) {
     signals.push(
@@ -334,7 +376,8 @@ function buildSignalsForTask(agentId, task, previousTaskState, details, detected
         task_url: task.permalink_url,
         signal_type: "new_task",
         priority: signalPriority("new_task", task),
-        due_on: task.due_on,
+        due_on: dueInfo?.due_on || task.due_on,
+        due_at: task.due_at,
         modified_at: task.modified_at,
         snippet: task.name,
         suggested_action: "start_or_include_in_next_standard_run"
@@ -350,7 +393,8 @@ function buildSignalsForTask(agentId, task, previousTaskState, details, detected
         task_url: task.permalink_url,
         signal_type: "modified_task",
         priority: "normal",
-        due_on: task.due_on,
+        due_on: dueInfo?.due_on || task.due_on,
+        due_at: task.due_at,
         modified_at: task.modified_at,
         snippet: task.name
       })
@@ -367,10 +411,14 @@ function buildSignalsForTask(agentId, task, previousTaskState, details, detected
         task_url: task.permalink_url,
         signal_type: dueSignal,
         priority: signalPriority(dueSignal, task),
-        due_on: task.due_on,
+        due_on: dueInfo.due_on,
+        due_at: dueInfo.due_at,
         modified_at: task.modified_at,
         snippet: task.name,
-        suggested_action: "prioritize_in_next_agent_run"
+        suggested_action:
+          dueSignal === "due_later_today"
+            ? "prepare_but_do_not_execute_before_due_at"
+            : "prioritize_in_next_agent_run"
       })
     );
   }
@@ -385,7 +433,8 @@ function buildSignalsForTask(agentId, task, previousTaskState, details, detected
         task_url: task.permalink_url,
         signal_type: "new_story",
         priority: "normal",
-        due_on: task.due_on,
+        due_on: dueInfo?.due_on || task.due_on,
+        due_at: task.due_at,
         modified_at: task.modified_at,
         story_gid: story.gid,
         snippet: story.text || story.resource_subtype || story.type
@@ -403,7 +452,8 @@ function buildSignalsForTask(agentId, task, previousTaskState, details, detected
         task_url: task.permalink_url,
         signal_type: "new_attachment",
         priority: "medium",
-        due_on: task.due_on,
+        due_on: dueInfo?.due_on || task.due_on,
+        due_at: task.due_at,
         modified_at: task.modified_at,
         attachment_gid: attachment.gid,
         snippet: attachment.name || attachment.resource_subtype,
