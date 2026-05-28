@@ -161,6 +161,9 @@ const WEB_PAGE_SECTION_VALUES = [
 const WEB_PAGE_DEFAULT_SECTIONS = ["seo", "headings", "links", "schema", "text"];
 const ASANA_ATTACHMENT_DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const ASANA_ATTACHMENT_HARD_MAX_BYTES = 8 * 1024 * 1024;
+const ASANA_TASK_SCHEDULE_OPT_FIELDS =
+  "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url";
+const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
 
 const TOOL_READ_ONLY = Object.freeze({ readOnlyHint: true, openWorldHint: false });
 const TOOL_EXTERNAL_READ = Object.freeze({ readOnlyHint: true, openWorldHint: true });
@@ -362,6 +365,19 @@ function assertSafeAsanaRequest(method, path, data) {
     /^\/tasks\/[^/]+\/?$/.test(path) &&
     data &&
     Object.prototype.hasOwnProperty.call(data, "assignee");
+  const isTaskScheduleUpdate =
+    method === "PUT" &&
+    /^\/tasks\/[^/]+\/?$/.test(path) &&
+    data &&
+    ["due_on", "due_at", "start_on", "start_at"].some((field) =>
+      Object.prototype.hasOwnProperty.call(data, field)
+    );
+  const isTaskRecurrenceUpdate =
+    method === "PUT" &&
+    /^\/tasks\/[^/]+\/?$/.test(path) &&
+    data &&
+    Object.prototype.hasOwnProperty.call(data, "recurrence");
+  const isTaskTagUpdate = method === "POST" && /^\/tasks\/[^/]+\/(?:addTag|removeTag)\/?$/.test(path);
 
   if (isTaskComplete) {
     throw new Error(
@@ -372,6 +388,24 @@ function assertSafeAsanaRequest(method, path, data) {
   if (isTaskAssign) {
     throw new Error(
       "Asana-Aufgaben duerfen nicht per rohem asana_request umgewiesen werden. Nutze asana_assign_task; es prueft Tags, blockiert Routine-Re-Assigns und verifiziert den Readback."
+    );
+  }
+
+  if (isTaskScheduleUpdate) {
+    throw new Error(
+      "Asana-Faelligkeit/Startzeit darf nicht per rohem asana_request geaendert werden. Nutze asana_update_task_schedule; es validiert due_on/due_at und prueft den Readback."
+    );
+  }
+
+  if (isTaskTagUpdate) {
+    throw new Error(
+      "Asana-Tags duerfen nicht per rohem asana_request geaendert werden. Nutze asana_update_task_tags; es ist idempotent und prueft den Readback."
+    );
+  }
+
+  if (isTaskRecurrenceUpdate) {
+    throw new Error(
+      "Asana-Wiederholungen duerfen nicht per rohem asana_request geaendert werden. Nutze asana_update_task_recurrence; es ist als experimenteller, enger Pfad markiert."
     );
   }
 
@@ -448,6 +482,27 @@ function validateAsanaGid(value, label) {
   if (value && !/^\d+$/.test(String(value))) {
     throw new Error(`${label} muss eine Asana-GID sein.`);
   }
+}
+
+function validateAsanaDate(value, label) {
+  if (value != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(value))) {
+    throw new Error(`${label} muss im Format YYYY-MM-DD sein.`);
+  }
+}
+
+function validateAsanaDateTime(value, label) {
+  if (value == null) return;
+  const text = String(value);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?(?:Z|[+-]\d{2}:\d{2})$/.test(text)) {
+    throw new Error(`${label} muss ein ISO-8601-Zeitpunkt mit Zeitzone sein, z. B. 2026-05-28T08:30:00.000Z.`);
+  }
+  if (!Number.isFinite(Date.parse(text))) {
+    throw new Error(`${label} ist kein gueltiger ISO-8601-Zeitpunkt.`);
+  }
+}
+
+function uniqueValues(values = []) {
+  return [...new Set((values || []).map((value) => String(value)).filter(Boolean))];
 }
 
 function asanaParagraph(text) {
@@ -3514,6 +3569,327 @@ function createServer() {
         final_comment,
         completion_basis,
         completion_basis_sha256: basis_sha256
+      });
+    }
+  );
+
+  server.tool(
+    "asana_update_task_schedule",
+    "Aendert Faelligkeitsdatum/-uhrzeit einer Asana-Aufgabe ueber einen engen Pfad. due_at ist verbindlich und muss als ISO-Zeitpunkt mit Zeitzone uebergeben werden; due_on und due_at sind gegenseitig exklusiv.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      due_on: z.string().optional(),
+      due_at: z.string().optional(),
+      clear_due: z.boolean().optional().default(false),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({ agent_id, task_gid, due_on, due_at, clear_due, dry_run, verify_after }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      validateAsanaDate(due_on, "due_on");
+      validateAsanaDateTime(due_at, "due_at");
+
+      const setCount = [Boolean(due_on), Boolean(due_at), Boolean(clear_due)].filter(Boolean).length;
+      if (setCount !== 1) {
+        throw new Error("Genau eines von due_on, due_at oder clear_due=true muss gesetzt sein.");
+      }
+
+      const data = clear_due ? { due_on: null, due_at: null } : due_at ? { due_at } : { due_on };
+      const asana = getAsana(agent_id);
+      const beforeRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/tasks/${task_gid}`,
+        params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
+      });
+      const before_task = beforeRes.data.data;
+
+      if (dry_run) {
+        return out({ agent_id, dry_run: true, task_gid, data, before_task });
+      }
+
+      const res = await asanaRequestWithRetry(asana, {
+        method: "PUT",
+        url: `/tasks/${task_gid}`,
+        timeout: ASANA_WRITE_TIMEOUT_MS,
+        data: { data },
+        params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
+      });
+
+      let verified_task;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verify = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${task_gid}`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
+        });
+        verified_task = verify.data.data;
+
+        if (clear_due) {
+          if (verified_task.due_on || verified_task.due_at) {
+            throw new Error("Asana-Readback zeigt weiterhin due_on/due_at nach clear_due=true.");
+          }
+        } else if (due_at) {
+          if (verified_task.due_at !== due_at) {
+            throw new Error(`Asana-Readback due_at=${verified_task.due_at || "null"} statt erwartet ${due_at}.`);
+          }
+        } else if (due_on && verified_task.due_on !== due_on) {
+          throw new Error(`Asana-Readback due_on=${verified_task.due_on || "null"} statt erwartet ${due_on}.`);
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        data,
+        before_task,
+        task: res.data.data,
+        verified_task,
+        verification_status
+      });
+    }
+  );
+
+  server.tool(
+    "asana_find_tags",
+    "Liest Tags eines Workspaces read-only, damit Agenten Tag-GIDs vor asana_update_task_tags sauber finden koennen.",
+    {
+      agent_id: agentIdSchema,
+      workspace_gid: z.string().optional(),
+      name_contains: z.string().optional(),
+      limit: z.number().int().min(1).max(100).optional().default(50)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id, workspace_gid, name_contains, limit }) => {
+      if (workspace_gid) validateAsanaGid(workspace_gid, "workspace_gid");
+      const asana = getAsana(agent_id);
+      let workspace = workspace_gid;
+      if (!workspace) {
+        const user = await asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" });
+        workspace = user.data.data.workspaces?.[0]?.gid;
+      }
+      if (!workspace) throw new Error("Kein Asana-Workspace gefunden.");
+
+      const res = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/workspaces/${workspace}/tags`,
+        params: { limit, opt_fields: "gid,name,color,workspace.gid" }
+      });
+      const needle = String(name_contains || "").trim().toLowerCase();
+      const tags = (res.data.data || []).filter((tag) =>
+        needle ? String(tag.name || "").toLowerCase().includes(needle) : true
+      );
+      return out({ agent_id, workspace_gid: workspace, returned_count: tags.length, tags });
+    }
+  );
+
+  server.tool(
+    "asana_update_task_tags",
+    "Fuegt Asana-Tags idempotent hinzu oder entfernt sie. Nutzt addTag/removeTag, prueft Routine-Tag-Schutz und verifiziert den Readback.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      add_tag_gids: z.array(z.string()).optional().default([]),
+      remove_tag_gids: z.array(z.string()).optional().default([]),
+      allow_routine_tag_change: z.boolean().optional().default(false),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({
+      agent_id,
+      task_gid,
+      add_tag_gids,
+      remove_tag_gids,
+      allow_routine_tag_change,
+      confirmed_by_asana,
+      dry_run,
+      verify_after
+    }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      const addTags = uniqueValues(add_tag_gids);
+      const removeTags = uniqueValues(remove_tag_gids);
+      for (const tagGid of [...addTags, ...removeTags]) validateAsanaGid(tagGid, "tag_gid");
+      if (!addTags.length && !removeTags.length) {
+        throw new Error("Mindestens ein Tag in add_tag_gids oder remove_tag_gids ist erforderlich.");
+      }
+
+      const asana = getAsana(agent_id);
+      const beforeRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/tasks/${task_gid}`,
+        params: { opt_fields: ASANA_TASK_TAG_OPT_FIELDS }
+      });
+      const before_task = beforeRes.data.data;
+      const currentTagGids = new Set((before_task.tags || []).map((tag) => tag.gid));
+      const currentTagsByGid = new Map((before_task.tags || []).map((tag) => [tag.gid, tag]));
+      const routineTagRemoval = removeTags.some(
+        (tagGid) => String(currentTagsByGid.get(tagGid)?.name || "").toLowerCase() === "routine"
+      );
+
+      if (routineTagRemoval && !(allow_routine_tag_change && confirmed_by_asana)) {
+        throw new Error(
+          "Das Entfernen des Tags Routine ist gesperrt, ausser allow_routine_tag_change=true und confirmed_by_asana=true sind gesetzt."
+        );
+      }
+
+      const toAdd = addTags.filter((tagGid) => !currentTagGids.has(tagGid));
+      const toRemove = removeTags.filter((tagGid) => currentTagGids.has(tagGid));
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          task_gid,
+          before_task,
+          add_tag_gids: addTags,
+          remove_tag_gids: removeTags,
+          would_add: toAdd,
+          would_remove: toRemove,
+          skipped_already_present: addTags.filter((tagGid) => currentTagGids.has(tagGid)),
+          skipped_not_present: removeTags.filter((tagGid) => !currentTagGids.has(tagGid))
+        });
+      }
+
+      const add_results = [];
+      for (const tagGid of toAdd) {
+        const res = await asanaRequestWithRetry(asana, {
+          method: "POST",
+          url: `/tasks/${task_gid}/addTag`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          data: { data: { tag: tagGid } }
+        });
+        add_results.push({ tag_gid: tagGid, response: res.data });
+      }
+
+      const remove_results = [];
+      for (const tagGid of toRemove) {
+        const res = await asanaRequestWithRetry(asana, {
+          method: "POST",
+          url: `/tasks/${task_gid}/removeTag`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          data: { data: { tag: tagGid } }
+        });
+        remove_results.push({ tag_gid: tagGid, response: res.data });
+      }
+
+      let verified_task;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verify = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${task_gid}`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          params: { opt_fields: ASANA_TASK_TAG_OPT_FIELDS }
+        });
+        verified_task = verify.data.data;
+        const verifiedGids = new Set((verified_task.tags || []).map((tag) => tag.gid));
+        for (const tagGid of addTags) {
+          if (!verifiedGids.has(tagGid)) throw new Error(`Asana-Readback zeigt hinzugefuegten Tag ${tagGid} nicht.`);
+        }
+        for (const tagGid of removeTags) {
+          if (verifiedGids.has(tagGid)) throw new Error(`Asana-Readback zeigt entfernten Tag ${tagGid} weiterhin.`);
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        before_task,
+        add_results,
+        remove_results,
+        skipped_already_present: addTags.filter((tagGid) => currentTagGids.has(tagGid)),
+        skipped_not_present: removeTags.filter((tagGid) => !currentTagGids.has(tagGid)),
+        verified_task,
+        verification_status
+      });
+    }
+  );
+
+  server.tool(
+    "asana_update_task_recurrence",
+    "Experimenteller enger Pfad fuer Asana-Wiederholungen. Asanas oeffentliche API dokumentiert Recurrence nicht stabil; nutze dieses Tool nur bei klarer Asana-Beauftragung und mit Readback/Fehlertransparenz.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      recurrence: z.record(z.string(), z.any()).optional(),
+      clear_recurrence: z.boolean().optional().default(false),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({ agent_id, task_gid, recurrence, clear_recurrence, confirmed_by_asana, dry_run, verify_after }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      const setCount = [Boolean(recurrence), Boolean(clear_recurrence)].filter(Boolean).length;
+      if (setCount !== 1) {
+        throw new Error("Genau eines von recurrence oder clear_recurrence=true muss gesetzt sein.");
+      }
+      if (!dry_run && !confirmed_by_asana) {
+        throw new Error(
+          "asana_update_task_recurrence braucht confirmed_by_asana=true, weil Asana-Recurrence API-seitig nicht stabil dokumentiert ist."
+        );
+      }
+
+      const data = clear_recurrence ? { recurrence: null } : { recurrence };
+      const asana = getAsana(agent_id);
+      const beforeRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/tasks/${task_gid}`,
+        params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
+      });
+      const before_task = beforeRes.data.data;
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          experimental: true,
+          task_gid,
+          data,
+          before_task,
+          note: "Recurrence ist in Asanas oeffentlicher API nicht stabil dokumentiert; Live-Call kann scheitern."
+        });
+      }
+
+      const res = await asanaRequestWithRetry(asana, {
+        method: "PUT",
+        url: `/tasks/${task_gid}`,
+        timeout: ASANA_WRITE_TIMEOUT_MS,
+        data: { data },
+        params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
+      });
+
+      let verified_task;
+      let verification_status = "api_response_only";
+      let verification_note =
+        "Asana gibt Recurrence nicht verlaesslich als dokumentiertes Feld zurueck; pruefe bei kritischen Aenderungen zusaetzlich im Asana-UI.";
+      if (verify_after) {
+        const verify = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${task_gid}`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
+        });
+        verified_task = verify.data.data;
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        experimental: true,
+        data,
+        before_task,
+        task: res.data.data,
+        verified_task,
+        verification_status,
+        verification_note
       });
     }
   );
