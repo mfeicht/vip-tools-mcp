@@ -161,6 +161,8 @@ const WEB_PAGE_SECTION_VALUES = [
 const WEB_PAGE_DEFAULT_SECTIONS = ["seo", "headings", "links", "schema", "text"];
 const ASANA_ATTACHMENT_DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const ASANA_ATTACHMENT_HARD_MAX_BYTES = 8 * 1024 * 1024;
+const ASANA_ATTACHMENT_DEFAULT_CHUNK_BYTES = 24 * 1024;
+const ASANA_ATTACHMENT_MAX_CHUNK_BYTES = 96 * 1024;
 const ASANA_TASK_SCHEDULE_OPT_FIELDS =
   "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url";
 const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
@@ -346,6 +348,29 @@ async function downloadAsanaAttachment(asana, attachmentGid, maxBytes) {
     content_type: downloadRes.headers["content-type"] || "",
     content_length_header: downloadRes.headers["content-length"] || null
   };
+}
+
+async function resolveAsanaAttachmentSelection(
+  asana,
+  { taskGid, attachmentGid, attachmentNameContains, downloadFirstMatch = false }
+) {
+  let attachments = [];
+  let selectedAttachmentGid = attachmentGid;
+
+  if (taskGid) {
+    attachments = await listAsanaTaskAttachments(asana, taskGid);
+    if (attachmentNameContains) {
+      const needle = String(attachmentNameContains).toLowerCase();
+      attachments = attachments.filter((attachment) =>
+        String(attachment.name || "").toLowerCase().includes(needle)
+      );
+    }
+    if (!selectedAttachmentGid && downloadFirstMatch && attachments.length) {
+      selectedAttachmentGid = attachments[0].gid;
+    }
+  }
+
+  return { attachments, selectedAttachmentGid };
 }
 
 function containsPlainMention(value) {
@@ -1304,6 +1329,42 @@ async function assertAllowedGoogleFolder(folderId) {
   throw new Error(
     `Google-Ordner ${folderId} liegt nicht im erlaubten Agenten-Drive-Bereich. Erlaubter Root: ${GOOGLE_AGENT_FOLDER_ID}`
   );
+}
+
+async function uploadBufferToDrive({ name, mimeType, targetFolderId, bytes }) {
+  await assertAllowedGoogleFolder(targetFolderId);
+  const boundary = `vip-tools-${randomUUID()}`;
+  const metadata = JSON.stringify({
+    name,
+    mimeType,
+    parents: [targetFolderId]
+  });
+  const body = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
+        `--${boundary}\r\nContent-Type: ${mimeType || "application/octet-stream"}\r\n\r\n`,
+      "utf8"
+    ),
+    bytes,
+    Buffer.from(`\r\n--${boundary}--`, "utf8")
+  ]);
+
+  const res = await googleRequest({
+    method: "POST",
+    url: "https://www.googleapis.com/upload/drive/v3/files",
+    params: {
+      uploadType: "multipart",
+      fields: "id,name,mimeType,parents,webViewLink,webContentLink",
+      supportsAllDrives: true
+    },
+    headers: {
+      "Content-Type": `multipart/related; boundary=${boundary}`,
+      "Content-Length": String(body.length)
+    },
+    maxBodyLength: Infinity,
+    data: body
+  });
+  return res.data;
 }
 
 async function getSheetIdByName(spreadsheetId, sheetName) {
@@ -3513,6 +3574,110 @@ function createServer() {
   );
 
   server.tool(
+    "asana_search_tasks",
+    "Sucht Asana-Aufgaben im Workspace read-only ueber den korrekten GET-/tasks/search-Pfad. Vermeidet den bekannten 404 durch POST /tasks/search und ist der Standardpfad fuer API-Ersatz-Inbox/Follower-/Collaborator-Deltas.",
+    {
+      agent_id: agentIdSchema,
+      workspace_gid: z.string().optional(),
+      assignee_any: z.string().optional(),
+      followers_any: z.string().optional(),
+      involved_any: z.string().optional(),
+      completed: z.boolean().optional(),
+      modified_since: z.string().optional(),
+      sort_by: z.string().optional().default("modified_at"),
+      sort_ascending: z.boolean().optional(),
+      limit: z.number().int().min(1).max(100).optional().default(20),
+      opt_fields: z
+        .string()
+        .optional()
+        .default(
+          "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,modified_at,permalink_url,tags.name,memberships.project.gid,memberships.project.name"
+        ),
+      extra_params: z.record(z.string(), z.any()).optional()
+    },
+    TOOL_READ_ONLY,
+    async ({
+      agent_id,
+      workspace_gid,
+      assignee_any,
+      followers_any,
+      involved_any,
+      completed,
+      modified_since,
+      sort_by,
+      sort_ascending,
+      limit,
+      opt_fields,
+      extra_params
+    }) => {
+      if (workspace_gid) validateAsanaGid(workspace_gid, "workspace_gid");
+      const asana = getAsana(agent_id);
+      const me = await asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" });
+      const meGid = me.data.data.gid;
+      const workspace = workspace_gid || me.data.data.workspaces?.[0]?.gid;
+      if (!workspace) throw new Error("Kein Asana-Workspace gefunden.");
+
+      const normalizeUserSelector = (value, label) => {
+        if (!value) return undefined;
+        if (value === "me") return meGid;
+        validateAsanaGid(value, label);
+        return value;
+      };
+
+      const params = {
+        ...(extra_params || {}),
+        limit,
+        opt_fields,
+        sort_by
+      };
+      if (sort_ascending !== undefined) params.sort_ascending = sort_ascending;
+      if (completed !== undefined) params.completed = completed;
+      if (modified_since) params.modified_since = modified_since;
+      const assignee = normalizeUserSelector(assignee_any, "assignee_any");
+      const followers = normalizeUserSelector(followers_any, "followers_any");
+      const involved = normalizeUserSelector(involved_any, "involved_any");
+      if (assignee) params["assignee.any"] = assignee;
+      if (followers) params["followers.any"] = followers;
+      if (involved) params["involved.any"] = involved;
+
+      try {
+        const res = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/workspaces/${workspace}/tasks/search`,
+          params
+        });
+        return out({
+          agent_id,
+          workspace_gid: workspace,
+          user_gid: meGid,
+          search_status: "ok",
+          request_method: "GET",
+          request_path: `/workspaces/${workspace}/tasks/search`,
+          params,
+          tasks: res.data.data || []
+        });
+      } catch (error) {
+        if (error.response?.status === 404) {
+          return out({
+            agent_id,
+            workspace_gid: workspace,
+            user_gid: meGid,
+            search_status: "not_available_or_not_supported",
+            request_method: "GET",
+            request_path: `/workspaces/${workspace}/tasks/search`,
+            params,
+            error: compactAxiosError(error),
+            tasks: [],
+            fallback:
+              "Keine POST-Search-Retrys ausfuehren. Eigene Tasks mit asana_get_my_tasks lesen und bekannte/Follower-Tasks aus agentenspezifischem State gezielt per GET /tasks/{gid} pruefen."
+          });
+        }
+        throw error;
+      }
+    }
+  );
+
+  server.tool(
     "asana_create_task",
     "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, einen klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel und Status=Todo sowie bei Follow-ups einen Link zur Ausgangsaufgabe.",
     {
@@ -4389,21 +4554,12 @@ function createServer() {
       if (attachment_gid) validateAsanaGid(attachment_gid, "attachment_gid");
 
       const asana = getAsana(agent_id);
-      let attachments = [];
-      let selectedAttachmentGid = attachment_gid;
-
-      if (task_gid) {
-        attachments = await listAsanaTaskAttachments(asana, task_gid);
-        if (attachment_name_contains) {
-          const needle = attachment_name_contains.toLowerCase();
-          attachments = attachments.filter((attachment) =>
-            String(attachment.name || "").toLowerCase().includes(needle)
-          );
-        }
-        if (!selectedAttachmentGid && download_first_match && attachments.length) {
-          selectedAttachmentGid = attachments[0].gid;
-        }
-      }
+      const { attachments, selectedAttachmentGid } = await resolveAsanaAttachmentSelection(asana, {
+        taskGid: task_gid,
+        attachmentGid: attachment_gid,
+        attachmentNameContains: attachment_name_contains,
+        downloadFirstMatch: download_first_match
+      });
 
       if (!selectedAttachmentGid) {
         return out({
@@ -4442,6 +4598,242 @@ function createServer() {
         content_base64: include_base64 ? bytes.toString("base64") : undefined,
         save_hint:
           "Base64-Inhalt in AGENT_WORKSPACE/temp speichern und danach mit passendem Dokument-/Tabellen-/PDF-Tool auswerten."
+      });
+    }
+  );
+
+  server.tool(
+    "asana_attachment_fetch_chunked",
+    "Liest Asana-Anhaenge read-only in kleinen Base64-Chunks, damit Tool-Output-Limits den Inhalt nicht kuerzen. Standard fuer Screenshots, PDFs, ZIPs oder andere binaere Anhaenge, wenn asana_attachment_fetch zu gross ist.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string().optional(),
+      attachment_gid: z.string().optional(),
+      attachment_name_contains: z.string().optional(),
+      download_first_match: z.boolean().optional().default(false),
+      chunk_index: z.number().int().min(0).optional().default(0),
+      chunk_size: z
+        .number()
+        .int()
+        .min(512)
+        .max(ASANA_ATTACHMENT_MAX_CHUNK_BYTES)
+        .optional()
+        .default(ASANA_ATTACHMENT_DEFAULT_CHUNK_BYTES),
+      include_text_preview: z.boolean().optional().default(true),
+      text_preview_chars: z.number().int().min(100).max(20000).optional().default(4000),
+      max_bytes: z
+        .number()
+        .int()
+        .min(1024)
+        .max(ASANA_ATTACHMENT_HARD_MAX_BYTES)
+        .optional()
+        .default(ASANA_ATTACHMENT_HARD_MAX_BYTES)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({
+      agent_id,
+      task_gid,
+      attachment_gid,
+      attachment_name_contains,
+      download_first_match,
+      chunk_index,
+      chunk_size,
+      include_text_preview,
+      text_preview_chars,
+      max_bytes
+    }) => {
+      if (!task_gid && !attachment_gid) {
+        throw new Error("task_gid oder attachment_gid ist erforderlich.");
+      }
+      if (task_gid) validateAsanaGid(task_gid, "task_gid");
+      if (attachment_gid) validateAsanaGid(attachment_gid, "attachment_gid");
+
+      const asana = getAsana(agent_id);
+      const { attachments, selectedAttachmentGid } = await resolveAsanaAttachmentSelection(asana, {
+        taskGid: task_gid,
+        attachmentGid: attachment_gid,
+        attachmentNameContains: attachment_name_contains,
+        downloadFirstMatch: download_first_match
+      });
+
+      if (!selectedAttachmentGid) {
+        return out({
+          agent_id,
+          task_gid,
+          attachment_name_contains: attachment_name_contains || null,
+          returned_count: attachments.length,
+          attachments,
+          downloaded: false,
+          next_step:
+            "Mit attachment_gid erneut aufrufen oder download_first_match=true setzen, wenn der erste Treffer bewusst geladen werden soll."
+        });
+      }
+
+      const { attachment, bytes, content_type, content_length_header } = await downloadAsanaAttachment(
+        asana,
+        selectedAttachmentGid,
+        max_bytes
+      );
+      const totalChunks = Math.max(1, Math.ceil(bytes.length / chunk_size));
+      if (chunk_index >= totalChunks) {
+        throw new Error(`chunk_index ${chunk_index} liegt ausserhalb der verfuegbaren Chunks 0..${totalChunks - 1}.`);
+      }
+      const start = chunk_index * chunk_size;
+      const end = Math.min(start + chunk_size, bytes.length);
+      const chunk = bytes.subarray(start, end);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const chunkSha256 = createHash("sha256").update(chunk).digest("hex");
+      const textPreview =
+        include_text_preview && chunk_index === 0 && isTextLikeAttachment(content_type, attachment.name)
+          ? decodeTextPreview(bytes, text_preview_chars)
+          : undefined;
+
+      return out({
+        agent_id,
+        task_gid: task_gid || attachment.parent?.gid || null,
+        attachment,
+        downloaded: true,
+        content_type,
+        content_length_header,
+        byte_length: bytes.length,
+        sha256,
+        chunk_index,
+        chunk_size,
+        chunk_start: start,
+        chunk_end_exclusive: end,
+        chunk_byte_length: chunk.length,
+        chunk_sha256: chunkSha256,
+        total_chunks: totalChunks,
+        next_chunk_index: chunk_index + 1 < totalChunks ? chunk_index + 1 : null,
+        content_base64_chunk: chunk.toString("base64"),
+        text_preview: textPreview,
+        reconstruct_hint:
+          "Alle content_base64_chunk-Werte in Reihenfolge chunk_index konkatenieren und base64-dekodieren; sha256 gegen den Gesamtwert pruefen."
+      });
+    }
+  );
+
+  server.tool(
+    "asana_attachment_copy_to_drive",
+    "Kopiert einen Asana-Anhang serverseitig in den erlaubten Google-Drive-Agentenordner und gibt Drive-Link/ID zurueck. Standard, wenn lokale DNS-Downloads blockieren oder binaere Anhaenge nicht durch Tool-Output passen.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string().optional(),
+      attachment_gid: z.string().optional(),
+      attachment_name_contains: z.string().optional(),
+      download_first_match: z.boolean().optional().default(false),
+      title: z.string().optional(),
+      target_folder_id: z.string().optional().default(GOOGLE_AGENT_FOLDER_ID),
+      max_bytes: z
+        .number()
+        .int()
+        .min(1024)
+        .max(ASANA_ATTACHMENT_HARD_MAX_BYTES)
+        .optional()
+        .default(ASANA_ATTACHMENT_HARD_MAX_BYTES),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_SAFE_WRITE,
+    async ({
+      agent_id,
+      task_gid,
+      attachment_gid,
+      attachment_name_contains,
+      download_first_match,
+      title,
+      target_folder_id,
+      max_bytes,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      verify_after
+    }) => {
+      if (!task_gid && !attachment_gid) {
+        throw new Error("task_gid oder attachment_gid ist erforderlich.");
+      }
+      if (task_gid) validateAsanaGid(task_gid, "task_gid");
+      if (attachment_gid) validateAsanaGid(attachment_gid, "attachment_gid");
+      if (asana_task_gid) validateAsanaGid(asana_task_gid, "asana_task_gid");
+      await assertAllowedGoogleFolder(target_folder_id);
+
+      const asana = getAsana(agent_id);
+      const { attachments, selectedAttachmentGid } = await resolveAsanaAttachmentSelection(asana, {
+        taskGid: task_gid,
+        attachmentGid: attachment_gid,
+        attachmentNameContains: attachment_name_contains,
+        downloadFirstMatch: download_first_match
+      });
+
+      if (!selectedAttachmentGid) {
+        return out({
+          agent_id,
+          task_gid,
+          attachment_name_contains: attachment_name_contains || null,
+          returned_count: attachments.length,
+          attachments,
+          downloaded: false,
+          copied: false,
+          next_step:
+            "Mit attachment_gid erneut aufrufen oder download_first_match=true setzen, wenn der erste Treffer bewusst kopiert werden soll."
+        });
+      }
+
+      const { attachment, bytes, content_type, content_length_header } = await downloadAsanaAttachment(
+        asana,
+        selectedAttachmentGid,
+        max_bytes
+      );
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const mimeType = String(content_type || "application/octet-stream").split(";")[0].trim() || "application/octet-stream";
+      const fileName = title?.trim() || attachment.name || `asana-attachment-${attachment.gid}`;
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          task_gid: task_gid || attachment.parent?.gid || null,
+          attachment,
+          target_folder_id,
+          planned_file_name: fileName,
+          content_type,
+          content_length_header,
+          byte_length: bytes.length,
+          sha256,
+          requires_for_live: ["dry_run=false", "confirmed_by_asana=true", "asana_task_gid"]
+        });
+      }
+
+      assertAsanaConfirmed(confirmed_by_asana, asana_task_gid, "asana_attachment_copy_to_drive");
+
+      const uploaded = await uploadBufferToDrive({
+        name: fileName,
+        mimeType,
+        targetFolderId: target_folder_id,
+        bytes
+      });
+      const verifiedFile = verify_after
+        ? await getDriveFile(uploaded.id, "id,name,mimeType,parents,webViewLink,webContentLink")
+        : undefined;
+      const verificationStatus =
+        !verify_after || verifiedFile?.parents?.includes(target_folder_id) ? "verified" : "folder_readback_mismatch";
+
+      return out({
+        agent_id,
+        dry_run: false,
+        asana_task_gid,
+        task_gid: task_gid || attachment.parent?.gid || null,
+        attachment,
+        target_folder_id,
+        content_type,
+        content_length_header,
+        byte_length: bytes.length,
+        sha256,
+        copied_file: uploaded,
+        verified_file: verifiedFile,
+        verification_status: verificationStatus
       });
     }
   );
