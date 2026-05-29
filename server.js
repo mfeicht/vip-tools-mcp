@@ -166,6 +166,13 @@ const ASANA_TASK_SCHEDULE_OPT_FIELDS =
 const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
 const ASANA_TASK_TAG_WORKSPACE_OPT_FIELDS =
   "gid,name,completed,tags.gid,tags.name,workspace.gid,permalink_url";
+const ASANA_TASK_CREATE_SOURCE_OPT_FIELDS =
+  "gid,name,permalink_url,workspace.gid,memberships.project.gid,memberships.project.name";
+const ASANA_TASK_CREATE_VERIFY_OPT_FIELDS =
+  "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,memberships.project.gid,memberships.project.name,custom_fields.gid,custom_fields.name,custom_fields.enum_value.gid,custom_fields.enum_value.name";
+const ASANA_PROJECT_OPT_FIELDS = "gid,name,workspace.gid,permalink_url";
+const ASANA_PROJECT_CUSTOM_FIELD_OPT_FIELDS =
+  "gid,project.gid,custom_field.gid,custom_field.name,custom_field.resource_subtype,custom_field.enum_options.gid,custom_field.enum_options.name";
 
 const TOOL_READ_ONLY = Object.freeze({ readOnlyHint: true, openWorldHint: false });
 const TOOL_EXTERNAL_READ = Object.freeze({ readOnlyHint: true, openWorldHint: true });
@@ -380,6 +387,7 @@ function assertSafeAsanaRequest(method, path, data) {
     data &&
     Object.prototype.hasOwnProperty.call(data, "recurrence");
   const isTaskTagUpdate = method === "POST" && /^\/tasks\/[^/]+\/(?:addTag|removeTag)\/?$/.test(path);
+  const isTaskCreate = method === "POST" && /^\/tasks\/?$/.test(path);
 
   if (isTaskComplete) {
     throw new Error(
@@ -408,6 +416,12 @@ function assertSafeAsanaRequest(method, path, data) {
   if (isTaskRecurrenceUpdate) {
     throw new Error(
       "Asana-Wiederholungen duerfen nicht per rohem asana_request geaendert werden. Nutze asana_update_task_recurrence; es ist als experimenteller, enger Pfad markiert."
+    );
+  }
+
+  if (isTaskCreate) {
+    throw new Error(
+      "Asana-Aufgaben duerfen nicht per rohem asana_request angelegt werden. Nutze asana_create_task; es erzwingt genau ein Projekt, Follow-up-Link, Standard-Faelligkeit, Prioritaet und Status."
     );
   }
 
@@ -503,8 +517,147 @@ function validateAsanaDateTime(value, label) {
   }
 }
 
+function getBerlinDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Berlin",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return {
+    year: Number(byType.year),
+    month: Number(byType.month),
+    day: Number(byType.day)
+  };
+}
+
+function dueOnInBerlinDaysFromNow(days) {
+  const offsetDays = Math.max(0, Number(days || 0));
+  const { year, month, day } = getBerlinDateParts();
+  const base = new Date(Date.UTC(year, month - 1, day));
+  base.setUTCDate(base.getUTCDate() + offsetDays);
+  return base.toISOString().slice(0, 10);
+}
+
+function normalizeAsanaLabel(value) {
+  return String(value || "")
+    .replace(/ß/g, "ss")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
 function uniqueValues(values = []) {
   return [...new Set((values || []).map((value) => String(value)).filter(Boolean))];
+}
+
+function uniqueObjectsByGid(values = []) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values || []) {
+    if (!value?.gid || seen.has(value.gid)) continue;
+    seen.add(value.gid);
+    result.push(value);
+  }
+  return result;
+}
+
+function buildAsanaTaskHtmlNotes({ description, source_task, project_selection_reason }) {
+  const parts = [];
+
+  if (source_task?.permalink_url) {
+    parts.push(
+      `<strong>Bezug:</strong> <a href="${escapeAsanaXml(source_task.permalink_url)}">Ausgangsaufgabe ${escapeAsanaXml(
+        source_task.gid
+      )}</a>\n\n`
+    );
+  }
+
+  if (description) {
+    ensureNoUnsafeAsanaText(description, "Asana-Aufgabenbeschreibung");
+    parts.push(`${escapeAsanaTextWithLinks(description)}\n\n`);
+  }
+
+  if (project_selection_reason) {
+    ensureNoUnsafeAsanaText(project_selection_reason, "Asana-Projektbegruendung");
+    parts.push(`<strong>Projektzuordnung:</strong> ${escapeAsanaTextWithLinks(project_selection_reason)}\n\n`);
+  }
+
+  if (!parts.length) {
+    throw new Error("asana_create_task braucht description oder source_task_gid fuer eine nachvollziehbare Beschreibung.");
+  }
+
+  const html = `<body>${parts.join("")}</body>`;
+  assertGeneratedAsanaHtml(html);
+  return html;
+}
+
+function findProjectEnumField(fields, fieldAliases, valueAliases) {
+  const fieldAliasSet = new Set(fieldAliases.map(normalizeAsanaLabel));
+  const valueAliasSet = new Set(valueAliases.map(normalizeAsanaLabel));
+
+  const matchingField = fields.find((field) => {
+    if (!field?.gid || field.resource_subtype !== "enum") return false;
+    return fieldAliasSet.has(normalizeAsanaLabel(field.name));
+  });
+
+  if (!matchingField) return { field: null, option: null };
+
+  const option = (matchingField.enum_options || []).find((candidate) =>
+    valueAliasSet.has(normalizeAsanaLabel(candidate.name))
+  );
+  return { field: matchingField, option: option || null };
+}
+
+async function resolveAsanaStandardCustomFields(
+  asana,
+  projectGid,
+  { priorityValue = "Mittel", statusValue = "Todo", requireStandardCustomFields = true } = {}
+) {
+  const settingsRes = await asanaRequestWithRetry(asana, {
+    method: "GET",
+    url: `/projects/${projectGid}/custom_field_settings`,
+    params: { limit: 100, opt_fields: ASANA_PROJECT_CUSTOM_FIELD_OPT_FIELDS }
+  });
+  const customFields = (settingsRes.data.data || [])
+    .map((setting) => setting.custom_field)
+    .filter(Boolean);
+
+  const priorityAliases = [priorityValue, "Mittel", "Medium"];
+  const statusAliases = [statusValue, "Todo", "To Do", "To-do"];
+  const priority = findProjectEnumField(customFields, ["Prioritaet", "Prioritat", "Priority"], priorityAliases);
+  const status = findProjectEnumField(customFields, ["Status"], statusAliases);
+
+  const missing = [];
+  const custom_fields = {};
+  const resolved = {};
+
+  if (priority.field?.gid && priority.option?.gid) {
+    custom_fields[priority.field.gid] = priority.option.gid;
+    resolved.priority = { field: priority.field, option: priority.option };
+  } else {
+    missing.push(`Prioritaet=${priorityValue}`);
+  }
+
+  if (status.field?.gid && status.option?.gid) {
+    custom_fields[status.field.gid] = status.option.gid;
+    resolved.status = { field: status.field, option: status.option };
+  } else {
+    missing.push(`Status=${statusValue}`);
+  }
+
+  if (missing.length && requireStandardCustomFields) {
+    throw new Error(
+      `Projekt ${projectGid} hat die benoetigten Standardfelder/-optionen nicht sichtbar: ${missing.join(
+        ", "
+      )}. Waehle ein passendes Projekt oder setze require_standard_custom_fields=false mit Projektbegruendung.`
+    );
+  }
+
+  return { custom_fields, resolved, missing, settings: settingsRes.data.data || [] };
 }
 
 function asanaParagraph(text) {
@@ -3356,6 +3509,220 @@ function createServer() {
       });
 
       return out({ agent_id, tasks: res.data.data });
+    }
+  );
+
+  server.tool(
+    "asana_create_task",
+    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, einen klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel und Status=Todo sowie bei Follow-ups einen Link zur Ausgangsaufgabe.",
+    {
+      agent_id: agentIdSchema,
+      name: z.string().min(12).max(200),
+      assignee_gid: z.string(),
+      project_gid: z.string().optional(),
+      source_task_gid: z.string().optional(),
+      description: z.string().optional(),
+      project_selection_reason: z.string().optional(),
+      allow_different_project_than_source: z.boolean().optional().default(false),
+      due_on: z.string().optional(),
+      due_in_days: z.number().int().min(0).max(30).optional().default(3),
+      priority_value: z.string().optional().default("Mittel"),
+      status_value: z.string().optional().default("Todo"),
+      require_standard_custom_fields: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      creation_basis: z.string().min(20),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_SAFE_WRITE,
+    async ({
+      agent_id,
+      name,
+      assignee_gid,
+      project_gid,
+      source_task_gid,
+      description,
+      project_selection_reason,
+      allow_different_project_than_source,
+      due_on,
+      due_in_days,
+      priority_value,
+      status_value,
+      require_standard_custom_fields,
+      confirmed_by_asana,
+      creation_basis,
+      dry_run,
+      verify_after
+    }) => {
+      validateAsanaGid(assignee_gid, "assignee_gid");
+      validateAsanaGid(project_gid, "project_gid");
+      validateAsanaGid(source_task_gid, "source_task_gid");
+      validateAsanaDate(due_on, "due_on");
+      ensureNoUnsafeAsanaText(name, "Asana-Aufgabentitel");
+      ensureNoUnsafeAsanaText(creation_basis, "Asana-Aufgabenanlage-Begruendung");
+
+      if (!source_task_gid && !confirmed_by_asana && !dry_run) {
+        throw new Error(
+          "asana_create_task braucht source_task_gid oder confirmed_by_asana=true, damit neue Aufgaben nicht ohne klare Arbeitsgrundlage entstehen."
+        );
+      }
+
+      if (
+        ["follow up", "followup", "todo", "aufgabe", "nacharbeit"].includes(normalizeAsanaLabel(name))
+      ) {
+        throw new Error("Der Aufgabentitel ist zu generisch. Waehle einen treffenden, konkreten Titel.");
+      }
+
+      const asana = getAsana(agent_id);
+      let source_task;
+      let source_projects = [];
+
+      if (source_task_gid) {
+        const sourceRes = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${source_task_gid}`,
+          params: { opt_fields: ASANA_TASK_CREATE_SOURCE_OPT_FIELDS }
+        });
+        source_task = sourceRes.data.data;
+        source_projects = uniqueObjectsByGid(
+          (source_task.memberships || []).map((membership) => membership.project).filter(Boolean)
+        );
+      }
+
+      let selectedProjectGid = project_gid;
+      if (!selectedProjectGid) {
+        if (source_projects.length === 1) {
+          selectedProjectGid = source_projects[0].gid;
+        } else if (source_projects.length > 1) {
+          throw new Error(
+            "Die Ausgangsaufgabe ist mehreren Projekten zugeordnet. project_gid explizit setzen, damit die neue Aufgabe genau einem Projekt zugeordnet wird."
+          );
+        } else {
+          throw new Error(
+            "Kein Projekt aus der Ausgangsaufgabe ableitbar. project_gid explizit setzen und project_selection_reason angeben."
+          );
+        }
+      }
+
+      const sourceProjectGids = new Set(source_projects.map((project) => project.gid));
+      const differsFromVisibleSourceProject = source_projects.length > 0 && !sourceProjectGids.has(selectedProjectGid);
+      if (differsFromVisibleSourceProject && !allow_different_project_than_source) {
+        throw new Error(
+          "Die Ausgangsaufgabe hat ein sichtbares Projekt. Neue Follow-up-Aufgaben muessen dieses Projekt nutzen, ausser allow_different_project_than_source=true und project_selection_reason erklaert die Ausnahme."
+        );
+      }
+      if (
+        (differsFromVisibleSourceProject || (source_task_gid && source_projects.length === 0)) &&
+        String(project_selection_reason || "").trim().length < 20
+      ) {
+        throw new Error(
+          "project_selection_reason ist erforderlich, wenn kein sichtbares Ausgangsprojekt genutzt werden kann oder bewusst ein anderes Projekt gewaehlt wird."
+        );
+      }
+
+      const projectRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/projects/${selectedProjectGid}`,
+        params: { opt_fields: ASANA_PROJECT_OPT_FIELDS }
+      });
+      const project = projectRes.data.data;
+      const finalDueOn = due_on || dueOnInBerlinDaysFromNow(due_in_days);
+
+      const { custom_fields, resolved, missing } = await resolveAsanaStandardCustomFields(asana, selectedProjectGid, {
+        priorityValue: priority_value,
+        statusValue: status_value,
+        requireStandardCustomFields: require_standard_custom_fields
+      });
+
+      const html_notes = buildAsanaTaskHtmlNotes({
+        description,
+        source_task,
+        project_selection_reason
+      });
+
+      const data = {
+        name,
+        assignee: assignee_gid,
+        workspace: project.workspace?.gid,
+        projects: [selectedProjectGid],
+        due_on: finalDueOn,
+        html_notes
+      };
+      if (Object.keys(custom_fields).length) data.custom_fields = custom_fields;
+
+      const basis_sha256 = createHash("sha256").update(creation_basis, "utf8").digest("hex");
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          data,
+          project,
+          source_task,
+          source_projects,
+          standard_fields: resolved,
+          missing_standard_fields: missing,
+          creation_basis,
+          creation_basis_sha256: basis_sha256
+        });
+      }
+
+      const res = await asanaRequestWithRetry(asana, {
+        method: "POST",
+        url: "/tasks",
+        timeout: ASANA_WRITE_TIMEOUT_MS,
+        data: { data },
+        params: { opt_fields: ASANA_TASK_CREATE_VERIFY_OPT_FIELDS }
+      });
+
+      let verified_task;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verify = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${res.data.data.gid}`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          params: { opt_fields: ASANA_TASK_CREATE_VERIFY_OPT_FIELDS }
+        });
+        verified_task = verify.data.data;
+        const verifiedProjectGids = uniqueObjectsByGid(
+          (verified_task.memberships || []).map((membership) => membership.project).filter(Boolean)
+        ).map((item) => item.gid);
+        if (verifiedProjectGids.length !== 1 || verifiedProjectGids[0] !== selectedProjectGid) {
+          throw new Error(
+            `Asana-Readback zeigt nicht genau das erwartete Projekt (${selectedProjectGid}), sondern ${verifiedProjectGids.join(
+              ", "
+            ) || "keins"}.`
+          );
+        }
+        if (verified_task.assignee?.gid !== assignee_gid) {
+          throw new Error("Asana-Readback zeigt nicht den erwarteten Assignee.");
+        }
+        if (verified_task.due_on !== finalDueOn) {
+          throw new Error(`Asana-Readback due_on=${verified_task.due_on || "null"} statt erwartet ${finalDueOn}.`);
+        }
+        for (const [fieldGid, enumGid] of Object.entries(custom_fields)) {
+          const verifiedField = (verified_task.custom_fields || []).find((field) => field.gid === fieldGid);
+          if (verifiedField?.enum_value?.gid !== enumGid) {
+            throw new Error(`Asana-Readback zeigt Custom Field ${fieldGid} nicht mit erwarteter Enum ${enumGid}.`);
+          }
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        task: res.data.data,
+        verified_task,
+        verification_status,
+        project,
+        source_task,
+        source_projects,
+        standard_fields: resolved,
+        missing_standard_fields: missing,
+        creation_basis,
+        creation_basis_sha256: basis_sha256
+      });
     }
   );
 
