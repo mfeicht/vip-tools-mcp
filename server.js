@@ -164,6 +164,8 @@ const ASANA_ATTACHMENT_HARD_MAX_BYTES = 8 * 1024 * 1024;
 const ASANA_TASK_SCHEDULE_OPT_FIELDS =
   "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url";
 const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
+const ASANA_TASK_TAG_WORKSPACE_OPT_FIELDS =
+  "gid,name,completed,tags.gid,tags.name,workspace.gid,permalink_url";
 
 const TOOL_READ_ONLY = Object.freeze({ readOnlyHint: true, openWorldHint: false });
 const TOOL_EXTERNAL_READ = Object.freeze({ readOnlyHint: true, openWorldHint: true });
@@ -3814,7 +3816,7 @@ function createServer() {
 
   server.tool(
     "asana_update_task_recurrence",
-    "Experimenteller enger Pfad fuer Asana-Wiederholungen. Asanas oeffentliche API dokumentiert Recurrence nicht stabil; nutze dieses Tool nur bei klarer Asana-Beauftragung und mit Readback/Fehlertransparenz.",
+    "Experimenteller enger Pfad fuer Asana-Wiederholungen. Stellt beim Setzen einer Wiederholung sicher, dass der Task den Tag Routine hat. Asanas oeffentliche API dokumentiert Recurrence nicht stabil; nutze dieses Tool nur bei klarer Asana-Beauftragung und mit Readback/Fehlertransparenz.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -3842,9 +3844,36 @@ function createServer() {
       const beforeRes = await asanaRequestWithRetry(asana, {
         method: "GET",
         url: `/tasks/${task_gid}`,
-        params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
+        params: { opt_fields: ASANA_TASK_TAG_WORKSPACE_OPT_FIELDS }
       });
       const before_task = beforeRes.data.data;
+      let routine_tag;
+      let routine_tag_result;
+
+      if (!clear_recurrence) {
+        const hasRoutineTag = (before_task.tags || []).some(
+          (tag) => String(tag.name || "").toLowerCase() === "routine"
+        );
+        if (!hasRoutineTag) {
+          const workspaceGid =
+            before_task.workspace?.gid ||
+            (await asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" })).data.data.workspaces?.[0]?.gid;
+          if (!workspaceGid) throw new Error("Kein Asana-Workspace fuer Routine-Tag-Suche gefunden.");
+          const tagsRes = await asanaRequestWithRetry(asana, {
+            method: "GET",
+            url: `/workspaces/${workspaceGid}/tags`,
+            params: { limit: 100, opt_fields: "gid,name,color,workspace.gid" }
+          });
+          routine_tag = (tagsRes.data.data || []).find(
+            (tag) => String(tag.name || "").toLowerCase() === "routine"
+          );
+          if (!routine_tag) {
+            throw new Error(
+              "Wiederkehrende Aufgaben muessen den Tag Routine haben, aber im Workspace wurde kein Tag mit Name Routine gefunden."
+            );
+          }
+        }
+      }
 
       if (dry_run) {
         return out({
@@ -3854,8 +3883,20 @@ function createServer() {
           task_gid,
           data,
           before_task,
+          routine_tag,
+          would_add_routine_tag: Boolean(routine_tag),
           note: "Recurrence ist in Asanas oeffentlicher API nicht stabil dokumentiert; Live-Call kann scheitern."
         });
+      }
+
+      if (routine_tag) {
+        const tagRes = await asanaRequestWithRetry(asana, {
+          method: "POST",
+          url: `/tasks/${task_gid}/addTag`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          data: { data: { tag: routine_tag.gid } }
+        });
+        routine_tag_result = tagRes.data;
       }
 
       const res = await asanaRequestWithRetry(asana, {
@@ -3886,6 +3927,8 @@ function createServer() {
         experimental: true,
         data,
         before_task,
+        routine_tag,
+        routine_tag_result,
         task: res.data.data,
         verified_task,
         verification_status,
