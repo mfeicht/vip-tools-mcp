@@ -57,7 +57,8 @@ const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/spreadsheets"
 ];
-const GOOGLE_DRIVE_OAUTH_PREFIXES = ["GOOGLE_ACCOUNTING_OAUTH", "GOOGLE_DRIVE_OAUTH", "GOOGLE_OAUTH"];
+const GOOGLE_DEFAULT_DRIVE_OAUTH_PREFIXES = ["GOOGLE_OAUTH"];
+const GOOGLE_ACCOUNTING_DRIVE_OAUTH_PREFIXES = ["GOOGLE_ACCOUNTING_OAUTH", "GOOGLE_DRIVE_OAUTH", "GOOGLE_OAUTH"];
 const GOOGLE_SEO_OAUTH_PREFIXES = ["GOOGLE_SEO_OAUTH", "GOOGLE_ANALYTICS_SEARCH_OAUTH", "GOOGLE_OAUTH"];
 const GOOGLE_SEO_REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/analytics.readonly",
@@ -904,6 +905,12 @@ function oauthEnvSummary(prefixes) {
   );
 }
 
+function getGoogleDriveOAuthPrefixesForAgent(agentId) {
+  return agentId === "vip-ai-accounting"
+    ? GOOGLE_ACCOUNTING_DRIVE_OAUTH_PREFIXES
+    : GOOGLE_DEFAULT_DRIVE_OAUTH_PREFIXES;
+}
+
 async function refreshGoogleOAuthAccessToken(oauthConfig, tokenCache) {
   const now = Math.floor(Date.now() / 1000);
   if (
@@ -947,13 +954,11 @@ async function refreshGoogleOAuthAccessToken(oauthConfig, tokenCache) {
   return tokenCache.accessToken;
 }
 
-async function getGoogleAccessToken() {
+async function getGoogleAccessToken({ agent_id } = {}) {
   const now = Math.floor(Date.now() / 1000);
-  if (googleTokenCache.accessToken && googleTokenCache.expiresAt > now + 60) {
-    return googleTokenCache.accessToken;
-  }
 
-  const oauthConfig = getFirstOAuthConfig(GOOGLE_DRIVE_OAUTH_PREFIXES);
+  const oauthPrefixes = getGoogleDriveOAuthPrefixesForAgent(agent_id);
+  const oauthConfig = getFirstOAuthConfig(oauthPrefixes);
   if (oauthConfig) {
     return refreshGoogleOAuthAccessToken(oauthConfig, googleTokenCache);
   }
@@ -961,10 +966,18 @@ async function getGoogleAccessToken() {
   const serviceAccount = parseGoogleServiceAccount();
   if (!serviceAccount) {
     throw new Error(
-      `Google-Zugang fehlt. Setze GOOGLE_SERVICE_ACCOUNT_JSON(_BASE64) oder ${GOOGLE_DRIVE_OAUTH_PREFIXES.map(
+      `Google-Zugang fehlt. Setze GOOGLE_SERVICE_ACCOUNT_JSON(_BASE64) oder ${oauthPrefixes.map(
         (prefix) => `${prefix}_CLIENT_ID/${prefix}_CLIENT_SECRET/${prefix}_REFRESH_TOKEN`
       ).join(" oder ")}.`
     );
+  }
+
+  if (
+    googleTokenCache.accessToken &&
+    googleTokenCache.expiresAt > now + 60 &&
+    googleTokenCache.envPrefix === "GOOGLE_SERVICE_ACCOUNT"
+  ) {
+    return googleTokenCache.accessToken;
   }
 
   const header = { alg: "RS256", typ: "JWT" };
@@ -1016,7 +1029,8 @@ async function getGoogleAccessToken() {
 
   googleTokenCache = {
     accessToken: res.data.access_token,
-    expiresAt: now + Number(res.data.expires_in || 3600)
+    expiresAt: now + Number(res.data.expires_in || 3600),
+    envPrefix: "GOOGLE_SERVICE_ACCOUNT"
   };
   return googleTokenCache.accessToken;
 }
@@ -1348,14 +1362,15 @@ function normalizeGa4PropertyName(property) {
   return raw.startsWith("properties/") ? raw : `properties/${raw}`;
 }
 
-async function googleRequest(config) {
-  const accessToken = await getGoogleAccessToken();
+async function googleRequest(config, googleContext = {}) {
+  const { agent_id: configAgentId, ...requestConfig } = config || {};
+  const accessToken = await getGoogleAccessToken({ agent_id: googleContext.agent_id || configAgentId });
   try {
     return await axios.request({
-      ...config,
+      ...requestConfig,
       headers: {
         Authorization: `Bearer ${accessToken}`,
-        ...(config.headers || {})
+        ...(requestConfig.headers || {})
       }
     });
   } catch (error) {
@@ -1369,8 +1384,8 @@ async function googleRequest(config) {
       dataSnippet = String(data).slice(0, 2000);
     }
 
-    const method = String(config?.method || "GET").toUpperCase();
-    const url = String(config?.url || "");
+    const method = String(requestConfig?.method || "GET").toUpperCase();
+    const url = String(requestConfig?.url || "");
     throw new Error(
       `Google API request failed (${status || "unknown"}${statusText ? ` ${statusText}` : ""}) for ${method} ${url}` +
         (dataSnippet ? ` | response=${dataSnippet}` : "")
@@ -1378,7 +1393,7 @@ async function googleRequest(config) {
   }
 }
 
-async function getDriveFile(fileId, fields = "id,name,mimeType,parents,webViewLink") {
+async function getDriveFile(fileId, fields = "id,name,mimeType,parents,webViewLink", googleContext = {}) {
   const res = await googleRequest({
     method: "GET",
     url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
@@ -1386,16 +1401,16 @@ async function getDriveFile(fileId, fields = "id,name,mimeType,parents,webViewLi
       fields,
       supportsAllDrives: true
     }
-  });
+  }, googleContext);
   return res.data;
 }
 
-async function assertAllowedGoogleFolder(folderId) {
+async function assertAllowedGoogleFolder(folderId, googleContext = {}) {
   if (GOOGLE_ALLOWED_FOLDER_IDS.has(folderId)) return;
 
   let currentId = folderId;
   for (let depth = 0; depth < 10; depth += 1) {
-    const folder = await getDriveFile(currentId, "id,name,mimeType,parents");
+    const folder = await getDriveFile(currentId, "id,name,mimeType,parents", googleContext);
     if (folder.mimeType !== "application/vnd.google-apps.folder") {
       throw new Error(`Google target_folder_id ist kein Ordner: ${folderId}`);
     }
@@ -1417,9 +1432,10 @@ async function uploadBufferToDrive({
   targetFolderId,
   bytes,
   appProperties,
-  assertFolder = assertAllowedGoogleFolder
+  assertFolder = assertAllowedGoogleFolder,
+  googleContext = {}
 }) {
-  await assertFolder(targetFolderId);
+  await assertFolder(targetFolderId, googleContext);
   const boundary = `vip-tools-${randomUUID()}`;
   const metadata = JSON.stringify({
     name,
@@ -1437,30 +1453,33 @@ async function uploadBufferToDrive({
     Buffer.from(`\r\n--${boundary}--`, "utf8")
   ]);
 
-  const res = await googleRequest({
-    method: "POST",
-    url: "https://www.googleapis.com/upload/drive/v3/files",
-    params: {
-      uploadType: "multipart",
-      fields: "id,name,mimeType,parents,webViewLink,webContentLink",
-      supportsAllDrives: true
+  const res = await googleRequest(
+    {
+      method: "POST",
+      url: "https://www.googleapis.com/upload/drive/v3/files",
+      params: {
+        uploadType: "multipart",
+        fields: "id,name,mimeType,parents,webViewLink,webContentLink",
+        supportsAllDrives: true
+      },
+      headers: {
+        "Content-Type": `multipart/related; boundary=${boundary}`,
+        "Content-Length": String(body.length)
+      },
+      maxBodyLength: Infinity,
+      data: body
     },
-    headers: {
-      "Content-Type": `multipart/related; boundary=${boundary}`,
-      "Content-Length": String(body.length)
-    },
-    maxBodyLength: Infinity,
-    data: body
-  });
+    googleContext
+  );
   return res.data;
 }
 
-async function getSheetIdByName(spreadsheetId, sheetName) {
+async function getSheetIdByName(spreadsheetId, sheetName, googleContext = {}) {
   const res = await googleRequest({
     method: "GET",
     url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}`,
     params: { fields: "sheets(properties(sheetId,title))" }
-  });
+  }, googleContext);
   const sheet = (res.data.sheets || []).find((item) => item.properties?.title === sheetName);
   if (!sheet) throw new Error(`Sheet nicht gefunden: ${sheetName}`);
   return sheet.properties.sheetId;
@@ -1470,14 +1489,14 @@ function buildSheetRange(sheetName, range) {
   return `${sheetName}!${range}`;
 }
 
-async function getSheetValues(spreadsheetId, range, valueRenderOption = "FORMATTED_VALUE") {
+async function getSheetValues(spreadsheetId, range, valueRenderOption = "FORMATTED_VALUE", googleContext = {}) {
   const res = await googleRequest({
     method: "GET",
     url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
       spreadsheetId
     )}/values/${encodeURIComponent(range)}`,
     params: { valueRenderOption }
-  });
+  }, googleContext);
   return res.data.values || [];
 }
 
@@ -2326,12 +2345,12 @@ async function fetchUnseenRawEmailWithFallback(configs, options) {
   throw error;
 }
 
-async function assertAllowedAccountingFolder(folderId) {
+async function assertAllowedAccountingFolder(folderId, googleContext = {}) {
   if (ACCOUNTING_ALLOWED_DRIVE_ROOT_IDS.has(folderId)) return;
 
   let currentId = folderId;
   for (let depth = 0; depth < 12; depth += 1) {
-    const folder = await getDriveFile(currentId, "id,name,mimeType,parents");
+    const folder = await getDriveFile(currentId, "id,name,mimeType,parents", googleContext);
     if (folder.mimeType !== "application/vnd.google-apps.folder") {
       throw new Error(`Accounting target_folder_id ist kein Ordner: ${folderId}`);
     }
@@ -2350,7 +2369,7 @@ function escapeGoogleDriveQueryString(value) {
   return String(value || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
-async function findAccountingDriveDuplicate({ folderId, sha256, fileName }) {
+async function findAccountingDriveDuplicate({ folderId, sha256, fileName }, googleContext = {}) {
   const query =
     `'${escapeGoogleDriveQueryString(folderId)}' in parents and trashed = false and ` +
     `(name = '${escapeGoogleDriveQueryString(fileName)}' or appProperties has { key='vip_sha256' and value='${escapeGoogleDriveQueryString(sha256)}' })`;
@@ -2363,7 +2382,7 @@ async function findAccountingDriveDuplicate({ folderId, sha256, fileName }) {
       supportsAllDrives: true,
       includeItemsFromAllDrives: true
     }
-  });
+  }, googleContext);
   return res.data.files || [];
 }
 
@@ -5289,7 +5308,7 @@ function createServer() {
       if (task_gid) validateAsanaGid(task_gid, "task_gid");
       if (attachment_gid) validateAsanaGid(attachment_gid, "attachment_gid");
       if (asana_task_gid) validateAsanaGid(asana_task_gid, "asana_task_gid");
-      await assertAllowedGoogleFolder(target_folder_id);
+      await assertAllowedGoogleFolder(target_folder_id, { agent_id });
 
       const asana = getAsana(agent_id);
       const { attachments, selectedAttachmentGid } = await resolveAsanaAttachmentSelection(asana, {
@@ -5344,10 +5363,11 @@ function createServer() {
         name: fileName,
         mimeType,
         targetFolderId: target_folder_id,
-        bytes
+        bytes,
+        googleContext: { agent_id }
       });
       const verifiedFile = verify_after
-        ? await getDriveFile(uploaded.id, "id,name,mimeType,parents,webViewLink,webContentLink")
+        ? await getDriveFile(uploaded.id, "id,name,mimeType,parents,webViewLink,webContentLink", { agent_id })
         : undefined;
       const verificationStatus =
         !verify_after || verifiedFile?.parents?.includes(target_folder_id) ? "verified" : "folder_readback_mismatch";
@@ -5423,7 +5443,8 @@ function createServer() {
       verify_after
     }) => {
       if (asana_task_gid) validateAsanaGid(asana_task_gid, "asana_task_gid");
-      await assertAllowedAccountingFolder(target_folder_id);
+      const googleContext = { agent_id };
+      await assertAllowedAccountingFolder(target_folder_id, googleContext);
       if (!dry_run) {
         assertMoritzAsanaConfirmed({
           confirmedByAsana: confirmed_by_asana,
@@ -5531,7 +5552,7 @@ function createServer() {
             folderId: target_folder_id,
             sha256,
             fileName: attachment.filename
-          });
+          }, googleContext);
           const duplicateSummary = duplicateFiles.map((file) => ({
             id: file.id,
             name: file.name,
@@ -5580,6 +5601,7 @@ function createServer() {
             targetFolderId: target_folder_id,
             bytes: attachment.bytes,
             assertFolder: assertAllowedAccountingFolder,
+            googleContext,
             appProperties: {
               vip_source: "accounting_mail",
               vip_agent_id: agent_id,
@@ -5595,7 +5617,8 @@ function createServer() {
           const verifiedFile = verify_after
             ? await getDriveFile(
                 uploaded.id,
-                "id,name,mimeType,parents,webViewLink,webContentLink,md5Checksum,appProperties,createdTime,modifiedTime"
+                "id,name,mimeType,parents,webViewLink,webContentLink,md5Checksum,appProperties,createdTime,modifiedTime",
+                googleContext
               )
             : undefined;
           const verificationStatus =
@@ -7424,7 +7447,8 @@ function createServer() {
     },
     TOOL_SAFE_WRITE,
     async ({ agent_id, title, mime_type, target_folder_id }) => {
-      await assertAllowedGoogleFolder(target_folder_id);
+      const googleContext = { agent_id };
+      await assertAllowedGoogleFolder(target_folder_id, googleContext);
 
       const res = await googleRequest({
         method: "POST",
@@ -7438,7 +7462,7 @@ function createServer() {
           mimeType: mime_type,
           parents: [target_folder_id]
         }
-      });
+      }, googleContext);
 
       return out({ agent_id, file: res.data });
     }
@@ -7468,9 +7492,10 @@ function createServer() {
       asana_task_gid,
       verify_after
     }) => {
-      await assertAllowedGoogleFolder(target_folder_id);
+      const googleContext = { agent_id };
+      await assertAllowedGoogleFolder(target_folder_id, googleContext);
 
-      const sourceFile = await getDriveFile(source_file_id, "id,name,mimeType,parents,webViewLink");
+      const sourceFile = await getDriveFile(source_file_id, "id,name,mimeType,parents,webViewLink", googleContext);
       if (sourceFile.mimeType === "application/vnd.google-apps.folder") {
         throw new Error("Google-Ordner koennen nicht per files.copy kopiert werden. Fuer Ordner braucht es einen separaten rekursiven Kopierprozess.");
       }
@@ -7505,10 +7530,10 @@ function createServer() {
           name: copyTitle,
           parents: [target_folder_id]
         }
-      });
+      }, googleContext);
 
       const verifiedFile = verify_after
-        ? await getDriveFile(res.data.id, "id,name,mimeType,parents,webViewLink")
+        ? await getDriveFile(res.data.id, "id,name,mimeType,parents,webViewLink", googleContext)
         : undefined;
       const verificationStatus =
         !verify_after || verifiedFile?.parents?.includes(target_folder_id) ? "verified" : "folder_readback_mismatch";
@@ -7537,9 +7562,10 @@ function createServer() {
     },
     TOOL_IDEMPOTENT_SAFE_WRITE,
     async ({ agent_id, file_id, target_folder_id, remove_previous_parents }) => {
-      await assertAllowedGoogleFolder(target_folder_id);
+      const googleContext = { agent_id };
+      await assertAllowedGoogleFolder(target_folder_id, googleContext);
 
-      const file = await getDriveFile(file_id, "id,name,mimeType,parents,webViewLink");
+      const file = await getDriveFile(file_id, "id,name,mimeType,parents,webViewLink", googleContext);
       const previousParents = file.parents || [];
 
       const res = await googleRequest({
@@ -7551,7 +7577,7 @@ function createServer() {
           fields: "id,name,mimeType,parents,webViewLink",
           supportsAllDrives: true
         }
-      });
+      }, googleContext);
 
       return out({
         agent_id,
@@ -7586,7 +7612,7 @@ function createServer() {
           insertDataOption: "INSERT_ROWS"
         },
         data: { values }
-      });
+      }, { agent_id });
 
       return out({ agent_id, response: res.data });
     }
@@ -7608,7 +7634,7 @@ function createServer() {
     TOOL_READ_ONLY,
     async ({ agent_id, spreadsheet_id, sheet_name, range, value_render_option }) => {
       const a1Range = buildSheetRange(sheet_name, range);
-      const values = await getSheetValues(spreadsheet_id, a1Range, value_render_option);
+      const values = await getSheetValues(spreadsheet_id, a1Range, value_render_option, { agent_id });
       return out({ agent_id, spreadsheet_id, sheet_name, range, values });
     }
   );
@@ -7634,7 +7660,7 @@ function createServer() {
           fields:
             "spreadsheetId,properties(title),sheets(properties(sheetId,title,gridProperties),merges,conditionalFormats,protectedRanges,filterViews,basicFilter,data(rowData(values(formattedValue,userEnteredFormat,effectiveFormat,dataValidation,note,hyperlink))))"
         }
-      });
+      }, { agent_id });
 
       const sheet = res.data.sheets?.[0];
       if (!sheet) throw new Error(`Sheet nicht gefunden oder Range nicht lesbar: ${sheet_name}`);
@@ -7713,9 +7739,9 @@ function createServer() {
         )}/values/${encodeURIComponent(a1Range)}`,
         params: { valueInputOption: value_input_option },
         data: { values }
-      });
+      }, { agent_id });
 
-      const verified_values = verify_after ? await getSheetValues(spreadsheet_id, a1Range) : undefined;
+      const verified_values = verify_after ? await getSheetValues(spreadsheet_id, a1Range, "FORMATTED_VALUE", { agent_id }) : undefined;
       return out({ agent_id, response: res.data, verified_values });
     }
   );
@@ -7906,7 +7932,7 @@ function createServer() {
       }
 
       const resolvedSheetId =
-        typeof sheet_id === "number" ? sheet_id : await getSheetIdByName(spreadsheet_id, sheet_name);
+        typeof sheet_id === "number" ? sheet_id : await getSheetIdByName(spreadsheet_id, sheet_name, { agent_id });
 
       const request = {
         deleteDuplicates: {
@@ -7938,7 +7964,7 @@ function createServer() {
           spreadsheet_id
         )}:batchUpdate`,
         data: { requests: [request] }
-      });
+      }, { agent_id });
 
       return out({ agent_id, response: res.data });
     }
