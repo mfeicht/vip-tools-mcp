@@ -163,6 +163,47 @@ const ASANA_ATTACHMENT_DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const ASANA_ATTACHMENT_HARD_MAX_BYTES = 8 * 1024 * 1024;
 const ASANA_ATTACHMENT_DEFAULT_CHUNK_BYTES = 24 * 1024;
 const ASANA_ATTACHMENT_MAX_CHUNK_BYTES = 96 * 1024;
+const ACCOUNTING_ATTACHMENT_HARD_MAX_BYTES = 16 * 1024 * 1024;
+const ACCOUNTING_EMAIL_HARD_MAX_BYTES = 25 * 1024 * 1024;
+const ACCOUNTING_ALLOWED_DRIVE_ROOT_IDS = new Set(
+  [
+    "1D7rxEBZM8gy7fqz0QY1OoaUSMoLC5i0w", // Rechnungen Kreditoren / 2026
+    "1Y_H-m69sZNeOmV--u4Ibh7ymlI4bS9zp", // Einnahmen-Rechnungen
+    ...(process.env.ACCOUNTING_DRIVE_ALLOWED_FOLDER_IDS || "").split(",")
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean)
+);
+const ACCOUNTING_ALLOWED_ATTACHMENT_EXTENSIONS = new Set([
+  "pdf",
+  "png",
+  "jpg",
+  "jpeg",
+  "tif",
+  "tiff",
+  "webp",
+  "heic",
+  "heif"
+]);
+const ACCOUNTING_ALLOWED_ATTACHMENT_MIME_TYPES = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/tiff",
+  "image/webp",
+  "image/heic",
+  "image/heif"
+]);
+const ACCOUNTING_MORITZ_EMAILS = new Set(
+  [
+    "moritz.feichtmeyer@vip-studios.de",
+    "moritz.feichtmeyer@gmail.com",
+    "mf@vip-studios.de",
+    ...(process.env.ACCOUNTING_MORITZ_EMAILS || "").split(",")
+  ]
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
+);
 const ASANA_TASK_SCHEDULE_OPT_FIELDS =
   "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url";
 const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
@@ -879,9 +920,25 @@ async function refreshGoogleOAuthAccessToken(oauthConfig, tokenCache) {
     grant_type: "refresh_token"
   });
 
-  const res = await axios.post("https://oauth2.googleapis.com/token", params.toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" }
-  });
+  let res;
+  try {
+    res = await axios.post("https://oauth2.googleapis.com/token", params.toString(), {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" }
+    });
+  } catch (error) {
+    const status = error?.response?.status;
+    const data = error?.response?.data;
+    let dataSnippet = "";
+    try {
+      if (data !== undefined) dataSnippet = JSON.stringify(data).slice(0, 2000);
+    } catch {
+      dataSnippet = String(data).slice(0, 2000);
+    }
+    throw new Error(
+      `Google OAuth token refresh failed for prefix=${oauthConfig.prefix} (${status || "unknown"})` +
+        (dataSnippet ? ` | response=${dataSnippet}` : "")
+    );
+  }
 
   tokenCache.accessToken = res.data.access_token;
   tokenCache.expiresAt = now + Number(res.data.expires_in || 3600);
@@ -907,9 +964,25 @@ async function getGoogleAccessToken() {
       grant_type: "refresh_token"
     });
 
-    const res = await axios.post("https://oauth2.googleapis.com/token", params.toString(), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" }
-    });
+    let res;
+    try {
+      res = await axios.post("https://oauth2.googleapis.com/token", params.toString(), {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" }
+      });
+    } catch (error) {
+      const status = error?.response?.status;
+      const data = error?.response?.data;
+      let dataSnippet = "";
+      try {
+        if (data !== undefined) dataSnippet = JSON.stringify(data).slice(0, 2000);
+      } catch {
+        dataSnippet = String(data).slice(0, 2000);
+      }
+      throw new Error(
+        `Google OAuth token refresh failed for env GOOGLE_OAUTH_* (${status || "unknown"})` +
+          (dataSnippet ? ` | response=${dataSnippet}` : "")
+      );
+    }
 
     googleTokenCache = {
       accessToken: res.data.access_token,
@@ -949,9 +1022,28 @@ async function getGoogleAccessToken() {
     assertion
   });
 
-  const res = await axios.post("https://oauth2.googleapis.com/token", params.toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" }
-  });
+  let res;
+  try {
+    res = await axios.post("https://oauth2.googleapis.com/token", params.toString(), {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" }
+    });
+  } catch (error) {
+    const status = error?.response?.status;
+    const data = error?.response?.data;
+    let dataSnippet = "";
+    try {
+      if (data !== undefined) dataSnippet = JSON.stringify(data).slice(0, 2000);
+    } catch {
+      dataSnippet = String(data).slice(0, 2000);
+    }
+    const impersonate = process.env.GOOGLE_WORKSPACE_IMPERSONATE_EMAIL
+      ? ` impersonate=${process.env.GOOGLE_WORKSPACE_IMPERSONATE_EMAIL}`
+      : "";
+    throw new Error(
+      `Google Service-Account token request failed (${status || "unknown"})${impersonate}` +
+        (dataSnippet ? ` | response=${dataSnippet}` : "")
+    );
+  }
 
   googleTokenCache = {
     accessToken: res.data.access_token,
@@ -1289,13 +1381,32 @@ function normalizeGa4PropertyName(property) {
 
 async function googleRequest(config) {
   const accessToken = await getGoogleAccessToken();
-  return axios.request({
-    ...config,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      ...(config.headers || {})
+  try {
+    return await axios.request({
+      ...config,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        ...(config.headers || {})
+      }
+    });
+  } catch (error) {
+    const status = error?.response?.status;
+    const statusText = error?.response?.statusText;
+    const data = error?.response?.data;
+    let dataSnippet = "";
+    try {
+      if (data !== undefined) dataSnippet = JSON.stringify(data).slice(0, 2000);
+    } catch {
+      dataSnippet = String(data).slice(0, 2000);
     }
-  });
+
+    const method = String(config?.method || "GET").toUpperCase();
+    const url = String(config?.url || "");
+    throw new Error(
+      `Google API request failed (${status || "unknown"}${statusText ? ` ${statusText}` : ""}) for ${method} ${url}` +
+        (dataSnippet ? ` | response=${dataSnippet}` : "")
+    );
+  }
 }
 
 async function getDriveFile(fileId, fields = "id,name,mimeType,parents,webViewLink") {
@@ -1331,13 +1442,21 @@ async function assertAllowedGoogleFolder(folderId) {
   );
 }
 
-async function uploadBufferToDrive({ name, mimeType, targetFolderId, bytes }) {
-  await assertAllowedGoogleFolder(targetFolderId);
+async function uploadBufferToDrive({
+  name,
+  mimeType,
+  targetFolderId,
+  bytes,
+  appProperties,
+  assertFolder = assertAllowedGoogleFolder
+}) {
+  await assertFolder(targetFolderId);
   const boundary = `vip-tools-${randomUUID()}`;
   const metadata = JSON.stringify({
     name,
     mimeType,
-    parents: [targetFolderId]
+    parents: [targetFolderId],
+    ...(appProperties && Object.keys(appProperties).length ? { appProperties } : {})
   });
   const body = Buffer.concat([
     Buffer.from(
@@ -1887,6 +2006,450 @@ async function readUnseenEmailWithFallback(configs, options) {
   );
   error.imap_attempts = attempts;
   throw error;
+}
+
+function extractEmailAddress(value) {
+  const raw = String(value || "").trim();
+  const bracket = /<([^>]+)>/.exec(raw);
+  const candidate = bracket ? bracket[1] : raw;
+  const match = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.exec(candidate);
+  return match ? match[0].toLowerCase() : "";
+}
+
+function normalizeEmailAllowlist(values) {
+  return new Set((values || []).map(extractEmailAddress).filter(Boolean));
+}
+
+function decodeMimeWordText(text, encoding) {
+  const enc = String(encoding || "").toUpperCase();
+  if (enc === "B") return Buffer.from(String(text || "").replace(/\s+/g, ""), "base64").toString("utf8");
+  if (enc === "Q") {
+    const bytes = String(text || "")
+      .replace(/_/g, " ")
+      .replace(/=([A-F0-9]{2})/gi, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
+    return Buffer.from(bytes, "binary").toString("utf8");
+  }
+  return String(text || "");
+}
+
+function decodeMimeHeaderValue(value) {
+  return String(value || "").replace(/=\?([^?]+)\?([BQ])\?([^?]*)\?=/gi, (_full, charset, encoding, text) => {
+    try {
+      const decoded = decodeMimeWordText(text, encoding);
+      return /utf-?8/i.test(charset) ? decoded : decoded;
+    } catch {
+      return _full;
+    }
+  });
+}
+
+function parseMimeHeaders(rawHeaders) {
+  const headers = {};
+  const unfolded = String(rawHeaders || "").replace(/\r?\n[ \t]+/g, " ");
+  for (const line of unfolded.split(/\r?\n/)) {
+    const index = line.indexOf(":");
+    if (index <= 0) continue;
+    const key = line.slice(0, index).trim().toLowerCase();
+    const value = line.slice(index + 1).trim();
+    headers[key] = headers[key] ? `${headers[key]}, ${value}` : value;
+  }
+  return headers;
+}
+
+function splitHeaderAndBody(raw) {
+  const normalized = String(raw || "");
+  const crlfIndex = normalized.indexOf("\r\n\r\n");
+  if (crlfIndex >= 0) {
+    return {
+      headersText: normalized.slice(0, crlfIndex),
+      body: normalized.slice(crlfIndex + 4)
+    };
+  }
+  const lfIndex = normalized.indexOf("\n\n");
+  if (lfIndex >= 0) {
+    return {
+      headersText: normalized.slice(0, lfIndex),
+      body: normalized.slice(lfIndex + 2)
+    };
+  }
+  return { headersText: normalized, body: "" };
+}
+
+function parseHeaderParams(headerValue) {
+  const segments = String(headerValue || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const value = (segments.shift() || "").toLowerCase();
+  const params = {};
+  for (const segment of segments) {
+    const index = segment.indexOf("=");
+    if (index <= 0) continue;
+    const key = segment.slice(0, index).trim().toLowerCase();
+    let rawValue = segment.slice(index + 1).trim();
+    if (rawValue.startsWith('"') && rawValue.endsWith('"')) {
+      rawValue = rawValue.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    }
+    params[key] = decodeMimeHeaderValue(rawValue);
+  }
+  return { value, params };
+}
+
+function decodeRfc2231Param(value) {
+  const raw = String(value || "");
+  const match = /^([^']*)'[^']*'(.*)$/.exec(raw);
+  const encoded = match ? match[2] : raw;
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return encoded;
+  }
+}
+
+function safeAttachmentFileName(value, fallback) {
+  const decoded = decodeMimeHeaderValue(decodeRfc2231Param(value || ""));
+  const cleaned = decoded
+    .replace(/[\/\\:\u0000-\u001f]+/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || fallback;
+}
+
+function splitMultipartBody(body, boundary) {
+  const marker = `--${boundary}`;
+  const segments = String(body || "").split(marker).slice(1);
+  const parts = [];
+  for (let segment of segments) {
+    if (segment.startsWith("--")) break;
+    segment = segment.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
+    if (segment.trim()) parts.push(segment);
+  }
+  return parts;
+}
+
+function decodeQuotedPrintableToBuffer(value) {
+  const binary = String(value || "")
+    .replace(/=\r?\n/g, "")
+    .replace(/=([A-F0-9]{2})/gi, (_full, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
+  return Buffer.from(binary, "binary");
+}
+
+function decodeMimePartBody(body, transferEncoding) {
+  const encoding = String(transferEncoding || "").trim().toLowerCase();
+  if (encoding === "base64") return Buffer.from(String(body || "").replace(/\s+/g, ""), "base64");
+  if (encoding === "quoted-printable") return decodeQuotedPrintableToBuffer(body);
+  return Buffer.from(String(body || ""), "binary");
+}
+
+function parseMimeMessageParts(raw, depth = 0) {
+  if (depth > 20) return [];
+  const { headersText, body } = splitHeaderAndBody(raw);
+  const headers = parseMimeHeaders(headersText);
+  const contentType = parseHeaderParams(headers["content-type"] || "text/plain");
+  const disposition = parseHeaderParams(headers["content-disposition"] || "");
+
+  if (contentType.value.startsWith("multipart/") && contentType.params.boundary) {
+    return splitMultipartBody(body, contentType.params.boundary).flatMap((part) =>
+      parseMimeMessageParts(part, depth + 1)
+    );
+  }
+
+  const fileName =
+    disposition.params.filename ||
+    disposition.params["filename*"] ||
+    contentType.params.name ||
+    contentType.params["name*"] ||
+    "";
+  const isAttachment =
+    disposition.value === "attachment" ||
+    disposition.value === "inline" && Boolean(fileName) ||
+    Boolean(fileName);
+  if (!isAttachment) return [];
+
+  const safeName = safeAttachmentFileName(fileName, `attachment-${randomUUID()}`);
+  const bytes = decodeMimePartBody(body, headers["content-transfer-encoding"]);
+  return [
+    {
+      filename: safeName,
+      content_type: contentType.value || "application/octet-stream",
+      content_disposition: disposition.value || null,
+      transfer_encoding: headers["content-transfer-encoding"] || null,
+      byte_length: bytes.length,
+      bytes
+    }
+  ];
+}
+
+function fileExtension(fileName) {
+  const match = /\.([A-Za-z0-9]+)$/.exec(String(fileName || ""));
+  return match ? match[1].toLowerCase() : "";
+}
+
+function isAccountingInvoiceAttachment(attachment) {
+  const mimeType = String(attachment.content_type || "").split(";")[0].trim().toLowerCase();
+  const ext = fileExtension(attachment.filename);
+  return ACCOUNTING_ALLOWED_ATTACHMENT_MIME_TYPES.has(mimeType) || ACCOUNTING_ALLOWED_ATTACHMENT_EXTENSIONS.has(ext);
+}
+
+function inferAccountingMimeType(attachment) {
+  const explicit = String(attachment.content_type || "").split(";")[0].trim().toLowerCase();
+  if (ACCOUNTING_ALLOWED_ATTACHMENT_MIME_TYPES.has(explicit)) return explicit;
+  const ext = fileExtension(attachment.filename);
+  if (ext === "pdf") return "application/pdf";
+  if (["jpg", "jpeg"].includes(ext)) return "image/jpeg";
+  if (ext === "png") return "image/png";
+  if (["tif", "tiff"].includes(ext)) return "image/tiff";
+  if (ext === "webp") return "image/webp";
+  if (ext === "heic") return "image/heic";
+  if (ext === "heif") return "image/heif";
+  return explicit || "application/octet-stream";
+}
+
+function publicAccountingAttachment(attachment) {
+  return {
+    filename: attachment.filename,
+    content_type: attachment.content_type,
+    content_disposition: attachment.content_disposition,
+    transfer_encoding: attachment.transfer_encoding,
+    byte_length: attachment.byte_length,
+    allowed_invoice_attachment: isAccountingInvoiceAttachment(attachment),
+    sha256: createHash("sha256").update(attachment.bytes).digest("hex")
+  };
+}
+
+function parseRawEmail(raw, uid) {
+  const { headersText } = splitHeaderAndBody(raw);
+  const headers = parseMimeHeaders(headersText);
+  const messageId = headers["message-id"] || "";
+  return {
+    uid,
+    from: decodeMimeHeaderValue(headers.from || ""),
+    from_email: extractEmailAddress(headers.from || ""),
+    subject: decodeMimeHeaderValue(headers.subject || ""),
+    date: headers.date || "",
+    message_id: messageId,
+    message_id_hash: messageId ? createHash("sha256").update(messageId).digest("hex") : "",
+    attachments: parseMimeMessageParts(raw).filter(isAccountingInvoiceAttachment)
+  };
+}
+
+function extractImapLiteral(response) {
+  const match = /BODY(?:\.PEEK)?\[\](?:[^\{]*)\{(\d+)\}\r?\n/i.exec(response);
+  if (!match) return "";
+  const start = match.index + match[0].length;
+  const length = Number(match[1]);
+  return response.slice(start, start + length);
+}
+
+async function runImapFetchUnseenRaw(config, { limit, maxEmailBytes }) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("binary");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    await command("EXAMINE INBOX");
+    const searchResponse = await command("UID SEARCH UNSEEN");
+    const searchLine = searchResponse
+      .split(/\r?\n/)
+      .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
+    const uidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
+    const uids = uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
+    const selectedUids = uids.slice(0, limit);
+    const messages = [];
+
+    for (const uid of selectedUids) {
+      const fetchResponse = await command(`UID FETCH ${uid} (BODY.PEEK[])`);
+      const raw = extractImapLiteral(fetchResponse);
+      if (!raw) {
+        messages.push({ uid, parse_error: "no_body_literal" });
+        continue;
+      }
+      if (Buffer.byteLength(raw, "binary") > maxEmailBytes) {
+        messages.push({ uid, parse_error: "message_too_large" });
+        continue;
+      }
+      messages.push(parseRawEmail(raw, uid));
+    }
+
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return {
+      unseen_count: uids.length,
+      returned_count: messages.length,
+      messages
+    };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function fetchUnseenRawEmailWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapFetchUnseenRaw(config, options);
+      return {
+        ...result,
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP Attachment-Fetch fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
+}
+
+async function assertAllowedAccountingFolder(folderId) {
+  if (ACCOUNTING_ALLOWED_DRIVE_ROOT_IDS.has(folderId)) return;
+
+  let currentId = folderId;
+  for (let depth = 0; depth < 12; depth += 1) {
+    const folder = await getDriveFile(currentId, "id,name,mimeType,parents");
+    if (folder.mimeType !== "application/vnd.google-apps.folder") {
+      throw new Error(`Accounting target_folder_id ist kein Ordner: ${folderId}`);
+    }
+    const parents = folder.parents || [];
+    if (parents.some((parent) => ACCOUNTING_ALLOWED_DRIVE_ROOT_IDS.has(parent))) return;
+    if (!parents.length) break;
+    currentId = parents[0];
+  }
+
+  throw new Error(
+    `Accounting-Zielordner ${folderId} liegt nicht unter einem freigegebenen Rechnungsordner.`
+  );
+}
+
+function escapeGoogleDriveQueryString(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+async function findAccountingDriveDuplicate({ folderId, sha256, fileName }) {
+  const query =
+    `'${escapeGoogleDriveQueryString(folderId)}' in parents and trashed = false and ` +
+    `(name = '${escapeGoogleDriveQueryString(fileName)}' or appProperties has { key='vip_sha256' and value='${escapeGoogleDriveQueryString(sha256)}' })`;
+  const res = await googleRequest({
+    method: "GET",
+    url: "https://www.googleapis.com/drive/v3/files",
+    params: {
+      q: query,
+      fields: "files(id,name,mimeType,parents,webViewLink,md5Checksum,appProperties,createdTime,modifiedTime)",
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true
+    }
+  });
+  return res.data.files || [];
+}
+
+function compactDriveAppProperty(value, maxLength = 124) {
+  return String(value || "").slice(0, maxLength);
+}
+
+async function scanBufferWithClamd(buffer) {
+  const host = process.env.CLAMD_HOST || process.env.CLAMAV_HOST || "";
+  const port = Number(process.env.CLAMD_PORT || process.env.CLAMAV_PORT || 3310);
+  if (!host) {
+    return {
+      status: "not_configured",
+      clean: false,
+      scanner: "clamd",
+      detail: "CLAMD_HOST/CLAMAV_HOST ist nicht gesetzt."
+    };
+  }
+
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host, port });
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`ClamAV scan timeout (${host}:${port})`));
+    }, Number(process.env.CLAMD_TIMEOUT_MS || 30_000));
+    const chunks = [];
+
+    socket.once("connect", () => {
+      socket.write(Buffer.from("zINSTREAM\0", "binary"));
+      for (let offset = 0; offset < buffer.length; offset += 64 * 1024) {
+        const chunk = buffer.subarray(offset, Math.min(offset + 64 * 1024, buffer.length));
+        const size = Buffer.alloc(4);
+        size.writeUInt32BE(chunk.length, 0);
+        socket.write(size);
+        socket.write(chunk);
+      }
+      const end = Buffer.alloc(4);
+      socket.write(end);
+    });
+    socket.on("data", (chunk) => chunks.push(chunk));
+    socket.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    socket.once("end", () => {
+      clearTimeout(timeout);
+      const response = Buffer.concat(chunks).toString("utf8").replace(/\u0000/g, "").trim();
+      resolve({
+        status: /:\s*OK$/i.test(response) || /^stream:\s*OK$/i.test(response) ? "clean" : "not_clean",
+        clean: /:\s*OK$/i.test(response) || /^stream:\s*OK$/i.test(response),
+        scanner: "clamd",
+        response
+      });
+    });
+  });
 }
 
 function normalizeEmailHttpProvider(value) {
@@ -4834,6 +5397,279 @@ function createServer() {
         copied_file: uploaded,
         verified_file: verifiedFile,
         verification_status: verificationStatus
+      });
+    }
+  );
+
+  server.tool(
+    "accounting_mail_scan_upload_attachment",
+    "Accounting-Spezialpfad: liest ungelesene Mailanhaenge serverseitig, akzeptiert nur PDF/Bilder, prueft Absender-Allowlist, scannt per ClamAV INSTREAM und laedt saubere Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
+    {
+      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      target_folder_id: z.string(),
+      sender_allowlist: z.array(z.string()).optional().default([]),
+      include_moritz_allowlist: z.boolean().optional().default(true),
+      uid: z.string().optional(),
+      attachment_name_contains: z.string().optional(),
+      download_first_match: z.boolean().optional().default(false),
+      upload_all_matching: z.boolean().optional().default(false),
+      limit: z.number().int().min(1).max(25).optional().default(10),
+      max_email_bytes: z
+        .number()
+        .int()
+        .min(20 * 1024)
+        .max(ACCOUNTING_EMAIL_HARD_MAX_BYTES)
+        .optional()
+        .default(ACCOUNTING_EMAIL_HARD_MAX_BYTES),
+      max_attachment_bytes: z
+        .number()
+        .int()
+        .min(1024)
+        .max(ACCOUNTING_ATTACHMENT_HARD_MAX_BYTES)
+        .optional()
+        .default(ACCOUNTING_ATTACHMENT_HARD_MAX_BYTES),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      approved_by: z.string().optional(),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_SAFE_WRITE,
+    async ({
+      agent_id,
+      target_folder_id,
+      sender_allowlist,
+      include_moritz_allowlist,
+      uid,
+      attachment_name_contains,
+      download_first_match,
+      upload_all_matching,
+      limit,
+      max_email_bytes,
+      max_attachment_bytes,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      approved_by,
+      verify_after
+    }) => {
+      if (asana_task_gid) validateAsanaGid(asana_task_gid, "asana_task_gid");
+      await assertAllowedAccountingFolder(target_folder_id);
+      if (!dry_run) {
+        assertMoritzAsanaConfirmed({
+          confirmedByAsana: confirmed_by_asana,
+          asanaTaskGid: asana_task_gid,
+          approvedBy: approved_by,
+          actionName: "accounting_mail_scan_upload_attachment"
+        });
+      }
+
+      const allowlist = normalizeEmailAllowlist(sender_allowlist);
+      if (include_moritz_allowlist) {
+        for (const email of ACCOUNTING_MORITZ_EMAILS) allowlist.add(email);
+      }
+      if (!allowlist.size) {
+        throw new Error("sender_allowlist ist leer. Fuer Accounting-Mailanhaenge braucht es eine Moritz-Allowlist.");
+      }
+
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const mailResult = await fetchUnseenRawEmailWithFallback(configs, { limit, maxEmailBytes: max_email_bytes });
+      const processed = [];
+
+      for (const message of mailResult.messages) {
+        if (uid && message.uid !== uid) continue;
+        if (message.parse_error) {
+          processed.push({ uid: message.uid, status: "blocked", reason: message.parse_error });
+          continue;
+        }
+
+        const senderAllowed = allowlist.has(message.from_email);
+        const baseMessage = {
+          uid: message.uid,
+          from_email: message.from_email || null,
+          date: message.date || null,
+          message_id_hash: message.message_id_hash || null
+        };
+        if (!senderAllowed) {
+          processed.push({
+            ...baseMessage,
+            status: "skipped",
+            reason: "sender_not_allowlisted",
+            attachment_count: message.attachments.length
+          });
+          continue;
+        }
+
+        let candidates = message.attachments;
+        if (attachment_name_contains) {
+          const needle = attachment_name_contains.toLowerCase();
+          candidates = candidates.filter((attachment) => attachment.filename.toLowerCase().includes(needle));
+        }
+
+        if (!candidates.length) {
+          processed.push({
+            ...baseMessage,
+            status: "skipped",
+            reason: "no_matching_pdf_or_image_attachment",
+            attachment_count: message.attachments.length
+          });
+          continue;
+        }
+
+        let selected = candidates;
+        if (!upload_all_matching) {
+          if (candidates.length > 1 && !download_first_match) {
+            processed.push({
+              ...baseMessage,
+              status: "selection_required",
+              reason: "multiple_matching_attachments",
+              attachments: candidates.map(publicAccountingAttachment),
+              next_step:
+                "Mit attachment_name_contains weiter eingrenzen, download_first_match=true setzen oder upload_all_matching=true bewusst nutzen."
+            });
+            continue;
+          }
+          selected = [candidates[0]];
+        }
+
+        for (const attachment of selected) {
+          const sha256 = createHash("sha256").update(attachment.bytes).digest("hex");
+          const attachmentSummary = publicAccountingAttachment(attachment);
+          if (attachment.bytes.length > max_attachment_bytes) {
+            processed.push({
+              ...baseMessage,
+              status: "blocked",
+              reason: "attachment_too_large",
+              attachment: attachmentSummary,
+              max_attachment_bytes
+            });
+            continue;
+          }
+
+          let scan;
+          try {
+            scan = await scanBufferWithClamd(attachment.bytes);
+          } catch (error) {
+            scan = {
+              status: "error",
+              clean: false,
+              scanner: "clamd",
+              error: String(error?.message || error)
+            };
+          }
+
+          const duplicateFiles = await findAccountingDriveDuplicate({
+            folderId: target_folder_id,
+            sha256,
+            fileName: attachment.filename
+          });
+          const duplicateSummary = duplicateFiles.map((file) => ({
+            id: file.id,
+            name: file.name,
+            webViewLink: file.webViewLink,
+            matched_by_hash: file.appProperties?.vip_sha256 === sha256,
+            matched_by_name: file.name === attachment.filename
+          }));
+
+          if (dry_run) {
+            processed.push({
+              ...baseMessage,
+              status: scan.clean && duplicateFiles.length === 0 ? "ready_for_upload" : "blocked_or_duplicate",
+              dry_run: true,
+              target_folder_id,
+              attachment: attachmentSummary,
+              scan,
+              duplicates: duplicateSummary
+            });
+            continue;
+          }
+
+          if (!scan.clean) {
+            processed.push({
+              ...baseMessage,
+              status: "blocked",
+              reason: "virus_scan_not_clean",
+              attachment: attachmentSummary,
+              scan
+            });
+            continue;
+          }
+
+          if (duplicateFiles.length) {
+            processed.push({
+              ...baseMessage,
+              status: "skipped_duplicate",
+              attachment: attachmentSummary,
+              duplicates: duplicateSummary
+            });
+            continue;
+          }
+
+          const uploaded = await uploadBufferToDrive({
+            name: attachment.filename,
+            mimeType: inferAccountingMimeType(attachment),
+            targetFolderId: target_folder_id,
+            bytes: attachment.bytes,
+            assertFolder: assertAllowedAccountingFolder,
+            appProperties: {
+              vip_source: "accounting_mail",
+              vip_agent_id: agent_id,
+              vip_sha256: sha256,
+              vip_imap_uid: compactDriveAppProperty(message.uid),
+              vip_message_hash: compactDriveAppProperty(message.message_id_hash),
+              vip_sender_hash: compactDriveAppProperty(
+                message.from_email ? createHash("sha256").update(message.from_email).digest("hex") : ""
+              ),
+              vip_original_name: compactDriveAppProperty(attachment.filename)
+            }
+          });
+          const verifiedFile = verify_after
+            ? await getDriveFile(
+                uploaded.id,
+                "id,name,mimeType,parents,webViewLink,webContentLink,md5Checksum,appProperties,createdTime,modifiedTime"
+              )
+            : undefined;
+          const verificationStatus =
+            !verify_after || verifiedFile?.parents?.includes(target_folder_id)
+              ? "verified"
+              : "folder_readback_mismatch";
+
+          processed.push({
+            ...baseMessage,
+            status: "uploaded",
+            dry_run: false,
+            asana_task_gid,
+            approved_by,
+            target_folder_id,
+            attachment: attachmentSummary,
+            scan,
+            uploaded_file: uploaded,
+            verified_file: verifiedFile,
+            verification_status: verificationStatus
+          });
+        }
+      }
+
+      return out({
+        agent_id,
+        dry_run,
+        ...summary,
+        mode: "accounting_mail_scan_upload_attachment",
+        connection: {
+          host: mailResult.host,
+          port: mailResult.port,
+          secure: mailResult.secure,
+          label: mailResult.label
+        },
+        target_folder_id,
+        unseen_count: mailResult.unseen_count,
+        returned_count: mailResult.returned_count,
+        processed_count: processed.length,
+        processed,
+        imap_attempts: mailResult.attempts,
+        requires_for_live: dry_run
+          ? ["dry_run=false", "confirmed_by_asana=true", "asana_task_gid", "approved_by=Moritz Feichtmeyer", "CLAMD_HOST"]
+          : undefined
       });
     }
   );
