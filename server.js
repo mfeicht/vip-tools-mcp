@@ -57,6 +57,7 @@ const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/spreadsheets"
 ];
+const GOOGLE_DRIVE_OAUTH_PREFIXES = ["GOOGLE_ACCOUNTING_OAUTH", "GOOGLE_DRIVE_OAUTH", "GOOGLE_OAUTH"];
 const GOOGLE_SEO_OAUTH_PREFIXES = ["GOOGLE_SEO_OAUTH", "GOOGLE_ANALYTICS_SEARCH_OAUTH", "GOOGLE_OAUTH"];
 const GOOGLE_SEO_REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/analytics.readonly",
@@ -952,49 +953,17 @@ async function getGoogleAccessToken() {
     return googleTokenCache.accessToken;
   }
 
-  if (
-    process.env.GOOGLE_OAUTH_CLIENT_ID &&
-    process.env.GOOGLE_OAUTH_CLIENT_SECRET &&
-    process.env.GOOGLE_OAUTH_REFRESH_TOKEN
-  ) {
-    const params = new URLSearchParams({
-      client_id: process.env.GOOGLE_OAUTH_CLIENT_ID,
-      client_secret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
-      refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN,
-      grant_type: "refresh_token"
-    });
-
-    let res;
-    try {
-      res = await axios.post("https://oauth2.googleapis.com/token", params.toString(), {
-        headers: { "Content-Type": "application/x-www-form-urlencoded" }
-      });
-    } catch (error) {
-      const status = error?.response?.status;
-      const data = error?.response?.data;
-      let dataSnippet = "";
-      try {
-        if (data !== undefined) dataSnippet = JSON.stringify(data).slice(0, 2000);
-      } catch {
-        dataSnippet = String(data).slice(0, 2000);
-      }
-      throw new Error(
-        `Google OAuth token refresh failed for env GOOGLE_OAUTH_* (${status || "unknown"})` +
-          (dataSnippet ? ` | response=${dataSnippet}` : "")
-      );
-    }
-
-    googleTokenCache = {
-      accessToken: res.data.access_token,
-      expiresAt: now + Number(res.data.expires_in || 3600)
-    };
-    return googleTokenCache.accessToken;
+  const oauthConfig = getFirstOAuthConfig(GOOGLE_DRIVE_OAUTH_PREFIXES);
+  if (oauthConfig) {
+    return refreshGoogleOAuthAccessToken(oauthConfig, googleTokenCache);
   }
 
   const serviceAccount = parseGoogleServiceAccount();
   if (!serviceAccount) {
     throw new Error(
-      "Google-Zugang fehlt. Setze GOOGLE_SERVICE_ACCOUNT_JSON(_BASE64) oder GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET/GOOGLE_OAUTH_REFRESH_TOKEN."
+      `Google-Zugang fehlt. Setze GOOGLE_SERVICE_ACCOUNT_JSON(_BASE64) oder ${GOOGLE_DRIVE_OAUTH_PREFIXES.map(
+        (prefix) => `${prefix}_CLIENT_ID/${prefix}_CLIENT_SECRET/${prefix}_REFRESH_TOKEN`
+      ).join(" oder ")}.`
     );
   }
 
