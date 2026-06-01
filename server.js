@@ -5127,11 +5127,15 @@ function createServer() {
 
         const asana = getAsana(agent_id);
 
+        const hasBody = data && typeof data === "object" && Object.keys(data).length > 0;
+        const allowBody = method === "POST" || method === "PUT";
+
         const requestConfig = {
           method,
           url: path,
           params,
-          data: data ? { data } : undefined
+          // Asana kann GET/DELETE mit Body ablehnen; Body daher nur fuer POST/PUT und nur wenn nicht-leer.
+          data: allowBody && hasBody ? { data } : undefined
         };
         const res = method === "GET" ? await asanaRequestWithRetry(asana, requestConfig) : await asana.request(requestConfig);
 
