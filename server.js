@@ -246,6 +246,17 @@ const TOOL_DESTRUCTIVE_IDEMPOTENT_WRITE = Object.freeze({
   openWorldHint: false
 });
 
+const AGENT_LOCK_MIN_TTL_SECONDS = 60;
+const AGENT_LOCK_DEFAULT_TTL_SECONDS = Math.max(
+  AGENT_LOCK_MIN_TTL_SECONDS,
+  Number(process.env.AGENT_LOCK_DEFAULT_TTL_SECONDS) || 60 * 60
+);
+const AGENT_LOCK_MAX_TTL_SECONDS = Math.max(
+  AGENT_LOCK_DEFAULT_TTL_SECONDS,
+  Number(process.env.AGENT_LOCK_MAX_TTL_SECONDS) || 6 * 60 * 60
+);
+const AGENT_OPERATION_LOCKS = new Map();
+
 const AGENT_EMAIL_DEFAULTS = {
   "vip-ai-sales": "sales-agent@vip-studios.de",
   "vip-ai-operations": "operations-agent@vip-studios.de",
@@ -667,6 +678,61 @@ function getAsanaTaskDueGate(task, now = new Date()) {
 function isRoutineLikeAsanaTask(task) {
   const tagNames = (task?.tags || []).map((tag) => String(tag.name || "").toLowerCase());
   return tagNames.includes("routine") || /^r\s*:/i.test(String(task?.name || "").trim());
+}
+
+function clampAgentLockTtlSeconds(value) {
+  const parsed = Number(value || AGENT_LOCK_DEFAULT_TTL_SECONDS);
+  const fallback = Number.isFinite(parsed) ? parsed : AGENT_LOCK_DEFAULT_TTL_SECONDS;
+  return Math.min(
+    Math.max(Math.round(fallback), AGENT_LOCK_MIN_TTL_SECONDS),
+    Math.max(AGENT_LOCK_MIN_TTL_SECONDS, AGENT_LOCK_MAX_TTL_SECONDS)
+  );
+}
+
+function cleanupAgentOperationLocks(nowMs = Date.now()) {
+  for (const [key, lock] of AGENT_OPERATION_LOCKS.entries()) {
+    if (!lock?.expires_at_ms || lock.expires_at_ms <= nowMs) {
+      AGENT_OPERATION_LOCKS.delete(key);
+    }
+  }
+}
+
+function buildAgentOperationLockKey({ scope, agent_id, task_gid, resource_key }) {
+  if (scope === "task") {
+    if (!task_gid) throw new Error("task_gid ist fuer scope=task erforderlich.");
+    validateAsanaGid(task_gid, "task_gid");
+    return `task:${task_gid}`;
+  }
+  if (scope === "agent") {
+    return `agent:${agent_id}`;
+  }
+  if (scope === "resource") {
+    const key = String(resource_key || "").trim();
+    if (key.length < 3) {
+      throw new Error("resource_key ist fuer scope=resource erforderlich und muss mindestens 3 Zeichen haben.");
+    }
+    return `resource:${key}`;
+  }
+  throw new Error(`Unbekannter Lock-Scope: ${scope}`);
+}
+
+function serializeAgentOperationLock(lock, nowMs = Date.now()) {
+  if (!lock) return null;
+  return {
+    key: lock.key,
+    scope: lock.scope,
+    agent_id: lock.agent_id,
+    task_gid: lock.task_gid || null,
+    resource_key: lock.resource_key || null,
+    run_id: lock.run_id,
+    holder: lock.holder,
+    purpose: lock.purpose,
+    lock_token: lock.lock_token,
+    acquired_at: new Date(lock.acquired_at_ms).toISOString(),
+    renewed_at: new Date(lock.renewed_at_ms).toISOString(),
+    expires_at: new Date(lock.expires_at_ms).toISOString(),
+    seconds_remaining: Math.max(0, Math.ceil((lock.expires_at_ms - nowMs) / 1000))
+  };
 }
 
 function normalizeAsanaLabel(value) {
@@ -4147,6 +4213,154 @@ function createServer() {
           token_configured: Boolean(process.env[env_name])
         }))
       );
+    }
+  );
+
+  server.tool(
+    "agent_lock_acquire",
+    "Setzt einen temporaeren Arbeits-Lock fuer eine Asana-Aufgabe, einen Agentenlauf oder eine Ressource, damit parallele Automationen nicht dieselbe Arbeit gleichzeitig ausfuehren. Vor tiefer Bearbeitung oder Schreibaktionen nutzen.",
+    {
+      agent_id: agentIdSchema,
+      scope: z.enum(["task", "agent", "resource"]).optional().default("task"),
+      task_gid: z.string().optional(),
+      resource_key: z.string().optional(),
+      run_id: z.string().min(3).max(160).optional(),
+      lock_token: z.string().min(8).max(120).optional(),
+      holder: z.string().max(160).optional(),
+      purpose: z.string().max(500).optional(),
+      ttl_seconds: z.number().int().min(AGENT_LOCK_MIN_TTL_SECONDS).max(AGENT_LOCK_MAX_TTL_SECONDS).optional(),
+      dry_run: z.boolean().optional().default(false)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({ agent_id, scope, task_gid, resource_key, run_id, lock_token, holder, purpose, ttl_seconds, dry_run }) => {
+      const nowMs = Date.now();
+      cleanupAgentOperationLocks(nowMs);
+      const key = buildAgentOperationLockKey({ scope, agent_id, task_gid, resource_key });
+      const ttl = clampAgentLockTtlSeconds(ttl_seconds);
+      const existing = AGENT_OPERATION_LOCKS.get(key);
+      const sameHolder =
+        existing &&
+        ((run_id && existing.run_id === run_id) || (lock_token && existing.lock_token === lock_token));
+
+      if (existing && !sameHolder) {
+        return out({
+          agent_id,
+          acquired: false,
+          reason: "lock_already_held",
+          requested: { key, scope, task_gid: task_gid || null, resource_key: resource_key || null, run_id: run_id || null },
+          active_lock: serializeAgentOperationLock(existing, nowMs),
+          retry_after_seconds: Math.max(1, Math.ceil((existing.expires_at_ms - nowMs) / 1000))
+        });
+      }
+
+      const nextRunId = run_id || existing?.run_id || `run-${randomUUID()}`;
+      const nextToken = existing?.lock_token || lock_token || randomUUID();
+      const nextLock = {
+        key,
+        scope,
+        agent_id,
+        task_gid: task_gid || null,
+        resource_key: resource_key || null,
+        run_id: nextRunId,
+        lock_token: nextToken,
+        holder: holder || agent_id,
+        purpose: purpose || "",
+        acquired_at_ms: existing?.acquired_at_ms || nowMs,
+        renewed_at_ms: nowMs,
+        expires_at_ms: nowMs + ttl * 1000
+      };
+
+      if (!dry_run) {
+        AGENT_OPERATION_LOCKS.set(key, nextLock);
+      }
+
+      return out({
+        agent_id,
+        acquired: true,
+        dry_run,
+        renewed: Boolean(existing),
+        lock: serializeAgentOperationLock(nextLock, nowMs),
+        note:
+          "Lock ist temporaer und schuetzt vor paralleler Bearbeitung derselben Aufgabe/Ressource. Nach Abschluss agent_lock_release nutzen; bei Crash laeuft der Lock per TTL ab."
+      });
+    }
+  );
+
+  server.tool(
+    "agent_lock_release",
+    "Gibt einen zuvor per agent_lock_acquire gesetzten temporaeren Arbeits-Lock frei. Nur derselbe run_id oder lock_token darf freigeben.",
+    {
+      agent_id: agentIdSchema,
+      scope: z.enum(["task", "agent", "resource"]).optional().default("task"),
+      task_gid: z.string().optional(),
+      resource_key: z.string().optional(),
+      run_id: z.string().min(3).max(160).optional(),
+      lock_token: z.string().min(8).max(120).optional(),
+      dry_run: z.boolean().optional().default(false)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({ agent_id, scope, task_gid, resource_key, run_id, lock_token, dry_run }) => {
+      if (!run_id && !lock_token) {
+        throw new Error("agent_lock_release braucht run_id oder lock_token, damit kein fremder Lock geloescht wird.");
+      }
+      const nowMs = Date.now();
+      cleanupAgentOperationLocks(nowMs);
+      const key = buildAgentOperationLockKey({ scope, agent_id, task_gid, resource_key });
+      const existing = AGENT_OPERATION_LOCKS.get(key);
+
+      if (!existing) {
+        return out({ agent_id, released: false, reason: "no_active_lock", key, dry_run });
+      }
+
+      const sameHolder =
+        (run_id && existing.run_id === run_id) || (lock_token && existing.lock_token === lock_token);
+      if (!sameHolder) {
+        return out({
+          agent_id,
+          released: false,
+          reason: "lock_held_by_other_run",
+          key,
+          active_lock: serializeAgentOperationLock(existing, nowMs),
+          dry_run
+        });
+      }
+
+      if (!dry_run) {
+        AGENT_OPERATION_LOCKS.delete(key);
+      }
+
+      return out({
+        agent_id,
+        released: true,
+        dry_run,
+        released_lock: serializeAgentOperationLock(existing, nowMs)
+      });
+    }
+  );
+
+  server.tool(
+    "agent_lock_status",
+    "Liest temporaere Arbeits-Locks read-only. Nutze es zur Diagnose, wenn ein Task oder Run bereits von einer anderen Automation bearbeitet wird.",
+    {
+      agent_id: agentIdSchema,
+      scope: z.enum(["task", "agent", "resource"]).optional(),
+      task_gid: z.string().optional(),
+      resource_key: z.string().optional(),
+      include_all: z.boolean().optional().default(false)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id, scope, task_gid, resource_key, include_all }) => {
+      const nowMs = Date.now();
+      cleanupAgentOperationLocks(nowMs);
+      let key;
+      if (scope) {
+        key = buildAgentOperationLockKey({ scope, agent_id, task_gid, resource_key });
+      }
+      const locks = [...AGENT_OPERATION_LOCKS.values()]
+        .filter((lock) => (key ? lock.key === key : include_all || lock.agent_id === agent_id))
+        .map((lock) => serializeAgentOperationLock(lock, nowMs));
+
+      return out({ agent_id, key: key || null, active_locks: locks });
     }
   );
 
