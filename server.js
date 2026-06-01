@@ -600,12 +600,73 @@ function getBerlinDateParts(date = new Date()) {
   };
 }
 
+function getBerlinDateString(date = new Date()) {
+  const { year, month, day } = getBerlinDateParts(date);
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
 function dueOnInBerlinDaysFromNow(days) {
   const offsetDays = Math.max(0, Number(days || 0));
   const { year, month, day } = getBerlinDateParts();
   const base = new Date(Date.UTC(year, month - 1, day));
   base.setUTCDate(base.getUTCDate() + offsetDays);
   return base.toISOString().slice(0, 10);
+}
+
+function getAsanaTaskDueGate(task, now = new Date()) {
+  if (task?.due_at) {
+    const dueAt = new Date(task.due_at);
+    if (Number.isFinite(dueAt.getTime()) && now.getTime() < dueAt.getTime()) {
+      return {
+        blocked: true,
+        mode: "due_at",
+        reason: "task_due_at_is_in_future",
+        due_at: task.due_at,
+        now_iso: now.toISOString(),
+        now_berlin_date: getBerlinDateString(now)
+      };
+    }
+    return {
+      blocked: false,
+      mode: "due_at",
+      due_at: task.due_at,
+      now_iso: now.toISOString(),
+      now_berlin_date: getBerlinDateString(now)
+    };
+  }
+
+  if (task?.due_on) {
+    const todayBerlin = getBerlinDateString(now);
+    if (todayBerlin < task.due_on) {
+      return {
+        blocked: true,
+        mode: "due_on",
+        reason: "task_due_on_is_in_future",
+        due_on: task.due_on,
+        today_berlin: todayBerlin,
+        now_iso: now.toISOString()
+      };
+    }
+    return {
+      blocked: false,
+      mode: "due_on",
+      due_on: task.due_on,
+      today_berlin: todayBerlin,
+      now_iso: now.toISOString()
+    };
+  }
+
+  return {
+    blocked: false,
+    mode: "none",
+    now_iso: now.toISOString(),
+    now_berlin_date: getBerlinDateString(now)
+  };
+}
+
+function isRoutineLikeAsanaTask(task) {
+  const tagNames = (task?.tags || []).map((tag) => String(tag.name || "").toLowerCase());
+  return tagNames.includes("routine") || /^r\s*:/i.test(String(task?.name || "").trim());
 }
 
 function normalizeAsanaLabel(value) {
@@ -4540,7 +4601,7 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar und Readback.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar, Routine-Due-Gate und Readback.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -4574,10 +4635,13 @@ function createServer() {
 
       const taskRes = await asana.get(`/tasks/${task_gid}`, {
         params: {
-          opt_fields: "gid,name,completed,completed_at,assignee.gid,assignee.name,tags.name,permalink_url"
+          opt_fields:
+            "gid,name,completed,completed_at,assignee.gid,assignee.name,due_on,due_at,tags.name,permalink_url"
         }
       });
       const task = taskRes.data.data;
+      const routine_like_task = isRoutineLikeAsanaTask(task);
+      const due_gate = getAsanaTaskDueGate(task);
 
       if (!task.assignee?.gid) {
         throw new Error("Asana-Aufgabe hat keinen Assignee; automatischer Abschluss ist nicht erlaubt.");
@@ -4603,6 +4667,13 @@ function createServer() {
         assertAsanaStoryReadbackLooksSafe(final_comment);
       }
 
+      const blockedByFutureRoutineDue = routine_like_task && due_gate.blocked;
+      if (blockedByFutureRoutineDue && !dry_run) {
+        throw new Error(
+          `Routine-Aufgabe darf nicht vor Faelligkeit abgeschlossen werden (${due_gate.reason}; due_on=${task.due_on || "-"}; due_at=${task.due_at || "-"}).`
+        );
+      }
+
       const basis_sha256 = createHash("sha256").update(completion_basis, "utf8").digest("hex");
 
       if (dry_run || task.completed) {
@@ -4610,7 +4681,9 @@ function createServer() {
           agent_id,
           dry_run,
           already_completed: Boolean(task.completed),
-          allowed_to_complete: !task.completed,
+          allowed_to_complete: !task.completed && !blockedByFutureRoutineDue,
+          routine_like_task,
+          due_gate,
           task,
           final_comment,
           completion_basis,
@@ -4652,6 +4725,8 @@ function createServer() {
         verified_task,
         verification_status,
         final_comment,
+        routine_like_task,
+        due_gate,
         completion_basis,
         completion_basis_sha256: basis_sha256
       });
