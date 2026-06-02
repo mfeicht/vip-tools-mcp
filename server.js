@@ -2440,7 +2440,7 @@ function extractImapLiteral(response) {
   return response.slice(start, start + length);
 }
 
-async function runImapFetchUnseenRaw(config, { limit, maxEmailBytes }) {
+async function runImapFetchUnseenRaw(config, { limit, maxEmailBytes, mailSearchMode = "unseen" }) {
   const socket = await openImapSocket(config);
   socket.setEncoding("binary");
   const state = { buffer: "" };
@@ -2489,13 +2489,14 @@ async function runImapFetchUnseenRaw(config, { limit, maxEmailBytes }) {
   try {
     await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
     await command("EXAMINE INBOX");
-    const searchResponse = await command("UID SEARCH UNSEEN");
+    const searchCriterion = mailSearchMode === "inbox_all" ? "ALL" : "UNSEEN";
+    const searchResponse = await command(`UID SEARCH ${searchCriterion}`);
     const searchLine = searchResponse
       .split(/\r?\n/)
       .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
     const uidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
     const uids = uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
-    const selectedUids = uids.slice(0, limit);
+    const selectedUids = mailSearchMode === "inbox_all" ? uids.slice(-limit).reverse() : uids.slice(0, limit);
     const messages = [];
 
     for (const uid of selectedUids) {
@@ -2515,7 +2516,10 @@ async function runImapFetchUnseenRaw(config, { limit, maxEmailBytes }) {
     await command("LOGOUT").catch(() => {});
     if (!socket.destroyed) socket.destroy();
     return {
-      unseen_count: uids.length,
+      mail_search_mode: mailSearchMode,
+      search_criterion: searchCriterion,
+      matching_count: uids.length,
+      unseen_count: mailSearchMode === "unseen" ? uids.length : null,
       returned_count: messages.length,
       messages
     };
@@ -6573,7 +6577,7 @@ function createServer() {
 
   server.tool(
     "accounting_mail_scan_upload_attachment",
-    "Accounting-Spezialpfad: liest ungelesene Mailanhaenge serverseitig, akzeptiert nur echte Rechnungs-PDFs/Bilder, prueft optional eine Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
+    "Accounting-Spezialpfad: liest neue oder noch im Postfach liegende Mailanhaenge serverseitig, akzeptiert nur echte Rechnungs-PDFs/Bilder, prueft optional eine Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
     {
       agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
       target_folder_id: z.string(),
@@ -6581,6 +6585,7 @@ function createServer() {
       include_moritz_allowlist: z.boolean().optional().default(true),
       enforce_sender_allowlist: z.boolean().optional().default(true),
       invoice_only: z.boolean().optional().default(true),
+      mail_search_mode: z.enum(["unseen", "inbox_all"]).optional().default("unseen"),
       uid: z.string().optional(),
       attachment_name_contains: z.string().optional(),
       download_first_match: z.boolean().optional().default(false),
@@ -6614,6 +6619,7 @@ function createServer() {
       include_moritz_allowlist,
       enforce_sender_allowlist,
       invoice_only,
+      mail_search_mode,
       uid,
       attachment_name_contains,
       download_first_match,
@@ -6648,7 +6654,11 @@ function createServer() {
       }
 
       const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
-      const mailResult = await fetchUnseenRawEmailWithFallback(configs, { limit, maxEmailBytes: max_email_bytes });
+      const mailResult = await fetchUnseenRawEmailWithFallback(configs, {
+        limit,
+        maxEmailBytes: max_email_bytes,
+        mailSearchMode: mail_search_mode
+      });
       const processed = [];
 
       for (const message of mailResult.messages) {
@@ -6884,6 +6894,8 @@ function createServer() {
         target_folder_id,
         sender_allowlist_enforced: enforce_sender_allowlist,
         invoice_only,
+        mail_search_mode,
+        matching_count: mailResult.matching_count,
         unseen_count: mailResult.unseen_count,
         returned_count: mailResult.returned_count,
         processed_count: processed.length,
