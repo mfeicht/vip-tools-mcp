@@ -194,6 +194,7 @@ const ACCOUNTING_ALLOWED_ATTACHMENT_MIME_TYPES = new Set([
   "image/heic",
   "image/heif"
 ]);
+const ACCOUNTING_INLINE_INVOICE_PDF_MIME_TYPE = "application/pdf";
 const ACCOUNTING_MORITZ_EMAILS = new Set(
   [
     "moritz.feichtmeyer@vip-studios.de",
@@ -214,6 +215,8 @@ const ACCOUNTING_ARCHIVE_MAILBOX_CANDIDATES = [
 ];
 const ASANA_TASK_SCHEDULE_OPT_FIELDS =
   "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url";
+const ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS =
+  "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,start_on,start_at,permalink_url,tags.gid,tags.name,workspace.gid,memberships.project.gid,memberships.project.name,modified_at";
 const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
 const ASANA_TASK_TAG_WORKSPACE_OPT_FIELDS =
   "gid,name,completed,tags.gid,tags.name,workspace.gid,permalink_url";
@@ -602,6 +605,12 @@ function validateAsanaDateTime(value, label) {
   }
 }
 
+function validateAsanaLocalTime(value, label) {
+  if (value != null && !/^\d{2}:\d{2}(?::\d{2})?$/.test(String(value))) {
+    throw new Error(`${label} muss im Format HH:mm oder HH:mm:ss sein.`);
+  }
+}
+
 function getBerlinDateParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Europe/Berlin",
@@ -620,6 +629,37 @@ function getBerlinDateParts(date = new Date()) {
 function getBerlinDateString(date = new Date()) {
   const { year, month, day } = getBerlinDateParts(date);
   return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function getTimeZoneOffsetMinutes(timeZone, date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    timeZoneName: "shortOffset",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+  const timeZoneName = parts.find((part) => part.type === "timeZoneName")?.value || "GMT";
+  if (timeZoneName === "GMT" || timeZoneName === "UTC") return 0;
+  const match = /^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(timeZoneName);
+  if (!match) {
+    throw new Error(`Zeitzonenoffset fuer ${timeZone} konnte nicht gelesen werden (${timeZoneName}).`);
+  }
+  const sign = match[1] === "-" ? -1 : 1;
+  return sign * (Number(match[2]) * 60 + Number(match[3] || 0));
+}
+
+function berlinLocalDateTimeToUtcIso(dateString, timeString) {
+  validateAsanaDate(dateString, "expected_due_date_berlin");
+  validateAsanaLocalTime(timeString, "expected_due_time_berlin");
+  const [year, month, day] = dateString.split("-").map(Number);
+  const [hour, minute, second = 0] = String(timeString).split(":").map(Number);
+  let utcMs = Date.UTC(year, month - 1, day, hour, minute, second, 0);
+  for (let index = 0; index < 3; index += 1) {
+    const offsetMinutes = getTimeZoneOffsetMinutes("Europe/Berlin", new Date(utcMs));
+    utcMs = Date.UTC(year, month - 1, day, hour, minute, second, 0) - offsetMinutes * 60 * 1000;
+  }
+  return new Date(utcMs).toISOString();
 }
 
 function dueOnInBerlinDaysFromNow(days) {
@@ -684,6 +724,153 @@ function getAsanaTaskDueGate(task, now = new Date()) {
 function isRoutineLikeAsanaTask(task) {
   const tagNames = (task?.tags || []).map((tag) => String(tag.name || "").toLowerCase());
   return tagNames.includes("routine") || /^r\s*:/i.test(String(task?.name || "").trim());
+}
+
+function getAsanaTaskTagNames(task) {
+  return (task?.tags || []).map((tag) => String(tag.name || ""));
+}
+
+function getAsanaTaskProjectGids(task) {
+  return uniqueValues(
+    (task?.memberships || [])
+      .map((membership) => membership?.project?.gid)
+      .filter(Boolean)
+  );
+}
+
+function buildAsanaScheduleVerification({
+  task,
+  expected_due_on,
+  expected_due_at,
+  expected_due_date_berlin,
+  expected_due_time_berlin,
+  expect_due_time,
+  expect_routine_tag,
+  expected_assignee_gid,
+  expected_project_gid,
+  expected_name_contains,
+  expected_completed,
+  recurrence_expected,
+  allow_unverifiable_native_recurrence
+}) {
+  validateAsanaDate(expected_due_on, "expected_due_on");
+  validateAsanaDateTime(expected_due_at, "expected_due_at");
+  validateAsanaDate(expected_due_date_berlin, "expected_due_date_berlin");
+  validateAsanaLocalTime(expected_due_time_berlin, "expected_due_time_berlin");
+  validateAsanaGid(expected_assignee_gid, "expected_assignee_gid");
+  validateAsanaGid(expected_project_gid, "expected_project_gid");
+
+  const hasBerlinLocalExpectation = Boolean(expected_due_date_berlin || expected_due_time_berlin);
+  if (hasBerlinLocalExpectation && !(expected_due_date_berlin && expected_due_time_berlin)) {
+    throw new Error("expected_due_date_berlin und expected_due_time_berlin muessen gemeinsam gesetzt werden.");
+  }
+  if (expected_due_at && hasBerlinLocalExpectation) {
+    throw new Error("expected_due_at nicht zusammen mit expected_due_date_berlin/expected_due_time_berlin setzen.");
+  }
+  if (expected_due_on && (expected_due_at || hasBerlinLocalExpectation)) {
+    throw new Error("expected_due_on nicht zusammen mit erwarteter Uhrzeit setzen.");
+  }
+
+  const resolvedExpectedDueAt = expected_due_at || (hasBerlinLocalExpectation
+    ? berlinLocalDateTimeToUtcIso(expected_due_date_berlin, expected_due_time_berlin)
+    : undefined);
+  const checks = [];
+  const addCheck = ({ name, ok, expected, actual, severity = "error", note }) => {
+    checks.push({ name, ok: Boolean(ok), expected, actual, severity, note });
+  };
+
+  if (expected_due_on) {
+    addCheck({
+      name: "due_on_exact",
+      ok: task?.due_on === expected_due_on && !task?.due_at,
+      expected: expected_due_on,
+      actual: { due_on: task?.due_on || null, due_at: task?.due_at || null },
+      note: "due_on ist ganztags; wenn eine Uhrzeit vorgesehen ist, expected_due_at oder Berlin-Date/Time nutzen."
+    });
+  }
+  if (resolvedExpectedDueAt) {
+    addCheck({
+      name: "due_at_exact",
+      ok: task?.due_at === resolvedExpectedDueAt,
+      expected: resolvedExpectedDueAt,
+      actual: task?.due_at || null,
+      note: hasBerlinLocalExpectation
+        ? `Berechnet aus Europe/Berlin ${expected_due_date_berlin} ${expected_due_time_berlin}.`
+        : undefined
+    });
+  }
+  if (expect_due_time) {
+    addCheck({
+      name: "due_time_present",
+      ok: Boolean(task?.due_at),
+      expected: "due_at gesetzt",
+      actual: task?.due_at || null
+    });
+  }
+  if (expect_routine_tag) {
+    const tagNames = getAsanaTaskTagNames(task);
+    addCheck({
+      name: "routine_tag_present",
+      ok: tagNames.some((name) => name.toLowerCase() === "routine"),
+      expected: "Routine",
+      actual: tagNames
+    });
+  }
+  if (expected_assignee_gid) {
+    addCheck({
+      name: "assignee_exact",
+      ok: task?.assignee?.gid === expected_assignee_gid,
+      expected: expected_assignee_gid,
+      actual: task?.assignee?.gid || null
+    });
+  }
+  if (expected_project_gid) {
+    const projectGids = getAsanaTaskProjectGids(task);
+    addCheck({
+      name: "project_present",
+      ok: projectGids.includes(expected_project_gid),
+      expected: expected_project_gid,
+      actual: projectGids
+    });
+  }
+  if (expected_name_contains) {
+    addCheck({
+      name: "name_contains",
+      ok: String(task?.name || "").toLowerCase().includes(String(expected_name_contains).toLowerCase()),
+      expected: expected_name_contains,
+      actual: task?.name || null
+    });
+  }
+  if (expected_completed !== undefined) {
+    addCheck({
+      name: "completed_exact",
+      ok: Boolean(task?.completed) === Boolean(expected_completed),
+      expected: Boolean(expected_completed),
+      actual: Boolean(task?.completed)
+    });
+  }
+  if (recurrence_expected) {
+    addCheck({
+      name: "native_recurrence_api_verification",
+      ok: false,
+      expected: "API-verifizierbare native Asana-Wiederholung",
+      actual: "not_api_verifiable",
+      severity: allow_unverifiable_native_recurrence ? "warning" : "error",
+      note:
+        "Native Asana-Wiederholung ist API-seitig nicht zuverlaessig auslesbar. Nicht als 100%-verifiziert behaupten; UI-Abnahme oder asana_verify_next_routine_instance nach Abschluss nutzen."
+    });
+  }
+
+  const errors = checks.filter((check) => !check.ok && check.severity !== "warning");
+  const warnings = checks.filter((check) => !check.ok && check.severity === "warning");
+  const verification_status = errors.length ? "failed" : warnings.length ? "ok_with_warnings" : "ok";
+  return {
+    verification_status,
+    resolved_expected_due_at: resolvedExpectedDueAt || null,
+    checks,
+    errors,
+    warnings
+  };
 }
 
 function clampAgentLockTtlSeconds(value) {
@@ -2328,6 +2515,51 @@ function decodeMimePartBody(body, transferEncoding) {
   return Buffer.from(String(body || ""), "binary");
 }
 
+function decodeWindows1252Buffer(bytes) {
+  const replacements = {
+    0x80: 0x20ac,
+    0x82: 0x201a,
+    0x83: 0x0192,
+    0x84: 0x201e,
+    0x85: 0x2026,
+    0x86: 0x2020,
+    0x87: 0x2021,
+    0x88: 0x02c6,
+    0x89: 0x2030,
+    0x8a: 0x0160,
+    0x8b: 0x2039,
+    0x8c: 0x0152,
+    0x8e: 0x017d,
+    0x91: 0x2018,
+    0x92: 0x2019,
+    0x93: 0x201c,
+    0x94: 0x201d,
+    0x95: 0x2022,
+    0x96: 0x2013,
+    0x97: 0x2014,
+    0x98: 0x02dc,
+    0x99: 0x2122,
+    0x9a: 0x0161,
+    0x9b: 0x203a,
+    0x9c: 0x0153,
+    0x9e: 0x017e,
+    0x9f: 0x0178
+  };
+  return Array.from(bytes, (byte) => String.fromCodePoint(replacements[byte] || byte)).join("");
+}
+
+function decodeMimeTextBody(body, transferEncoding, charset) {
+  const bytes = decodeMimePartBody(body, transferEncoding);
+  const normalizedCharset = String(charset || "utf-8").trim().toLowerCase();
+  if (["windows-1252", "cp1252"].includes(normalizedCharset)) {
+    return decodeWindows1252Buffer(bytes);
+  }
+  if (["iso-8859-1", "latin1", "latin-1"].includes(normalizedCharset)) {
+    return bytes.toString("latin1");
+  }
+  return bytes.toString("utf8");
+}
+
 function parseMimeMessageParts(raw, depth = 0) {
   if (depth > 20) return [];
   const { headersText, body } = splitHeaderAndBody(raw);
@@ -2367,6 +2599,31 @@ function parseMimeMessageParts(raw, depth = 0) {
   ];
 }
 
+function parseMimeMessageTextParts(raw, depth = 0) {
+  if (depth > 20) return [];
+  const { headersText, body } = splitHeaderAndBody(raw);
+  const headers = parseMimeHeaders(headersText);
+  const contentType = parseHeaderParams(headers["content-type"] || "text/plain");
+  const disposition = parseHeaderParams(headers["content-disposition"] || "");
+
+  if (contentType.value.startsWith("multipart/") && contentType.params.boundary) {
+    return splitMultipartBody(body, contentType.params.boundary).flatMap((part) =>
+      parseMimeMessageTextParts(part, depth + 1)
+    );
+  }
+
+  const type = contentType.value.toLowerCase();
+  if (!["text/plain", "text/html"].includes(type)) return [];
+  if (disposition.value === "attachment") return [];
+  return [
+    {
+      content_type: type,
+      charset: contentType.params.charset || null,
+      text: decodeMimeTextBody(body, headers["content-transfer-encoding"], contentType.params.charset)
+    }
+  ];
+}
+
 function fileExtension(fileName) {
   const match = /\.([A-Za-z0-9]+)$/.exec(String(fileName || ""));
   return match ? match[1].toLowerCase() : "";
@@ -2400,7 +2657,10 @@ function publicAccountingAttachment(attachment) {
     transfer_encoding: attachment.transfer_encoding,
     byte_length: attachment.byte_length,
     allowed_invoice_attachment: isAccountingInvoiceAttachment(attachment),
-    sha256: createHash("sha256").update(attachment.bytes).digest("hex")
+    sha256: createHash("sha256").update(attachment.bytes).digest("hex"),
+    generated_from_inline_invoice: Boolean(attachment.generated_from_inline_invoice),
+    inline_invoice_vendor: attachment.inline_invoice_vendor || undefined,
+    inline_invoice_source: attachment.inline_invoice_source || undefined
   };
 }
 
@@ -2444,9 +2704,257 @@ function classifyAccountingTextAsInvoice(text) {
   };
 }
 
+function decodeAccountingHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&euro;/gi, "€")
+    .replace(/&auml;/gi, "ä")
+    .replace(/&ouml;/gi, "ö")
+    .replace(/&uuml;/gi, "ü")
+    .replace(/&Auml;/g, "Ä")
+    .replace(/&Ouml;/g, "Ö")
+    .replace(/&Uuml;/g, "Ü")
+    .replace(/&szlig;/gi, "ß")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_full, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_full, code) => String.fromCodePoint(Number.parseInt(code, 10)));
+}
+
+function htmlToAccountingText(html) {
+  return decodeAccountingHtmlEntities(
+    String(html || "")
+      .replace(/<\s*(script|style)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, " ")
+      .replace(/<\s*br\s*\/?>/gi, "\n")
+      .replace(/<\s*\/\s*(p|div|tr|table|section|article|h[1-6]|li)\s*>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+  )
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function plainTextFromAccountingTextParts(textParts) {
+  const htmlText = textParts
+    .filter((part) => part.content_type === "text/html")
+    .map((part) => htmlToAccountingText(part.text))
+    .filter(Boolean);
+  const plainText = textParts
+    .filter((part) => part.content_type === "text/plain")
+    .map((part) => part.text)
+    .filter(Boolean);
+  return [...htmlText, ...plainText].join("\n\n").trim();
+}
+
+function normalizePdfAsciiText(value) {
+  return String(value || "")
+    .replace(/€/g, " EUR")
+    .replace(/–|—/g, "-")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/ä/g, "ae")
+    .replace(/ö/g, "oe")
+    .replace(/ü/g, "ue")
+    .replace(/Ä/g, "Ae")
+    .replace(/Ö/g, "Oe")
+    .replace(/Ü/g, "Ue")
+    .replace(/ß/g, "ss")
+    .replace(/[^\x09\x0a\x0d\x20-\x7e]/g, " ");
+}
+
+function escapePdfLiteralString(value) {
+  return normalizePdfAsciiText(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)");
+}
+
+function wrapAccountingPdfLine(line, maxChars = 96) {
+  const words = normalizePdfAsciiText(line).split(/\s+/).filter(Boolean);
+  if (!words.length) return [""];
+  const lines = [];
+  let current = "";
+  for (const word of words) {
+    if (!current) {
+      current = word;
+      continue;
+    }
+    if ((current.length + 1 + word.length) <= maxChars) {
+      current += ` ${word}`;
+    } else {
+      lines.push(current);
+      current = word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+function createSimpleAccountingPdfBuffer({ title, lines }) {
+  const pageWidth = 595;
+  const pageHeight = 842;
+  const marginLeft = 46;
+  const firstY = 800;
+  const lineHeight = 14;
+  const maxLinesPerPage = 54;
+  const normalizedLines = [
+    title || "Inline-Rechnung",
+    "",
+    ...String(lines || "")
+      .split(/\r?\n/)
+      .flatMap((line) => wrapAccountingPdfLine(line))
+  ];
+  const pages = [];
+  for (let index = 0; index < normalizedLines.length; index += maxLinesPerPage) {
+    pages.push(normalizedLines.slice(index, index + maxLinesPerPage));
+  }
+  if (!pages.length) pages.push(["Inline-Rechnung"]);
+
+  const objects = [];
+  const addObject = (content) => {
+    objects.push(content);
+    return objects.length;
+  };
+
+  const catalogId = addObject("<< /Type /Catalog /Pages 2 0 R >>");
+  const pagesId = addObject("");
+  const fontId = addObject("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>");
+  const pageIds = [];
+
+  for (const pageLines of pages) {
+    const textCommands = pageLines
+      .map((line, index) => {
+        const y = firstY - index * lineHeight;
+        return `BT /F1 10 Tf ${marginLeft} ${y} Td (${escapePdfLiteralString(line)}) Tj ET`;
+      })
+      .join("\n");
+    const stream = `${textCommands}\n`;
+    const contentId = addObject(`<< /Length ${Buffer.byteLength(stream, "binary")} >>\nstream\n${stream}endstream`);
+    const pageId = addObject(
+      `<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /Font << /F1 ${fontId} 0 R >> >> /Contents ${contentId} 0 R >>`
+    );
+    pageIds.push(pageId);
+  }
+
+  objects[pagesId - 1] = `<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] /Count ${pageIds.length} >>`;
+  objects[catalogId - 1] = `<< /Type /Catalog /Pages ${pagesId} 0 R >>`;
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (let index = 0; index < objects.length; index += 1) {
+    offsets.push(Buffer.byteLength(pdf, "binary"));
+    pdf += `${index + 1} 0 obj\n${objects[index]}\nendobj\n`;
+  }
+  const xrefOffset = Buffer.byteLength(pdf, "binary");
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let index = 1; index < offsets.length; index += 1) {
+    pdf += `${String(offsets[index]).padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root ${catalogId} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return Buffer.from(pdf, "binary");
+}
+
+function compactInlineInvoiceText(text, maxLines = 90) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const startCandidates = [
+    lines.findIndex((line) => /^rechnung$/i.test(line)),
+    lines.findIndex((line) => /\bApple\b/i.test(line) && /\b(no_reply|no-reply|email\.apple\.com)\b/i.test(line)),
+    lines.findIndex((line) => /\bDokument\s*:/i.test(line))
+  ].filter((index) => index >= 0);
+  const start = startCandidates.length ? Math.max(0, Math.min(...startCandidates) - 2) : 0;
+  return lines.slice(start, start + maxLines).join("\n");
+}
+
+function buildInlineInvoiceFileName({ vendor, invoiceDate, documentNumber, uid }) {
+  const safeVendor = safeAttachmentFileName(vendor || "Inline-Rechnung", "Inline-Rechnung").replace(/\.[^.]+$/, "");
+  const datePart = invoiceDate
+    ? invoiceDate.replace(/^(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})$/, (_full, day, month, year) =>
+        `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+      )
+    : "ohne-datum";
+  const docPart = documentNumber
+    ? `-${safeAttachmentFileName(documentNumber, "Dokument")}`
+    : `-uid-${uid}`;
+  return `${safeVendor}_Inline-Rechnung_${datePart}${docPart}.pdf`;
+}
+
+function detectInlineAccountingInvoiceAttachment(message) {
+  const bodyText = plainTextFromAccountingTextParts(message.text_parts || []);
+  if (!bodyText) return null;
+
+  const normalized = normalizeAccountingClassificationText(bodyText);
+  const subject = normalizeAccountingClassificationText(message.subject || "");
+  const isAppleInvoice =
+    /\bapple\b/.test(normalized) &&
+    (/\brechnung\b/.test(normalized) || /\brechnung\b/.test(subject)) &&
+    /\b(dokument|bestellnummer|sequenz|icloud|mehrwertsteuer)\b/.test(normalized) &&
+    /(\d+,\d{2})\s*(€|eur)/i.test(bodyText);
+
+  if (!isAppleInvoice) return null;
+
+  const invoiceText = compactInlineInvoiceText(bodyText);
+  const invoiceExtraction = extractInvoiceAmountsFromPdfText(invoiceText || bodyText);
+  const invoiceDate = invoiceExtraction.invoice_date || extractFirstGermanInvoiceDate(bodyText);
+  const documentNumber = bodyText.match(/\bDokument\s*:\s*([A-Z0-9-]+)/i)?.[1] || null;
+  const filename = buildInlineInvoiceFileName({
+    vendor: "Apple",
+    invoiceDate,
+    documentNumber,
+    uid: message.uid
+  });
+  const pdfText = [
+    "Aus Inline-E-Mail extrahierte Rechnung",
+    `Quelle: ${message.from_email || message.from || "unbekannt"}`,
+    `Betreff: ${message.subject || ""}`,
+    `E-Mail-Datum: ${message.date || ""}`,
+    "",
+    invoiceText || bodyText
+  ].join("\n");
+  const bytes = createSimpleAccountingPdfBuffer({
+    title: filename.replace(/\.pdf$/i, ""),
+    lines: pdfText
+  });
+
+  return {
+    filename,
+    content_type: ACCOUNTING_INLINE_INVOICE_PDF_MIME_TYPE,
+    content_disposition: "generated-inline",
+    transfer_encoding: null,
+    byte_length: bytes.length,
+    bytes,
+    generated_from_inline_invoice: true,
+    inline_invoice_vendor: "Apple",
+    inline_invoice_source: "email_body",
+    inline_invoice_extraction: invoiceExtraction
+  };
+}
+
 async function classifyAccountingAttachmentForUpload(attachment, message) {
   const ext = fileExtension(attachment.filename);
   const subjectAndName = `${message?.subject || ""}\n${attachment.filename || ""}`;
+  if (attachment.generated_from_inline_invoice) {
+    const extraction =
+      attachment.inline_invoice_extraction || extractInvoiceAmountsFromPdfText(message?.inline_invoice_text || "");
+    return {
+      ...classifyAccountingTextAsInvoice(`${subjectAndName}\n${message?.subject || ""}`),
+      status: "invoice",
+      invoice_signal: true,
+      non_invoice_signal: false,
+      decision: "allow",
+      source: "inline_email_body",
+      reason: "recognized_inline_invoice_body",
+      invoice_extraction: extraction
+    };
+  }
   if (ext !== "pdf" && String(attachment.content_type || "").toLowerCase() !== "application/pdf") {
     const metadataClassification = classifyAccountingTextAsInvoice(subjectAndName);
     return {
@@ -2486,7 +2994,7 @@ function parseRawEmail(raw, uid) {
   const { headersText } = splitHeaderAndBody(raw);
   const headers = parseMimeHeaders(headersText);
   const messageId = headers["message-id"] || "";
-  return {
+  const message = {
     uid,
     from: decodeMimeHeaderValue(headers.from || ""),
     from_email: extractEmailAddress(headers.from || ""),
@@ -2494,8 +3002,14 @@ function parseRawEmail(raw, uid) {
     date: headers.date || "",
     message_id: messageId,
     message_id_hash: messageId ? createHash("sha256").update(messageId).digest("hex") : "",
-    attachments: parseMimeMessageParts(raw).filter(isAccountingInvoiceAttachment)
+    attachments: parseMimeMessageParts(raw).filter(isAccountingInvoiceAttachment),
+    text_parts: parseMimeMessageTextParts(raw)
   };
+  const inlineInvoiceAttachment = detectInlineAccountingInvoiceAttachment(message);
+  if (inlineInvoiceAttachment) {
+    message.attachments.push(inlineInvoiceAttachment);
+  }
+  return message;
 }
 
 function extractImapLiteral(response) {
@@ -2902,6 +3416,7 @@ async function findAccountingDriveDuplicate({ folderId, sha256, fileName }, goog
 }
 
 function parseEuroAmount(value) {
+  if (!/\d/.test(String(value || ""))) return null;
   const normalized = String(value || "")
     .replace(/\s/g, "")
     .replace(/\./g, "")
@@ -2968,6 +3483,45 @@ function extractGermanMonthKey(text) {
   return `${month}/${String(match[2]).slice(-2)}`;
 }
 
+function germanMonthNameToNumber(value) {
+  const monthNames = {
+    jan: "01",
+    januar: "01",
+    feb: "02",
+    februar: "02",
+    maerz: "03",
+    marz: "03",
+    apr: "04",
+    april: "04",
+    mai: "05",
+    jun: "06",
+    juni: "06",
+    jul: "07",
+    juli: "07",
+    aug: "08",
+    august: "08",
+    sep: "09",
+    sept: "09",
+    september: "09",
+    okt: "10",
+    oktober: "10",
+    nov: "11",
+    november: "11",
+    dez: "12",
+    dezember: "12"
+  };
+  const key = String(value || "").toLowerCase().replace(/ä/g, "ae").replace(/\.$/, "");
+  return monthNames[key] || null;
+}
+
+function parseGermanTextualDateToNumeric(text) {
+  const match = String(text || "").match(/\b(\d{1,2})\.\s*([A-Za-zÄÖÜäöü]+)\.?\s+(\d{4})\b/);
+  if (!match) return null;
+  const month = germanMonthNameToNumber(match[2]);
+  if (!month) return null;
+  return `${String(match[1]).padStart(2, "0")}.${month}.${match[3]}`;
+}
+
 function parseFirstEuroAmountFromText(text, patterns) {
   for (const pattern of patterns) {
     const amount = parseEuroAmount(String(text || "").match(pattern)?.[1]);
@@ -2981,7 +3535,11 @@ function extractFirstGermanInvoiceDate(text) {
   return (
     value.match(/Rechnungsnr\.?:\s*[^\n]*?\bDatum\s+(\d{2}\.\d{2}\.\d{4})/i)?.[1] ||
     value.match(/\b(?:Rechnungsdatum|Datum der Rechnung|Belegdatum|Invoice Date|Datum)\b\s*:?\s*(\d{2}\.\d{2}\.\d{4})/i)?.[1] ||
+    parseGermanTextualDateToNumeric(
+      value.match(/\b(?:Rechnungsdatum|Datum der Rechnung|Belegdatum|Invoice Date|Datum)\b\s*:?\s*(\d{1,2}\.\s*[A-Za-zÄÖÜäöü]+\.?\s+\d{4})/i)?.[1]
+    ) ||
     value.match(/\b(\d{2}\.\d{2}\.\d{4})\b/)?.[1] ||
+    parseGermanTextualDateToNumeric(value) ||
     null
   );
 }
@@ -5763,6 +6321,194 @@ function createServer() {
   );
 
   server.tool(
+    "asana_verify_task_schedule",
+    "Verifiziert read-only, ob eine Asana-Aufgabe dem erwarteten Faelligkeits-/Routine-Vertrag entspricht. Nutze dieses Tool nach jeder neuen/geaenderten Routine, Faelligkeit, Uhrzeit oder Schedule-Annahme; es aendert keine Aufgabe.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      expected_due_on: z.string().optional(),
+      expected_due_at: z.string().optional(),
+      expected_due_date_berlin: z.string().optional(),
+      expected_due_time_berlin: z.string().optional(),
+      expect_due_time: z.boolean().optional().default(false),
+      expect_routine_tag: z.boolean().optional().default(false),
+      expected_assignee_gid: z.string().optional(),
+      expected_project_gid: z.string().optional(),
+      expected_name_contains: z.string().optional(),
+      expected_completed: z.boolean().optional(),
+      recurrence_expected: z.boolean().optional().default(false),
+      allow_unverifiable_native_recurrence: z.boolean().optional().default(false)
+    },
+    TOOL_READ_ONLY,
+    async ({
+      agent_id,
+      task_gid,
+      expected_due_on,
+      expected_due_at,
+      expected_due_date_berlin,
+      expected_due_time_berlin,
+      expect_due_time,
+      expect_routine_tag,
+      expected_assignee_gid,
+      expected_project_gid,
+      expected_name_contains,
+      expected_completed,
+      recurrence_expected,
+      allow_unverifiable_native_recurrence
+    }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      const asana = getAsana(agent_id);
+      const res = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/tasks/${task_gid}`,
+        params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
+      });
+      const task = res.data.data;
+      const verification = buildAsanaScheduleVerification({
+        task,
+        expected_due_on,
+        expected_due_at,
+        expected_due_date_berlin,
+        expected_due_time_berlin,
+        expect_due_time,
+        expect_routine_tag,
+        expected_assignee_gid,
+        expected_project_gid,
+        expected_name_contains,
+        expected_completed,
+        recurrence_expected,
+        allow_unverifiable_native_recurrence
+      });
+      return out({
+        agent_id,
+        task_gid,
+        task,
+        ...verification,
+        production_ready_claim_allowed: verification.verification_status === "ok",
+        note:
+          verification.verification_status === "ok"
+            ? "Schedule-Vertrag ist API-seitig verifiziert."
+            : "Nicht als vollstaendig korrekt/einsatzbereit behaupten, bis alle Fehler behoben sind. ok_with_warnings reicht nicht fuer 100%-Claims."
+      });
+    }
+  );
+
+  server.tool(
+    "asana_verify_next_routine_instance",
+    "Verifiziert read-only nach einem Routine-Abschluss, ob Asana eine passende naechste offene Routine-Instanz erzeugt hat. Nutze dieses Tool, bevor ein Agent behauptet, Wiederholung/Fortsetzung sei korrekt.",
+    {
+      agent_id: agentIdSchema,
+      source_task_gid: z.string(),
+      expected_next_due_on: z.string().optional(),
+      expected_next_due_at: z.string().optional(),
+      expected_next_due_date_berlin: z.string().optional(),
+      expected_next_due_time_berlin: z.string().optional(),
+      expected_assignee_gid: z.string().optional(),
+      expected_project_gid: z.string().optional(),
+      expected_name_exact: z.string().optional(),
+      expect_routine_tag: z.boolean().optional().default(true),
+      limit: z.number().int().min(1).max(100).optional().default(100)
+    },
+    TOOL_READ_ONLY,
+    async ({
+      agent_id,
+      source_task_gid,
+      expected_next_due_on,
+      expected_next_due_at,
+      expected_next_due_date_berlin,
+      expected_next_due_time_berlin,
+      expected_assignee_gid,
+      expected_project_gid,
+      expected_name_exact,
+      expect_routine_tag,
+      limit
+    }) => {
+      validateAsanaGid(source_task_gid, "source_task_gid");
+      validateAsanaDate(expected_next_due_on, "expected_next_due_on");
+      validateAsanaDateTime(expected_next_due_at, "expected_next_due_at");
+      validateAsanaDate(expected_next_due_date_berlin, "expected_next_due_date_berlin");
+      validateAsanaLocalTime(expected_next_due_time_berlin, "expected_next_due_time_berlin");
+      validateAsanaGid(expected_assignee_gid, "expected_assignee_gid");
+      validateAsanaGid(expected_project_gid, "expected_project_gid");
+
+      const asana = getAsana(agent_id);
+      const sourceRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/tasks/${source_task_gid}`,
+        params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
+      });
+      const source_task = sourceRes.data.data;
+      const projectGids = getAsanaTaskProjectGids(source_task);
+      const selectedProjectGid = expected_project_gid || projectGids[0];
+      if (!selectedProjectGid) {
+        throw new Error("Kein Projekt aus source_task ableitbar. expected_project_gid setzen.");
+      }
+      const expectedName = expected_name_exact || source_task.name;
+      const expectedAssignee = expected_assignee_gid || source_task.assignee?.gid;
+
+      const tasksRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/projects/${selectedProjectGid}/tasks`,
+        params: {
+          completed_since: "now",
+          limit,
+          opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
+        }
+      });
+      const candidates = (tasksRes.data.data || []).filter((task) => {
+        if (task.gid === source_task_gid) return false;
+        if (String(task.name || "") !== String(expectedName || "")) return false;
+        if (expectedAssignee && task.assignee?.gid !== expectedAssignee) return false;
+        return true;
+      });
+
+      const candidate_results = candidates.map((task) => ({
+        task,
+        ...buildAsanaScheduleVerification({
+          task,
+          expected_due_on: expected_next_due_on,
+          expected_due_at: expected_next_due_at,
+          expected_due_date_berlin: expected_next_due_date_berlin,
+          expected_due_time_berlin: expected_next_due_time_berlin,
+          expect_due_time: Boolean(expected_next_due_at || expected_next_due_time_berlin),
+          expect_routine_tag,
+          expected_assignee_gid: expectedAssignee,
+          expected_project_gid: selectedProjectGid,
+          expected_name_contains: expectedName,
+          expected_completed: false,
+          recurrence_expected: false,
+          allow_unverifiable_native_recurrence: false
+        })
+      }));
+      const exactMatches = candidate_results.filter((candidate) => candidate.verification_status === "ok");
+      const verification_status =
+        exactMatches.length === 1
+          ? "ok"
+          : exactMatches.length > 1
+            ? "ambiguous"
+            : "failed";
+
+      return out({
+        agent_id,
+        source_task_gid,
+        source_task,
+        selected_project_gid: selectedProjectGid,
+        expected_name: expectedName,
+        expected_assignee_gid: expectedAssignee || null,
+        candidate_count: candidates.length,
+        exact_match_count: exactMatches.length,
+        verification_status,
+        production_ready_claim_allowed: verification_status === "ok",
+        candidates: candidate_results,
+        note:
+          verification_status === "ok"
+            ? "Naechste Routine-Instanz ist API-seitig gegen den erwarteten Vertrag verifiziert."
+            : "Naechste Routine-Instanz nicht eindeutig korrekt verifiziert. Nicht behaupten, dass Wiederholung/Fortsetzung sauber ist."
+      });
+    }
+  );
+
+  server.tool(
     "asana_find_tags",
     "Liest Tags eines Workspaces read-only, damit Agenten Tag-GIDs vor asana_update_task_tags sauber finden koennen.",
     {
@@ -5922,18 +6668,28 @@ function createServer() {
 
   server.tool(
     "asana_update_task_recurrence",
-    "Experimenteller enger Pfad fuer Asana-Wiederholungen. Stellt beim Setzen einer Wiederholung sicher, dass der Task den Tag Routine hat. Asanas oeffentliche API dokumentiert Recurrence nicht stabil; nutze dieses Tool nur bei klarer Asana-Beauftragung und mit Readback/Fehlertransparenz.",
+    "Streng begrenzter experimenteller Pfad fuer native Asana-Wiederholungen. Native Recurrence ist API-seitig nicht zuverlaessig auslesbar; nutze fuer Produktionsfreigaben asana_verify_task_schedule und nach Abschluss asana_verify_next_routine_instance. Kein 100%-Verifikationspfad.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
       recurrence: z.record(z.string(), z.any()).optional(),
       clear_recurrence: z.boolean().optional().default(false),
       confirmed_by_asana: z.boolean().optional().default(false),
+      allow_unverified_native_recurrence_api: z.boolean().optional().default(false),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
     },
     TOOL_IDEMPOTENT_SAFE_WRITE,
-    async ({ agent_id, task_gid, recurrence, clear_recurrence, confirmed_by_asana, dry_run, verify_after }) => {
+    async ({
+      agent_id,
+      task_gid,
+      recurrence,
+      clear_recurrence,
+      confirmed_by_asana,
+      allow_unverified_native_recurrence_api,
+      dry_run,
+      verify_after
+    }) => {
       validateAsanaGid(task_gid, "task_gid");
       const setCount = [Boolean(recurrence), Boolean(clear_recurrence)].filter(Boolean).length;
       if (setCount !== 1) {
@@ -5942,6 +6698,11 @@ function createServer() {
       if (!dry_run && !confirmed_by_asana) {
         throw new Error(
           "asana_update_task_recurrence braucht confirmed_by_asana=true, weil Asana-Recurrence API-seitig nicht stabil dokumentiert ist."
+        );
+      }
+      if (!dry_run && !allow_unverified_native_recurrence_api) {
+        throw new Error(
+          "Native Asana-Wiederholung ist API-seitig nicht 100% verifizierbar. Setze allow_unverified_native_recurrence_api=true nur als bewusste Ausnahme; fuer Standard-Routinen stattdessen UI-verifizieren oder nach Abschluss asana_verify_next_routine_instance nutzen."
         );
       }
 
@@ -5986,6 +6747,7 @@ function createServer() {
           agent_id,
           dry_run: true,
           experimental: true,
+          production_ready_claim_allowed: false,
           task_gid,
           data,
           before_task,
@@ -6031,6 +6793,7 @@ function createServer() {
         agent_id,
         task_gid,
         experimental: true,
+        production_ready_claim_allowed: false,
         data,
         before_task,
         routine_tag,
@@ -6687,7 +7450,7 @@ function createServer() {
 
   server.tool(
     "accounting_mail_scan_upload_attachment",
-    "Accounting-Spezialpfad: liest neue oder noch im Postfach liegende Mailanhaenge serverseitig, akzeptiert nur echte Rechnungs-PDFs/Bilder, prueft optional eine Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
+    "Accounting-Spezialpfad: liest neue oder noch im Postfach liegende Rechnungen serverseitig, akzeptiert echte Rechnungs-PDFs/Bilder und erkannte Inline-Rechnungen wie Apple, rendert Inline-Rechnungen als PDF, prueft optional eine Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
     {
       agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
       target_folder_id: z.string(),
@@ -6952,7 +7715,9 @@ function createServer() {
               vip_sender_hash: compactDriveAppProperty(
                 message.from_email ? createHash("sha256").update(message.from_email).digest("hex") : ""
               ),
-              vip_original_name: compactDriveAppProperty(attachment.filename)
+              vip_original_name: compactDriveAppProperty(attachment.filename),
+              vip_inline_invoice: attachment.generated_from_inline_invoice ? "true" : "false",
+              vip_inline_vendor: compactDriveAppProperty(attachment.inline_invoice_vendor || "")
             }
           });
           const verifiedFile = verify_after
