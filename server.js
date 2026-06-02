@@ -2404,6 +2404,8 @@ async function classifyAccountingAttachmentForUpload(attachment, message) {
     await parser.destroy().catch(() => {});
   }
   const classification = classifyAccountingTextAsInvoice(`${subjectAndName}\n${parsed.text || ""}`);
+  const invoiceExtraction =
+    classification.decision === "allow" ? extractInvoiceAmountsFromPdfText(parsed.text || "") : null;
   return {
     ...classification,
     source: "pdf_text",
@@ -2412,7 +2414,8 @@ async function classifyAccountingAttachmentForUpload(attachment, message) {
         ? "invoice_signal_in_pdf_text"
         : classification.status === "non_invoice"
           ? "non_invoice_signal_in_pdf_text"
-          : "missing_invoice_signal_in_pdf_text"
+          : "missing_invoice_signal_in_pdf_text",
+    invoice_extraction: invoiceExtraction
   };
 }
 
@@ -2902,6 +2905,24 @@ function extractGermanMonthKey(text) {
   return `${month}/${String(match[2]).slice(-2)}`;
 }
 
+function parseFirstEuroAmountFromText(text, patterns) {
+  for (const pattern of patterns) {
+    const amount = parseEuroAmount(String(text || "").match(pattern)?.[1]);
+    if (amount !== null) return amount;
+  }
+  return null;
+}
+
+function extractFirstGermanInvoiceDate(text) {
+  const value = String(text || "");
+  return (
+    value.match(/Rechnungsnr\.?:\s*[^\n]*?\bDatum\s+(\d{2}\.\d{2}\.\d{4})/i)?.[1] ||
+    value.match(/\b(?:Rechnungsdatum|Datum der Rechnung|Belegdatum|Invoice Date|Datum)\b\s*:?\s*(\d{2}\.\d{2}\.\d{4})/i)?.[1] ||
+    value.match(/\b(\d{2}\.\d{2}\.\d{4})\b/)?.[1] ||
+    null
+  );
+}
+
 function extractAccountingPdfRecipient(rawText) {
   const lines = getNormalizedPdfTextLines(rawText);
   const adsenseLine = lines.find((line) => /\bEinnahmen\b.*AdSense/i.test(line));
@@ -2963,10 +2984,19 @@ function extractInvoiceAmountsFromPdfText(rawText) {
     };
   }
 
-  const invoiceDate = text.match(/Rechnungsnr\.?:\s*[^\n]*?\bDatum\s+(\d{2}\.\d{2}\.\d{4})/i)?.[1] || null;
-  const rawNetInvoice = parseEuroAmount(text.match(/\bSumme\s*:?\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
-  const vatInvoice = parseEuroAmount(text.match(/\bMwSt\.?\s*(?:\([^)]*\))?\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
-  const grossInvoice = parseEuroAmount(text.match(/\bGesamtsumme:\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
+  const invoiceDate = extractFirstGermanInvoiceDate(text);
+  const rawNetInvoice = parseFirstEuroAmountFromText(text, [
+    /\bSumme\s*:?\s*(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i,
+    /\b(?:Nettobetrag|Netto(?:summe|betrag)?|Summe\s+netto|Zwischensumme)\b[^\n€]{0,120}(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i
+  ]);
+  const vatInvoice = parseFirstEuroAmountFromText(text, [
+    /\bMwSt\.?\s*(?:\([^)]*\))?\s*(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i,
+    /\b(?:USt\.?|Umsatzsteuer|Mehrwertsteuer|VAT)\b[^\n€]{0,120}(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i
+  ]);
+  const grossInvoice = parseFirstEuroAmountFromText(text, [
+    /\bGesamtsumme\s*:?\s*(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i,
+    /\b(?:Gesamtbetrag|Rechnungsbetrag|Betrag\s+zu\s+zahlen|Zu\s+zahlen|Amount\s+due|Total)\b[^\n€]{0,120}(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i
+  ]);
   let netInvoice = rawNetInvoice;
   if (
     (netInvoice === null || (netInvoice === 0 && grossInvoice !== null && vatInvoice !== null && grossInvoice > vatInvoice)) &&
@@ -2974,6 +3004,23 @@ function extractInvoiceAmountsFromPdfText(rawText) {
     vatInvoice !== null
   ) {
     netInvoice = Math.round((grossInvoice - vatInvoice) * 100) / 100;
+  }
+  if (netInvoice !== null && grossInvoice === null && vatInvoice !== null) {
+    const inferredGross = Math.round((netInvoice + vatInvoice) * 100) / 100;
+    return {
+      ...recipient,
+      kind: "invoice",
+      status: "extracted",
+      invoice_date: invoiceDate,
+      month_key: invoiceDate ? extractMonthKeyFromGermanDate(invoiceDate) : null,
+      net_amount: netInvoice,
+      vat_amount: vatInvoice,
+      gross_amount: inferredGross,
+      confidence: "medium"
+    };
+  }
+  if (netInvoice === null && grossInvoice !== null && vatInvoice === null) {
+    netInvoice = grossInvoice;
   }
   if (netInvoice !== null || vatInvoice !== null || grossInvoice !== null) {
     return {
