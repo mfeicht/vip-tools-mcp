@@ -4,6 +4,7 @@ import axios from "axios";
 import net from "net";
 import tls from "tls";
 import { createHash, createSign, randomUUID } from "crypto";
+import pdfParse from "pdf-parse";
 import { z } from "zod";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -2511,6 +2512,162 @@ async function findAccountingDriveDuplicate({ folderId, sha256, fileName }, goog
     }
   }, googleContext);
   return res.data.files || [];
+}
+
+function parseEuroAmount(value) {
+  const normalized = String(value || "")
+    .replace(/\s/g, "")
+    .replace(/\./g, "")
+    .replace(",", ".");
+  const amount = Number(normalized);
+  if (!Number.isFinite(amount)) return null;
+  return Math.round(amount * 100) / 100;
+}
+
+function normalizeExtractedPdfText(text) {
+  return String(text || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\r/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n[ \t]+/g, "\n")
+    .trim();
+}
+
+function extractMonthKeyFromGermanDate(dateText) {
+  const match = String(dateText || "").match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (!match) return null;
+  return `${match[2]}/${match[3].slice(-2)}`;
+}
+
+function extractGermanMonthKey(text) {
+  const monthNames = {
+    jan: "01",
+    januar: "01",
+    feb: "02",
+    februar: "02",
+    maerz: "03",
+    marz: "03",
+    apr: "04",
+    april: "04",
+    mai: "05",
+    jun: "06",
+    juni: "06",
+    jul: "07",
+    juli: "07",
+    aug: "08",
+    august: "08",
+    sep: "09",
+    sept: "09",
+    september: "09",
+    okt: "10",
+    oktober: "10",
+    nov: "11",
+    november: "11",
+    dez: "12",
+    dezember: "12"
+  };
+  const cleaned = String(text || "").toLowerCase().replace(/ä/g, "ae");
+  const match = cleaned.match(/\b(?:1\.|01\.)\s*[–-]\s*(?:\d{1,2}\.)\s*([a-z]+)\.?\s+(\d{4})/i);
+  if (!match) return null;
+  const month = monthNames[match[1]] || monthNames[match[1].replace(/\.$/, "")];
+  if (!month) return null;
+  return `${month}/${String(match[2]).slice(-2)}`;
+}
+
+function extractInvoiceAmountsFromPdfText(rawText) {
+  const text = normalizeExtractedPdfText(rawText);
+  const invoiceDate = text.match(/Rechnungsnr\.?:\s*[^\n]*?\bDatum\s+(\d{2}\.\d{2}\.\d{4})/i)?.[1] || null;
+  const netInvoice = parseEuroAmount(text.match(/\bSumme:\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
+  const vatInvoice = parseEuroAmount(text.match(/\bMwSt\.?\s*(?:\([^)]*\))?\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
+  const grossInvoice = parseEuroAmount(text.match(/\bGesamtsumme:\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
+  if (netInvoice !== null || vatInvoice !== null || grossInvoice !== null) {
+    return {
+      kind: "invoice",
+      status: netInvoice !== null && vatInvoice !== null ? "extracted" : "partial",
+      invoice_date: invoiceDate,
+      month_key: invoiceDate ? extractMonthKeyFromGermanDate(invoiceDate) : null,
+      net_amount: netInvoice,
+      vat_amount: vatInvoice ?? 0,
+      gross_amount: grossInvoice,
+      confidence: netInvoice !== null && vatInvoice !== null && grossInvoice !== null ? "high" : "medium"
+    };
+  }
+
+  const adsenseAmount =
+    parseEuroAmount(text.match(/\bEinnahmen\b[^\n€]*?(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]) ??
+    parseEuroAmount(text.match(/\bEinnahmen\s+[–-][^\n€]*?(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
+  if (adsenseAmount !== null) {
+    return {
+      kind: "income_statement",
+      status: "extracted",
+      invoice_date: null,
+      month_key: extractGermanMonthKey(text),
+      net_amount: adsenseAmount,
+      vat_amount: 0,
+      gross_amount: adsenseAmount,
+      confidence: "medium"
+    };
+  }
+
+  return {
+    kind: "unknown",
+    status: "not_extracted",
+    invoice_date: null,
+    month_key: null,
+    net_amount: null,
+    vat_amount: null,
+    gross_amount: null,
+    confidence: "low"
+  };
+}
+
+async function listAccountingDriveFolderPdfFiles(folderId, maxFiles, googleContext = {}) {
+  const files = [];
+  let pageToken;
+  do {
+    const res = await googleRequest(
+      {
+        method: "GET",
+        url: "https://www.googleapis.com/drive/v3/files",
+        params: {
+          q: `'${escapeGoogleDriveQueryString(folderId)}' in parents and trashed = false`,
+          fields: "nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,parents,webViewLink)",
+          pageSize: Math.min(100, Math.max(1, maxFiles - files.length)),
+          pageToken,
+          orderBy: "name",
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true
+        }
+      },
+      googleContext
+    );
+    files.push(...(res.data.files || []));
+    pageToken = res.data.nextPageToken;
+  } while (pageToken && files.length < maxFiles);
+
+  return files.filter((file) => file.mimeType === "application/pdf").slice(0, maxFiles);
+}
+
+async function downloadDrivePdfBuffer(fileId, maxBytes, googleContext = {}) {
+  const res = await googleRequest(
+    {
+      method: "GET",
+      url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+      params: {
+        alt: "media",
+        supportsAllDrives: true
+      },
+      responseType: "arraybuffer",
+      maxContentLength: maxBytes,
+      maxBodyLength: maxBytes
+    },
+    googleContext
+  );
+  const buffer = Buffer.from(res.data);
+  if (buffer.length > maxBytes) {
+    throw new Error(`PDF ${fileId} ist groesser als max_pdf_bytes.`);
+  }
+  return buffer;
 }
 
 function compactDriveAppProperty(value, maxLength = 124) {
@@ -5679,6 +5836,109 @@ function createServer() {
         copied_file: uploaded,
         verified_file: verifiedFile,
         verification_status: verificationStatus
+      });
+    }
+  );
+
+  server.tool(
+    "accounting_drive_pdf_invoice_totals",
+    "Accounting-Spezialpfad: liest PDF-Rechnungen in einem freigegebenen Accounting-Drive-Ordner read-only, extrahiert nur Netto/MwSt./Brutto und gibt keine vollstaendigen Rechnungstexte aus.",
+    {
+      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      folder_id: z.string(),
+      expected_month_key: z.string().regex(/^\d{2}\/\d{2}$/).optional(),
+      max_files: z.number().int().positive().max(300).optional().default(200),
+      max_pdf_bytes: z
+        .number()
+        .int()
+        .min(1024)
+        .max(ACCOUNTING_ATTACHMENT_HARD_MAX_BYTES)
+        .optional()
+        .default(ACCOUNTING_ATTACHMENT_HARD_MAX_BYTES),
+      include_file_details: z.boolean().optional().default(true)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id, folder_id, expected_month_key, max_files, max_pdf_bytes, include_file_details }) => {
+      const googleContext = { agent_id };
+      await assertAllowedAccountingFolder(folder_id, googleContext);
+      const files = await listAccountingDriveFolderPdfFiles(folder_id, max_files, googleContext);
+      const details = [];
+      const totals = { net_amount: 0, vat_amount: 0, gross_amount: 0 };
+      let extractedCount = 0;
+      let partialCount = 0;
+      let notExtractedCount = 0;
+      let monthMismatchCount = 0;
+
+      for (const file of files) {
+        const fileSummary = {
+          id: file.id,
+          name: file.name,
+          mimeType: file.mimeType,
+          size: file.size ? Number(file.size) : null,
+          createdTime: file.createdTime,
+          modifiedTime: file.modifiedTime,
+          webViewLink: file.webViewLink
+        };
+
+        try {
+          if (file.size && Number(file.size) > max_pdf_bytes) {
+            notExtractedCount += 1;
+            details.push({
+              ...fileSummary,
+              status: "blocked",
+              reason: "pdf_too_large",
+              max_pdf_bytes
+            });
+            continue;
+          }
+
+          const buffer = await downloadDrivePdfBuffer(file.id, max_pdf_bytes, googleContext);
+          const parsed = await pdfParse(buffer);
+          const extracted = extractInvoiceAmountsFromPdfText(parsed.text || "");
+          const monthMismatch = Boolean(
+            expected_month_key && extracted.month_key && extracted.month_key !== expected_month_key
+          );
+
+          if (extracted.status === "extracted") extractedCount += 1;
+          else if (extracted.status === "partial") partialCount += 1;
+          else notExtractedCount += 1;
+          if (monthMismatch) monthMismatchCount += 1;
+
+          if (extracted.net_amount !== null) totals.net_amount += extracted.net_amount;
+          if (extracted.vat_amount !== null) totals.vat_amount += extracted.vat_amount;
+          if (extracted.gross_amount !== null) totals.gross_amount += extracted.gross_amount;
+
+          details.push({
+            ...fileSummary,
+            ...extracted,
+            month_mismatch: monthMismatch
+          });
+        } catch (error) {
+          notExtractedCount += 1;
+          details.push({
+            ...fileSummary,
+            status: "error",
+            error: String(error?.message || error)
+          });
+        }
+      }
+
+      const round = (value) => Math.round(value * 100) / 100;
+      return out({
+        agent_id,
+        folder_id,
+        expected_month_key: expected_month_key || null,
+        pdf_count: files.length,
+        extracted_count: extractedCount,
+        partial_count: partialCount,
+        not_extracted_count: notExtractedCount,
+        month_mismatch_count: monthMismatchCount,
+        totals: {
+          net_amount: round(totals.net_amount),
+          vat_amount: round(totals.vat_amount),
+          gross_amount: round(totals.gross_amount)
+        },
+        files: include_file_details ? details : undefined
       });
     }
   );
