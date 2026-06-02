@@ -3029,6 +3029,88 @@ async function listAccountingDriveFolderPdfFiles(folderId, maxFiles, googleConte
   return files.filter((file) => file.mimeType === "application/pdf").slice(0, maxFiles);
 }
 
+function isAccountingDriveInvoiceCandidateFile(file) {
+  const mimeType = String(file?.mimeType || "").split(";")[0].trim().toLowerCase();
+  const ext = fileExtension(file?.name || "");
+  return ACCOUNTING_ALLOWED_ATTACHMENT_MIME_TYPES.has(mimeType) || ACCOUNTING_ALLOWED_ATTACHMENT_EXTENSIONS.has(ext);
+}
+
+function publicAccountingDriveMetadata(file, folderId, folderLabel = null) {
+  return {
+    id: file.id,
+    folder_id: folderId,
+    folder_label: folderLabel,
+    name: file.name || null,
+    mimeType: file.mimeType || null,
+    size: file.size ? String(file.size) : null,
+    md5Checksum: file.md5Checksum || null,
+    createdTime: file.createdTime || null,
+    modifiedTime: file.modifiedTime || null,
+    webViewLink: file.webViewLink || null,
+    vip_sha256: file.appProperties?.vip_sha256 || null,
+    vip_source: file.appProperties?.vip_source || null
+  };
+}
+
+async function listAccountingDriveFolderInvoiceFiles(folderId, maxFiles, googleContext = {}) {
+  const files = [];
+  let pageToken;
+  do {
+    const res = await googleRequest(
+      {
+        method: "GET",
+        url: "https://www.googleapis.com/drive/v3/files",
+        params: {
+          q: `'${escapeGoogleDriveQueryString(folderId)}' in parents and trashed = false`,
+          fields:
+            "nextPageToken,files(id,name,mimeType,size,md5Checksum,appProperties,createdTime,modifiedTime,parents,webViewLink)",
+          pageSize: Math.min(100, Math.max(1, maxFiles - files.length)),
+          pageToken,
+          orderBy: "modifiedTime desc",
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true
+        }
+      },
+      googleContext
+    );
+    files.push(...(res.data.files || []));
+    pageToken = res.data.nextPageToken;
+  } while (pageToken && files.length < maxFiles);
+
+  return files.filter(isAccountingDriveInvoiceCandidateFile).slice(0, maxFiles);
+}
+
+function normalizeAccountingKnownFile(file) {
+  return {
+    id: String(file?.id || ""),
+    folder_id: file?.folder_id ? String(file.folder_id) : null,
+    folder_label: file?.folder_label ? String(file.folder_label) : null,
+    name: file?.name ? String(file.name) : null,
+    mimeType: file?.mimeType ? String(file.mimeType) : null,
+    size: file?.size === undefined || file?.size === null ? null : String(file.size),
+    md5Checksum: file?.md5Checksum ? String(file.md5Checksum) : null,
+    modifiedTime: file?.modifiedTime ? String(file.modifiedTime) : null,
+    vip_sha256: file?.vip_sha256 ? String(file.vip_sha256) : null
+  };
+}
+
+function compareAccountingDriveMetadata(previous, current) {
+  const fields = ["folder_id", "name", "mimeType", "size", "md5Checksum", "modifiedTime", "vip_sha256"];
+  const changed_fields = [];
+  for (const field of fields) {
+    const beforeValue = previous[field] ?? null;
+    const afterValue = current[field] ?? null;
+    if (beforeValue !== afterValue) {
+      changed_fields.push({
+        field,
+        before: beforeValue,
+        after: afterValue
+      });
+    }
+  }
+  return changed_fields;
+}
+
 async function downloadDrivePdfBuffer(fileId, maxBytes, googleContext = {}) {
   const res = await googleRequest(
     {
@@ -6341,6 +6423,150 @@ function createServer() {
           gross_amount: round(totals.gross_amount)
         },
         files: include_file_details ? details : undefined
+      });
+    }
+  );
+
+  server.tool(
+    "accounting_drive_invoice_metadata_delta",
+    "Accounting-Spezialpfad: prueft freigegebene Accounting-Drive-Ordner read-only und leichtgewichtig nur per Dateimetadaten auf neue, geaenderte oder fehlende Rechnungs-PDFs/Bilder. Laedt keine Dateien herunter.",
+    {
+      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      folders: z
+        .array(
+          z.object({
+            folder_id: z.string(),
+            folder_label: z.string().optional(),
+            expected_month_key: z.string().regex(/^\d{2}\/\d{2}$/).optional()
+          })
+        )
+        .min(1)
+        .max(24),
+      known_files: z
+        .array(
+          z.object({
+            id: z.string(),
+            folder_id: z.string().optional(),
+            folder_label: z.string().optional(),
+            name: z.string().optional(),
+            mimeType: z.string().optional(),
+            size: z.union([z.string(), z.number()]).optional().nullable(),
+            md5Checksum: z.string().optional().nullable(),
+            modifiedTime: z.string().optional().nullable(),
+            vip_sha256: z.string().optional().nullable()
+          })
+        )
+        .optional()
+        .default([]),
+      max_files_per_folder: z.number().int().positive().max(500).optional().default(300),
+      include_unchanged_files: z.boolean().optional().default(false),
+      include_current_snapshot: z.boolean().optional().default(true)
+    },
+    TOOL_READ_ONLY,
+    async ({
+      agent_id,
+      folders,
+      known_files,
+      max_files_per_folder,
+      include_unchanged_files,
+      include_current_snapshot
+    }) => {
+      const googleContext = { agent_id };
+      const requestedFolderIds = new Set(folders.map((folder) => folder.folder_id));
+      const currentFiles = [];
+      const folderSummaries = [];
+
+      for (const folder of folders) {
+        await assertAllowedAccountingFolder(folder.folder_id, googleContext);
+        const files = await listAccountingDriveFolderInvoiceFiles(
+          folder.folder_id,
+          max_files_per_folder,
+          googleContext
+        );
+        const publicFiles = files.map((file) =>
+          publicAccountingDriveMetadata(file, folder.folder_id, folder.folder_label || folder.expected_month_key || null)
+        );
+        currentFiles.push(...publicFiles);
+        folderSummaries.push({
+          folder_id: folder.folder_id,
+          folder_label: folder.folder_label || null,
+          expected_month_key: folder.expected_month_key || null,
+          invoice_candidate_count: publicFiles.length,
+          newest_modifiedTime: publicFiles
+            .map((file) => file.modifiedTime)
+            .filter(Boolean)
+            .sort()
+            .at(-1) || null
+        });
+      }
+
+      const knownById = new Map(
+        known_files
+          .map(normalizeAccountingKnownFile)
+          .filter((file) => file.id)
+          .map((file) => [file.id, file])
+      );
+      const currentById = new Map(currentFiles.map((file) => [file.id, normalizeAccountingKnownFile(file)]));
+      const newFiles = [];
+      const changedFiles = [];
+      const unchangedFiles = [];
+      const missingFiles = [];
+
+      for (const currentFile of currentFiles) {
+        const normalizedCurrent = normalizeAccountingKnownFile(currentFile);
+        const previous = knownById.get(currentFile.id);
+        if (!previous) {
+          newFiles.push(currentFile);
+          continue;
+        }
+
+        const changed_fields = compareAccountingDriveMetadata(previous, normalizedCurrent);
+        if (changed_fields.length) {
+          changedFiles.push({
+            ...currentFile,
+            previous,
+            changed_fields
+          });
+        } else if (include_unchanged_files) {
+          unchangedFiles.push(currentFile);
+        }
+      }
+
+      for (const previous of knownById.values()) {
+        const relevantFolder =
+          !previous.folder_id || requestedFolderIds.has(previous.folder_id) || folders.length === 1;
+        if (relevantFolder && !currentById.has(previous.id)) {
+          missingFiles.push({
+            ...previous,
+            status: "missing_from_current_folder",
+            note: "Datei wurde nicht mehr in den abgefragten Accounting-Ordnern gefunden; moeglich sind Loeschung, Papierkorb oder Verschiebung."
+          });
+        }
+      }
+
+      const needsReconcile = Boolean(newFiles.length || changedFiles.length || missingFiles.length);
+      return out({
+        agent_id,
+        mode: "accounting_drive_invoice_metadata_delta",
+        read_only: true,
+        folders: folderSummaries,
+        known_files_count: known_files.length,
+        current_files_count: currentFiles.length,
+        delta: {
+          new_count: newFiles.length,
+          changed_count: changedFiles.length,
+          missing_count: missingFiles.length,
+          unchanged_count: currentFiles.length - newFiles.length - changedFiles.length,
+          new_files: newFiles,
+          changed_files: changedFiles,
+          missing_files: missingFiles,
+          unchanged_files: include_unchanged_files ? unchangedFiles : undefined
+        },
+        current_snapshot: include_current_snapshot ? currentFiles : undefined,
+        needs_reconcile: needsReconcile,
+        next_step: needsReconcile
+          ? "Nur neue/geaenderte/fehlende Dateien fachlich pruefen, betroffene PDF/Bild-Rechnungen neu auswerten und Sheet/Register abgleichen."
+          : "Keine Metadaten-Aenderung gefunden; schwere PDF-Auswertung und Sheet-Betragskorrektur koennen uebersprungen werden."
       });
     }
   );
