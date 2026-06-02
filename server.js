@@ -2621,6 +2621,14 @@ function extractInvoiceAmountsFromPdfText(rawText) {
   };
 }
 
+function getLimitedPdfTextDebugLines(rawText, limit) {
+  return normalizeExtractedPdfText(rawText)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
 async function listAccountingDriveFolderPdfFiles(folderId, maxFiles, googleContext = {}) {
   const files = [];
   let pageToken;
@@ -5855,10 +5863,21 @@ function createServer() {
         .max(ACCOUNTING_ATTACHMENT_HARD_MAX_BYTES)
         .optional()
         .default(ACCOUNTING_ATTACHMENT_HARD_MAX_BYTES),
-      include_file_details: z.boolean().optional().default(true)
+      include_file_details: z.boolean().optional().default(true),
+      include_text_debug_lines: z.boolean().optional().default(false),
+      text_debug_line_limit: z.number().int().positive().max(80).optional().default(30)
     },
     TOOL_READ_ONLY,
-    async ({ agent_id, folder_id, expected_month_key, max_files, max_pdf_bytes, include_file_details }) => {
+    async ({
+      agent_id,
+      folder_id,
+      expected_month_key,
+      max_files,
+      max_pdf_bytes,
+      include_file_details,
+      include_text_debug_lines,
+      text_debug_line_limit
+    }) => {
       const googleContext = { agent_id };
       await assertAllowedAccountingFolder(folder_id, googleContext);
       const files = await listAccountingDriveFolderPdfFiles(folder_id, max_files, googleContext);
@@ -5900,7 +5919,8 @@ function createServer() {
           } finally {
             await parser.destroy().catch(() => {});
           }
-          const extracted = extractInvoiceAmountsFromPdfText(parsed.text || "");
+          const pdfText = parsed.text || "";
+          const extracted = extractInvoiceAmountsFromPdfText(pdfText);
           const monthMismatch = Boolean(
             expected_month_key && extracted.month_key && extracted.month_key !== expected_month_key
           );
@@ -5917,7 +5937,10 @@ function createServer() {
           details.push({
             ...fileSummary,
             ...extracted,
-            month_mismatch: monthMismatch
+            month_mismatch: monthMismatch,
+            text_debug_lines: include_text_debug_lines
+              ? getLimitedPdfTextDebugLines(pdfText, text_debug_line_limit)
+              : undefined
           });
         } catch (error) {
           notExtractedCount += 1;
