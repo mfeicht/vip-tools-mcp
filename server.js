@@ -207,6 +207,14 @@ const ACCOUNTING_MORITZ_EMAILS = new Set(
     .map((value) => value.trim().toLowerCase())
     .filter(Boolean)
 );
+const ACCOUNTING_ARCHIVE_MAILBOX_CANDIDATES = [
+  "Archive",
+  "Archives",
+  "Archiv",
+  "INBOX.Archive",
+  "INBOX.Archives",
+  "INBOX.Archiv"
+];
 const ASANA_TASK_SCHEDULE_OPT_FIELDS =
   "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url";
 const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
@@ -2468,6 +2476,208 @@ async function fetchUnseenRawEmailWithFallback(configs, options) {
   }
   const error = new Error(
     `IMAP Attachment-Fetch fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
+}
+
+function unquoteImapMailboxName(value) {
+  const text = String(value || "").trim();
+  if (!text.startsWith('"') || !text.endsWith('"')) return text;
+  return text.slice(1, -1).replace(/\\(["\\])/g, "$1");
+}
+
+function parseImapListMailboxes(response) {
+  const mailboxes = [];
+  for (const line of String(response || "").split(/\r?\n/)) {
+    if (!/^\* LIST(?:[ \t]|$)/i.test(line)) continue;
+    const quoted = line.match(/"((?:[^"\\]|\\.)*)"\s*$/);
+    if (quoted) {
+      mailboxes.push(unquoteImapMailboxName(`"${quoted[1]}"`));
+      continue;
+    }
+    const atom = line.trim().split(/\s+/).pop();
+    if (atom && atom !== "NIL") mailboxes.push(unquoteImapMailboxName(atom));
+  }
+  return uniqueValues(mailboxes);
+}
+
+function resolveArchiveMailbox(mailboxes, preferredMailbox) {
+  const available = uniqueValues(mailboxes);
+  const exact = (candidate) =>
+    available.find((mailbox) => mailbox.toLowerCase() === String(candidate || "").toLowerCase());
+  if (preferredMailbox) {
+    const found = exact(preferredMailbox);
+    if (!found) {
+      throw new Error(
+        `Archivordner ${preferredMailbox} existiert nicht. Verfuegbar: ${available.join(", ") || "keine"}`
+      );
+    }
+    return found;
+  }
+  for (const candidate of ACCOUNTING_ARCHIVE_MAILBOX_CANDIDATES) {
+    const found = exact(candidate);
+    if (found) return found;
+  }
+  throw new Error(
+    `Kein bestehender Archivordner gefunden. Verfuegbar: ${available.join(", ") || "keine"}`
+  );
+}
+
+async function runImapArchiveUid(config, {
+  uid,
+  archiveMailbox,
+  expectedFromEmail,
+  expectedMessageIdHash,
+  dryRun,
+  verifyAfter
+}) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("utf8");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    const listResponse = await command('LIST "" "*"');
+    const mailboxes = parseImapListMailboxes(listResponse);
+    const resolvedArchiveMailbox = resolveArchiveMailbox(mailboxes, archiveMailbox);
+    await command("SELECT INBOX");
+    const fetchResponse = await command(`UID FETCH ${uid} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])`);
+    const found = new RegExp(`\\bUID\\s+${uid}\\b`).test(fetchResponse);
+    if (!found) {
+      await command("LOGOUT").catch(() => {});
+      if (!socket.destroyed) socket.destroy();
+      return {
+        status: "not_found",
+        uid,
+        archive_mailbox: resolvedArchiveMailbox,
+        available_mailboxes: mailboxes
+      };
+    }
+
+    const headers = parseImapHeaderBlock(fetchResponse);
+    const fromEmail = extractEmailAddress(headers.from);
+    const messageIdHash = headers.message_id
+      ? createHash("sha256").update(headers.message_id).digest("hex")
+      : "";
+
+    if (expectedFromEmail && fromEmail !== extractEmailAddress(expectedFromEmail)) {
+      throw new Error(`UID ${uid} Absender-Mismatch: erwartet ${expectedFromEmail}, gefunden ${fromEmail || "unbekannt"}.`);
+    }
+    if (expectedMessageIdHash && messageIdHash !== expectedMessageIdHash) {
+      throw new Error(`UID ${uid} Message-ID-Hash-Mismatch.`);
+    }
+
+    const messageSummary = {
+      uid,
+      from_email: fromEmail || null,
+      subject: headers.subject || null,
+      date: headers.date || null,
+      message_id_hash: messageIdHash || null
+    };
+
+    if (dryRun) {
+      await command("LOGOUT").catch(() => {});
+      if (!socket.destroyed) socket.destroy();
+      return {
+        status: "ready_for_archive",
+        dry_run: true,
+        archive_mailbox: resolvedArchiveMailbox,
+        available_mailboxes: mailboxes,
+        message: messageSummary
+      };
+    }
+
+    const moveResponse = await command(`UID MOVE ${uid} ${quoteImapString(resolvedArchiveMailbox)}`);
+    let inInboxAfterMove = null;
+    if (verifyAfter) {
+      const verifyResponse = await command(`UID FETCH ${uid} (UID FLAGS)`);
+      inInboxAfterMove = new RegExp(`\\bUID\\s+${uid}\\b`).test(verifyResponse);
+    }
+
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return {
+      status: inInboxAfterMove ? "archive_verification_failed" : "archived",
+      dry_run: false,
+      archive_mailbox: resolvedArchiveMailbox,
+      message: messageSummary,
+      move_response_preview: cleanImapPreview(moveResponse, 300),
+      in_inbox_after_move: inInboxAfterMove
+    };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function archiveImapUidWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapArchiveUid(config, options);
+      return {
+        ...result,
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP Archivierung fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
   );
   error.imap_attempts = attempts;
   throw error;
@@ -6311,6 +6521,118 @@ function createServer() {
         imap_attempts: mailResult.attempts,
         requires_for_live: dry_run
           ? ["dry_run=false", "confirmed_by_asana=true", "asana_task_gid", "approved_by=Moritz Feichtmeyer"]
+          : undefined
+      });
+    }
+  );
+
+  server.tool(
+    "accounting_email_archive_processed",
+    "Accounting-Spezialpfad: archiviert eine konkrete verarbeitete Accounting-Mail erst nach Drive-Ablage und verifiziertem Sheet-Readback. Verschiebt per IMAP UID MOVE in einen bestehenden Archivordner.",
+    {
+      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      uid: z.string().regex(/^\d+$/),
+      archive_mailbox: z.string().optional(),
+      expected_from_email: z.string().optional(),
+      expected_message_id_hash: z.string().optional(),
+      drive_file_id: z.string().optional(),
+      target_folder_id: z.string().optional(),
+      sheet_verified: z.boolean().optional().default(false),
+      sheet_range: z.string().optional(),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      approved_by: z.string().optional(),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_SAFE_WRITE,
+    async ({
+      agent_id,
+      uid,
+      archive_mailbox,
+      expected_from_email,
+      expected_message_id_hash,
+      drive_file_id,
+      target_folder_id,
+      sheet_verified,
+      sheet_range,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      approved_by,
+      verify_after
+    }) => {
+      if (asana_task_gid) validateAsanaGid(asana_task_gid, "asana_task_gid");
+      const googleContext = { agent_id };
+      let verifiedDriveFile = null;
+
+      if (target_folder_id) {
+        await assertAllowedAccountingFolder(target_folder_id, googleContext);
+      }
+      if (!dry_run) {
+        assertMoritzAsanaConfirmed({
+          confirmedByAsana: confirmed_by_asana,
+          asanaTaskGid: asana_task_gid,
+          approvedBy: approved_by,
+          actionName: "accounting_email_archive_processed"
+        });
+        if (!sheet_verified) {
+          throw new Error("accounting_email_archive_processed braucht sheet_verified=true nach erfolgreichem Sheet-Readback.");
+        }
+        if (!drive_file_id) {
+          throw new Error("accounting_email_archive_processed braucht drive_file_id der abgelegten Rechnung.");
+        }
+      }
+
+      if (drive_file_id) {
+        verifiedDriveFile = await getDriveFile(
+          drive_file_id,
+          "id,name,mimeType,parents,webViewLink,appProperties,createdTime,modifiedTime",
+          googleContext
+        );
+        if (target_folder_id && !verifiedDriveFile.parents?.includes(target_folder_id)) {
+          throw new Error(`Drive-Datei ${drive_file_id} liegt nicht im erwarteten Zielordner ${target_folder_id}.`);
+        }
+      }
+
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const archiveResult = await archiveImapUidWithFallback(configs, {
+        uid,
+        archiveMailbox: archive_mailbox,
+        expectedFromEmail: expected_from_email,
+        expectedMessageIdHash: expected_message_id_hash,
+        dryRun: dry_run,
+        verifyAfter: verify_after
+      });
+
+      return out({
+        agent_id,
+        dry_run,
+        ...summary,
+        mode: "accounting_email_archive_processed",
+        connection: {
+          host: archiveResult.host,
+          port: archiveResult.port,
+          secure: archiveResult.secure,
+          label: archiveResult.label
+        },
+        uid,
+        asana_task_gid: dry_run ? undefined : asana_task_gid,
+        approved_by: dry_run ? undefined : approved_by,
+        sheet_verified,
+        sheet_range: sheet_range || null,
+        drive_file: verifiedDriveFile,
+        result: archiveResult,
+        imap_attempts: archiveResult.attempts,
+        requires_for_live: dry_run
+          ? [
+              "dry_run=false",
+              "confirmed_by_asana=true",
+              "asana_task_gid",
+              "approved_by=Moritz Feichtmeyer",
+              "sheet_verified=true",
+              "drive_file_id"
+            ]
           : undefined
       });
     }
