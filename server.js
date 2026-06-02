@@ -2533,6 +2533,13 @@ function normalizeExtractedPdfText(text) {
     .trim();
 }
 
+function getNormalizedPdfTextLines(rawText) {
+  return normalizeExtractedPdfText(rawText)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
 function extractMonthKeyFromGermanDate(dateText) {
   const match = String(dateText || "").match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
   if (!match) return null;
@@ -2574,14 +2581,82 @@ function extractGermanMonthKey(text) {
   return `${month}/${String(match[2]).slice(-2)}`;
 }
 
+function extractAccountingPdfRecipient(rawText) {
+  const lines = getNormalizedPdfTextLines(rawText);
+  const adsenseLine = lines.find((line) => /\bEinnahmen\b.*AdSense/i.test(line));
+  if (adsenseLine) {
+    const orgIndex = lines.findIndex((line) => /^Name der Organisation$/i.test(line));
+    const aliasIndex = lines.findIndex((line) => /^Alias des Zahlungskontos$/i.test(line));
+    return {
+      recipient_name: "Google AdSense",
+      recipient_address: [],
+      recipient_firm_id: null,
+      recipient_vat_id: null,
+      recipient_confidence: "high",
+      recipient_source: "adsense_statement",
+      payment_organization: orgIndex >= 0 ? lines[orgIndex + 1] || null : null,
+      payment_account_alias: aliasIndex >= 0 ? lines[aliasIndex + 1] || null : null
+    };
+  }
+
+  const senderReferenceIndex = lines.findIndex((line) => /^VIP-Studios\s*\|\s*Feichtmeyer,/i.test(line));
+  const invoiceIndex = lines.findIndex(
+    (line, index) => index > senderReferenceIndex && /^Rechnungsnr\.?:/i.test(line)
+  );
+  const recipientLines =
+    senderReferenceIndex >= 0 && invoiceIndex > senderReferenceIndex
+      ? lines.slice(senderReferenceIndex + 1, invoiceIndex)
+      : [];
+  const firmLine = lines.find((line) => /^Firmen-ID:/i.test(line)) || "";
+
+  return {
+    recipient_name: recipientLines[0] || null,
+    recipient_address: recipientLines.slice(1),
+    recipient_firm_id: firmLine.match(/Firmen-ID:\s*([^\s]+)/i)?.[1] || null,
+    recipient_vat_id: firmLine.match(/USt-ID:\s*([A-Z]{2}[A-Z0-9]+)/i)?.[1] || null,
+    recipient_confidence: recipientLines[0] ? "high" : "low",
+    recipient_source: recipientLines[0] ? "invoice_address_block" : "not_found",
+    payment_organization: null,
+    payment_account_alias: null
+  };
+}
+
 function extractInvoiceAmountsFromPdfText(rawText) {
   const text = normalizeExtractedPdfText(rawText);
+  const recipient = extractAccountingPdfRecipient(rawText);
+
+  const adsenseAmount =
+    parseEuroAmount(text.match(/\bEinnahmen\b[^\n€]*?(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]) ??
+    parseEuroAmount(text.match(/\bEinnahmen\s+[–-][^\n€]*?(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
+  if (/AdSense/i.test(text) && adsenseAmount !== null) {
+    return {
+      ...recipient,
+      kind: "income_statement",
+      status: "extracted",
+      invoice_date: null,
+      month_key: extractGermanMonthKey(text),
+      net_amount: adsenseAmount,
+      vat_amount: 0,
+      gross_amount: adsenseAmount,
+      confidence: "high"
+    };
+  }
+
   const invoiceDate = text.match(/Rechnungsnr\.?:\s*[^\n]*?\bDatum\s+(\d{2}\.\d{2}\.\d{4})/i)?.[1] || null;
-  const netInvoice = parseEuroAmount(text.match(/\bSumme:\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
+  const rawNetInvoice = parseEuroAmount(text.match(/\bSumme\s*:?\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
   const vatInvoice = parseEuroAmount(text.match(/\bMwSt\.?\s*(?:\([^)]*\))?\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
   const grossInvoice = parseEuroAmount(text.match(/\bGesamtsumme:\s*(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
+  let netInvoice = rawNetInvoice;
+  if (
+    (netInvoice === null || (netInvoice === 0 && grossInvoice !== null && vatInvoice !== null && grossInvoice > vatInvoice)) &&
+    grossInvoice !== null &&
+    vatInvoice !== null
+  ) {
+    netInvoice = Math.round((grossInvoice - vatInvoice) * 100) / 100;
+  }
   if (netInvoice !== null || vatInvoice !== null || grossInvoice !== null) {
     return {
+      ...recipient,
       kind: "invoice",
       status: netInvoice !== null && vatInvoice !== null ? "extracted" : "partial",
       invoice_date: invoiceDate,
@@ -2593,23 +2668,8 @@ function extractInvoiceAmountsFromPdfText(rawText) {
     };
   }
 
-  const adsenseAmount =
-    parseEuroAmount(text.match(/\bEinnahmen\b[^\n€]*?(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]) ??
-    parseEuroAmount(text.match(/\bEinnahmen\s+[–-][^\n€]*?(-?\s*[\d.]+,\d{2})\s*€/i)?.[1]);
-  if (adsenseAmount !== null) {
-    return {
-      kind: "income_statement",
-      status: "extracted",
-      invoice_date: null,
-      month_key: extractGermanMonthKey(text),
-      net_amount: adsenseAmount,
-      vat_amount: 0,
-      gross_amount: adsenseAmount,
-      confidence: "medium"
-    };
-  }
-
   return {
+    ...recipient,
     kind: "unknown",
     status: "not_extracted",
     invoice_date: null,
@@ -2622,11 +2682,7 @@ function extractInvoiceAmountsFromPdfText(rawText) {
 }
 
 function getLimitedPdfTextDebugLines(rawText, limit) {
-  return normalizeExtractedPdfText(rawText)
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, limit);
+  return getNormalizedPdfTextLines(rawText).slice(0, limit);
 }
 
 async function listAccountingDriveFolderPdfFiles(folderId, maxFiles, googleContext = {}) {
