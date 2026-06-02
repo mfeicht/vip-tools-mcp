@@ -2524,9 +2524,16 @@ function resolveArchiveMailbox(mailboxes, preferredMailbox) {
   );
 }
 
+function isAllowedAccountingArchiveMailboxName(value) {
+  return ACCOUNTING_ARCHIVE_MAILBOX_CANDIDATES.some(
+    (candidate) => candidate.toLowerCase() === String(value || "").trim().toLowerCase()
+  );
+}
+
 async function runImapArchiveUid(config, {
   uid,
   archiveMailbox,
+  createArchiveMailbox,
   expectedFromEmail,
   expectedMessageIdHash,
   dryRun,
@@ -2580,8 +2587,30 @@ async function runImapArchiveUid(config, {
   try {
     await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
     const listResponse = await command('LIST "" "*"');
-    const mailboxes = parseImapListMailboxes(listResponse);
-    const resolvedArchiveMailbox = resolveArchiveMailbox(mailboxes, archiveMailbox);
+    let mailboxes = parseImapListMailboxes(listResponse);
+    let archiveMailboxCreated = false;
+    let archiveMailboxCreatePlanned = false;
+    let resolvedArchiveMailbox;
+    try {
+      resolvedArchiveMailbox = resolveArchiveMailbox(mailboxes, archiveMailbox);
+    } catch (error) {
+      if (!createArchiveMailbox || !archiveMailbox) throw error;
+      if (!isAllowedAccountingArchiveMailboxName(archiveMailbox)) {
+        throw new Error(
+          `Archivordner ${archiveMailbox} darf nicht automatisch angelegt werden. Erlaubt: ${ACCOUNTING_ARCHIVE_MAILBOX_CANDIDATES.join(", ")}`
+        );
+      }
+      if (dryRun) {
+        resolvedArchiveMailbox = archiveMailbox;
+        archiveMailboxCreatePlanned = true;
+      } else {
+        await command(`CREATE ${quoteImapString(archiveMailbox)}`);
+        archiveMailboxCreated = true;
+        const relistResponse = await command('LIST "" "*"');
+        mailboxes = parseImapListMailboxes(relistResponse);
+        resolvedArchiveMailbox = resolveArchiveMailbox(mailboxes, archiveMailbox);
+      }
+    }
     await command("SELECT INBOX");
     const fetchResponse = await command(`UID FETCH ${uid} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])`);
     const found = new RegExp(`\\bUID\\s+${uid}\\b`).test(fetchResponse);
@@ -2624,6 +2653,8 @@ async function runImapArchiveUid(config, {
         status: "ready_for_archive",
         dry_run: true,
         archive_mailbox: resolvedArchiveMailbox,
+        archive_mailbox_created: false,
+        archive_mailbox_create_planned: archiveMailboxCreatePlanned,
         available_mailboxes: mailboxes,
         message: messageSummary
       };
@@ -2642,6 +2673,7 @@ async function runImapArchiveUid(config, {
       status: inInboxAfterMove ? "archive_verification_failed" : "archived",
       dry_run: false,
       archive_mailbox: resolvedArchiveMailbox,
+      archive_mailbox_created: archiveMailboxCreated,
       message: messageSummary,
       move_response_preview: cleanImapPreview(moveResponse, 300),
       in_inbox_after_move: inInboxAfterMove
@@ -6533,6 +6565,7 @@ function createServer() {
       agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
       uid: z.string().regex(/^\d+$/),
       archive_mailbox: z.string().optional(),
+      create_archive_mailbox: z.boolean().optional().default(false),
       expected_from_email: z.string().optional(),
       expected_message_id_hash: z.string().optional(),
       drive_file_id: z.string().optional(),
@@ -6550,6 +6583,7 @@ function createServer() {
       agent_id,
       uid,
       archive_mailbox,
+      create_archive_mailbox,
       expected_from_email,
       expected_message_id_hash,
       drive_file_id,
@@ -6582,6 +6616,9 @@ function createServer() {
         if (!drive_file_id) {
           throw new Error("accounting_email_archive_processed braucht drive_file_id der abgelegten Rechnung.");
         }
+        if (create_archive_mailbox && !archive_mailbox) {
+          throw new Error("create_archive_mailbox=true braucht archive_mailbox.");
+        }
       }
 
       if (drive_file_id) {
@@ -6599,6 +6636,7 @@ function createServer() {
       const archiveResult = await archiveImapUidWithFallback(configs, {
         uid,
         archiveMailbox: archive_mailbox,
+        createArchiveMailbox: create_archive_mailbox,
         expectedFromEmail: expected_from_email,
         expectedMessageIdHash: expected_message_id_hash,
         dryRun: dry_run,
@@ -6617,6 +6655,7 @@ function createServer() {
           label: archiveResult.label
         },
         uid,
+        create_archive_mailbox,
         asana_task_gid: dry_run ? undefined : asana_task_gid,
         approved_by: dry_run ? undefined : approved_by,
         sheet_verified,
@@ -6631,7 +6670,8 @@ function createServer() {
               "asana_task_gid",
               "approved_by=Moritz Feichtmeyer",
               "sheet_verified=true",
-              "drive_file_id"
+              "drive_file_id",
+              "create_archive_mailbox=true nur mit archive_mailbox"
             ]
           : undefined
       });
