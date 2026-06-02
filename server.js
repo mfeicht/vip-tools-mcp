@@ -58,18 +58,15 @@ const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/spreadsheets"
 ];
-const GOOGLE_DEFAULT_DRIVE_OAUTH_PREFIXES = ["GOOGLE_DRIVE_OAUTH", "GOOGLE_OAUTH"];
-const GOOGLE_ACCOUNTING_DRIVE_OAUTH_PREFIXES = ["GOOGLE_ACCOUNTING_OAUTH", "GOOGLE_DRIVE_OAUTH", "GOOGLE_OAUTH"];
+const GOOGLE_DEFAULT_DRIVE_OAUTH_PREFIXES = ["GOOGLE_DRIVE_OAUTH"];
+const GOOGLE_ACCOUNTING_DRIVE_OAUTH_PREFIXES = ["GOOGLE_ACCOUNTING_OAUTH", "GOOGLE_DRIVE_OAUTH"];
 const GOOGLE_SEO_OAUTH_PREFIXES = ["GOOGLE_SEO_OAUTH", "GOOGLE_ANALYTICS_SEARCH_OAUTH", "GOOGLE_OAUTH"];
 const GOOGLE_SEO_REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/analytics.readonly",
   "https://www.googleapis.com/auth/webmasters.readonly"
 ];
 const GOOGLE_ADS_OAUTH_PREFIXES = [
-  "GOOGLE_ADS_OAUTH",
-  "GOOGLE_SEO_OAUTH",
-  "GOOGLE_ANALYTICS_SEARCH_OAUTH",
-  "GOOGLE_OAUTH"
+  "GOOGLE_ADS_OAUTH"
 ];
 const GOOGLE_ADS_REQUIRED_SCOPES = ["https://www.googleapis.com/auth/adwords"];
 const GOOGLE_ADS_API_BASE = (process.env.GOOGLE_ADS_API_BASE || "https://googleads.googleapis.com").replace(
@@ -1065,7 +1062,7 @@ function googleDriveAuthSummary(agentId) {
     oauth: oauthEnvSummary(oauthPrefixes),
     auth_priority: authPriority || (serviceAccount ? "service_account" : "oauth"),
     fallback_behavior:
-      "Drive/Sheets nutzt Service Account bevorzugt, wenn konfiguriert; OAuth wird als Fallback genutzt. Bei OAuth invalid_grant wird auf Service Account ausgewichen, sofern vorhanden."
+      "Drive/Sheets nutzt nur Service Account oder Drive/Sheets-OAuth-Prefixe (GOOGLE_DRIVE_OAUTH, bei Accounting zusaetzlich GOOGLE_ACCOUNTING_OAUTH). GOOGLE_OAUTH ist fuer GA4/GSC reserviert und wird nicht fuer Drive/Sheets genutzt. Bei Drive-OAuth invalid_grant wird auf Service Account ausgewichen, sofern vorhanden."
   };
 }
 
