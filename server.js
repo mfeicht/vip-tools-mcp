@@ -2874,8 +2874,23 @@ function compactInlineInvoiceText(text, maxLines = 90) {
   return lines.slice(start, start + maxLines).join("\n");
 }
 
+function buildFullInlineEmailPdfText(message, bodyText) {
+  return [
+    "Aus kompletter E-Mail erzeugtes PDF",
+    `Von: ${message.from || message.from_email || "unbekannt"}`,
+    `Absender-Adresse: ${message.from_email || "unbekannt"}`,
+    `Betreff: ${message.subject || ""}`,
+    `E-Mail-Datum: ${message.date || ""}`,
+    message.message_id_hash ? `Message-ID-Hash: ${message.message_id_hash}` : null,
+    "",
+    "E-Mail-Inhalt:",
+    "",
+    bodyText || ""
+  ].filter((line) => line !== null).join("\n");
+}
+
 function buildInlineInvoiceFileName({ vendor, invoiceDate, documentNumber, uid }) {
-  const safeVendor = safeAttachmentFileName(vendor || "Inline-Rechnung", "Inline-Rechnung").replace(/\.[^.]+$/, "");
+  const safeVendor = safeAttachmentFileName(vendor || "E-Mail-Rechnung", "E-Mail-Rechnung").replace(/\.[^.]+$/, "");
   const datePart = invoiceDate
     ? invoiceDate.replace(/^(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})$/, (_full, day, month, year) =>
         `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
@@ -2884,7 +2899,7 @@ function buildInlineInvoiceFileName({ vendor, invoiceDate, documentNumber, uid }
   const docPart = documentNumber
     ? `-${safeAttachmentFileName(documentNumber, "Dokument")}`
     : `-uid-${uid}`;
-  return `${safeVendor}_Inline-Rechnung_${datePart}${docPart}.pdf`;
+  return `${safeVendor}_E-Mail-Rechnung_${datePart}${docPart}.pdf`;
 }
 
 function detectInlineAccountingInvoiceAttachment(message) {
@@ -2911,14 +2926,7 @@ function detectInlineAccountingInvoiceAttachment(message) {
     documentNumber,
     uid: message.uid
   });
-  const pdfText = [
-    "Aus Inline-E-Mail extrahierte Rechnung",
-    `Quelle: ${message.from_email || message.from || "unbekannt"}`,
-    `Betreff: ${message.subject || ""}`,
-    `E-Mail-Datum: ${message.date || ""}`,
-    "",
-    invoiceText || bodyText
-  ].join("\n");
+  const pdfText = buildFullInlineEmailPdfText(message, bodyText);
   const bytes = createSimpleAccountingPdfBuffer({
     title: filename.replace(/\.pdf$/i, ""),
     lines: pdfText
@@ -2933,7 +2941,7 @@ function detectInlineAccountingInvoiceAttachment(message) {
     bytes,
     generated_from_inline_invoice: true,
     inline_invoice_vendor: "Apple",
-    inline_invoice_source: "email_body",
+    inline_invoice_source: "full_email_body",
     inline_invoice_extraction: invoiceExtraction
   };
 }
@@ -3020,7 +3028,13 @@ function extractImapLiteral(response) {
   return response.slice(start, start + length);
 }
 
-async function runImapFetchUnseenRaw(config, { limit, maxEmailBytes, mailSearchMode = "unseen" }) {
+async function runImapFetchUnseenRaw(config, {
+  limit,
+  maxEmailBytes,
+  mailSearchMode = "unseen",
+  fetchAllMatching = false,
+  specificUid
+}) {
   const socket = await openImapSocket(config);
   socket.setEncoding("binary");
   const state = { buffer: "" };
@@ -3076,21 +3090,29 @@ async function runImapFetchUnseenRaw(config, { limit, maxEmailBytes, mailSearchM
       .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
     const uidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
     const uids = uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
-    const selectedUids = mailSearchMode === "inbox_all" ? uids.slice(-limit).reverse() : uids.slice(0, limit);
+    const batchSize = Math.max(1, Number(limit || 25));
+    const selectedUids = specificUid
+      ? [String(specificUid)]
+      : fetchAllMatching
+        ? (mailSearchMode === "inbox_all" ? [...uids].reverse() : [...uids])
+        : (mailSearchMode === "inbox_all" ? uids.slice(-batchSize).reverse() : uids.slice(0, batchSize));
     const messages = [];
 
-    for (const uid of selectedUids) {
-      const fetchResponse = await command(`UID FETCH ${uid} (BODY.PEEK[])`);
-      const raw = extractImapLiteral(fetchResponse);
-      if (!raw) {
-        messages.push({ uid, parse_error: "no_body_literal" });
-        continue;
+    for (let index = 0; index < selectedUids.length; index += batchSize) {
+      const batchUids = selectedUids.slice(index, index + batchSize);
+      for (const uid of batchUids) {
+        const fetchResponse = await command(`UID FETCH ${uid} (BODY.PEEK[])`);
+        const raw = extractImapLiteral(fetchResponse);
+        if (!raw) {
+          messages.push({ uid, parse_error: "no_body_literal" });
+          continue;
+        }
+        if (Buffer.byteLength(raw, "binary") > maxEmailBytes) {
+          messages.push({ uid, parse_error: "message_too_large" });
+          continue;
+        }
+        messages.push(parseRawEmail(raw, uid));
       }
-      if (Buffer.byteLength(raw, "binary") > maxEmailBytes) {
-        messages.push({ uid, parse_error: "message_too_large" });
-        continue;
-      }
-      messages.push(parseRawEmail(raw, uid));
     }
 
     await command("LOGOUT").catch(() => {});
@@ -3098,6 +3120,10 @@ async function runImapFetchUnseenRaw(config, { limit, maxEmailBytes, mailSearchM
     return {
       mail_search_mode: mailSearchMode,
       search_criterion: searchCriterion,
+      fetch_all_matching: Boolean(fetchAllMatching),
+      specific_uid: specificUid || null,
+      batch_size: batchSize,
+      batch_count: Math.ceil(selectedUids.length / batchSize),
       matching_count: uids.length,
       unseen_count: mailSearchMode === "unseen" ? uids.length : null,
       returned_count: messages.length,
@@ -7450,7 +7476,7 @@ function createServer() {
 
   server.tool(
     "accounting_mail_scan_upload_attachment",
-    "Accounting-Spezialpfad: liest neue oder noch im Postfach liegende Rechnungen serverseitig, akzeptiert echte Rechnungs-PDFs/Bilder und erkannte Inline-Rechnungen wie Apple, rendert Inline-Rechnungen als PDF, prueft optional eine Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
+    "Accounting-Spezialpfad: liest neue oder noch im Postfach liegende Rechnungen serverseitig, akzeptiert echte Rechnungs-PDFs/Bilder und erkannte Inline-Rechnungen wie Apple, rendert Inline-Rechnungen als komplette E-Mail-PDFs, prueft optional eine Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien. Fuer Routinen process_all_matching=true nutzen; limit ist dann nur die interne Batchgroesse, kein Gesamtlimit.",
     {
       agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
       target_folder_id: z.string(),
@@ -7463,7 +7489,8 @@ function createServer() {
       attachment_name_contains: z.string().optional(),
       download_first_match: z.boolean().optional().default(false),
       upload_all_matching: z.boolean().optional().default(false),
-      limit: z.number().int().min(1).max(25).optional().default(10),
+      process_all_matching: z.boolean().optional().default(false),
+      limit: z.number().int().min(1).max(100).optional().default(25),
       max_email_bytes: z
         .number()
         .int()
@@ -7497,6 +7524,7 @@ function createServer() {
       attachment_name_contains,
       download_first_match,
       upload_all_matching,
+      process_all_matching,
       limit,
       max_email_bytes,
       max_attachment_bytes,
@@ -7530,7 +7558,9 @@ function createServer() {
       const mailResult = await fetchUnseenRawEmailWithFallback(configs, {
         limit,
         maxEmailBytes: max_email_bytes,
-        mailSearchMode: mail_search_mode
+        mailSearchMode: mail_search_mode,
+        fetchAllMatching: process_all_matching && !uid,
+        specificUid: uid
       });
       const processed = [];
 
@@ -7770,6 +7800,9 @@ function createServer() {
         sender_allowlist_enforced: enforce_sender_allowlist,
         invoice_only,
         mail_search_mode,
+        process_all_matching,
+        batch_size: mailResult.batch_size,
+        batch_count: mailResult.batch_count,
         matching_count: mailResult.matching_count,
         unseen_count: mailResult.unseen_count,
         returned_count: mailResult.returned_count,
