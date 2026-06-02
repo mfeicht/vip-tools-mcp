@@ -6030,7 +6030,7 @@ function createServer() {
 
   server.tool(
     "accounting_mail_scan_upload_attachment",
-    "Accounting-Spezialpfad: liest ungelesene Mailanhaenge serverseitig, akzeptiert nur PDF/Bilder, prueft Absender-Allowlist, scannt per ClamAV INSTREAM und laedt saubere Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
+    "Accounting-Spezialpfad: liest ungelesene Mailanhaenge serverseitig, akzeptiert nur PDF/Bilder, prueft Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
     {
       agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
       target_folder_id: z.string(),
@@ -6185,6 +6185,8 @@ function createServer() {
               error: String(error?.message || error)
             };
           }
+          const scanBlocksUpload = scan.status === "not_clean";
+          const scanWasSkipped = scan.status === "not_configured" || scan.status === "error";
 
           const duplicateFiles = await findAccountingDriveDuplicate({
             folderId: target_folder_id,
@@ -6202,17 +6204,22 @@ function createServer() {
           if (dry_run) {
             processed.push({
               ...baseMessage,
-              status: scan.clean && duplicateFiles.length === 0 ? "ready_for_upload" : "blocked_or_duplicate",
+              status: !scanBlocksUpload && duplicateFiles.length === 0 ? "ready_for_upload" : "blocked_or_duplicate",
               dry_run: true,
               target_folder_id,
               attachment: attachmentSummary,
               scan,
+              virus_scan_required: false,
+              virus_scan_available: !scanWasSkipped,
+              virus_scan_note: scanWasSkipped
+                ? "ClamAV ist optional und aktuell nicht verfuegbar; Upload waere ohne Virenscan erlaubt."
+                : undefined,
               duplicates: duplicateSummary
             });
             continue;
           }
 
-          if (!scan.clean) {
+          if (scanBlocksUpload) {
             processed.push({
               ...baseMessage,
               status: "blocked",
@@ -6273,6 +6280,11 @@ function createServer() {
             target_folder_id,
             attachment: attachmentSummary,
             scan,
+            virus_scan_required: false,
+            virus_scan_available: !scanWasSkipped,
+            virus_scan_note: scanWasSkipped
+              ? "ClamAV war nicht verfuegbar; Datei wurde gemaess optionalem Scan-Modus ohne Virenscan verarbeitet."
+              : undefined,
             uploaded_file: uploaded,
             verified_file: verifiedFile,
             verification_status: verificationStatus
@@ -6298,7 +6310,7 @@ function createServer() {
         processed,
         imap_attempts: mailResult.attempts,
         requires_for_live: dry_run
-          ? ["dry_run=false", "confirmed_by_asana=true", "asana_task_gid", "approved_by=Moritz Feichtmeyer", "CLAMD_HOST"]
+          ? ["dry_run=false", "confirmed_by_asana=true", "asana_task_gid", "approved_by=Moritz Feichtmeyer"]
           : undefined
       });
     }
