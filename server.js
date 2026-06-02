@@ -58,7 +58,7 @@ const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/spreadsheets"
 ];
-const GOOGLE_DEFAULT_DRIVE_OAUTH_PREFIXES = ["GOOGLE_OAUTH"];
+const GOOGLE_DEFAULT_DRIVE_OAUTH_PREFIXES = ["GOOGLE_DRIVE_OAUTH", "GOOGLE_OAUTH"];
 const GOOGLE_ACCOUNTING_DRIVE_OAUTH_PREFIXES = ["GOOGLE_ACCOUNTING_OAUTH", "GOOGLE_DRIVE_OAUTH", "GOOGLE_OAUTH"];
 const GOOGLE_SEO_OAUTH_PREFIXES = ["GOOGLE_SEO_OAUTH", "GOOGLE_ANALYTICS_SEARCH_OAUTH", "GOOGLE_OAUTH"];
 const GOOGLE_SEO_REQUIRED_SCOPES = [
@@ -1041,6 +1041,34 @@ function oauthEnvSummary(prefixes) {
   );
 }
 
+function googleDriveAuthSummary(agentId) {
+  let serviceAccount = null;
+  let serviceAccountError = null;
+  try {
+    serviceAccount = parseGoogleServiceAccount();
+  } catch (error) {
+    serviceAccountError = error?.message || String(error);
+  }
+  const oauthPrefixes = getGoogleDriveOAuthPrefixesForAgent(agentId);
+  const authPriority = String(
+    process.env.GOOGLE_DRIVE_AUTH_PRIORITY || process.env.GOOGLE_AUTH_PRIORITY || ""
+  ).toLowerCase();
+  return {
+    agent_id: agentId,
+    google_scopes: GOOGLE_SCOPES,
+    service_account: {
+      configured: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64),
+      parse_ok: Boolean(serviceAccount),
+      client_email: serviceAccount?.client_email || null,
+      error: serviceAccountError
+    },
+    oauth: oauthEnvSummary(oauthPrefixes),
+    auth_priority: authPriority || (serviceAccount ? "service_account" : "oauth"),
+    fallback_behavior:
+      "Drive/Sheets nutzt Service Account bevorzugt, wenn konfiguriert; OAuth wird als Fallback genutzt. Bei OAuth invalid_grant wird auf Service Account ausgewichen, sofern vorhanden."
+  };
+}
+
 function getGoogleDriveOAuthPrefixesForAgent(agentId) {
   return agentId === "vip-ai-accounting"
     ? GOOGLE_ACCOUNTING_DRIVE_OAUTH_PREFIXES
@@ -1090,23 +1118,8 @@ async function refreshGoogleOAuthAccessToken(oauthConfig, tokenCache) {
   return tokenCache.accessToken;
 }
 
-async function getGoogleAccessToken({ agent_id } = {}) {
+async function refreshGoogleServiceAccountAccessToken(serviceAccount) {
   const now = Math.floor(Date.now() / 1000);
-
-  const oauthPrefixes = getGoogleDriveOAuthPrefixesForAgent(agent_id);
-  const oauthConfig = getFirstOAuthConfig(oauthPrefixes);
-  if (oauthConfig) {
-    return refreshGoogleOAuthAccessToken(oauthConfig, googleTokenCache);
-  }
-
-  const serviceAccount = parseGoogleServiceAccount();
-  if (!serviceAccount) {
-    throw new Error(
-      `Google-Zugang fehlt. Setze GOOGLE_SERVICE_ACCOUNT_JSON(_BASE64) oder ${oauthPrefixes.map(
-        (prefix) => `${prefix}_CLIENT_ID/${prefix}_CLIENT_SECRET/${prefix}_REFRESH_TOKEN`
-      ).join(" oder ")}.`
-    );
-  }
 
   if (
     googleTokenCache.accessToken &&
@@ -1169,6 +1182,59 @@ async function getGoogleAccessToken({ agent_id } = {}) {
     envPrefix: "GOOGLE_SERVICE_ACCOUNT"
   };
   return googleTokenCache.accessToken;
+}
+
+async function getGoogleAccessToken({ agent_id } = {}) {
+  const oauthPrefixes = getGoogleDriveOAuthPrefixesForAgent(agent_id);
+  const oauthConfig = getFirstOAuthConfig(oauthPrefixes);
+  let serviceAccount = null;
+  let serviceAccountParseError = null;
+  try {
+    serviceAccount = parseGoogleServiceAccount();
+  } catch (error) {
+    serviceAccountParseError = error;
+  }
+
+  const authPriority = String(
+    process.env.GOOGLE_DRIVE_AUTH_PRIORITY || process.env.GOOGLE_AUTH_PRIORITY || ""
+  ).toLowerCase();
+  const preferServiceAccount = authPriority
+    ? ["service", "service_account", "service-account", "sa"].includes(authPriority)
+    : Boolean(serviceAccount);
+
+  if (preferServiceAccount) {
+    if (serviceAccount) {
+      try {
+        return await refreshGoogleServiceAccountAccessToken(serviceAccount);
+      } catch (serviceError) {
+        if (!oauthConfig) throw serviceError;
+      }
+    } else if (serviceAccountParseError && !oauthConfig) {
+      throw serviceAccountParseError;
+    }
+  }
+
+  if (oauthConfig) {
+    try {
+      return await refreshGoogleOAuthAccessToken(oauthConfig, googleTokenCache);
+    } catch (oauthError) {
+      if (serviceAccount) {
+        return refreshGoogleServiceAccountAccessToken(serviceAccount);
+      }
+      throw oauthError;
+    }
+  }
+
+  if (serviceAccount) {
+    return refreshGoogleServiceAccountAccessToken(serviceAccount);
+  }
+  if (serviceAccountParseError) throw serviceAccountParseError;
+
+  throw new Error(
+    `Google-Zugang fehlt. Setze GOOGLE_SERVICE_ACCOUNT_JSON(_BASE64) oder ${oauthPrefixes.map(
+      (prefix) => `${prefix}_CLIENT_ID/${prefix}_CLIENT_SECRET/${prefix}_REFRESH_TOKEN`
+    ).join(" oder ")}.`
+  );
 }
 
 async function getGoogleSeoAccessToken() {
@@ -8836,6 +8902,45 @@ function createServer() {
         live_requests: planned_requests.map(({ name, endpoint, max_results }) => ({ name, endpoint, max_results })),
         total_cost,
         responses
+      });
+    }
+  );
+
+  server.tool(
+    "google_drive_check_config",
+    "Prueft die Google-Drive/Sheets-Konfiguration fuer den Remote-MCP read-only. Gibt keine Secret-Werte aus und kann optional testweise ein Access Token erzeugen.",
+    {
+      agent_id: agentIdSchema,
+      fetch_token: z.boolean().optional().default(false)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id, fetch_token }) => {
+      const summary = googleDriveAuthSummary(agent_id);
+      let token_check = { requested: Boolean(fetch_token), status: "not_requested" };
+      if (fetch_token) {
+        try {
+          await getGoogleAccessToken({ agent_id });
+          token_check = {
+            requested: true,
+            status: "ok",
+            active_auth: googleTokenCache.envPrefix || null,
+            expires_at: googleTokenCache.expiresAt
+              ? new Date(googleTokenCache.expiresAt * 1000).toISOString()
+              : null
+          };
+        } catch (error) {
+          token_check = {
+            requested: true,
+            status: "failed",
+            error: error?.message || String(error)
+          };
+        }
+      }
+
+      return out({
+        agent_id,
+        ...summary,
+        token_check
       });
     }
   );
