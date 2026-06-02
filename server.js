@@ -4,7 +4,7 @@ import axios from "axios";
 import net from "net";
 import tls from "tls";
 import { createHash, createSign, randomUUID } from "crypto";
-import pdfParse from "pdf-parse";
+import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -5893,7 +5893,13 @@ function createServer() {
           }
 
           const buffer = await downloadDrivePdfBuffer(file.id, max_pdf_bytes, googleContext);
-          const parsed = await pdfParse(buffer);
+          const parser = new PDFParse({ data: buffer });
+          let parsed;
+          try {
+            parsed = await parser.getText();
+          } finally {
+            await parser.destroy().catch(() => {});
+          }
           const extracted = extractInvoiceAmountsFromPdfText(parsed.text || "");
           const monthMismatch = Boolean(
             expected_month_key && extracted.month_key && extracted.month_key !== expected_month_key
