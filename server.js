@@ -195,6 +195,9 @@ const ACCOUNTING_ALLOWED_ATTACHMENT_MIME_TYPES = new Set([
   "image/heif"
 ]);
 const ACCOUNTING_INLINE_INVOICE_PDF_MIME_TYPE = "application/pdf";
+const ACCOUNTING_INLINE_EMAIL_RENDER_TIMEOUT_MS = Number(process.env.ACCOUNTING_INLINE_EMAIL_RENDER_TIMEOUT_MS || 30_000);
+const ACCOUNTING_INLINE_EMAIL_RENDER_REMOTE_IMAGES =
+  String(process.env.ACCOUNTING_INLINE_EMAIL_RENDER_REMOTE_IMAGES || "true").toLowerCase() !== "false";
 const ACCOUNTING_MORITZ_EMAILS = new Set(
   [
     "moritz.feichtmeyer@vip-studios.de",
@@ -2624,6 +2627,47 @@ function parseMimeMessageTextParts(raw, depth = 0) {
   ];
 }
 
+function stripMimeContentId(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^<|>$/g, "")
+    .trim();
+}
+
+function parseMimeMessageInlineResources(raw, depth = 0) {
+  if (depth > 20) return [];
+  const { headersText, body } = splitHeaderAndBody(raw);
+  const headers = parseMimeHeaders(headersText);
+  const contentType = parseHeaderParams(headers["content-type"] || "application/octet-stream");
+  const disposition = parseHeaderParams(headers["content-disposition"] || "");
+
+  if (contentType.value.startsWith("multipart/") && contentType.params.boundary) {
+    return splitMultipartBody(body, contentType.params.boundary).flatMap((part) =>
+      parseMimeMessageInlineResources(part, depth + 1)
+    );
+  }
+
+  const mimeType = contentType.value.toLowerCase();
+  const contentId = stripMimeContentId(headers["content-id"]);
+  const contentLocation = decodeMimeHeaderValue(headers["content-location"] || "").trim();
+  const isImage = mimeType.startsWith("image/");
+  const isInlineResource = isImage && (contentId || contentLocation || disposition.value === "inline");
+  if (!isInlineResource) return [];
+
+  const bytes = decodeMimePartBody(body, headers["content-transfer-encoding"]);
+  return [
+    {
+      content_id: contentId || null,
+      content_location: contentLocation || null,
+      content_type: mimeType,
+      content_disposition: disposition.value || null,
+      transfer_encoding: headers["content-transfer-encoding"] || null,
+      byte_length: bytes.length,
+      bytes
+    }
+  ];
+}
+
 function fileExtension(fileName) {
   const match = /\.([A-Za-z0-9]+)$/.exec(String(fileName || ""));
   return match ? match[1].toLowerCase() : "";
@@ -2660,7 +2704,11 @@ function publicAccountingAttachment(attachment) {
     sha256: createHash("sha256").update(attachment.bytes).digest("hex"),
     generated_from_inline_invoice: Boolean(attachment.generated_from_inline_invoice),
     inline_invoice_vendor: attachment.inline_invoice_vendor || undefined,
-    inline_invoice_source: attachment.inline_invoice_source || undefined
+    inline_invoice_source: attachment.inline_invoice_source || undefined,
+    inline_invoice_render_mode: attachment.inline_invoice_render_mode || undefined,
+    inline_invoice_render_engine: attachment.inline_invoice_render_engine || undefined,
+    inline_invoice_render_remote_images: attachment.inline_invoice_render_remote_images ?? undefined,
+    inline_invoice_render_error: attachment.inline_invoice_render_error || undefined
   };
 }
 
@@ -2722,6 +2770,192 @@ function decodeAccountingHtmlEntities(value) {
     .replace(/&#39;/gi, "'")
     .replace(/&#x([0-9a-f]+);/gi, (_full, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
     .replace(/&#(\d+);/g, (_full, code) => String.fromCodePoint(Number.parseInt(code, 10)));
+}
+
+function escapeAccountingHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function extractAccountingHtmlBody(html) {
+  const match = String(html || "").match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
+  return match ? match[1] : String(html || "");
+}
+
+function extractAccountingHtmlStyleTags(html) {
+  return Array.from(String(html || "").matchAll(/<style\b[^>]*>[\s\S]*?<\/style>/gi))
+    .map((match) => match[0])
+    .join("\n");
+}
+
+function decodeCidReference(value) {
+  const raw = String(value || "").replace(/^cid:/i, "").trim();
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function resourceDataUri(resource) {
+  if (!resource?.bytes?.length || !resource.content_type) return null;
+  return `data:${resource.content_type};base64,${resource.bytes.toString("base64")}`;
+}
+
+function rewriteCidUrlsForAccountingHtml(html, inlineResources = []) {
+  const byCid = new Map();
+  const byLocation = new Map();
+  for (const resource of inlineResources || []) {
+    const contentId = stripMimeContentId(resource.content_id);
+    if (contentId) byCid.set(contentId.toLowerCase(), resource);
+    if (resource.content_location) byLocation.set(String(resource.content_location).trim(), resource);
+  }
+  if (!byCid.size && !byLocation.size) return String(html || "");
+  return String(html || "")
+    .replace(/cid:([^"'\s)>]+)/gi, (full, cid) => {
+      const resource = byCid.get(decodeCidReference(cid).toLowerCase());
+      const dataUri = resourceDataUri(resource);
+      return dataUri || full;
+    })
+    .replace(/\b(src|background)\s*=\s*(["'])([^"']+)\2/gi, (full, attr, quote, url) => {
+      const resource = byLocation.get(url.trim());
+      const dataUri = resourceDataUri(resource);
+      return dataUri ? `${attr}=${quote}${dataUri}${quote}` : full;
+    })
+    .replace(/url\((["']?)([^"')]+)\1\)/gi, (full, quote, url) => {
+      const resource = byLocation.get(url.trim());
+      const dataUri = resourceDataUri(resource);
+      return dataUri ? `url(${quote}${dataUri}${quote})` : full;
+    });
+}
+
+function htmlPartForAccountingPdf(message, fallbackText) {
+  const htmlParts = (message.text_parts || [])
+    .filter((part) => part.content_type === "text/html")
+    .map((part) => part.text)
+    .filter(Boolean);
+  if (htmlParts.length) {
+    return htmlParts
+      .map((html) => `${extractAccountingHtmlStyleTags(html)}\n${extractAccountingHtmlBody(html)}`)
+      .join('<hr style="border:0;border-top:1px solid #d0d7de;margin:18px 0;">');
+  }
+  return `<pre style="white-space:pre-wrap;font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">${escapeAccountingHtml(fallbackText)}</pre>`;
+}
+
+function buildInlineEmailHtmlDocument(message, bodyText) {
+  const bodyHtml = rewriteCidUrlsForAccountingHtml(
+    htmlPartForAccountingPdf(message, bodyText),
+    message.inline_resources || []
+  )
+    .replace(/<\s*script\b[^>]*>[\s\S]*?<\s*\/\s*script\s*>/gi, "")
+    .replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page { margin: 14mm; }
+  html, body { margin: 0; padding: 0; background: #fff; color: #1f2328; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 14px; line-height: 1.45; }
+  img { max-width: 100%; height: auto; }
+  table { max-width: 100%; border-collapse: collapse; }
+  .vip-mail-header {
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 0 0 16px 0;
+    background: #f6f8fa;
+    font-size: 12px;
+    color: #424a53;
+  }
+  .vip-mail-header div { margin: 2px 0; }
+  .vip-mail-body { width: 100%; }
+</style>
+</head>
+<body>
+  <div class="vip-mail-header">
+    <div><strong>Von:</strong> ${escapeAccountingHtml(message.from || message.from_email || "unbekannt")}</div>
+    <div><strong>Betreff:</strong> ${escapeAccountingHtml(message.subject || "")}</div>
+    <div><strong>Datum:</strong> ${escapeAccountingHtml(message.date || "")}</div>
+  </div>
+  <div class="vip-mail-body">${bodyHtml}</div>
+</body>
+</html>`;
+}
+
+async function renderAccountingHtmlEmailPdfBuffer(html, { allowRemoteImages = ACCOUNTING_INLINE_EMAIL_RENDER_REMOTE_IMAGES } = {}) {
+  const puppeteer = await import("puppeteer");
+  const executablePath =
+    process.env.PUPPETEER_EXECUTABLE_PATH ||
+    process.env.CHROME_BIN ||
+    process.env.GOOGLE_CHROME_BIN ||
+    "";
+  const browser = await puppeteer.default.launch({
+    headless: "new",
+    ...(executablePath ? { executablePath } : {}),
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setJavaScriptEnabled(false);
+    await page.setViewport({ width: 1024, height: 1440, deviceScaleFactor: 1 });
+    await page.emulateMediaType("screen");
+    await page.setRequestInterception(true);
+    page.on("request", (request) => {
+      const url = request.url();
+      const type = request.resourceType();
+      if (/^(data|blob|about):/i.test(url)) {
+        request.continue().catch(() => {});
+        return;
+      }
+      if (allowRemoteImages && /^https?:/i.test(url) && ["image", "stylesheet", "font"].includes(type)) {
+        request.continue().catch(() => {});
+        return;
+      }
+      request.abort().catch(() => {});
+    });
+    await page.setContent(html, {
+      waitUntil: "load",
+      timeout: ACCOUNTING_INLINE_EMAIL_RENDER_TIMEOUT_MS
+    });
+    return Buffer.from(await page.pdf({
+      format: "A4",
+      printBackground: true,
+      preferCSSPageSize: false,
+      margin: { top: "12mm", right: "12mm", bottom: "12mm", left: "12mm" },
+      timeout: ACCOUNTING_INLINE_EMAIL_RENDER_TIMEOUT_MS
+    }));
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+async function createInlineAccountingEmailPdf({ message, bodyText, fallbackTextPdfTitle }) {
+  const html = buildInlineEmailHtmlDocument(message, bodyText);
+  try {
+    const bytes = await renderAccountingHtmlEmailPdfBuffer(html);
+    return {
+      bytes,
+      render_mode: "html_email_pdf",
+      render_engine: "puppeteer",
+      render_remote_images: ACCOUNTING_INLINE_EMAIL_RENDER_REMOTE_IMAGES
+    };
+  } catch (error) {
+    const fallbackText = buildFullInlineEmailPdfText(message, bodyText);
+    return {
+      bytes: createSimpleAccountingPdfBuffer({
+        title: fallbackTextPdfTitle,
+        lines: fallbackText
+      }),
+      render_mode: "text_email_pdf_fallback",
+      render_engine: "simple_pdf",
+      render_error: String(error?.message || error),
+      render_remote_images: false
+    };
+  }
 }
 
 function htmlToAccountingText(html) {
@@ -2902,7 +3136,7 @@ function buildInlineInvoiceFileName({ vendor, invoiceDate, documentNumber, uid }
   return `${safeVendor}_E-Mail-Rechnung_${datePart}${docPart}.pdf`;
 }
 
-function detectInlineAccountingInvoiceAttachment(message) {
+async function detectInlineAccountingInvoiceAttachment(message) {
   const bodyText = plainTextFromAccountingTextParts(message.text_parts || []);
   if (!bodyText) return null;
 
@@ -2926,10 +3160,10 @@ function detectInlineAccountingInvoiceAttachment(message) {
     documentNumber,
     uid: message.uid
   });
-  const pdfText = buildFullInlineEmailPdfText(message, bodyText);
-  const bytes = createSimpleAccountingPdfBuffer({
-    title: filename.replace(/\.pdf$/i, ""),
-    lines: pdfText
+  const rendered = await createInlineAccountingEmailPdf({
+    message,
+    bodyText,
+    fallbackTextPdfTitle: filename.replace(/\.pdf$/i, "")
   });
 
   return {
@@ -2937,11 +3171,15 @@ function detectInlineAccountingInvoiceAttachment(message) {
     content_type: ACCOUNTING_INLINE_INVOICE_PDF_MIME_TYPE,
     content_disposition: "generated-inline",
     transfer_encoding: null,
-    byte_length: bytes.length,
-    bytes,
+    byte_length: rendered.bytes.length,
+    bytes: rendered.bytes,
     generated_from_inline_invoice: true,
     inline_invoice_vendor: "Apple",
-    inline_invoice_source: "full_email_body",
+    inline_invoice_source: rendered.render_mode === "html_email_pdf" ? "rendered_full_email_html" : "full_email_body",
+    inline_invoice_render_mode: rendered.render_mode,
+    inline_invoice_render_engine: rendered.render_engine,
+    inline_invoice_render_remote_images: rendered.render_remote_images,
+    inline_invoice_render_error: rendered.render_error,
     inline_invoice_extraction: invoiceExtraction
   };
 }
@@ -2998,7 +3236,7 @@ async function classifyAccountingAttachmentForUpload(attachment, message) {
   };
 }
 
-function parseRawEmail(raw, uid) {
+async function parseRawEmail(raw, uid) {
   const { headersText } = splitHeaderAndBody(raw);
   const headers = parseMimeHeaders(headersText);
   const messageId = headers["message-id"] || "";
@@ -3011,9 +3249,10 @@ function parseRawEmail(raw, uid) {
     message_id: messageId,
     message_id_hash: messageId ? createHash("sha256").update(messageId).digest("hex") : "",
     attachments: parseMimeMessageParts(raw).filter(isAccountingInvoiceAttachment),
-    text_parts: parseMimeMessageTextParts(raw)
+    text_parts: parseMimeMessageTextParts(raw),
+    inline_resources: parseMimeMessageInlineResources(raw)
   };
-  const inlineInvoiceAttachment = detectInlineAccountingInvoiceAttachment(message);
+  const inlineInvoiceAttachment = await detectInlineAccountingInvoiceAttachment(message);
   if (inlineInvoiceAttachment) {
     message.attachments.push(inlineInvoiceAttachment);
   }
@@ -3111,7 +3350,7 @@ async function runImapFetchUnseenRaw(config, {
           messages.push({ uid, parse_error: "message_too_large" });
           continue;
         }
-        messages.push(parseRawEmail(raw, uid));
+        messages.push(await parseRawEmail(raw, uid));
       }
     }
 
@@ -7476,7 +7715,7 @@ function createServer() {
 
   server.tool(
     "accounting_mail_scan_upload_attachment",
-    "Accounting-Spezialpfad: liest neue oder noch im Postfach liegende Rechnungen serverseitig, akzeptiert echte Rechnungs-PDFs/Bilder und erkannte Inline-Rechnungen wie Apple, rendert Inline-Rechnungen als komplette E-Mail-PDFs, prueft optional eine Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien. Fuer Routinen process_all_matching=true nutzen; limit ist dann nur die interne Batchgroesse, kein Gesamtlimit.",
+    "Accounting-Spezialpfad: liest neue oder noch im Postfach liegende Rechnungen serverseitig, akzeptiert echte Rechnungs-PDFs/Bilder und erkannte Inline-Rechnungen wie Apple, rendert Inline-Rechnungen bevorzugt als visuelle HTML-Mail-PDFs mit Layout/Styles/Bildern und nutzt nur bei fehlender Browser-Runtime ein Text-PDF-Fallback, prueft optional eine Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien. Fuer Routinen process_all_matching=true nutzen; limit ist dann nur die interne Batchgroesse, kein Gesamtlimit.",
     {
       agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
       target_folder_id: z.string(),
