@@ -2341,6 +2341,81 @@ function publicAccountingAttachment(attachment) {
   };
 }
 
+function normalizeAccountingClassificationText(value) {
+  return String(value || "")
+    .replace(/\u00a0/g, " ")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function classifyAccountingTextAsInvoice(text) {
+  const normalized = normalizeAccountingClassificationText(text);
+  const hasInvoiceSignal = /\b(rechnung|invoice|tax invoice|credit note|gutschrift|facture|fattura|receipt|quittung)\b/i.test(normalized);
+  const hasNonInvoiceSignal =
+    /\b(mahnung|zahlungserinnerung|payment reminder|dunning|overdue|ubersicht|overview|report|kontoauszug|account statement|transaction overview|statement of account)\b/i.test(normalized);
+
+  if (hasInvoiceSignal) {
+    return {
+      status: "invoice",
+      invoice_signal: true,
+      non_invoice_signal: hasNonInvoiceSignal,
+      decision: "allow"
+    };
+  }
+  if (hasNonInvoiceSignal) {
+    return {
+      status: "non_invoice",
+      invoice_signal: false,
+      non_invoice_signal: true,
+      decision: "skip"
+    };
+  }
+  return {
+    status: "unclear",
+    invoice_signal: false,
+    non_invoice_signal: false,
+    decision: "skip"
+  };
+}
+
+async function classifyAccountingAttachmentForUpload(attachment, message) {
+  const ext = fileExtension(attachment.filename);
+  const subjectAndName = `${message?.subject || ""}\n${attachment.filename || ""}`;
+  if (ext !== "pdf" && String(attachment.content_type || "").toLowerCase() !== "application/pdf") {
+    const metadataClassification = classifyAccountingTextAsInvoice(subjectAndName);
+    return {
+      ...metadataClassification,
+      source: "attachment_metadata",
+      reason:
+        metadataClassification.decision === "allow"
+          ? "invoice_signal_in_subject_or_filename"
+          : "image_attachment_without_invoice_signal"
+    };
+  }
+
+  const parser = new PDFParse({ data: attachment.bytes });
+  let parsed;
+  try {
+    parsed = await parser.getText();
+  } finally {
+    await parser.destroy().catch(() => {});
+  }
+  const classification = classifyAccountingTextAsInvoice(`${subjectAndName}\n${parsed.text || ""}`);
+  return {
+    ...classification,
+    source: "pdf_text",
+    reason:
+      classification.decision === "allow"
+        ? "invoice_signal_in_pdf_text"
+        : classification.status === "non_invoice"
+          ? "non_invoice_signal_in_pdf_text"
+          : "missing_invoice_signal_in_pdf_text"
+  };
+}
+
 function parseRawEmail(raw, uid) {
   const { headersText } = splitHeaderAndBody(raw);
   const headers = parseMimeHeaders(headersText);
@@ -6272,12 +6347,14 @@ function createServer() {
 
   server.tool(
     "accounting_mail_scan_upload_attachment",
-    "Accounting-Spezialpfad: liest ungelesene Mailanhaenge serverseitig, akzeptiert nur PDF/Bilder, prueft Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
+    "Accounting-Spezialpfad: liest ungelesene Mailanhaenge serverseitig, akzeptiert nur echte Rechnungs-PDFs/Bilder, prueft optional eine Absender-Allowlist, scannt optional per ClamAV INSTREAM falls verfuegbar und laedt Dateien direkt in freigegebene Accounting-Drive-Ordner. Keine lokalen Zwischenkopien.",
     {
       agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
       target_folder_id: z.string(),
       sender_allowlist: z.array(z.string()).optional().default([]),
       include_moritz_allowlist: z.boolean().optional().default(true),
+      enforce_sender_allowlist: z.boolean().optional().default(true),
+      invoice_only: z.boolean().optional().default(true),
       uid: z.string().optional(),
       attachment_name_contains: z.string().optional(),
       download_first_match: z.boolean().optional().default(false),
@@ -6309,6 +6386,8 @@ function createServer() {
       target_folder_id,
       sender_allowlist,
       include_moritz_allowlist,
+      enforce_sender_allowlist,
+      invoice_only,
       uid,
       attachment_name_contains,
       download_first_match,
@@ -6335,10 +6414,10 @@ function createServer() {
       }
 
       const allowlist = normalizeEmailAllowlist(sender_allowlist);
-      if (include_moritz_allowlist) {
+      if (enforce_sender_allowlist && include_moritz_allowlist) {
         for (const email of ACCOUNTING_MORITZ_EMAILS) allowlist.add(email);
       }
-      if (!allowlist.size) {
+      if (enforce_sender_allowlist && !allowlist.size) {
         throw new Error("sender_allowlist ist leer. Fuer Accounting-Mailanhaenge braucht es eine Moritz-Allowlist.");
       }
 
@@ -6353,7 +6432,7 @@ function createServer() {
           continue;
         }
 
-        const senderAllowed = allowlist.has(message.from_email);
+        const senderAllowed = !enforce_sender_allowlist || allowlist.has(message.from_email);
         const baseMessage = {
           uid: message.uid,
           from_email: message.from_email || null,
@@ -6365,6 +6444,7 @@ function createServer() {
             ...baseMessage,
             status: "skipped",
             reason: "sender_not_allowlisted",
+            sender_allowlist_enforced: true,
             attachment_count: message.attachments.length
           });
           continue;
@@ -6416,6 +6496,32 @@ function createServer() {
             continue;
           }
 
+          let invoiceClassification = null;
+          if (invoice_only) {
+            try {
+              invoiceClassification = await classifyAccountingAttachmentForUpload(attachment, message);
+            } catch (error) {
+              processed.push({
+                ...baseMessage,
+                status: "blocked",
+                reason: "invoice_classification_failed",
+                attachment: attachmentSummary,
+                error: String(error?.message || error)
+              });
+              continue;
+            }
+            if (invoiceClassification.decision !== "allow") {
+              processed.push({
+                ...baseMessage,
+                status: "skipped",
+                reason: "skipped_non_invoice_attachment",
+                attachment: attachmentSummary,
+                invoice_classification: invoiceClassification
+              });
+              continue;
+            }
+          }
+
           let scan;
           try {
             scan = await scanBufferWithClamd(attachment.bytes);
@@ -6449,7 +6555,9 @@ function createServer() {
               status: !scanBlocksUpload && duplicateFiles.length === 0 ? "ready_for_upload" : "blocked_or_duplicate",
               dry_run: true,
               target_folder_id,
+              sender_allowlist_enforced: enforce_sender_allowlist,
               attachment: attachmentSummary,
+              invoice_classification: invoiceClassification,
               scan,
               virus_scan_required: false,
               virus_scan_available: !scanWasSkipped,
@@ -6520,7 +6628,9 @@ function createServer() {
             asana_task_gid,
             approved_by,
             target_folder_id,
+            sender_allowlist_enforced: enforce_sender_allowlist,
             attachment: attachmentSummary,
+            invoice_classification: invoiceClassification,
             scan,
             virus_scan_required: false,
             virus_scan_available: !scanWasSkipped,
@@ -6546,6 +6656,8 @@ function createServer() {
           label: mailResult.label
         },
         target_folder_id,
+        sender_allowlist_enforced: enforce_sender_allowlist,
+        invoice_only,
         unseen_count: mailResult.unseen_count,
         returned_count: mailResult.returned_count,
         processed_count: processed.length,
