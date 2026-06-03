@@ -4714,6 +4714,44 @@ function isRetryableAxiosError(error) {
   return Boolean(error.code && ["ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN"].includes(error.code));
 }
 
+function getWordPressImportConfigSummary() {
+  let parsedUrl = null;
+  try {
+    parsedUrl = new URL(WP_IMPORT_URL);
+  } catch {
+    parsedUrl = null;
+  }
+
+  const apiKeyConfigured = Boolean(process.env.WORDPRESS_GK_API_KEY);
+  return {
+    wordpress_import_url_configured: Boolean(WP_IMPORT_URL),
+    wordpress_import_url_valid: Boolean(parsedUrl),
+    wordpress_import_host: parsedUrl?.host || null,
+    wordpress_import_path: parsedUrl?.pathname || null,
+    wordpress_api_key_env: "WORDPRESS_GK_API_KEY",
+    wordpress_api_key_configured: apiKeyConfigured,
+    ready_for_import: Boolean(parsedUrl && apiKeyConfigured)
+  };
+}
+
+function summarizeWordPressImportResponse(responseData) {
+  if (!responseData || typeof responseData !== "object") {
+    return {
+      success_count: null,
+      error_count: null,
+      subscriber_ids: null,
+      list_id: null
+    };
+  }
+
+  return {
+    success_count: Number.isFinite(Number(responseData.success_count)) ? Number(responseData.success_count) : null,
+    error_count: Number.isFinite(Number(responseData.error_count)) ? Number(responseData.error_count) : null,
+    subscriber_ids: Array.isArray(responseData.subscriber_ids) ? responseData.subscriber_ids : null,
+    list_id: responseData.list_id ?? null
+  };
+}
+
 function getDataForSeoConfigDetails(agentId, { requireCredentials = true } = {}) {
   const credentials = getDataForSeoCredentialSets(agentId);
   const primary = credentials.primary;
@@ -11071,6 +11109,72 @@ function createServer() {
   );
 
   server.tool(
+    "wp_import_check_config",
+    "Prueft die Goklever-WordPress-Import-Konfiguration ohne CSV-Import. Optional wird der Endpunkt per HEAD read-only auf Erreichbarkeit geprueft.",
+    {
+      agent_id: agentIdSchema,
+      check_endpoint: z.boolean().optional().default(false)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, check_endpoint }) => {
+      const summary = getWordPressImportConfigSummary();
+      const result = {
+        agent_id,
+        ...summary,
+        check_endpoint,
+        endpoint_check: null
+      };
+
+      if (!check_endpoint) {
+        return out(result);
+      }
+
+      if (!summary.wordpress_import_url_valid) {
+        return out({
+          ...result,
+          endpoint_check: {
+            attempted: false,
+            reachable: false,
+            reason: "WORDPRESS_GK_IMPORT_URL ist keine gueltige URL."
+          }
+        });
+      }
+
+      try {
+        const response = await axios.request({
+          method: "HEAD",
+          url: WP_IMPORT_URL,
+          timeout: 15000,
+          validateStatus: () => true
+        });
+
+        return out({
+          ...result,
+          endpoint_check: {
+            attempted: true,
+            method: "HEAD",
+            reachable: true,
+            status: response.status,
+            status_text: response.statusText || null
+          }
+        });
+      } catch (error) {
+        return out({
+          ...result,
+          endpoint_check: {
+            attempted: true,
+            method: "HEAD",
+            reachable: false,
+            code: error.code || null,
+            retryable: isRetryableAxiosError(error),
+            message: error.message
+          }
+        });
+      }
+    }
+  );
+
+  server.tool(
     "wp_import_csv",
     "Importiert CSV-Inhalte in den Goklever-WordPress-Import-Endpunkt. Live-Ausfuehrung nur mit klarer Asana-Freigabe; dry_run prueft nur den Payload.",
     {
@@ -11090,10 +11194,14 @@ function createServer() {
       }
 
       const lines = trimmedCsv.split(/\r?\n/).filter(Boolean);
+      const csvBytes = Buffer.byteLength(trimmedCsv, "utf8");
+      const csvSha256 = createHash("sha256").update(trimmedCsv).digest("hex");
       const preview = {
         line_count: lines.length,
         first_line: lines[0],
-        source
+        source,
+        csv_bytes: csvBytes,
+        csv_sha256: csvSha256
       };
 
       if (dry_run) {
@@ -11104,9 +11212,15 @@ function createServer() {
 
       const apiKey = process.env.WORDPRESS_GK_API_KEY;
       if (!apiKey) throw new Error("WORDPRESS_GK_API_KEY fehlt im MCP-Environment.");
+      const importConfig = getWordPressImportConfigSummary();
+      if (!importConfig.wordpress_import_url_valid) {
+        throw new Error("WORDPRESS_GK_IMPORT_URL ist keine gueltige URL.");
+      }
 
       let lastError;
+      let attempts = 0;
       for (let attempt = 1; attempt <= 3; attempt += 1) {
+        attempts = attempt;
         try {
           const res = await axios.post(
             WP_IMPORT_URL,
@@ -11122,9 +11236,19 @@ function createServer() {
 
           return out({
             agent_id,
+            ok: true,
             status: res.status,
+            attempts: attempt,
+            source,
+            csv_line_count: lines.length,
+            csv_bytes: csvBytes,
+            csv_sha256: csvSha256,
+            response_summary: summarizeWordPressImportResponse(res.data),
             response: res.data,
-            attempts: attempt
+            endpoint: {
+              host: importConfig.wordpress_import_host,
+              path: importConfig.wordpress_import_path
+            }
           });
         } catch (error) {
           lastError = error;
@@ -11137,12 +11261,35 @@ function createServer() {
         return out({
           agent_id,
           ok: false,
+          attempts,
+          source,
+          csv_line_count: lines.length,
+          csv_bytes: csvBytes,
+          csv_sha256: csvSha256,
           status: lastError.response.status,
+          response_summary: summarizeWordPressImportResponse(lastError.response.data),
           response: lastError.response.data
         });
       }
 
-      throw lastError;
+      return out({
+        agent_id,
+        ok: false,
+        attempts,
+        source,
+        csv_line_count: lines.length,
+        csv_bytes: csvBytes,
+        csv_sha256: csvSha256,
+        endpoint: {
+          host: importConfig.wordpress_import_host,
+          path: importConfig.wordpress_import_path
+        },
+        network_error: {
+          code: lastError?.code || null,
+          retryable: lastError ? isRetryableAxiosError(lastError) : null,
+          message: lastError?.message || "Unbekannter Netzwerkfehler."
+        }
+      });
     }
   );
 
