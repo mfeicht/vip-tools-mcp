@@ -238,6 +238,8 @@ const ASANA_TASK_CREATE_SOURCE_OPT_FIELDS =
   "gid,name,permalink_url,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name";
 const ASANA_TASK_CREATE_VERIFY_OPT_FIELDS =
   "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,followers.gid,followers.name,memberships.project.gid,memberships.project.name,custom_fields.gid,custom_fields.name,custom_fields.enum_value.gid,custom_fields.enum_value.name";
+const ASANA_TASK_DESCRIPTION_OPT_FIELDS =
+  "gid,name,completed,notes,html_notes,permalink_url,tags.gid,tags.name,assignee.gid,assignee.name,memberships.project.gid,memberships.project.name";
 const ASANA_DEFAULT_SUPERVISOR_GID =
   process.env.ASANA_DEFAULT_SUPERVISOR_GID || "1108801330389276";
 const ASANA_PROJECT_OPT_FIELDS = "gid,name,workspace.gid,permalink_url";
@@ -1124,6 +1126,34 @@ function buildAsanaTaskHtmlNotes({ description, source_task, project_selection_r
   const html = `<body>${parts.join("")}</body>`;
   assertGeneratedAsanaHtml(html);
   return html;
+}
+
+function buildAsanaDescriptionAppendSection({ section_title, section_text, dedupe_key }) {
+  ensureNoUnsafeAsanaText(section_title, "Asana-Aufgabenbeschreibung-Ueberschrift");
+  ensureNoUnsafeAsanaText(section_text, "Asana-Aufgabenbeschreibung-Ergaenzung");
+  ensureNoUnsafeAsanaText(dedupe_key, "Asana-Aufgabenbeschreibung-Dedupe-Key");
+
+  const parts = [];
+  if (dedupe_key) {
+    parts.push(`<strong>Update-Key:</strong> ${escapeAsanaXml(dedupe_key)}\n`);
+  }
+  if (section_title) {
+    parts.push(`<strong>${escapeAsanaXml(section_title)}</strong>\n`);
+  }
+  parts.push(`${escapeAsanaTextWithLinks(section_text)}\n`);
+
+  const sectionHtml = parts.join("");
+  assertGeneratedAsanaHtml(`<body>${sectionHtml}</body>`);
+  return sectionHtml;
+}
+
+function appendAsanaHtmlNotesSection(existingHtmlNotes, sectionHtml) {
+  const existing = String(existingHtmlNotes || "").trim();
+  if (!existing) return `<body>${sectionHtml}</body>`;
+  if (/^<body(?:\s[^>]*)?>[\s\S]*<\/body>\s*$/i.test(existing)) {
+    return existing.replace(/<\/body>\s*$/i, `\n\n${sectionHtml}</body>`);
+  }
+  return `<body>${existing}\n\n${sectionHtml}</body>`;
 }
 
 function findProjectEnumField(fields, fieldAliases, valueAliases) {
@@ -6666,6 +6696,149 @@ function createServer() {
         must_not_retry_comment: verification_status === "posted_but_verification_failed_do_not_retry",
         html_bytes: Buffer.byteLength(html_text, "utf8"),
         html_sha256
+      });
+    }
+  );
+
+  server.tool(
+    "asana_update_task_description",
+    "Ergaenzt eine Asana-Aufgabenbeschreibung kontrolliert und mit Readback. Standardpfad fuer dauerhafte Aenderungen an Routine-Aufgaben; Kommentare allein reichen dafuer nicht.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      section_title: z.string().min(3).max(140).optional().default("Dauerhafte Routine-Anweisung"),
+      section_text: z.string().min(20).max(8000),
+      dedupe_key: z.string().min(3).max(160).optional(),
+      update_basis: z.string().min(20),
+      require_routine_context: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      allow_completed_task: z.boolean().optional().default(false),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_SAFE_WRITE,
+    async ({
+      agent_id,
+      task_gid,
+      section_title,
+      section_text,
+      dedupe_key,
+      update_basis,
+      require_routine_context,
+      confirmed_by_asana,
+      allow_completed_task,
+      dry_run,
+      verify_after
+    }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      ensureNoUnsafeAsanaText(update_basis, "Asana-Aufgabenbeschreibung-Aenderungsgrund");
+
+      if (!confirmed_by_asana && !dry_run) {
+        throw new Error(
+          "asana_update_task_description braucht confirmed_by_asana=true, damit dauerhafte Aufgabenbeschreibungen nur auf sichtbare Asana-/Moritz-Anweisung geaendert werden."
+        );
+      }
+
+      const asana = getAsana(agent_id);
+      const beforeRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/tasks/${task_gid}`,
+        params: { opt_fields: ASANA_TASK_DESCRIPTION_OPT_FIELDS }
+      });
+      const before_task = beforeRes.data.data;
+
+      if (before_task.completed && !allow_completed_task) {
+        throw new Error("Abgeschlossene Aufgabenbeschreibungen werden nicht geaendert, ausser allow_completed_task=true.");
+      }
+
+      const routine_like_task = isRoutineLikeAsanaTask(before_task);
+      if (require_routine_context && !routine_like_task) {
+        throw new Error("Aufgabe ist keine erkennbare Routine (Tag Routine oder Titelpraefix R: fehlt).");
+      }
+
+      const existingForDedupe = `${before_task.notes || ""}\n${before_task.html_notes || ""}`;
+      if (dedupe_key && existingForDedupe.includes(dedupe_key)) {
+        return out({
+          agent_id,
+          task_gid,
+          no_change: true,
+          reason: "dedupe_key_already_present",
+          dedupe_key,
+          before_task,
+          routine_like_task
+        });
+      }
+
+      const sectionHtml = buildAsanaDescriptionAppendSection({
+        section_title,
+        section_text,
+        dedupe_key
+      });
+      const existingHtmlNotes = before_task.html_notes || escapeAsanaTextWithLinks(before_task.notes || "");
+      const html_notes = appendAsanaHtmlNotesSection(existingHtmlNotes, sectionHtml);
+      const html_sha256 = createHash("sha256").update(html_notes, "utf8").digest("hex");
+      const update_basis_sha256 = createHash("sha256").update(update_basis, "utf8").digest("hex");
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          task_gid,
+          routine_like_task,
+          before_task,
+          html_notes,
+          html_bytes: Buffer.byteLength(html_notes, "utf8"),
+          html_sha256,
+          update_basis,
+          update_basis_sha256
+        });
+      }
+
+      const res = await asanaRequestWithRetry(asana, {
+        method: "PUT",
+        url: `/tasks/${task_gid}`,
+        timeout: ASANA_WRITE_TIMEOUT_MS,
+        data: { data: { html_notes } },
+        params: { opt_fields: ASANA_TASK_DESCRIPTION_OPT_FIELDS }
+      });
+
+      let verified_task;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verify = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${task_gid}`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          params: { opt_fields: ASANA_TASK_DESCRIPTION_OPT_FIELDS }
+        });
+        verified_task = verify.data.data;
+        const readback = `${verified_task.notes || ""}\n${verified_task.html_notes || ""}`;
+        const snippet = String(section_text)
+          .split(/\n+/)
+          .map((line) => line.trim())
+          .find((line) => line.length >= 8)
+          ?.slice(0, 140);
+        if (snippet && !readback.includes(snippet) && !readback.includes(escapeAsanaXml(snippet))) {
+          throw new Error("Asana-Readback zeigt die neue Aufgabenbeschreibung-Ergaenzung nicht sicher.");
+        }
+        if (dedupe_key && !readback.includes(dedupe_key)) {
+          throw new Error("Asana-Readback zeigt den Dedupe-Key der Aufgabenbeschreibung-Ergaenzung nicht.");
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        task: res.data.data,
+        before_task,
+        verified_task,
+        routine_like_task,
+        verification_status,
+        html_bytes: Buffer.byteLength(html_notes, "utf8"),
+        html_sha256,
+        update_basis,
+        update_basis_sha256
       });
     }
   );
