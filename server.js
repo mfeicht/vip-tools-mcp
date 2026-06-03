@@ -745,6 +745,102 @@ function getAsanaTaskDueGate(task, now = new Date()) {
   };
 }
 
+function getAsanaTaskDuePosition(task, now = new Date()) {
+  if (task?.due_at) {
+    const dueAt = new Date(task.due_at);
+    const dueAtTime = dueAt.getTime();
+    if (!Number.isFinite(dueAtTime)) {
+      return {
+        mode: "due_at",
+        relation: "invalid",
+        due_at: task.due_at,
+        now_iso: now.toISOString(),
+        now_berlin_date: getBerlinDateString(now)
+      };
+    }
+    return {
+      mode: "due_at",
+      relation: dueAtTime > now.getTime() ? "future" : "past_or_now",
+      due_at: task.due_at,
+      now_iso: now.toISOString(),
+      now_berlin_date: getBerlinDateString(now)
+    };
+  }
+
+  if (task?.due_on) {
+    const todayBerlin = getBerlinDateString(now);
+    return {
+      mode: "due_on",
+      relation: task.due_on > todayBerlin ? "future" : "past_or_today",
+      due_on: task.due_on,
+      today_berlin: todayBerlin,
+      now_iso: now.toISOString()
+    };
+  }
+
+  return {
+    mode: "none",
+    relation: "none",
+    now_iso: now.toISOString(),
+    now_berlin_date: getBerlinDateString(now)
+  };
+}
+
+function resolveNextFutureAsanaScheduleInput({
+  next_future_due_on,
+  next_future_due_at,
+  next_future_due_date_berlin,
+  next_future_due_time_berlin
+}, now = new Date()) {
+  validateAsanaDate(next_future_due_on, "next_future_due_on");
+  validateAsanaDateTime(next_future_due_at, "next_future_due_at");
+  validateAsanaDate(next_future_due_date_berlin, "next_future_due_date_berlin");
+  validateAsanaLocalTime(next_future_due_time_berlin, "next_future_due_time_berlin");
+
+  const hasBerlinLocalDue = Boolean(next_future_due_date_berlin || next_future_due_time_berlin);
+  if (hasBerlinLocalDue && !(next_future_due_date_berlin && next_future_due_time_berlin)) {
+    throw new Error("next_future_due_date_berlin und next_future_due_time_berlin muessen gemeinsam gesetzt werden.");
+  }
+  const setCount = [Boolean(next_future_due_on), Boolean(next_future_due_at), hasBerlinLocalDue].filter(Boolean).length;
+  if (setCount !== 1) {
+    throw new Error("Genau eines von next_future_due_on, next_future_due_at oder Berlin-Date/Time muss gesetzt sein.");
+  }
+
+  if (next_future_due_on) {
+    const todayBerlin = getBerlinDateString(now);
+    if (next_future_due_on <= todayBerlin) {
+      throw new Error(
+        `next_future_due_on muss nach heute liegen, damit kein Catch-up-Backlog entsteht (heute=${todayBerlin}).`
+      );
+    }
+    return {
+      mode: "due_on",
+      data: { due_on: next_future_due_on },
+      expected_due_on: next_future_due_on,
+      expected_due_at: null,
+      now_iso: now.toISOString(),
+      today_berlin: todayBerlin
+    };
+  }
+
+  const resolvedDueAt = next_future_due_at
+    ? new Date(next_future_due_at).toISOString()
+    : berlinLocalDateTimeToUtcIso(next_future_due_date_berlin, next_future_due_time_berlin);
+  if (new Date(resolvedDueAt).getTime() <= now.getTime()) {
+    throw new Error(
+      `next_future_due_at muss nach jetzt liegen, damit kein Catch-up-Backlog entsteht (jetzt=${now.toISOString()}).`
+    );
+  }
+  return {
+    mode: "due_at",
+    data: { due_at: resolvedDueAt },
+    expected_due_on: null,
+    expected_due_at: resolvedDueAt,
+    now_iso: now.toISOString(),
+    today_berlin: getBerlinDateString(now)
+  };
+}
+
 function isRoutineLikeAsanaTask(task) {
   const tagNames = (task?.tags || []).map((tag) => String(tag.name || "").toLowerCase());
   return tagNames.includes("routine") || /^r\s*:/i.test(String(task?.name || "").trim());
@@ -7019,6 +7115,168 @@ function createServer() {
           verification_status === "ok"
             ? "Naechste Routine-Instanz ist API-seitig gegen den erwarteten Vertrag verifiziert."
             : "Naechste Routine-Instanz nicht eindeutig korrekt verifiziert. Nicht behaupten, dass Wiederholung/Fortsetzung sauber ist."
+      });
+    }
+  );
+
+  server.tool(
+    "asana_repair_routine_catchup_due",
+    "Korrigiert nach verspaetetem Routine-Abschluss eine erzeugte Folgeinstanz, deren Faelligkeit noch in der Vergangenheit/heute liegt, auf den naechsten vorgesehenen Zeitpunkt nach jetzt. Verhindert Catch-up-Backlogs bei kurz getakteten Asana-Wiederholungen.",
+    {
+      agent_id: agentIdSchema,
+      source_task_gid: z.string(),
+      next_task_gid: z.string(),
+      next_future_due_on: z.string().optional(),
+      next_future_due_at: z.string().optional(),
+      next_future_due_date_berlin: z.string().optional(),
+      next_future_due_time_berlin: z.string().optional(),
+      repair_basis: z.string().min(20),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({
+      agent_id,
+      source_task_gid,
+      next_task_gid,
+      next_future_due_on,
+      next_future_due_at,
+      next_future_due_date_berlin,
+      next_future_due_time_berlin,
+      repair_basis,
+      dry_run,
+      verify_after
+    }) => {
+      validateAsanaGid(source_task_gid, "source_task_gid");
+      validateAsanaGid(next_task_gid, "next_task_gid");
+      if (source_task_gid === next_task_gid) {
+        throw new Error("source_task_gid und next_task_gid muessen unterschiedliche Aufgaben sein.");
+      }
+
+      const now = new Date();
+      const scheduleInput = resolveNextFutureAsanaScheduleInput(
+        {
+          next_future_due_on,
+          next_future_due_at,
+          next_future_due_date_berlin,
+          next_future_due_time_berlin
+        },
+        now
+      );
+      const asana = getAsana(agent_id);
+      const [sourceRes, nextRes] = await Promise.all([
+        asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${source_task_gid}`,
+          params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
+        }),
+        asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${next_task_gid}`,
+          params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
+        })
+      ]);
+      const source_task = sourceRes.data.data;
+      const next_task = nextRes.data.data;
+
+      if (!dry_run && !source_task.completed) {
+        throw new Error("Catch-up-Reparatur ist erst nach abgeschlossenem source_task erlaubt.");
+      }
+      if (next_task.completed) {
+        throw new Error("next_task ist bereits abgeschlossen; keine Catch-up-Reparatur moeglich.");
+      }
+      if (!isRoutineLikeAsanaTask(next_task)) {
+        throw new Error("next_task ist keine Routine-Aufgabe (Tag Routine oder Titel R: fehlt).");
+      }
+      if (String(source_task.name || "") !== String(next_task.name || "")) {
+        throw new Error("source_task und next_task haben unterschiedliche Titel; falsche Folgeinstanz vermutet.");
+      }
+      if (source_task.assignee?.gid && next_task.assignee?.gid !== source_task.assignee.gid) {
+        throw new Error("source_task und next_task haben unterschiedliche Assignees; falsche Folgeinstanz vermutet.");
+      }
+
+      const sourceProjectGids = getAsanaTaskProjectGids(source_task);
+      const nextProjectGids = getAsanaTaskProjectGids(next_task);
+      const sharedProjectGids = sourceProjectGids.filter((projectGid) => nextProjectGids.includes(projectGid));
+      if (!sharedProjectGids.length) {
+        throw new Error("source_task und next_task teilen kein Projekt; falsche Folgeinstanz vermutet.");
+      }
+
+      const due_position = getAsanaTaskDuePosition(next_task, now);
+      if (due_position.mode === "none") {
+        throw new Error("next_task hat keine Faelligkeit; Catch-up-Reparatur braucht einen vorhandenen Due-Stand.");
+      }
+      if (due_position.relation === "invalid") {
+        throw new Error("next_task hat eine ungueltige Faelligkeit; manuelle Klaerung noetig.");
+      }
+      const repairNeeded = due_position.relation !== "future";
+      const repair_basis_sha256 = createHash("sha256").update(repair_basis, "utf8").digest("hex");
+
+      if (!repairNeeded || dry_run) {
+        return out({
+          agent_id,
+          dry_run,
+          repair_needed: repairNeeded,
+          no_action_reason: repairNeeded ? null : "next_task_due_is_already_after_now",
+          source_task,
+          next_task,
+          due_position,
+          proposed_schedule: scheduleInput,
+          shared_project_gids: sharedProjectGids,
+          repair_basis,
+          repair_basis_sha256
+        });
+      }
+
+      const updateRes = await asanaRequestWithRetry(asana, {
+        method: "PUT",
+        url: `/tasks/${next_task_gid}`,
+        timeout: ASANA_WRITE_TIMEOUT_MS,
+        data: { data: scheduleInput.data },
+        params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
+      });
+
+      let verified_task = null;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verify = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${next_task_gid}`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
+        });
+        verified_task = verify.data.data;
+
+        if (scheduleInput.expected_due_at) {
+          if (verified_task.due_at !== scheduleInput.expected_due_at) {
+            throw new Error(
+              `Asana-Readback due_at=${verified_task.due_at || "null"} statt erwartet ${scheduleInput.expected_due_at}.`
+            );
+          }
+        } else if (scheduleInput.expected_due_on) {
+          if (verified_task.due_on !== scheduleInput.expected_due_on || verified_task.due_at) {
+            throw new Error(
+              `Asana-Readback due_on=${verified_task.due_on || "null"}, due_at=${verified_task.due_at || "null"} statt erwartet ${scheduleInput.expected_due_on}.`
+            );
+          }
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        repaired: true,
+        repair_needed: true,
+        source_task,
+        before_next_task: next_task,
+        task: updateRes.data.data,
+        verified_task,
+        verification_status,
+        previous_due_position: due_position,
+        applied_schedule: scheduleInput,
+        shared_project_gids: sharedProjectGids,
+        repair_basis,
+        repair_basis_sha256
       });
     }
   );
