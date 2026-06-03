@@ -230,14 +230,16 @@ const ACCOUNTING_ARCHIVE_MAILBOX_CANDIDATES = [
 const ASANA_TASK_SCHEDULE_OPT_FIELDS =
   "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url";
 const ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS =
-  "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,start_on,start_at,permalink_url,tags.gid,tags.name,workspace.gid,memberships.project.gid,memberships.project.name,modified_at";
+  "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,start_on,start_at,permalink_url,tags.gid,tags.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name,modified_at";
 const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
 const ASANA_TASK_TAG_WORKSPACE_OPT_FIELDS =
   "gid,name,completed,tags.gid,tags.name,workspace.gid,permalink_url";
 const ASANA_TASK_CREATE_SOURCE_OPT_FIELDS =
-  "gid,name,permalink_url,workspace.gid,memberships.project.gid,memberships.project.name";
+  "gid,name,permalink_url,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name";
 const ASANA_TASK_CREATE_VERIFY_OPT_FIELDS =
-  "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,memberships.project.gid,memberships.project.name,custom_fields.gid,custom_fields.name,custom_fields.enum_value.gid,custom_fields.enum_value.name";
+  "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,followers.gid,followers.name,memberships.project.gid,memberships.project.name,custom_fields.gid,custom_fields.name,custom_fields.enum_value.gid,custom_fields.enum_value.name";
+const ASANA_DEFAULT_SUPERVISOR_GID =
+  process.env.ASANA_DEFAULT_SUPERVISOR_GID || "1108801330389276";
 const ASANA_PROJECT_OPT_FIELDS = "gid,name,workspace.gid,permalink_url";
 const ASANA_PROJECT_CUSTOM_FIELD_OPT_FIELDS =
   "gid,project.gid,custom_field.gid,custom_field.name,custom_field.resource_subtype,custom_field.enum_options.gid,custom_field.enum_options.name";
@@ -489,6 +491,8 @@ function assertSafeAsanaRequest(method, path, data) {
     data &&
     Object.prototype.hasOwnProperty.call(data, "recurrence");
   const isTaskTagUpdate = method === "POST" && /^\/tasks\/[^/]+\/(?:addTag|removeTag)\/?$/.test(path);
+  const isTaskFollowerUpdate =
+    method === "POST" && /^\/tasks\/[^/]+\/(?:addFollowers|removeFollowers)\/?$/.test(path);
   const isTaskCreate = method === "POST" && /^\/tasks\/?$/.test(path);
 
   if (isTaskComplete) {
@@ -512,6 +516,12 @@ function assertSafeAsanaRequest(method, path, data) {
   if (isTaskTagUpdate) {
     throw new Error(
       "Asana-Tags duerfen nicht per rohem asana_request geaendert werden. Nutze asana_update_task_tags; es ist idempotent und prueft den Readback."
+    );
+  }
+
+  if (isTaskFollowerUpdate) {
+    throw new Error(
+      "Asana-Beteiligte/Follower duerfen nicht per rohem asana_request geaendert werden. Nutze asana_ensure_task_followers; es ist idempotent und prueft den Readback."
     );
   }
 
@@ -752,6 +762,10 @@ function getAsanaTaskProjectGids(task) {
   );
 }
 
+function getAsanaTaskFollowerGids(task) {
+  return uniqueValues((task?.followers || []).map((follower) => follower?.gid).filter(Boolean));
+}
+
 function buildAsanaScheduleVerification({
   task,
   expected_due_on,
@@ -762,6 +776,8 @@ function buildAsanaScheduleVerification({
   expect_routine_tag,
   expected_assignee_gid,
   expected_project_gid,
+  expected_follower_gid,
+  expected_follower_gids,
   expected_name_contains,
   expected_completed,
   recurrence_expected,
@@ -773,6 +789,12 @@ function buildAsanaScheduleVerification({
   validateAsanaLocalTime(expected_due_time_berlin, "expected_due_time_berlin");
   validateAsanaGid(expected_assignee_gid, "expected_assignee_gid");
   validateAsanaGid(expected_project_gid, "expected_project_gid");
+  validateAsanaGid(expected_follower_gid, "expected_follower_gid");
+  const followerExpectations = uniqueValues([
+    ...(expected_follower_gids || []),
+    ...(expected_follower_gid ? [expected_follower_gid] : [])
+  ]);
+  for (const followerGid of followerExpectations) validateAsanaGid(followerGid, "expected_follower_gids");
 
   const hasBerlinLocalExpectation = Boolean(expected_due_date_berlin || expected_due_time_berlin);
   if (hasBerlinLocalExpectation && !(expected_due_date_berlin && expected_due_time_berlin)) {
@@ -845,6 +867,17 @@ function buildAsanaScheduleVerification({
       ok: projectGids.includes(expected_project_gid),
       expected: expected_project_gid,
       actual: projectGids
+    });
+  }
+  if (followerExpectations.length) {
+    const followerGids = getAsanaTaskFollowerGids(task);
+    addCheck({
+      name: "followers_present",
+      ok: followerExpectations.every((followerGid) => followerGids.includes(followerGid)),
+      expected: followerExpectations,
+      actual: followerGids,
+      note:
+        "Pflicht fuer relevante Agenten-Aufgaben: Hauptvorgesetzter/Moritz muss als Beteiligter/Follower sichtbar sein."
     });
   }
   if (expected_name_contains) {
@@ -6167,7 +6200,7 @@ function createServer() {
 
   server.tool(
     "asana_create_task",
-    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, einen klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel und Status=Todo sowie bei Follow-ups einen Link zur Ausgangsaufgabe.",
+    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Supervisor-Follower und bei Follow-ups einen Link zur Ausgangsaufgabe.",
     {
       agent_id: agentIdSchema,
       name: z.string().min(12).max(200),
@@ -6182,6 +6215,8 @@ function createServer() {
       priority_value: z.string().optional().default("Mittel"),
       status_value: z.string().optional().default("Todo"),
       require_standard_custom_fields: z.boolean().optional().default(true),
+      ensure_supervisor_follower: z.boolean().optional().default(true),
+      supervisor_follower_gid: z.string().optional(),
       confirmed_by_asana: z.boolean().optional().default(false),
       creation_basis: z.string().min(20),
       dry_run: z.boolean().optional().default(false),
@@ -6202,6 +6237,8 @@ function createServer() {
       priority_value,
       status_value,
       require_standard_custom_fields,
+      ensure_supervisor_follower,
+      supervisor_follower_gid,
       confirmed_by_asana,
       creation_basis,
       dry_run,
@@ -6211,6 +6248,8 @@ function createServer() {
       validateAsanaGid(project_gid, "project_gid");
       validateAsanaGid(source_task_gid, "source_task_gid");
       validateAsanaDate(due_on, "due_on");
+      const finalSupervisorFollowerGid = supervisor_follower_gid || ASANA_DEFAULT_SUPERVISOR_GID;
+      if (ensure_supervisor_follower) validateAsanaGid(finalSupervisorFollowerGid, "supervisor_follower_gid");
       ensureNoUnsafeAsanaText(name, "Asana-Aufgabentitel");
       ensureNoUnsafeAsanaText(creation_basis, "Asana-Aufgabenanlage-Begruendung");
 
@@ -6315,6 +6354,8 @@ function createServer() {
           source_projects,
           standard_fields: resolved,
           missing_standard_fields: missing,
+          ensure_supervisor_follower,
+          supervisor_follower_gid: ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
           creation_basis,
           creation_basis_sha256: basis_sha256
         });
@@ -6327,6 +6368,17 @@ function createServer() {
         data: { data },
         params: { opt_fields: ASANA_TASK_CREATE_VERIFY_OPT_FIELDS }
       });
+
+      let supervisor_follower_add_result = null;
+      if (ensure_supervisor_follower) {
+        const followerRes = await asanaRequestWithRetry(asana, {
+          method: "POST",
+          url: `/tasks/${res.data.data.gid}/addFollowers`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          data: { data: { followers: [finalSupervisorFollowerGid] } }
+        });
+        supervisor_follower_add_result = followerRes.data;
+      }
 
       let verified_task;
       let verification_status = "not_requested";
@@ -6354,6 +6406,12 @@ function createServer() {
         if (verified_task.due_on !== finalDueOn) {
           throw new Error(`Asana-Readback due_on=${verified_task.due_on || "null"} statt erwartet ${finalDueOn}.`);
         }
+        if (ensure_supervisor_follower) {
+          const verifiedFollowerGids = getAsanaTaskFollowerGids(verified_task);
+          if (!verifiedFollowerGids.includes(finalSupervisorFollowerGid)) {
+            throw new Error(`Asana-Readback zeigt Supervisor-Follower ${finalSupervisorFollowerGid} nicht.`);
+          }
+        }
         for (const [fieldGid, enumGid] of Object.entries(custom_fields)) {
           const verifiedField = (verified_task.custom_fields || []).find((field) => field.gid === fieldGid);
           if (verifiedField?.enum_value?.gid !== enumGid) {
@@ -6366,6 +6424,9 @@ function createServer() {
       return out({
         agent_id,
         task: res.data.data,
+        supervisor_follower_add_result,
+        ensure_supervisor_follower,
+        supervisor_follower_gid: ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
         verified_task,
         verification_status,
         project,
@@ -6477,13 +6538,15 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar, Routine-Due-Gate und Readback.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar, Supervisor-Follower, Routine-Due-Gate und Readback.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
       completion_basis: z.string().min(20),
       final_comment_story_gid: z.string().optional(),
       require_final_comment: z.boolean().optional().default(true),
+      ensure_supervisor_follower: z.boolean().optional().default(true),
+      supervisor_follower_gid: z.string().optional(),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
     },
@@ -6494,6 +6557,8 @@ function createServer() {
       completion_basis,
       final_comment_story_gid,
       require_final_comment,
+      ensure_supervisor_follower,
+      supervisor_follower_gid,
       dry_run,
       verify_after
     }) => {
@@ -6504,6 +6569,8 @@ function createServer() {
           "asana_complete_task braucht final_comment_story_gid, wenn require_final_comment=true ist. Poste zuerst einen Abschlusskommentar mit asana_comment."
         );
       }
+      const finalSupervisorFollowerGid = supervisor_follower_gid || ASANA_DEFAULT_SUPERVISOR_GID;
+      if (ensure_supervisor_follower) validateAsanaGid(finalSupervisorFollowerGid, "supervisor_follower_gid");
 
       const asana = getAsana(agent_id);
       const me = await asana.get("/users/me");
@@ -6512,7 +6579,7 @@ function createServer() {
       const taskRes = await asana.get(`/tasks/${task_gid}`, {
         params: {
           opt_fields:
-            "gid,name,completed,completed_at,assignee.gid,assignee.name,due_on,due_at,tags.name,permalink_url"
+            "gid,name,completed,completed_at,assignee.gid,assignee.name,due_on,due_at,tags.name,followers.gid,followers.name,permalink_url"
         }
       });
       const task = taskRes.data.data;
@@ -6553,11 +6620,17 @@ function createServer() {
       const basis_sha256 = createHash("sha256").update(completion_basis, "utf8").digest("hex");
 
       if (dry_run || task.completed) {
+        const followerGids = getAsanaTaskFollowerGids(task);
         return out({
           agent_id,
           dry_run,
           already_completed: Boolean(task.completed),
           allowed_to_complete: !task.completed && !blockedByFutureRoutineDue,
+          ensure_supervisor_follower,
+          supervisor_follower_gid: ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
+          supervisor_follower_present: ensure_supervisor_follower
+            ? followerGids.includes(finalSupervisorFollowerGid)
+            : null,
           routine_like_task,
           due_gate,
           task,
@@ -6565,6 +6638,17 @@ function createServer() {
           completion_basis,
           completion_basis_sha256: basis_sha256
         });
+      }
+
+      let supervisor_follower_add_result = null;
+      if (ensure_supervisor_follower && !getAsanaTaskFollowerGids(task).includes(finalSupervisorFollowerGid)) {
+        const followerRes = await asanaRequestWithRetry(asana, {
+          method: "POST",
+          url: `/tasks/${task_gid}/addFollowers`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          data: { data: { followers: [finalSupervisorFollowerGid] } }
+        });
+        supervisor_follower_add_result = followerRes.data;
       }
 
       const completeRes = await asana.put(
@@ -6581,7 +6665,7 @@ function createServer() {
       if (verify_after) {
         const verify = await asana.get(`/tasks/${task_gid}`, {
           timeout: ASANA_WRITE_TIMEOUT_MS,
-          params: { opt_fields: "gid,name,completed,completed_at,assignee.gid,assignee.name,permalink_url" }
+          params: { opt_fields: "gid,name,completed,completed_at,assignee.gid,assignee.name,followers.gid,followers.name,permalink_url" }
         });
         verified_task = verify.data.data;
         if (!verified_task.completed) {
@@ -6589,6 +6673,12 @@ function createServer() {
         }
         if (verified_task.assignee?.gid !== meGid) {
           throw new Error("Asana-Readback zeigt veraenderten Assignee nach Abschlussversuch.");
+        }
+        if (ensure_supervisor_follower) {
+          const verifiedFollowerGids = getAsanaTaskFollowerGids(verified_task);
+          if (!verifiedFollowerGids.includes(finalSupervisorFollowerGid)) {
+            throw new Error(`Asana-Readback zeigt Supervisor-Follower ${finalSupervisorFollowerGid} nicht.`);
+          }
         }
         verification_status = "ok";
       }
@@ -6598,6 +6688,9 @@ function createServer() {
         task_gid,
         completed: true,
         task: completeRes.data.data,
+        supervisor_follower_add_result,
+        ensure_supervisor_follower,
+        supervisor_follower_gid: ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
         verified_task,
         verification_status,
         final_comment,
@@ -6704,6 +6797,8 @@ function createServer() {
       expect_routine_tag: z.boolean().optional().default(false),
       expected_assignee_gid: z.string().optional(),
       expected_project_gid: z.string().optional(),
+      expected_follower_gid: z.string().optional(),
+      expected_follower_gids: z.array(z.string()).optional().default([]),
       expected_name_contains: z.string().optional(),
       expected_completed: z.boolean().optional(),
       recurrence_expected: z.boolean().optional().default(false),
@@ -6721,6 +6816,8 @@ function createServer() {
       expect_routine_tag,
       expected_assignee_gid,
       expected_project_gid,
+      expected_follower_gid,
+      expected_follower_gids,
       expected_name_contains,
       expected_completed,
       recurrence_expected,
@@ -6744,6 +6841,8 @@ function createServer() {
         expect_routine_tag,
         expected_assignee_gid,
         expected_project_gid,
+        expected_follower_gid,
+        expected_follower_gids,
         expected_name_contains,
         expected_completed,
         recurrence_expected,
@@ -6775,6 +6874,8 @@ function createServer() {
       expected_next_due_time_berlin: z.string().optional(),
       expected_assignee_gid: z.string().optional(),
       expected_project_gid: z.string().optional(),
+      expected_follower_gid: z.string().optional(),
+      expected_follower_gids: z.array(z.string()).optional().default([]),
       expected_name_exact: z.string().optional(),
       expect_routine_tag: z.boolean().optional().default(true),
       limit: z.number().int().min(1).max(100).optional().default(100)
@@ -6789,6 +6890,8 @@ function createServer() {
       expected_next_due_time_berlin,
       expected_assignee_gid,
       expected_project_gid,
+      expected_follower_gid,
+      expected_follower_gids,
       expected_name_exact,
       expect_routine_tag,
       limit
@@ -6800,6 +6903,8 @@ function createServer() {
       validateAsanaLocalTime(expected_next_due_time_berlin, "expected_next_due_time_berlin");
       validateAsanaGid(expected_assignee_gid, "expected_assignee_gid");
       validateAsanaGid(expected_project_gid, "expected_project_gid");
+      validateAsanaGid(expected_follower_gid, "expected_follower_gid");
+      for (const followerGid of expected_follower_gids || []) validateAsanaGid(followerGid, "expected_follower_gids");
 
       const asana = getAsana(agent_id);
       const sourceRes = await asanaRequestWithRetry(asana, {
@@ -6844,6 +6949,8 @@ function createServer() {
           expect_routine_tag,
           expected_assignee_gid: expectedAssignee,
           expected_project_gid: selectedProjectGid,
+          expected_follower_gid,
+          expected_follower_gids,
           expected_name_contains: expectedName,
           expected_completed: false,
           recurrence_expected: false,
@@ -6874,6 +6981,92 @@ function createServer() {
           verification_status === "ok"
             ? "Naechste Routine-Instanz ist API-seitig gegen den erwarteten Vertrag verifiziert."
             : "Naechste Routine-Instanz nicht eindeutig korrekt verifiziert. Nicht behaupten, dass Wiederholung/Fortsetzung sauber ist."
+      });
+    }
+  );
+
+  server.tool(
+    "asana_ensure_task_followers",
+    "Stellt idempotent sicher, dass bestimmte Asana-Nutzer als Beteiligte/Follower einer Aufgabe gesetzt sind, und verifiziert den Readback. Standard fuer Hauptvorgesetzten-/Moritz-Beteiligung; nicht per rohem asana_request nutzen.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      follower_gids: z.array(z.string()).min(1),
+      ensure_basis: z.string().optional(),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({ agent_id, task_gid, follower_gids, ensure_basis, dry_run, verify_after }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      const followersToEnsure = uniqueValues(follower_gids);
+      for (const followerGid of followersToEnsure) validateAsanaGid(followerGid, "follower_gids");
+      ensureNoUnsafeAsanaText(ensure_basis, "Asana-Follower-Begruendung");
+
+      const asana = getAsana(agent_id);
+      const beforeRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/tasks/${task_gid}`,
+        params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
+      });
+      const before_task = beforeRes.data.data;
+      const currentFollowerGids = getAsanaTaskFollowerGids(before_task);
+      const toAdd = followersToEnsure.filter((followerGid) => !currentFollowerGids.includes(followerGid));
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          task_gid,
+          before_task,
+          follower_gids: followersToEnsure,
+          would_add: toAdd,
+          skipped_already_present: followersToEnsure.filter((followerGid) => currentFollowerGids.includes(followerGid)),
+          ensure_basis: ensure_basis || null
+        });
+      }
+
+      let add_result = null;
+      if (toAdd.length) {
+        const res = await asanaRequestWithRetry(asana, {
+          method: "POST",
+          url: `/tasks/${task_gid}/addFollowers`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          data: { data: { followers: toAdd } }
+        });
+        add_result = res.data;
+      }
+
+      let verified_task;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verify = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${task_gid}`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
+        });
+        verified_task = verify.data.data;
+        const verifiedFollowerGids = getAsanaTaskFollowerGids(verified_task);
+        for (const followerGid of followersToEnsure) {
+          if (!verifiedFollowerGids.includes(followerGid)) {
+            throw new Error(`Asana-Readback zeigt erwarteten Follower ${followerGid} nicht.`);
+          }
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        before_task,
+        follower_gids: followersToEnsure,
+        added_follower_gids: toAdd,
+        skipped_already_present: followersToEnsure.filter((followerGid) => currentFollowerGids.includes(followerGid)),
+        add_result,
+        verified_task,
+        verification_status,
+        ensure_basis: ensure_basis || null
       });
     }
   );
