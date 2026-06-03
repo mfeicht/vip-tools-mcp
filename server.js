@@ -3,7 +3,11 @@ import express from "express";
 import axios from "axios";
 import net from "net";
 import tls from "tls";
+import path from "path";
+import { execFile } from "child_process";
 import { createHash, createSign, randomUUID } from "crypto";
+import { existsSync, readdirSync } from "fs";
+import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 
@@ -17,6 +21,7 @@ const ASANA_TIMEOUT_MS = Number(process.env.ASANA_TIMEOUT_MS || 12_000);
 const ASANA_WRITE_TIMEOUT_MS = Number(process.env.ASANA_WRITE_TIMEOUT_MS || 30_000);
 const ASANA_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ASANA_RETRY_ATTEMPTS || 2));
 const ASANA_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ASANA_RETRY_BASE_DELAY_MS || 250));
+const execFileAsync = promisify(execFile);
 
 const ASANA_TOKEN_ENVS = {
   "vip-ai-sales": "ASANA_TOKEN_VIP_AI_SALES",
@@ -198,6 +203,12 @@ const ACCOUNTING_INLINE_INVOICE_PDF_MIME_TYPE = "application/pdf";
 const ACCOUNTING_INLINE_EMAIL_RENDER_TIMEOUT_MS = Number(process.env.ACCOUNTING_INLINE_EMAIL_RENDER_TIMEOUT_MS || 30_000);
 const ACCOUNTING_INLINE_EMAIL_RENDER_REMOTE_IMAGES =
   String(process.env.ACCOUNTING_INLINE_EMAIL_RENDER_REMOTE_IMAGES || "true").toLowerCase() !== "false";
+const ACCOUNTING_INLINE_EMAIL_RUNTIME_CHROME_INSTALL =
+  String(process.env.ACCOUNTING_INLINE_EMAIL_RUNTIME_CHROME_INSTALL || "true").toLowerCase() !== "false";
+const ACCOUNTING_INLINE_EMAIL_CHROME_INSTALL_TIMEOUT_MS =
+  Number(process.env.ACCOUNTING_INLINE_EMAIL_CHROME_INSTALL_TIMEOUT_MS || 180_000);
+const ACCOUNTING_INLINE_EMAIL_CHROME_CACHE_DIR =
+  process.env.PUPPETEER_CACHE_DIR || process.env.ACCOUNTING_INLINE_EMAIL_CHROME_CACHE_DIR || "/opt/render/.cache/puppeteer";
 const ACCOUNTING_MORITZ_EMAILS = new Set(
   [
     "moritz.feichtmeyer@vip-studios.de",
@@ -2886,13 +2897,107 @@ function buildInlineEmailHtmlDocument(message, bodyText) {
 </html>`;
 }
 
+function uniqueExistingPaths(paths) {
+  return uniqueValues(paths.filter(Boolean).map((item) => String(item).trim()))
+    .filter((item) => item && existsSync(item));
+}
+
+function findChromeExecutableInDirectory(root, maxDepth = 5) {
+  if (!root || !existsSync(root) || maxDepth < 0) return null;
+  const executableNames = new Set(["chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]);
+  let entries = [];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(root, entry.name);
+    if (entry.isFile() && executableNames.has(entry.name) && existsSync(fullPath)) return fullPath;
+  }
+  if (maxDepth === 0) return null;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const found = findChromeExecutableInDirectory(path.join(root, entry.name), maxDepth - 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function resolveAccountingChromeExecutablePath(puppeteer) {
+  const explicitPaths = uniqueExistingPaths([
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.CHROME_BIN,
+    process.env.GOOGLE_CHROME_BIN,
+    ...(process.env.ACCOUNTING_INLINE_EMAIL_CHROME_PATHS || "").split(",")
+  ]);
+  if (explicitPaths.length) return explicitPaths[0];
+
+  try {
+    const bundledPath = puppeteer.default.executablePath();
+    if (bundledPath && existsSync(bundledPath)) return bundledPath;
+  } catch {
+    // Puppeteer throws here when the browser has not been installed yet.
+  }
+
+  const cacheRoots = uniqueExistingPaths([
+    ACCOUNTING_INLINE_EMAIL_CHROME_CACHE_DIR,
+    process.env.PUPPETEER_CACHE_DIR,
+    path.join(process.cwd(), ".cache", "puppeteer"),
+    path.join(process.cwd(), "node_modules", ".cache", "puppeteer"),
+    process.env.HOME ? path.join(process.env.HOME, ".cache", "puppeteer") : ""
+  ]);
+  for (const root of cacheRoots) {
+    const found = findChromeExecutableInDirectory(root);
+    if (found) return found;
+  }
+
+  const systemPaths = uniqueExistingPaths([
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser"
+  ]);
+  return systemPaths[0] || "";
+}
+
+let accountingChromeInstallPromise = null;
+
+async function installAccountingChromeRuntime() {
+  if (!ACCOUNTING_INLINE_EMAIL_RUNTIME_CHROME_INSTALL) return;
+  if (!accountingChromeInstallPromise) {
+    accountingChromeInstallPromise = (async () => {
+      const cliPath = path.join(process.cwd(), "node_modules", "puppeteer", "lib", "cjs", "puppeteer", "node", "cli.js");
+      if (!existsSync(cliPath)) {
+        throw new Error(`Puppeteer CLI nicht gefunden: ${cliPath}`);
+      }
+      await execFileAsync(process.execPath, [cliPath, "browsers", "install", "chrome"], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          PUPPETEER_CACHE_DIR: ACCOUNTING_INLINE_EMAIL_CHROME_CACHE_DIR
+        },
+        timeout: ACCOUNTING_INLINE_EMAIL_CHROME_INSTALL_TIMEOUT_MS,
+        maxBuffer: 2_000_000
+      });
+    })().catch((error) => {
+      accountingChromeInstallPromise = null;
+      throw error;
+    });
+  }
+  await accountingChromeInstallPromise;
+}
+
 async function renderAccountingHtmlEmailPdfBuffer(html, { allowRemoteImages = ACCOUNTING_INLINE_EMAIL_RENDER_REMOTE_IMAGES } = {}) {
+  if (!process.env.PUPPETEER_CACHE_DIR) {
+    process.env.PUPPETEER_CACHE_DIR = ACCOUNTING_INLINE_EMAIL_CHROME_CACHE_DIR;
+  }
   const puppeteer = await import("puppeteer");
-  const executablePath =
-    process.env.PUPPETEER_EXECUTABLE_PATH ||
-    process.env.CHROME_BIN ||
-    process.env.GOOGLE_CHROME_BIN ||
-    "";
+  let executablePath = resolveAccountingChromeExecutablePath(puppeteer);
+  if (!executablePath && ACCOUNTING_INLINE_EMAIL_RUNTIME_CHROME_INSTALL) {
+    await installAccountingChromeRuntime();
+    executablePath = resolveAccountingChromeExecutablePath(puppeteer);
+  }
   const browser = await puppeteer.default.launch({
     headless: "new",
     ...(executablePath ? { executablePath } : {}),
