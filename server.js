@@ -864,6 +864,14 @@ function getAsanaTaskFollowerGids(task) {
   return uniqueValues((task?.followers || []).map((follower) => follower?.gid).filter(Boolean));
 }
 
+function isDefaultSupervisorFollowerGid(followerGid) {
+  return String(followerGid || "") === String(ASANA_DEFAULT_SUPERVISOR_GID || "");
+}
+
+function isRoutineSupervisorDoNotReaddCandidate(task, followerGid) {
+  return isRoutineLikeAsanaTask(task) && isDefaultSupervisorFollowerGid(followerGid);
+}
+
 function buildAsanaScheduleVerification({
   task,
   expected_due_on,
@@ -879,7 +887,8 @@ function buildAsanaScheduleVerification({
   expected_name_contains,
   expected_completed,
   recurrence_expected,
-  allow_unverifiable_native_recurrence
+  allow_unverifiable_native_recurrence,
+  allow_routine_supervisor_do_not_readd
 }) {
   validateAsanaDate(expected_due_on, "expected_due_on");
   validateAsanaDateTime(expected_due_at, "expected_due_at");
@@ -969,13 +978,23 @@ function buildAsanaScheduleVerification({
   }
   if (followerExpectations.length) {
     const followerGids = getAsanaTaskFollowerGids(task);
+    const missingFollowerGids = followerExpectations.filter((followerGid) => !followerGids.includes(followerGid));
+    const allowedMissingRoutineSupervisorGids = missingFollowerGids.filter((followerGid) =>
+      allow_routine_supervisor_do_not_readd && isRoutineSupervisorDoNotReaddCandidate(task, followerGid)
+    );
+    const hardMissingFollowerGids = missingFollowerGids.filter(
+      (followerGid) => !allowedMissingRoutineSupervisorGids.includes(followerGid)
+    );
     addCheck({
       name: "followers_present",
-      ok: followerExpectations.every((followerGid) => followerGids.includes(followerGid)),
+      ok: hardMissingFollowerGids.length === 0,
       expected: followerExpectations,
       actual: followerGids,
+      severity: hardMissingFollowerGids.length === 0 && allowedMissingRoutineSupervisorGids.length ? "warning" : "error",
       note:
-        "Pflicht fuer relevante Agenten-Aufgaben: Hauptvorgesetzter/Moritz muss als Beteiligter/Follower sichtbar sein."
+        allowedMissingRoutineSupervisorGids.length
+          ? "Routine-Aufgabe ohne Default-Supervisor-Follower wird als moeglicher do_not_readd-Fall behandelt; nicht automatisch readden, solange die Routine normal erfolgreich abgeschlossen werden kann."
+          : "Pflicht fuer relevante Agenten-Aufgaben: Hauptvorgesetzter/Moritz muss als Beteiligter/Follower sichtbar sein."
     });
   }
   if (expected_name_contains) {
@@ -6845,7 +6864,7 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar, Supervisor-Follower, Routine-Due-Gate und Readback.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar, Supervisor-Follower, Routine-Due-Gate und Readback. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nicht automatisch wieder hinzugefuegt, ausser allow_routine_supervisor_readd=true.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -6853,6 +6872,7 @@ function createServer() {
       final_comment_story_gid: z.string().optional(),
       require_final_comment: z.boolean().optional().default(true),
       ensure_supervisor_follower: z.boolean().optional().default(true),
+      allow_routine_supervisor_readd: z.boolean().optional().default(false),
       supervisor_follower_gid: z.string().optional(),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
@@ -6865,6 +6885,7 @@ function createServer() {
       final_comment_story_gid,
       require_final_comment,
       ensure_supervisor_follower,
+      allow_routine_supervisor_readd,
       supervisor_follower_gid,
       dry_run,
       verify_after
@@ -6892,6 +6913,18 @@ function createServer() {
       const task = taskRes.data.data;
       const routine_like_task = isRoutineLikeAsanaTask(task);
       const due_gate = getAsanaTaskDueGate(task);
+      const initialFollowerGids = getAsanaTaskFollowerGids(task);
+      const supervisor_follower_present_initially = initialFollowerGids.includes(finalSupervisorFollowerGid);
+      const supervisor_follower_readd_guarded =
+        ensure_supervisor_follower &&
+        !supervisor_follower_present_initially &&
+        isRoutineSupervisorDoNotReaddCandidate(task, finalSupervisorFollowerGid) &&
+        !allow_routine_supervisor_readd;
+      const effective_ensure_supervisor_follower =
+        ensure_supervisor_follower && !supervisor_follower_readd_guarded;
+      const supervisor_follower_readd_guard_reason = supervisor_follower_readd_guarded
+        ? "Routine-Aufgabe ohne Default-Supervisor-Follower: als moeglicher do_not_readd-Fall behandelt. Kein automatisches Re-Add bei normal erfolgreichem Abschluss; fuer Blocker/Rueckfrage explizit allow_routine_supervisor_readd=true setzen."
+        : null;
 
       if (!task.assignee?.gid) {
         throw new Error("Asana-Aufgabe hat keinen Assignee; automatischer Abschluss ist nicht erlaubt.");
@@ -6927,16 +6960,19 @@ function createServer() {
       const basis_sha256 = createHash("sha256").update(completion_basis, "utf8").digest("hex");
 
       if (dry_run || task.completed) {
-        const followerGids = getAsanaTaskFollowerGids(task);
         return out({
           agent_id,
           dry_run,
           already_completed: Boolean(task.completed),
           allowed_to_complete: !task.completed && !blockedByFutureRoutineDue,
           ensure_supervisor_follower,
-          supervisor_follower_gid: ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
+          effective_ensure_supervisor_follower,
+          allow_routine_supervisor_readd,
+          supervisor_follower_readd_guarded,
+          supervisor_follower_readd_guard_reason,
+          supervisor_follower_gid: effective_ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
           supervisor_follower_present: ensure_supervisor_follower
-            ? followerGids.includes(finalSupervisorFollowerGid)
+            ? supervisor_follower_present_initially
             : null,
           routine_like_task,
           due_gate,
@@ -6948,7 +6984,7 @@ function createServer() {
       }
 
       let supervisor_follower_add_result = null;
-      if (ensure_supervisor_follower && !getAsanaTaskFollowerGids(task).includes(finalSupervisorFollowerGid)) {
+      if (effective_ensure_supervisor_follower && !supervisor_follower_present_initially) {
         const followerRes = await asanaRequestWithRetry(asana, {
           method: "POST",
           url: `/tasks/${task_gid}/addFollowers`,
@@ -6981,7 +7017,7 @@ function createServer() {
         if (verified_task.assignee?.gid !== meGid) {
           throw new Error("Asana-Readback zeigt veraenderten Assignee nach Abschlussversuch.");
         }
-        if (ensure_supervisor_follower) {
+        if (effective_ensure_supervisor_follower) {
           const verifiedFollowerGids = getAsanaTaskFollowerGids(verified_task);
           if (!verifiedFollowerGids.includes(finalSupervisorFollowerGid)) {
             throw new Error(`Asana-Readback zeigt Supervisor-Follower ${finalSupervisorFollowerGid} nicht.`);
@@ -6997,7 +7033,11 @@ function createServer() {
         task: completeRes.data.data,
         supervisor_follower_add_result,
         ensure_supervisor_follower,
-        supervisor_follower_gid: ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
+        effective_ensure_supervisor_follower,
+        allow_routine_supervisor_readd,
+        supervisor_follower_readd_guarded,
+        supervisor_follower_readd_guard_reason,
+        supervisor_follower_gid: effective_ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
         verified_task,
         verification_status,
         final_comment,
@@ -7092,7 +7132,7 @@ function createServer() {
 
   server.tool(
     "asana_verify_task_schedule",
-    "Verifiziert read-only, ob eine Asana-Aufgabe dem erwarteten Faelligkeits-/Routine-Vertrag entspricht. Nutze dieses Tool nach jeder neuen/geaenderten Routine, Faelligkeit, Uhrzeit oder Schedule-Annahme; es aendert keine Aufgabe.",
+    "Verifiziert read-only, ob eine Asana-Aufgabe dem erwarteten Faelligkeits-/Routine-Vertrag entspricht. Nutze dieses Tool nach jeder neuen/geaenderten Routine, Faelligkeit, Uhrzeit oder Schedule-Annahme; es aendert keine Aufgabe. Fehlender Default-Supervisor/Moritz auf bestehenden Routinen wird standardmaessig als moeglicher do_not_readd-Fall nur gewarnt.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -7109,7 +7149,8 @@ function createServer() {
       expected_name_contains: z.string().optional(),
       expected_completed: z.boolean().optional(),
       recurrence_expected: z.boolean().optional().default(false),
-      allow_unverifiable_native_recurrence: z.boolean().optional().default(false)
+      allow_unverifiable_native_recurrence: z.boolean().optional().default(false),
+      allow_routine_supervisor_do_not_readd: z.boolean().optional().default(true)
     },
     TOOL_READ_ONLY,
     async ({
@@ -7128,7 +7169,8 @@ function createServer() {
       expected_name_contains,
       expected_completed,
       recurrence_expected,
-      allow_unverifiable_native_recurrence
+      allow_unverifiable_native_recurrence,
+      allow_routine_supervisor_do_not_readd
     }) => {
       validateAsanaGid(task_gid, "task_gid");
       const asana = getAsana(agent_id);
@@ -7153,7 +7195,8 @@ function createServer() {
         expected_name_contains,
         expected_completed,
         recurrence_expected,
-        allow_unverifiable_native_recurrence
+        allow_unverifiable_native_recurrence,
+        allow_routine_supervisor_do_not_readd
       });
       return out({
         agent_id,
@@ -7171,7 +7214,7 @@ function createServer() {
 
   server.tool(
     "asana_verify_next_routine_instance",
-    "Verifiziert read-only nach einem Routine-Abschluss, ob Asana eine passende naechste offene Routine-Instanz erzeugt hat. Nutze dieses Tool, bevor ein Agent behauptet, Wiederholung/Fortsetzung sei korrekt.",
+    "Verifiziert read-only nach einem Routine-Abschluss, ob Asana eine passende naechste offene Routine-Instanz erzeugt hat. Nutze dieses Tool, bevor ein Agent behauptet, Wiederholung/Fortsetzung sei korrekt. Fehlender Default-Supervisor/Moritz auf Routine-Folgeinstanzen wird standardmaessig als moeglicher do_not_readd-Fall nur gewarnt.",
     {
       agent_id: agentIdSchema,
       source_task_gid: z.string(),
@@ -7185,6 +7228,7 @@ function createServer() {
       expected_follower_gids: z.array(z.string()).optional().default([]),
       expected_name_exact: z.string().optional(),
       expect_routine_tag: z.boolean().optional().default(true),
+      allow_routine_supervisor_do_not_readd: z.boolean().optional().default(true),
       limit: z.number().int().min(1).max(100).optional().default(100)
     },
     TOOL_READ_ONLY,
@@ -7201,6 +7245,7 @@ function createServer() {
       expected_follower_gids,
       expected_name_exact,
       expect_routine_tag,
+      allow_routine_supervisor_do_not_readd,
       limit
     }) => {
       validateAsanaGid(source_task_gid, "source_task_gid");
@@ -7261,16 +7306,25 @@ function createServer() {
           expected_name_contains: expectedName,
           expected_completed: false,
           recurrence_expected: false,
-          allow_unverifiable_native_recurrence: false
+          allow_unverifiable_native_recurrence: false,
+          allow_routine_supervisor_do_not_readd
         })
       }));
       const exactMatches = candidate_results.filter((candidate) => candidate.verification_status === "ok");
+      const acceptableWarningMatches = candidate_results.filter(
+        (candidate) => candidate.verification_status === "ok_with_warnings"
+      );
+      const acceptableMatches = [...exactMatches, ...acceptableWarningMatches];
       const verification_status =
         exactMatches.length === 1
           ? "ok"
           : exactMatches.length > 1
             ? "ambiguous"
-            : "failed";
+            : acceptableMatches.length === 1
+              ? "ok_with_warnings"
+              : acceptableMatches.length > 1
+                ? "ambiguous"
+                : "failed";
 
       return out({
         agent_id,
@@ -7281,12 +7335,15 @@ function createServer() {
         expected_assignee_gid: expectedAssignee || null,
         candidate_count: candidates.length,
         exact_match_count: exactMatches.length,
+        acceptable_match_count: acceptableMatches.length,
         verification_status,
         production_ready_claim_allowed: verification_status === "ok",
         candidates: candidate_results,
         note:
           verification_status === "ok"
             ? "Naechste Routine-Instanz ist API-seitig gegen den erwarteten Vertrag verifiziert."
+            : verification_status === "ok_with_warnings"
+              ? "Naechste Routine-Instanz wurde gefunden, hat aber Warnungen. Reine Default-Supervisor/Moritz-Warnungen auf bestehenden Routinen sind kein automatischer Re-Add-Auftrag."
             : "Naechste Routine-Instanz nicht eindeutig korrekt verifiziert. Nicht behaupten, dass Wiederholung/Fortsetzung sauber ist."
       });
     }
@@ -7456,17 +7513,18 @@ function createServer() {
 
   server.tool(
     "asana_ensure_task_followers",
-    "Stellt idempotent sicher, dass bestimmte Asana-Nutzer als Beteiligte/Follower einer Aufgabe gesetzt sind, und verifiziert den Readback. Standard fuer Hauptvorgesetzten-/Moritz-Beteiligung; nicht per rohem asana_request nutzen.",
+    "Stellt idempotent sicher, dass bestimmte Asana-Nutzer als Beteiligte/Follower einer Aufgabe gesetzt sind, und verifiziert den Readback. Standard fuer Hauptvorgesetzten-/Moritz-Beteiligung; nicht per rohem asana_request nutzen. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nicht automatisch wieder hinzugefuegt, ausser allow_routine_supervisor_readd=true.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
       follower_gids: z.array(z.string()).min(1),
       ensure_basis: z.string().optional(),
+      allow_routine_supervisor_readd: z.boolean().optional().default(false),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
     },
     TOOL_IDEMPOTENT_SAFE_WRITE,
-    async ({ agent_id, task_gid, follower_gids, ensure_basis, dry_run, verify_after }) => {
+    async ({ agent_id, task_gid, follower_gids, ensure_basis, allow_routine_supervisor_readd, dry_run, verify_after }) => {
       validateAsanaGid(task_gid, "task_gid");
       const followersToEnsure = uniqueValues(follower_gids);
       for (const followerGid of followersToEnsure) validateAsanaGid(followerGid, "follower_gids");
@@ -7481,6 +7539,14 @@ function createServer() {
       const before_task = beforeRes.data.data;
       const currentFollowerGids = getAsanaTaskFollowerGids(before_task);
       const toAdd = followersToEnsure.filter((followerGid) => !currentFollowerGids.includes(followerGid));
+      const guardedSkipFollowerGids = toAdd.filter(
+        (followerGid) =>
+          isRoutineSupervisorDoNotReaddCandidate(before_task, followerGid) && !allow_routine_supervisor_readd
+      );
+      const finalToAdd = toAdd.filter((followerGid) => !guardedSkipFollowerGids.includes(followerGid));
+      const guardedSkipReason = guardedSkipFollowerGids.length
+        ? "Routine-Aufgabe ohne Default-Supervisor-Follower: als moeglicher do_not_readd-Fall behandelt. Kein automatisches Re-Add; fuer Blocker/Rueckfrage explizit allow_routine_supervisor_readd=true setzen."
+        : null;
 
       if (dry_run) {
         return out({
@@ -7489,19 +7555,22 @@ function createServer() {
           task_gid,
           before_task,
           follower_gids: followersToEnsure,
-          would_add: toAdd,
+          would_add: finalToAdd,
+          guarded_skip_follower_gids: guardedSkipFollowerGids,
+          guarded_skip_reason: guardedSkipReason,
+          allow_routine_supervisor_readd,
           skipped_already_present: followersToEnsure.filter((followerGid) => currentFollowerGids.includes(followerGid)),
           ensure_basis: ensure_basis || null
         });
       }
 
       let add_result = null;
-      if (toAdd.length) {
+      if (finalToAdd.length) {
         const res = await asanaRequestWithRetry(asana, {
           method: "POST",
           url: `/tasks/${task_gid}/addFollowers`,
           timeout: ASANA_WRITE_TIMEOUT_MS,
-          data: { data: { followers: toAdd } }
+          data: { data: { followers: finalToAdd } }
         });
         add_result = res.data;
       }
@@ -7517,7 +7586,10 @@ function createServer() {
         });
         verified_task = verify.data.data;
         const verifiedFollowerGids = getAsanaTaskFollowerGids(verified_task);
-        for (const followerGid of followersToEnsure) {
+        const followersToVerify = followersToEnsure.filter(
+          (followerGid) => !guardedSkipFollowerGids.includes(followerGid)
+        );
+        for (const followerGid of followersToVerify) {
           if (!verifiedFollowerGids.includes(followerGid)) {
             throw new Error(`Asana-Readback zeigt erwarteten Follower ${followerGid} nicht.`);
           }
@@ -7530,7 +7602,10 @@ function createServer() {
         task_gid,
         before_task,
         follower_gids: followersToEnsure,
-        added_follower_gids: toAdd,
+        added_follower_gids: finalToAdd,
+        guarded_skip_follower_gids: guardedSkipFollowerGids,
+        guarded_skip_reason: guardedSkipReason,
+        allow_routine_supervisor_readd,
         skipped_already_present: followersToEnsure.filter((followerGid) => currentFollowerGids.includes(followerGid)),
         add_result,
         verified_task,
