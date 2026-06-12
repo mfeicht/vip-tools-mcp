@@ -523,7 +523,7 @@ function assertSafeAsanaRequest(method, path, data) {
 
   if (isTaskFollowerUpdate) {
     throw new Error(
-      "Asana-Beteiligte/Follower duerfen nicht per rohem asana_request geaendert werden. Nutze asana_ensure_task_followers; es ist idempotent und prueft den Readback."
+      "Asana-Beteiligte/Follower duerfen nicht per rohem asana_request geaendert werden. Nutze asana_ensure_task_followers zum Hinzufuegen oder asana_leave_task_followers zum Entfernen; beide pruefen den Readback."
     );
   }
 
@@ -7611,6 +7611,112 @@ function createServer() {
         verified_task,
         verification_status,
         ensure_basis: ensure_basis || null
+      });
+    }
+  );
+
+  server.tool(
+    "asana_leave_task_followers",
+    "Entfernt Follower/Beteiligte aus einer Asana-Aufgabe ueber einen engen, verifizierten Pfad. Standard: der aufrufende Agent entfernt nur sich selbst als Nebenrollen-Follower, z. B. vor oder direkt nach einer Routine-Folgeinstanz. Andere Follower nur mit allow_remove_other_followers=true.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      follower_gid: z.string().optional(),
+      leave_basis: z.string().min(12),
+      allow_remove_other_followers: z.boolean().optional().default(false),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({ agent_id, task_gid, follower_gid, leave_basis, allow_remove_other_followers, dry_run, verify_after }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      if (follower_gid) validateAsanaGid(follower_gid, "follower_gid");
+      ensureNoUnsafeAsanaText(leave_basis, "Asana-Follower-Entfernungsbegruendung");
+
+      const asana = getAsana(agent_id);
+      const meRes = await asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" });
+      const me = meRes.data.data;
+      const targetFollowerGid = follower_gid || me.gid;
+      validateAsanaGid(targetFollowerGid, "target_follower_gid");
+      const removingSelf = String(targetFollowerGid) === String(me.gid);
+      if (!removingSelf && !allow_remove_other_followers) {
+        throw new Error(
+          "Dieses Tool entfernt standardmaessig nur den aufrufenden Agenten selbst. Fuer andere Follower ist allow_remove_other_followers=true plus klare Begruendung noetig."
+        );
+      }
+
+      const beforeRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/tasks/${task_gid}`,
+        params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
+      });
+      const before_task = beforeRes.data.data;
+      if (String(before_task?.assignee?.gid || "") === String(targetFollowerGid)) {
+        throw new Error(
+          "Der aktuelle Assignee darf nicht ueber asana_leave_task_followers als Follower entfernt werden. Erst Verantwortlichkeit klaeren; Routine-Assignee bleibt unveraendert."
+        );
+      }
+      const beforeFollowerGids = getAsanaTaskFollowerGids(before_task);
+      const alreadyAbsent = !beforeFollowerGids.includes(targetFollowerGid);
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          task_gid,
+          before_task,
+          me,
+          target_follower_gid: targetFollowerGid,
+          removing_self: removingSelf,
+          would_remove: !alreadyAbsent,
+          skipped_already_absent: alreadyAbsent,
+          routine_like: isRoutineLikeAsanaTask(before_task),
+          leave_basis
+        });
+      }
+
+      let remove_result = null;
+      if (!alreadyAbsent) {
+        const res = await asanaRequestWithRetry(asana, {
+          method: "POST",
+          url: `/tasks/${task_gid}/removeFollowers`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          data: { data: { followers: [targetFollowerGid] } }
+        });
+        remove_result = res.data;
+      }
+
+      let verified_task;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verify = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${task_gid}`,
+          timeout: ASANA_WRITE_TIMEOUT_MS,
+          params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
+        });
+        verified_task = verify.data.data;
+        const verifiedFollowerGids = getAsanaTaskFollowerGids(verified_task);
+        if (verifiedFollowerGids.includes(targetFollowerGid)) {
+          throw new Error(`Asana-Readback zeigt entfernten Follower ${targetFollowerGid} weiterhin.`);
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        before_task,
+        me,
+        target_follower_gid: targetFollowerGid,
+        removing_self: removingSelf,
+        removed_follower_gids: alreadyAbsent ? [] : [targetFollowerGid],
+        skipped_already_absent: alreadyAbsent,
+        routine_like: isRoutineLikeAsanaTask(before_task),
+        remove_result,
+        verified_task,
+        verification_status,
+        leave_basis
       });
     }
   );
