@@ -123,6 +123,7 @@ const UNSPLASH_TIMEOUT_MS = Number(process.env.UNSPLASH_TIMEOUT_MS || 20_000);
 const BUFFER_API_BASE = (process.env.BUFFER_API_BASE || "https://api.buffer.com").replace(/\/$/, "");
 const BUFFER_TIMEOUT_MS = Number(process.env.BUFFER_TIMEOUT_MS || 30_000);
 const CLOUDINARY_UPLOAD_TIMEOUT_MS = Number(process.env.CLOUDINARY_UPLOAD_TIMEOUT_MS || 45_000);
+const CLOUDINARY_ADMIN_TIMEOUT_MS = Number(process.env.CLOUDINARY_ADMIN_TIMEOUT_MS || 30_000);
 const CLOUDINARY_DEFAULT_FOLDER_PREFIX = process.env.CLOUDINARY_FOLDER_PREFIX || "vip-social-media";
 const WEB_FETCH_TIMEOUT_MS = Number(process.env.WEB_FETCH_TIMEOUT_MS || 20_000);
 const WEB_FETCH_MAX_BYTES = Number(process.env.WEB_FETCH_MAX_BYTES || 2_000_000);
@@ -6171,6 +6172,93 @@ async function uploadImageToCloudinary({ projectKey, asanaTaskGid, attachment, b
   };
 }
 
+function normalizeCloudinaryCleanupPrefix({ folderPrefix, projectKey, targetPrefix }) {
+  const basePrefix = [folderPrefix, sanitizeCloudinaryPathPart(projectKey)].filter(Boolean).join("/");
+  const rawPrefix = String(targetPrefix || `${basePrefix}/`).trim().replace(/^\/+/, "");
+  const prefix = rawPrefix.endsWith("/") ? rawPrefix : `${rawPrefix}/`;
+
+  if (!basePrefix || !prefix.startsWith(`${basePrefix}/`)) {
+    throw new Error(`Cloudinary-Cleanup-Prefix muss unter ${basePrefix}/ liegen.`);
+  }
+  if (prefix.length < 12 || prefix.split("/").filter(Boolean).length < 2) {
+    throw new Error("Cloudinary-Cleanup-Prefix ist zu breit oder ungueltig.");
+  }
+
+  return prefix;
+}
+
+async function cloudinaryAdminRequest({ method = "GET", path: requestPath, params, data, config, timeout }) {
+  const url = `https://api.cloudinary.com/v1_1/${encodeURIComponent(config.cloudName)}${requestPath}`;
+  const res = await axios.request({
+    url,
+    method,
+    params,
+    data,
+    timeout: timeout || CLOUDINARY_ADMIN_TIMEOUT_MS,
+    validateStatus: () => true,
+    auth: {
+      username: config.apiKey,
+      password: config.apiSecret
+    },
+    headers: {
+      "User-Agent": WEB_FETCH_USER_AGENT,
+      ...(data ? { "Content-Type": "application/x-www-form-urlencoded" } : {})
+    }
+  });
+
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`Cloudinary-Admin-Request fehlgeschlagen: HTTP ${res.status}; ${JSON.stringify(res.data)}`);
+  }
+  return res.data || {};
+}
+
+async function listCloudinaryResourcesByPrefix({ config, prefix, maxResources }) {
+  const resources = [];
+  let nextCursor = null;
+
+  do {
+    const remaining = maxResources - resources.length;
+    if (remaining <= 0) break;
+    const data = await cloudinaryAdminRequest({
+      config,
+      path: "/resources/image/upload",
+      params: {
+        prefix,
+        max_results: Math.min(500, remaining),
+        fields: "public_id,asset_id,created_at,bytes,secure_url,resource_type,type",
+        ...(nextCursor ? { next_cursor: nextCursor } : {})
+      }
+    });
+    resources.push(...(data.resources || []));
+    nextCursor = data.next_cursor || null;
+  } while (nextCursor);
+
+  return { resources, next_cursor: nextCursor };
+}
+
+async function deleteCloudinaryResourcesByPublicId({ config, publicIds, invalidate = false }) {
+  const batches = [];
+  for (let index = 0; index < publicIds.length; index += 100) {
+    batches.push(publicIds.slice(index, index + 100));
+  }
+
+  const results = [];
+  for (const batch of batches) {
+    const body = new URLSearchParams();
+    for (const publicId of batch) body.append("public_ids[]", publicId);
+    body.set("invalidate", invalidate ? "true" : "false");
+
+    const data = await cloudinaryAdminRequest({
+      method: "DELETE",
+      config,
+      path: "/resources/image/upload",
+      data: body
+    });
+    results.push(data);
+  }
+  return results;
+}
+
 function bufferAssetInputFromUrls(urls) {
   return urls.map((url) => `{ image: { url: "${escapeGraphqlString(url)}" } }`).join(", ");
 }
@@ -9894,6 +9982,120 @@ function createServer() {
       }
 
       return out(result);
+    }
+  );
+
+  server.tool(
+    "cloudinary_cleanup_old_uploads",
+    "Raeumt alte Social-Media-Uploads aus dem eng begrenzten Cloudinary-Projektprefix auf. Standard ist dry_run=true; echte Loeschungen brauchen confirmed_cleanup=true.",
+    {
+      agent_id: agentIdSchema,
+      project_key: z.string().min(2).max(80).optional().default("holzpunkt"),
+      target_prefix: z.string().min(6).max(240).optional(),
+      older_than_days: z.number().int().min(7).max(365).optional().default(30),
+      max_scan: z.number().int().min(1).max(2000).optional().default(500),
+      max_delete: z.number().int().min(0).max(500).optional().default(100),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_cleanup: z.boolean().optional().default(false),
+      invalidate_cdn: z.boolean().optional().default(false)
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      project_key,
+      target_prefix,
+      older_than_days,
+      max_scan,
+      max_delete,
+      dry_run,
+      confirmed_cleanup,
+      invalidate_cdn
+    }) => {
+      if (!dry_run && !confirmed_cleanup) {
+        throw new Error("cloudinary_cleanup_old_uploads braucht confirmed_cleanup=true fuer Live-Loeschung.");
+      }
+
+      const normalizedProjectKey = normalizeBufferProjectKey(project_key);
+      const { config, summary } = getCloudinaryConfigDetails({ requireCredentials: true });
+      const prefix = normalizeCloudinaryCleanupPrefix({
+        folderPrefix: config.folderPrefix,
+        projectKey: normalizedProjectKey,
+        targetPrefix: target_prefix
+      });
+      const cutoff = new Date(Date.now() - older_than_days * 24 * 60 * 60 * 1000);
+      const { resources, next_cursor } = await listCloudinaryResourcesByPrefix({
+        config,
+        prefix,
+        maxResources: max_scan
+      });
+
+      const expired = [];
+      const recent = [];
+      const unparseable = [];
+      for (const resource of resources) {
+        const createdAt = new Date(resource.created_at);
+        if (Number.isNaN(createdAt.getTime())) {
+          unparseable.push(resource);
+        } else if (createdAt.getTime() < cutoff.getTime()) {
+          expired.push(resource);
+        } else {
+          recent.push(resource);
+        }
+      }
+
+      expired.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+      const selected = expired.slice(0, max_delete);
+      const publicIds = selected.map((resource) => resource.public_id).filter(Boolean);
+      const deleteResults = !dry_run && publicIds.length
+        ? await deleteCloudinaryResourcesByPublicId({
+            config,
+            publicIds,
+            invalidate: invalidate_cdn
+          })
+        : [];
+
+      const deletedCount = deleteResults.reduce((sum, result) => {
+        const deleted = result?.deleted || {};
+        return sum + Object.values(deleted).filter((status) => status === "deleted").length;
+      }, 0);
+
+      return out({
+        agent_id,
+        project_key: normalizedProjectKey,
+        cloudinary: {
+          ...summary,
+          admin_timeout_ms: CLOUDINARY_ADMIN_TIMEOUT_MS
+        },
+        target_prefix: prefix,
+        cutoff_iso: cutoff.toISOString(),
+        older_than_days,
+        max_scan,
+        max_delete,
+        dry_run,
+        confirmed_cleanup,
+        invalidate_cdn,
+        scanned_count: resources.length,
+        next_cursor_available: Boolean(next_cursor),
+        expired_count: expired.length,
+        recent_kept_count: recent.length,
+        unparseable_created_at_count: unparseable.length,
+        selected_delete_count: publicIds.length,
+        deleted_count: dry_run ? 0 : deletedCount,
+        candidates_sample: selected.slice(0, 20).map((resource) => ({
+          public_id: resource.public_id,
+          created_at: resource.created_at,
+          bytes: resource.bytes || null,
+          secure_url: resource.secure_url || null
+        })),
+        delete_batches: deleteResults.map((result) => ({
+          deleted_count: Object.values(result?.deleted || {}).filter((status) => status === "deleted").length,
+          partial: Boolean(result?.partial),
+          next_cursor_available: Boolean(result?.next_cursor)
+        })),
+        note: dry_run
+          ? "Dry-Run: keine Cloudinary-Ressourcen geloescht."
+          : "Live: nur die ausgewaehlten Ressourcen unter dem geprueften Prefix wurden geloescht."
+      });
     }
   );
 
