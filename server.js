@@ -5970,7 +5970,8 @@ function getBufferPinterestDefaults(projectKey) {
   const boardEnvNames = [`BUFFER_PINTEREST_BOARD_SERVICE_ID_${suffix}`, `BUFFER_PINTEREST_BOARD_ID_${suffix}`];
   const selectedBoardEnvName = boardEnvNames.find((name) => Boolean(process.env[name])) || boardEnvNames[0];
   const defaultUrlEnvName = `BUFFER_PINTEREST_DEFAULT_URL_${suffix}`;
-  const boardServiceId = process.env[selectedBoardEnvName] || "";
+  const projectDefaultBoardServiceId = normalizedProjectKey === "holzpunkt" ? "586312513927645928" : "";
+  const boardServiceId = process.env[selectedBoardEnvName] || projectDefaultBoardServiceId;
   const defaultUrl =
     process.env[defaultUrlEnvName] ||
     (normalizedProjectKey === "holzpunkt" ? "https://www.holzpunkt-parkett.ch/" : "");
@@ -5981,6 +5982,7 @@ function getBufferPinterestDefaults(projectKey) {
       board_service_id_configured: Boolean(boardServiceId),
       board_service_id_env_name: selectedBoardEnvName,
       board_service_id_candidate_env_names: boardEnvNames,
+      board_service_id_source: process.env[selectedBoardEnvName] ? "env" : projectDefaultBoardServiceId ? "project_default" : null,
       default_url_configured: Boolean(defaultUrl),
       default_url_env_name: defaultUrlEnvName
     }
