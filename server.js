@@ -5964,6 +5964,29 @@ function getBufferConfiguredChannels(projectKey, channels = ["instagram", "pinte
   return channels.map((channel) => getBufferChannelConfig(projectKey, channel, { requireChannelId: false }));
 }
 
+function getBufferPinterestDefaults(projectKey) {
+  const normalizedProjectKey = normalizeBufferProjectKey(projectKey);
+  const suffix = bufferProjectEnvSuffix(normalizedProjectKey);
+  const boardEnvNames = [`BUFFER_PINTEREST_BOARD_SERVICE_ID_${suffix}`, `BUFFER_PINTEREST_BOARD_ID_${suffix}`];
+  const selectedBoardEnvName = boardEnvNames.find((name) => Boolean(process.env[name])) || boardEnvNames[0];
+  const defaultUrlEnvName = `BUFFER_PINTEREST_DEFAULT_URL_${suffix}`;
+  const boardServiceId = process.env[selectedBoardEnvName] || "";
+  const defaultUrl =
+    process.env[defaultUrlEnvName] ||
+    (normalizedProjectKey === "holzpunkt" ? "https://www.holzpunkt-parkett.ch/" : "");
+
+  return {
+    config: { boardServiceId, defaultUrl },
+    summary: {
+      board_service_id_configured: Boolean(boardServiceId),
+      board_service_id_env_name: selectedBoardEnvName,
+      board_service_id_candidate_env_names: boardEnvNames,
+      default_url_configured: Boolean(defaultUrl),
+      default_url_env_name: defaultUrlEnvName
+    }
+  };
+}
+
 async function bufferGraphqlRequest(projectKey, { query, variables, timeout = BUFFER_TIMEOUT_MS }) {
   const { config } = getBufferProjectConfigDetails(projectKey, { requireApiKey: true });
   const res = await axios.post(
@@ -6263,11 +6286,40 @@ function bufferAssetInputFromUrls(urls) {
   return urls.map((url) => `{ image: { url: "${escapeGraphqlString(url)}" } }`).join(", ");
 }
 
-function bufferMetadataInputForChannel({ channel, instagramType, instagramShouldShareToFeed }) {
+function bufferMetadataStringField(name, value) {
+  if (value === undefined || value === null || value === "") return "";
+  return `${name}: "${escapeGraphqlString(value)}"`;
+}
+
+function bufferMetadataInputForChannel({
+  channel,
+  instagramType,
+  instagramShouldShareToFeed,
+  pinterestTitle,
+  pinterestUrl,
+  pinterestBoardServiceId,
+  linkedinFirstComment,
+  linkedinLinkUrl
+}) {
   if (channel === "instagram") {
     return `\n          metadata: { instagram: { type: ${instagramType}, shouldShareToFeed: ${
       instagramShouldShareToFeed ? "true" : "false"
     } } }`;
+  }
+  if (channel === "pinterest") {
+    const fields = [
+      bufferMetadataStringField("title", pinterestTitle),
+      bufferMetadataStringField("url", pinterestUrl),
+      bufferMetadataStringField("boardServiceId", pinterestBoardServiceId)
+    ].filter(Boolean);
+    return fields.length ? `\n          metadata: { pinterest: { ${fields.join(" ")} } }` : "";
+  }
+  if (channel === "linkedin") {
+    const fields = [bufferMetadataStringField("firstComment", linkedinFirstComment)].filter(Boolean);
+    if (linkedinLinkUrl) {
+      fields.push(`linkAttachment: { url: "${escapeGraphqlString(linkedinLinkUrl)}" }`);
+    }
+    return fields.length ? `\n          metadata: { linkedin: { ${fields.join(" ")} } }` : "";
   }
   return "";
 }
@@ -9973,10 +10025,12 @@ function createServer() {
       });
       const cloudinaryDetails = getCloudinaryConfigDetails({ requireCredentials: false });
       const configuredChannels = getBufferConfiguredChannels(project_key);
+      const pinterestDefaults = getBufferPinterestDefaults(project_key);
       const result = {
         agent_id,
         ...bufferDetails.summary,
         cloudinary: cloudinaryDetails.summary,
+        pinterest: pinterestDefaults.summary,
         channels: configuredChannels,
         fetch_organizations,
         fetch_channels
@@ -10186,6 +10240,11 @@ function createServer() {
       timezone: z.string().min(3).max(80).optional().default("Europe/Berlin"),
       instagram_type: z.enum(["post", "story", "reel"]).optional().default("post"),
       instagram_should_share_to_feed: z.boolean().optional().default(true),
+      pinterest_title: z.string().min(1).max(200).optional(),
+      pinterest_url: z.string().url().optional(),
+      pinterest_board_service_id: z.string().min(1).max(200).optional(),
+      linkedin_first_comment: z.string().min(1).max(3000).optional(),
+      linkedin_link_url: z.string().url().optional(),
       max_attachment_bytes: z
         .number()
         .int()
@@ -10212,6 +10271,11 @@ function createServer() {
       timezone,
       instagram_type,
       instagram_should_share_to_feed,
+      pinterest_title,
+      pinterest_url,
+      pinterest_board_service_id,
+      linkedin_first_comment,
+      linkedin_link_url,
       max_attachment_bytes
     }) => {
       validateAsanaGid(asana_task_gid, "asana_task_gid");
@@ -10230,6 +10294,15 @@ function createServer() {
         requireApiKey: !dry_run,
         requireOrganizationId: !dry_run || auto_next_free_slot
       });
+      const pinterestDefaults = getBufferPinterestDefaults(normalizedProjectKey);
+      const resolvedPinterestBoardServiceId =
+        pinterest_board_service_id || pinterestDefaults.config.boardServiceId || "";
+      const resolvedPinterestUrl = pinterest_url || pinterestDefaults.config.defaultUrl || "";
+      if (!dry_run && normalizedChannels.includes("pinterest") && !resolvedPinterestBoardServiceId) {
+        throw new Error(
+          `Pinterest braucht boardServiceId. Uebergib pinterest_board_service_id oder setze ${pinterestDefaults.summary.board_service_id_env_name} in Render.`
+        );
+      }
       const cloudinary = getCloudinaryConfigDetails({ requireCredentials: !dry_run && !public_media_urls?.length });
       const asana = getAsana(agent_id);
 
@@ -10323,7 +10396,23 @@ function createServer() {
                   shouldShareToFeed: instagram_should_share_to_feed
                 }
               }
-            : null
+            : channel === "pinterest"
+              ? {
+                  pinterest: {
+                    title: pinterest_title || null,
+                    url: resolvedPinterestUrl || null,
+                    boardServiceId: resolvedPinterestBoardServiceId || null,
+                    board_service_id_env_name: pinterestDefaults.summary.board_service_id_env_name
+                  }
+                }
+              : channel === "linkedin"
+                ? {
+                    linkedin: {
+                      firstComment: linkedin_first_comment || null,
+                      linkAttachmentUrl: linkedin_link_url || null
+                    }
+                  }
+                : null
         };
         planned.push(plan);
 
@@ -10331,7 +10420,12 @@ function createServer() {
           const metadataInput = bufferMetadataInputForChannel({
             channel,
             instagramType: instagram_type,
-            instagramShouldShareToFeed: instagram_should_share_to_feed
+            instagramShouldShareToFeed: instagram_should_share_to_feed,
+            pinterestTitle: pinterest_title,
+            pinterestUrl: resolvedPinterestUrl,
+            pinterestBoardServiceId: resolvedPinterestBoardServiceId,
+            linkedinFirstComment: linkedin_first_comment,
+            linkedinLinkUrl: linkedin_link_url
           });
           const post = await createBufferPost(normalizedProjectKey, {
             text: channelText,
