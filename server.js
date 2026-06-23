@@ -120,6 +120,10 @@ const MAGNIFIC_API_BASE = (process.env.MAGNIFIC_API_BASE || "https://api.magnifi
 const FREEPIK_TIMEOUT_MS = Number(process.env.FREEPIK_TIMEOUT_MS || 30_000);
 const UNSPLASH_API_BASE = (process.env.UNSPLASH_API_BASE || "https://api.unsplash.com").replace(/\/$/, "");
 const UNSPLASH_TIMEOUT_MS = Number(process.env.UNSPLASH_TIMEOUT_MS || 20_000);
+const BUFFER_API_BASE = (process.env.BUFFER_API_BASE || "https://api.buffer.com").replace(/\/$/, "");
+const BUFFER_TIMEOUT_MS = Number(process.env.BUFFER_TIMEOUT_MS || 30_000);
+const CLOUDINARY_UPLOAD_TIMEOUT_MS = Number(process.env.CLOUDINARY_UPLOAD_TIMEOUT_MS || 45_000);
+const CLOUDINARY_DEFAULT_FOLDER_PREFIX = process.env.CLOUDINARY_FOLDER_PREFIX || "vip-social-media";
 const WEB_FETCH_TIMEOUT_MS = Number(process.env.WEB_FETCH_TIMEOUT_MS || 20_000);
 const WEB_FETCH_MAX_BYTES = Number(process.env.WEB_FETCH_MAX_BYTES || 2_000_000);
 const WEB_FETCH_USER_AGENT =
@@ -5867,6 +5871,452 @@ function sha256Json(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+function normalizeBufferProjectKey(projectKey) {
+  const normalized = String(projectKey || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{1,80}$/.test(normalized)) {
+    throw new Error("project_key muss aus Kleinbuchstaben, Zahlen, Bindestrichen oder Unterstrichen bestehen.");
+  }
+  return normalized;
+}
+
+function bufferProjectEnvSuffix(projectKey) {
+  return normalizeBufferProjectKey(projectKey).replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").toUpperCase();
+}
+
+function normalizeBufferChannelKey(channel) {
+  const normalized = String(channel || "").trim().toLowerCase();
+  const aliases = {
+    ig: "instagram",
+    insta: "instagram",
+    instagram: "instagram",
+    pin: "pinterest",
+    pinterest: "pinterest",
+    linkedin: "linkedin",
+    linked_in: "linkedin",
+    li: "linkedin"
+  };
+  const mapped = aliases[normalized] || normalized;
+  if (!["instagram", "pinterest", "linkedin"].includes(mapped)) {
+    throw new Error(`Unbekannter Buffer-Kanal: ${channel}. Erlaubt: instagram, pinterest, linkedin.`);
+  }
+  return mapped;
+}
+
+function bufferChannelEnvSuffix(channel) {
+  return normalizeBufferChannelKey(channel).toUpperCase();
+}
+
+function getBufferProjectConfigDetails(projectKey, { requireApiKey = true, requireOrganizationId = false } = {}) {
+  const normalizedProjectKey = normalizeBufferProjectKey(projectKey);
+  const suffix = bufferProjectEnvSuffix(normalizedProjectKey);
+  const apiKeyEnvNames = [`BUFFER_API_KEY_${suffix}`, `BUFFER_TOKEN_${suffix}`, `BUFFER_ACCESS_TOKEN_${suffix}`];
+  const selectedApiKeyEnvName = apiKeyEnvNames.find((name) => Boolean(process.env[name])) || apiKeyEnvNames[0];
+  const apiKey = process.env[selectedApiKeyEnvName] || "";
+  const organizationEnvName = `BUFFER_ORGANIZATION_ID_${suffix}`;
+  const organizationId = process.env[organizationEnvName] || "";
+
+  if (requireApiKey && !apiKey) {
+    throw new Error(`Buffer API-Key fehlt fuer ${normalizedProjectKey}. Setze ${apiKeyEnvNames.join(" oder ")}.`);
+  }
+  if (requireOrganizationId && !organizationId) {
+    throw new Error(`Buffer Organization-ID fehlt fuer ${normalizedProjectKey}. Setze ${organizationEnvName}.`);
+  }
+
+  return {
+    project_key: normalizedProjectKey,
+    suffix,
+    config: { apiKey, organizationId },
+    summary: {
+      project_key: normalizedProjectKey,
+      buffer_api_base: BUFFER_API_BASE,
+      api_key_configured: Boolean(apiKey),
+      api_key_env_name: apiKey ? selectedApiKeyEnvName : null,
+      api_key_candidate_env_names: apiKeyEnvNames,
+      organization_id_configured: Boolean(organizationId),
+      organization_id_env_name: organizationEnvName,
+      ready_for_read_calls: Boolean(apiKey),
+      ready_for_schedule_calls: Boolean(apiKey && organizationId),
+      timeout_ms: BUFFER_TIMEOUT_MS
+    }
+  };
+}
+
+function getBufferChannelConfig(projectKey, channel, { requireChannelId = true } = {}) {
+  const normalizedProjectKey = normalizeBufferProjectKey(projectKey);
+  const projectSuffix = bufferProjectEnvSuffix(normalizedProjectKey);
+  const normalizedChannel = normalizeBufferChannelKey(channel);
+  const channelSuffix = bufferChannelEnvSuffix(normalizedChannel);
+  const envName = `BUFFER_CHANNEL_ID_${projectSuffix}_${channelSuffix}`;
+  const channelId = process.env[envName] || "";
+  if (requireChannelId && !channelId) {
+    throw new Error(`Buffer Channel-ID fehlt fuer ${normalizedProjectKey}/${normalizedChannel}. Setze ${envName}.`);
+  }
+  return {
+    channel: normalizedChannel,
+    channel_id: channelId || null,
+    channel_id_configured: Boolean(channelId),
+    channel_id_env_name: envName
+  };
+}
+
+function getBufferConfiguredChannels(projectKey, channels = ["instagram", "pinterest", "linkedin"]) {
+  return channels.map((channel) => getBufferChannelConfig(projectKey, channel, { requireChannelId: false }));
+}
+
+async function bufferGraphqlRequest(projectKey, { query, variables, timeout = BUFFER_TIMEOUT_MS }) {
+  const { config } = getBufferProjectConfigDetails(projectKey, { requireApiKey: true });
+  const res = await axios.post(
+    BUFFER_API_BASE,
+    { query, variables },
+    {
+      timeout,
+      validateStatus: () => true,
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": WEB_FETCH_USER_AGENT
+      }
+    }
+  );
+
+  const ok = res.status >= 200 && res.status < 300 && !res.data?.errors;
+  return {
+    ok,
+    status: res.status,
+    status_text: res.statusText,
+    data: res.data,
+    errors: res.data?.errors || null
+  };
+}
+
+function assertBufferGraphqlOk(response, context) {
+  if (response.ok) return;
+  const errors = response.errors ? JSON.stringify(response.errors) : JSON.stringify(response.data);
+  throw new Error(`${context} fehlgeschlagen: HTTP ${response.status} ${response.status_text}; ${errors}`);
+}
+
+async function fetchBufferOrganizations(projectKey) {
+  const response = await bufferGraphqlRequest(projectKey, {
+    query: `query GetOrganizations {
+      account {
+        organizations {
+          id
+          name
+          ownerEmail
+        }
+      }
+    }`
+  });
+  assertBufferGraphqlOk(response, "Buffer Organization-Read");
+  return response.data?.data?.account?.organizations || [];
+}
+
+async function fetchBufferChannels(projectKey, organizationId) {
+  const response = await bufferGraphqlRequest(projectKey, {
+    query: `query GetChannels {
+      channels(input: { organizationId: "${escapeGraphqlString(organizationId)}" }) {
+        id
+        name
+        displayName
+        service
+        avatar
+        isQueuePaused
+      }
+    }`
+  });
+  assertBufferGraphqlOk(response, "Buffer Channel-Read");
+  return response.data?.data?.channels || [];
+}
+
+async function fetchBufferScheduledPosts(projectKey, { organizationId, channelIds = [], first = 100 }) {
+  const safeFirst = Math.min(Math.max(Number(first) || 20, 1), 100);
+  const channelFilter = channelIds.length
+    ? `, channelIds: [${channelIds.map((id) => `"${escapeGraphqlString(id)}"`).join(", ")}]`
+    : "";
+  const response = await bufferGraphqlRequest(projectKey, {
+    query: `query GetScheduledPosts {
+      posts(
+        first: ${safeFirst}
+        input: {
+          organizationId: "${escapeGraphqlString(organizationId)}"
+          sort: [{ field: dueAt, direction: asc }, { field: createdAt, direction: desc }]
+          filter: { status: [scheduled]${channelFilter} }
+        }
+      ) {
+        edges {
+          node {
+            id
+            text
+            dueAt
+            createdAt
+            channelId
+            status
+          }
+        }
+      }
+    }`
+  });
+  assertBufferGraphqlOk(response, "Buffer Scheduled-Posts-Read");
+  return (response.data?.data?.posts?.edges || []).map((edge) => edge.node).filter(Boolean);
+}
+
+function escapeGraphqlString(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+}
+
+function parseCloudinaryUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const parsed = new URL(raw);
+  if (parsed.protocol !== "cloudinary:") {
+    throw new Error("CLOUDINARY_URL muss mit cloudinary:// beginnen.");
+  }
+  return {
+    cloudName: parsed.hostname,
+    apiKey: decodeURIComponent(parsed.username || ""),
+    apiSecret: decodeURIComponent(parsed.password || "")
+  };
+}
+
+function getCloudinaryConfigDetails({ requireCredentials = true } = {}) {
+  const urlConfig = process.env.CLOUDINARY_URL ? parseCloudinaryUrl(process.env.CLOUDINARY_URL) : null;
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME || urlConfig?.cloudName || "";
+  const apiKey = process.env.CLOUDINARY_API_KEY || urlConfig?.apiKey || "";
+  const apiSecret = process.env.CLOUDINARY_API_SECRET || urlConfig?.apiSecret || "";
+  const folderPrefix = CLOUDINARY_DEFAULT_FOLDER_PREFIX;
+
+  if (requireCredentials && (!cloudName || !apiKey || !apiSecret)) {
+    throw new Error(
+      "Cloudinary-Konfiguration fehlt. Setze CLOUDINARY_URL oder CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY und CLOUDINARY_API_SECRET."
+    );
+  }
+
+  return {
+    config: { cloudName, apiKey, apiSecret, folderPrefix },
+    summary: {
+      cloudinary_url_configured: Boolean(process.env.CLOUDINARY_URL),
+      cloud_name_configured: Boolean(cloudName),
+      api_key_configured: Boolean(apiKey),
+      api_secret_configured: Boolean(apiSecret),
+      folder_prefix: folderPrefix,
+      ready_for_uploads: Boolean(cloudName && apiKey && apiSecret),
+      upload_timeout_ms: CLOUDINARY_UPLOAD_TIMEOUT_MS
+    }
+  };
+}
+
+function sanitizeCloudinaryPathPart(value, fallback = "asset") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  return normalized || fallback;
+}
+
+function cloudinarySignature(params, apiSecret) {
+  const payload = Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${value}`)
+    .join("&");
+  return createHash("sha1").update(`${payload}${apiSecret}`).digest("hex");
+}
+
+async function uploadImageToCloudinary({ projectKey, asanaTaskGid, attachment, bytes, contentType, index }) {
+  const { config } = getCloudinaryConfigDetails({ requireCredentials: true });
+  const taskPart = asanaTaskGid ? `asana-${sanitizeCloudinaryPathPart(asanaTaskGid)}` : `manual-${Date.now()}`;
+  const folder = [config.folderPrefix, sanitizeCloudinaryPathPart(projectKey), taskPart].filter(Boolean).join("/");
+  const publicId = `${String(index + 1).padStart(2, "0")}-${sanitizeCloudinaryPathPart(
+    attachment?.name || attachment?.gid || randomUUID()
+  )}-${randomUUID().slice(0, 8)}`;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signParams = { folder, public_id: publicId, timestamp };
+  const signature = cloudinarySignature(signParams, config.apiSecret);
+  const dataUri = `data:${contentType || "image/jpeg"};base64,${bytes.toString("base64")}`;
+  const body = new URLSearchParams({
+    file: dataUri,
+    api_key: config.apiKey,
+    timestamp: String(timestamp),
+    folder,
+    public_id: publicId,
+    signature
+  });
+
+  const res = await axios.post(`https://api.cloudinary.com/v1_1/${encodeURIComponent(config.cloudName)}/image/upload`, body, {
+    timeout: CLOUDINARY_UPLOAD_TIMEOUT_MS,
+    validateStatus: () => true,
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": WEB_FETCH_USER_AGENT
+    }
+  });
+
+  if (res.status < 200 || res.status >= 300 || !res.data?.secure_url) {
+    throw new Error(`Cloudinary-Upload fehlgeschlagen: HTTP ${res.status}; ${JSON.stringify(res.data)}`);
+  }
+
+  return {
+    attachment_gid: attachment?.gid,
+    attachment_name: attachment?.name,
+    bytes: bytes.length,
+    content_type: contentType || null,
+    cloudinary_public_id: res.data.public_id,
+    secure_url: res.data.secure_url,
+    width: res.data.width,
+    height: res.data.height,
+    format: res.data.format
+  };
+}
+
+function bufferAssetInputFromUrls(urls) {
+  return urls.map((url) => `{ image: { url: "${escapeGraphqlString(url)}" } }`).join(", ");
+}
+
+function bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls = [] }) {
+  const assets = mediaUrls.length ? `\n          assets: [${bufferAssetInputFromUrls(mediaUrls)}]` : "";
+  const dueAtLine = dueAt ? `\n          dueAt: "${escapeGraphqlString(dueAt)}"` : "";
+  const mode = dueAt ? "customScheduled" : "addToQueue";
+  return `mutation CreatePost {
+    createPost(
+      input: {
+        text: "${escapeGraphqlString(text)}"
+        channelId: "${escapeGraphqlString(channelId)}"
+        schedulingType: automatic
+        mode: ${mode}${dueAtLine}${assets}
+      }
+    ) {
+      ... on PostActionSuccess {
+        post {
+          id
+          text
+          dueAt
+          createdAt
+          channelId
+          status
+          assets {
+            id
+            mimeType
+          }
+        }
+      }
+      ... on MutationError {
+        message
+      }
+    }
+  }`;
+}
+
+async function createBufferPost(projectKey, { text, channelId, dueAt, mediaUrls }) {
+  const response = await bufferGraphqlRequest(projectKey, {
+    query: bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls })
+  });
+  assertBufferGraphqlOk(response, "Buffer createPost");
+  const result = response.data?.data?.createPost;
+  if (result?.message && !result?.post) {
+    throw new Error(`Buffer createPost MutationError: ${result.message}`);
+  }
+  if (!result?.post?.id) {
+    throw new Error(`Buffer createPost lieferte keinen Post-Readback: ${JSON.stringify(response.data)}`);
+  }
+  return result.post;
+}
+
+function localDatePartsInTimeZone(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  })
+    .formatToParts(date)
+    .reduce((acc, part) => {
+      if (part.type !== "literal") acc[part.type] = part.value;
+      return acc;
+    }, {});
+  return {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+    hour: Number(parts.hour),
+    minute: Number(parts.minute),
+    dateKey: `${parts.year}-${parts.month}-${parts.day}`
+  };
+}
+
+function zonedDateTimeToUtcIso({ dateKey, time, timeZone }) {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  const [hour, minute] = time.split(":").map(Number);
+  let guess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
+  for (let i = 0; i < 4; i += 1) {
+    const local = localDatePartsInTimeZone(guess, timeZone);
+    const diffMinutes =
+      (Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute) -
+        Date.UTC(year, month - 1, day, hour, minute)) /
+      60000;
+    if (diffMinutes === 0) break;
+    guess = new Date(guess.getTime() - diffMinutes * 60000);
+  }
+  return guess.toISOString();
+}
+
+function addDaysUtcDateKey(dateKey, days) {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days, 12, 0, 0, 0));
+  return date.toISOString().slice(0, 10);
+}
+
+function normalizePreferredBufferTimes(values) {
+  const rawValues = Array.isArray(values) && values.length ? values : ["08:30", "17:15"];
+  const normalized = rawValues.map((value) => String(value || "").trim()).filter(Boolean);
+  for (const value of normalized) {
+    if (!/^\d{2}:\d{2}$/.test(value)) {
+      throw new Error(`Ungueltiger Buffer-Zeitwert: ${value}. Erwartet HH:MM, z. B. 08:30.`);
+    }
+    const [hour, minute] = value.split(":").map(Number);
+    if (hour > 23 || minute > 59) throw new Error(`Ungueltiger Buffer-Zeitwert: ${value}.`);
+  }
+  return [...new Set(normalized)];
+}
+
+function resolveBufferAutoSlot({ scheduledPosts, timeZone, preferredTimes, startDate = new Date() }) {
+  const occupiedDates = new Set(
+    scheduledPosts
+      .map((post) => post?.dueAt)
+      .filter(Boolean)
+      .map((dueAt) => localDatePartsInTimeZone(new Date(dueAt), timeZone).dateKey)
+  );
+  const todayKey = localDatePartsInTimeZone(startDate, timeZone).dateKey;
+  const times = normalizePreferredBufferTimes(preferredTimes);
+
+  for (let offset = 1; offset <= 120; offset += 1) {
+    const dateKey = addDaysUtcDateKey(todayKey, offset);
+    if (occupiedDates.has(dateKey)) continue;
+    const localTime = times[0];
+    return {
+      due_at: zonedDateTimeToUtcIso({ dateKey, time: localTime, timeZone }),
+      local_date: dateKey,
+      local_time: localTime,
+      timezone: timeZone,
+      reason: "next_free_local_day_for_channel"
+    };
+  }
+  throw new Error("Kein freier Buffer-Tag innerhalb der naechsten 120 Tage gefunden.");
+}
+
+function bufferTextForChannel({ channel, text, textByChannel }) {
+  const candidate = textByChannel?.[channel] || textByChannel?.[normalizeBufferChannelKey(channel)] || text;
+  const normalized = String(candidate || "").trim();
+  if (!normalized) throw new Error(`Buffer-Text fehlt fuer Kanal ${channel}.`);
+  if (normalized.length > 10_000) throw new Error(`Buffer-Text fuer ${channel} ist zu lang (${normalized.length}).`);
+  return normalized;
+}
+
 function resolveFreepikKeyDetails(agentId) {
   const freepik = getScopedEnvDetails("FREEPIK_API_KEY", agentId);
   if (freepik.value) return { provider: "freepik", ...freepik };
@@ -9405,6 +9855,286 @@ function createServer() {
         note: result.ok
           ? undefined
           : "Wenn status 404 oder Luecken geliefert werden, hat CrUX fuer diese URL/Origin moeglicherweise nicht genug reale Nutzerdaten."
+      });
+    }
+  );
+
+  server.tool(
+    "buffer_check_config",
+    "Prueft Buffer- und Cloudinary-Konfiguration fuer ein Projekt ohne Secret-Werte auszugeben. Optional werden Organizations und Channels read-only aus Buffer gelesen.",
+    {
+      agent_id: agentIdSchema,
+      project_key: z.string().min(2).max(80).optional().default("holzpunkt"),
+      fetch_organizations: z.boolean().optional().default(false),
+      fetch_channels: z.boolean().optional().default(false)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, project_key, fetch_organizations, fetch_channels }) => {
+      const bufferDetails = getBufferProjectConfigDetails(project_key, {
+        requireApiKey: fetch_organizations || fetch_channels,
+        requireOrganizationId: fetch_channels
+      });
+      const cloudinaryDetails = getCloudinaryConfigDetails({ requireCredentials: false });
+      const configuredChannels = getBufferConfiguredChannels(project_key);
+      const result = {
+        agent_id,
+        ...bufferDetails.summary,
+        cloudinary: cloudinaryDetails.summary,
+        channels: configuredChannels,
+        fetch_organizations,
+        fetch_channels
+      };
+
+      if (fetch_organizations) {
+        result.organizations = await fetchBufferOrganizations(project_key);
+      }
+      if (fetch_channels) {
+        const organizationId = bufferDetails.config.organizationId;
+        result.buffer_channels = await fetchBufferChannels(project_key, organizationId);
+      }
+
+      return out(result);
+    }
+  );
+
+  server.tool(
+    "buffer_list_channels",
+    "Liest Buffer-Channels fuer ein Projekt read-only. Gibt IDs, Namen und Plattformen aus, aber keine API-Keys.",
+    {
+      agent_id: agentIdSchema,
+      project_key: z.string().min(2).max(80).optional().default("holzpunkt")
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, project_key }) => {
+      const { config, summary } = getBufferProjectConfigDetails(project_key, {
+        requireApiKey: true,
+        requireOrganizationId: true
+      });
+      const channels = await fetchBufferChannels(project_key, config.organizationId);
+      return out({
+        agent_id,
+        project_key: normalizeBufferProjectKey(project_key),
+        organization_id_configured: summary.organization_id_configured,
+        organization_id_env_name: summary.organization_id_env_name,
+        channels
+      });
+    }
+  );
+
+  server.tool(
+    "buffer_get_scheduled_posts",
+    "Liest geplante Buffer-Posts fuer ein Projekt und optional einen oder mehrere Kanaele read-only. Standard fuer naechsten freien Tag/Slot.",
+    {
+      agent_id: agentIdSchema,
+      project_key: z.string().min(2).max(80).optional().default("holzpunkt"),
+      channels: z.array(z.enum(["instagram", "pinterest", "linkedin"])).min(1).max(3).optional(),
+      first: z.number().int().min(1).max(100).optional().default(100)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, project_key, channels, first }) => {
+      const { config } = getBufferProjectConfigDetails(project_key, {
+        requireApiKey: true,
+        requireOrganizationId: true
+      });
+      const channelConfigs = (channels || ["instagram", "pinterest", "linkedin"]).map((channel) =>
+        getBufferChannelConfig(project_key, channel, { requireChannelId: false })
+      );
+      const channelIds = channelConfigs.map((channel) => channel.channel_id).filter(Boolean);
+      const posts = await fetchBufferScheduledPosts(project_key, {
+        organizationId: config.organizationId,
+        channelIds,
+        first
+      });
+      return out({
+        agent_id,
+        project_key: normalizeBufferProjectKey(project_key),
+        channels: channelConfigs,
+        scheduled_count: posts.length,
+        posts
+      });
+    }
+  );
+
+  server.tool(
+    "buffer_schedule_post",
+    "Plant Buffer-Posts kontrolliert fuer projektbezogene Kanaele. Laedt Asana-Bildanhaenge zuerst zu Cloudinary hoch und uebergibt stabile HTTPS-URLs an Buffer. Live-Ausfuehrung nur mit klarer Asana-Freigabe.",
+    {
+      agent_id: agentIdSchema,
+      project_key: z.string().min(2).max(80).optional().default("holzpunkt"),
+      asana_task_gid: z.string(),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      dry_run: z.boolean().optional().default(true),
+      channels: z.array(z.enum(["instagram", "pinterest", "linkedin"])).min(1).max(3),
+      text: z.string().min(1).max(10000).optional(),
+      text_by_channel: z.record(z.string(), z.string()).optional(),
+      attachment_gids: z.array(z.string()).max(20).optional(),
+      public_media_urls: z.array(z.string().url()).max(20).optional(),
+      due_at: z.string().optional(),
+      auto_next_free_slot: z.boolean().optional().default(true),
+      preferred_times: z.array(z.string()).max(6).optional().default(["08:30", "17:15"]),
+      timezone: z.string().min(3).max(80).optional().default("Europe/Berlin"),
+      max_attachment_bytes: z
+        .number()
+        .int()
+        .min(1024)
+        .max(ASANA_ATTACHMENT_HARD_MAX_BYTES)
+        .optional()
+        .default(ASANA_ATTACHMENT_HARD_MAX_BYTES)
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      project_key,
+      asana_task_gid,
+      confirmed_by_asana,
+      dry_run,
+      channels,
+      text,
+      text_by_channel,
+      attachment_gids,
+      public_media_urls,
+      due_at,
+      auto_next_free_slot,
+      preferred_times,
+      timezone,
+      max_attachment_bytes
+    }) => {
+      validateAsanaGid(asana_task_gid, "asana_task_gid");
+      if (!dry_run && !confirmed_by_asana) {
+        throw new Error("buffer_schedule_post braucht confirmed_by_asana=true fuer Live-Planung.");
+      }
+      if (!text && !text_by_channel) {
+        throw new Error("buffer_schedule_post braucht text oder text_by_channel.");
+      }
+      const normalizedProjectKey = normalizeBufferProjectKey(project_key);
+      const normalizedChannels = [...new Set(channels.map(normalizeBufferChannelKey))];
+      const channelConfigs = normalizedChannels.map((channel) =>
+        getBufferChannelConfig(normalizedProjectKey, channel, { requireChannelId: !dry_run })
+      );
+      const { config: bufferConfig } = getBufferProjectConfigDetails(normalizedProjectKey, {
+        requireApiKey: !dry_run,
+        requireOrganizationId: !dry_run || auto_next_free_slot
+      });
+      const cloudinary = getCloudinaryConfigDetails({ requireCredentials: !dry_run && !public_media_urls?.length });
+      const asana = getAsana(agent_id);
+
+      const attachmentSelection = [];
+      if (attachment_gids?.length) {
+        for (const gid of attachment_gids) {
+          validateAsanaGid(gid, "attachment_gid");
+          attachmentSelection.push(gid);
+        }
+      } else if (!public_media_urls?.length) {
+        const attachments = await listAsanaTaskAttachments(asana, asana_task_gid);
+        for (const attachment of attachments) {
+          attachmentSelection.push(attachment.gid);
+        }
+      }
+
+      if (!public_media_urls?.length && !attachmentSelection.length) {
+        throw new Error("Keine Medien gefunden. Uebergib attachment_gids, public_media_urls oder Asana-Anhaenge am Task.");
+      }
+
+      const uploadedMedia = [];
+      const mediaUrls = [...(public_media_urls || [])];
+      if (!dry_run && !public_media_urls?.length) {
+        for (let index = 0; index < attachmentSelection.length; index += 1) {
+          const attachmentGid = attachmentSelection[index];
+          const { attachment, bytes, content_type } = await downloadAsanaAttachment(
+            asana,
+            attachmentGid,
+            max_attachment_bytes
+          );
+          if (!String(content_type || "").toLowerCase().startsWith("image/")) {
+            throw new Error(`Asana-Anhang ${attachment.name || attachment.gid} ist kein Bild (${content_type || "unknown"}).`);
+          }
+          const upload = await uploadImageToCloudinary({
+            projectKey: normalizedProjectKey,
+            asanaTaskGid: asana_task_gid,
+            attachment,
+            bytes,
+            contentType: content_type,
+            index
+          });
+          uploadedMedia.push(upload);
+          mediaUrls.push(upload.secure_url);
+        }
+      }
+
+      const scheduledPostsByChannel = {};
+      const planned = [];
+      const created = [];
+      for (const channelConfig of channelConfigs) {
+        const channel = channelConfig.channel;
+        const channelText = bufferTextForChannel({ channel, text, textByChannel: text_by_channel });
+        let resolvedSchedule = null;
+        if (due_at) {
+          const date = new Date(due_at);
+          if (Number.isNaN(date.getTime())) throw new Error(`due_at ist kein gueltiger ISO-Zeitpunkt: ${due_at}`);
+          if (date.getTime() <= Date.now()) throw new Error(`due_at liegt nicht in der Zukunft: ${due_at}`);
+          resolvedSchedule = {
+            due_at: date.toISOString(),
+            reason: "explicit_due_at",
+            timezone
+          };
+        } else if (auto_next_free_slot) {
+          const scheduledPosts = dry_run
+            ? []
+            : await fetchBufferScheduledPosts(normalizedProjectKey, {
+                organizationId: bufferConfig.organizationId,
+                channelIds: channelConfig.channel_id ? [channelConfig.channel_id] : [],
+                first: 100
+              });
+          scheduledPostsByChannel[channel] = scheduledPosts;
+          resolvedSchedule = resolveBufferAutoSlot({
+            scheduledPosts,
+            timeZone: timezone,
+            preferredTimes: preferred_times
+          });
+        }
+
+        const plan = {
+          channel,
+          channel_id: channelConfig.channel_id,
+          channel_id_env_name: channelConfig.channel_id_env_name,
+          text_chars: channelText.length,
+          media_count: mediaUrls.length || attachmentSelection.length,
+          due_at: resolvedSchedule?.due_at || null,
+          schedule: resolvedSchedule
+        };
+        planned.push(plan);
+
+        if (!dry_run) {
+          const post = await createBufferPost(normalizedProjectKey, {
+            text: channelText,
+            channelId: channelConfig.channel_id,
+            dueAt: resolvedSchedule?.due_at || null,
+            mediaUrls
+          });
+          created.push({ channel, post });
+        }
+      }
+
+      return out({
+        agent_id,
+        project_key: normalizedProjectKey,
+        asana_task_gid,
+        confirmed_by_asana,
+        dry_run,
+        buffer_api_key_configured: getBufferProjectConfigDetails(normalizedProjectKey, { requireApiKey: false }).summary
+          .api_key_configured,
+        cloudinary: cloudinary.summary,
+        attachment_gids: attachmentSelection,
+        provided_public_media_urls: public_media_urls?.length || 0,
+        uploaded_media: uploadedMedia,
+        planned,
+        created,
+        scheduled_read_counts: Object.fromEntries(
+          Object.entries(scheduledPostsByChannel).map(([channel, posts]) => [channel, posts.length])
+        ),
+        note: dry_run
+          ? "Dry-Run: keine Cloudinary-Uploads und keine Buffer-Posts erstellt."
+          : "Live: Cloudinary-Uploads und Buffer-Planung wurden per Readback bestaetigt."
       });
     }
   );
