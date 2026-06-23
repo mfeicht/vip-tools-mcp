@@ -6263,7 +6263,16 @@ function bufferAssetInputFromUrls(urls) {
   return urls.map((url) => `{ image: { url: "${escapeGraphqlString(url)}" } }`).join(", ");
 }
 
-function bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls = [] }) {
+function bufferMetadataInputForChannel({ channel, instagramType, instagramShouldShareToFeed }) {
+  if (channel === "instagram") {
+    return `\n          metadata: { instagram: { type: ${instagramType}, shouldShareToFeed: ${
+      instagramShouldShareToFeed ? "true" : "false"
+    } } }`;
+  }
+  return "";
+}
+
+function bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls = [], metadataInput = "" }) {
   const assets = mediaUrls.length ? `\n          assets: [${bufferAssetInputFromUrls(mediaUrls)}]` : "";
   const dueAtLine = dueAt ? `\n          dueAt: "${escapeGraphqlString(dueAt)}"` : "";
   const mode = dueAt ? "customScheduled" : "addToQueue";
@@ -6273,7 +6282,7 @@ function bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls = [] }) {
         text: "${escapeGraphqlString(text)}"
         channelId: "${escapeGraphqlString(channelId)}"
         schedulingType: automatic
-        mode: ${mode}${dueAtLine}${assets}
+        mode: ${mode}${dueAtLine}${assets}${metadataInput}
       }
     ) {
       ... on PostActionSuccess {
@@ -6297,9 +6306,9 @@ function bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls = [] }) {
   }`;
 }
 
-async function createBufferPost(projectKey, { text, channelId, dueAt, mediaUrls }) {
+async function createBufferPost(projectKey, { text, channelId, dueAt, mediaUrls, metadataInput }) {
   const response = await bufferGraphqlRequest(projectKey, {
-    query: bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls })
+    query: bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls, metadataInput })
   });
   assertBufferGraphqlOk(response, "Buffer createPost");
   const result = response.data?.data?.createPost;
@@ -10175,6 +10184,8 @@ function createServer() {
       auto_next_free_slot: z.boolean().optional().default(true),
       preferred_times: z.array(z.string()).max(6).optional().default(["08:30", "17:15"]),
       timezone: z.string().min(3).max(80).optional().default("Europe/Berlin"),
+      instagram_type: z.enum(["post", "story", "reel"]).optional().default("post"),
+      instagram_should_share_to_feed: z.boolean().optional().default(true),
       max_attachment_bytes: z
         .number()
         .int()
@@ -10199,6 +10210,8 @@ function createServer() {
       auto_next_free_slot,
       preferred_times,
       timezone,
+      instagram_type,
+      instagram_should_share_to_feed,
       max_attachment_bytes
     }) => {
       validateAsanaGid(asana_task_gid, "asana_task_gid");
@@ -10302,16 +10315,30 @@ function createServer() {
           text_chars: channelText.length,
           media_count: mediaUrls.length || attachmentSelection.length,
           due_at: resolvedSchedule?.due_at || null,
-          schedule: resolvedSchedule
+          schedule: resolvedSchedule,
+          metadata: channel === "instagram"
+            ? {
+                instagram: {
+                  type: instagram_type,
+                  shouldShareToFeed: instagram_should_share_to_feed
+                }
+              }
+            : null
         };
         planned.push(plan);
 
         if (!dry_run) {
+          const metadataInput = bufferMetadataInputForChannel({
+            channel,
+            instagramType: instagram_type,
+            instagramShouldShareToFeed: instagram_should_share_to_feed
+          });
           const post = await createBufferPost(normalizedProjectKey, {
             text: channelText,
             channelId: channelConfig.channel_id,
             dueAt: resolvedSchedule?.due_at || null,
-            mediaUrls
+            mediaUrls,
+            metadataInput
           });
           created.push({ channel, post });
         }
