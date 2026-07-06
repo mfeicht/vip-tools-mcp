@@ -6,7 +6,7 @@ import tls from "tls";
 import path from "path";
 import { Readable } from "stream";
 import { execFile } from "child_process";
-import { createHash, createSign, randomUUID } from "crypto";
+import { createHash, createHmac, createSign, randomUUID, timingSafeEqual } from "crypto";
 import { existsSync, readdirSync } from "fs";
 import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
@@ -33,6 +33,7 @@ const VIP_INTAKE_RATE_LIMIT_WINDOW_MS = Math.max(
 const VIP_INTAKE_RATE_LIMIT_MAX = Math.max(1, Number(process.env.VIP_INTAKE_RATE_LIMIT_MAX || 30));
 const VIP_INTAKE_ROUTE_CONFIG = parseJsonEnv(process.env.VIP_INTAKE_CONFIG_JSON || "{}", {});
 const VIP_INTAKE_ALLOWED_ORIGINS = parseCsvEnv(process.env.VIP_INTAKE_ALLOWED_ORIGINS || "");
+const VIP_INTAKE_ROUTING_SECRET = String(process.env.VIP_INTAKE_ROUTING_SECRET || "");
 
 const ASANA_TOKEN_ENVS = {
   "vip-ai-sales": "ASANA_TOKEN_VIP_AI_SALES",
@@ -411,9 +412,100 @@ function normalizeIntakeBodyValue(value) {
   return Array.isArray(value) ? String(value[0] || "").trim() : String(value || "").trim();
 }
 
-function getIntakeRoute(formKey) {
+function parseIntakeExtraFields(body) {
+  const extra = {};
+  try {
+    const parsed = JSON.parse(String(body.extra_fields_json || "{}"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [key, value] of Object.entries(parsed)) {
+        extra[key] = normalizeIntakeBodyValue(value);
+      }
+    }
+  } catch {
+    // Individual extra__ fields below are still used as fallback.
+  }
+
+  for (const [key, value] of Object.entries(body || {})) {
+    if (!key.startsWith("extra__")) continue;
+    extra[key.slice("extra__".length)] = normalizeIntakeBodyValue(value);
+  }
+
+  return extra;
+}
+
+function decodeBase64Url(value) {
+  const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
+  return Buffer.from(padded, "base64").toString("utf8");
+}
+
+function safeEqualHex(a, b) {
+  const left = Buffer.from(String(a || ""), "hex");
+  const right = Buffer.from(String(b || ""), "hex");
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+function verifySignedIntakeRoute(body) {
+  const payload = String(body.route_payload || "").trim();
+  const signature = String(body.route_signature || "").trim();
+  if (!payload && !signature) return null;
+  if (!payload || !signature) {
+    throw Object.assign(new Error("Signed intake route is incomplete."), { statusCode: 400 });
+  }
+  if (!VIP_INTAKE_ROUTING_SECRET) {
+    throw Object.assign(new Error("VIP_INTAKE_ROUTING_SECRET is not configured."), { statusCode: 503 });
+  }
+
+  const expected = createHmac("sha256", VIP_INTAKE_ROUTING_SECRET).update(payload).digest("hex");
+  if (!safeEqualHex(expected, signature)) {
+    throw Object.assign(new Error("Signed intake route is invalid."), { statusCode: 403 });
+  }
+
+  let route;
+  try {
+    route = JSON.parse(decodeBase64Url(payload));
+  } catch {
+    throw Object.assign(new Error("Signed intake route payload is invalid."), { statusCode: 400 });
+  }
+
+  if (!route || typeof route !== "object" || Array.isArray(route)) {
+    throw Object.assign(new Error("Signed intake route payload must be an object."), { statusCode: 400 });
+  }
+  if (route.form_key && String(route.form_key) !== String(body.form_key || "default")) {
+    throw Object.assign(new Error("Signed intake route form_key mismatch."), { statusCode: 403 });
+  }
+
+  const signedRoute = {
+    agent_id: route.agent_id,
+    project_gid: route.project_gid,
+    assignee_gid: route.assignee_gid,
+    task_name: route.task_name,
+    description_template: route.description_template,
+    custom_fields: route.custom_fields,
+    tags: Array.isArray(route.tags) ? route.tags : [],
+    follower_gids: Array.isArray(route.follower_gids) ? route.follower_gids : [],
+    allowed_site_keys: Array.isArray(route.allowed_site_keys) ? route.allowed_site_keys : []
+  };
+
+  if (!/^\d+$/.test(String(signedRoute.project_gid || ""))) {
+    throw Object.assign(new Error("Signed intake route has invalid project_gid."), { statusCode: 400 });
+  }
+  if (!/^\d+$/.test(String(signedRoute.assignee_gid || ""))) {
+    throw Object.assign(new Error("Signed intake route has invalid assignee_gid."), { statusCode: 400 });
+  }
+
+  return signedRoute;
+}
+
+function getConfiguredIntakeRoute(formKey) {
   const key = String(formKey || "default").trim() || "default";
-  return VIP_INTAKE_ROUTE_CONFIG[key] || VIP_INTAKE_ROUTE_CONFIG.default || null;
+  return VIP_INTAKE_ROUTE_CONFIG[key] || null;
+}
+
+function resolveIntakeRoute(body) {
+  const formKey = body.form_key || "default";
+  return getConfiguredIntakeRoute(formKey) || verifySignedIntakeRoute(body) || VIP_INTAKE_ROUTE_CONFIG.default || null;
 }
 
 function assertIntakeRoute(route, formKey) {
@@ -450,10 +542,193 @@ function validateIntakeBody(body) {
   if (body.consent !== "on" && body.consent !== "true" && body.consent !== "1") {
     errors.push("Consent is required.");
   }
+  if (String(body.form_key || "") === "rs-story-erstellen") {
+    const extra = parseIntakeExtraFields(body);
+    if (!extra.story_title) errors.push("Story title is required.");
+    if (!extra.content_source) errors.push("Story briefing content is required.");
+    if (!extra.cooperation_backlink) errors.push("Cooperation/backlink selection is required.");
+    if (!extra.featured_category) errors.push("Featured category selection is required.");
+    if (!extra.content_handling) errors.push("Content handling selection is required.");
+  }
   return errors;
 }
 
-function buildIntakeTaskNotes(body, files) {
+function isRsStoryIntake(body, route) {
+  return (
+    String(body.form_key || "") === "rs-story-erstellen" ||
+    String(route?.description_template || "") === "rs-story-erstellen"
+  );
+}
+
+function asanaMultilineParagraphs(value) {
+  const paragraphs = String(value || "")
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  if (paragraphs.length === 0) return "<p>-</p>";
+  return paragraphs.map((paragraph) => `<p>${escapeAsanaHtml(paragraph).replace(/\n/g, " ")}</p>`).join("");
+}
+
+function asanaValue(value) {
+  const rendered = String(value || "").trim();
+  return rendered ? escapeAsanaHtml(rendered) : "-";
+}
+
+function buildRsStoryTaskNotes(body, files) {
+  const extra = parseIntakeExtraFields(body);
+  const attachmentList =
+    files.length > 0
+      ? files.map((file) => `<li>${escapeAsanaHtml(file.name || "attachment")}</li>`).join("")
+      : "<li>-</li>";
+  const rows = [
+    ["Quelle", "Oeffentliches RS-Story-Formular"],
+    ["Form Key", body.form_key || "rs-story-erstellen"],
+    ["Site Key", body.site_key || "-"],
+    ["Absender", body.requester_name],
+    ["E-Mail", body.requester_email],
+    ["Firma", body.company || "-"],
+    ["Kategorie", body.category || "Story"],
+    ["Prioritaet", body.priority || "Mittel"],
+    ["Wunschdatum", body.wanted_until || "-"],
+    ["Website", body.source_url || "-"],
+    ["Submitted At", body.submitted_at || new Date().toISOString()]
+  ];
+  const metaList = rows
+    .map(([label, value]) => {
+      const renderedValue = label === "Website" ? asanaLinkHtml(value) : escapeAsanaHtml(value);
+      return `<li><strong>${escapeAsanaHtml(label)}:</strong> ${renderedValue}</li>`;
+    })
+    .join("");
+
+  return `<body>
+<p>Bitte erstelle eine neue Reise-Stories-Story nach der bestehenden Thrive-Vorlage.</p>
+<p><strong>Vorlage:</strong></p>
+<p>${asanaLinkHtml("https://reise-stories.de/?p=147947&preview=true")}</p>
+<p><strong>Grunddaten</strong></p>
+<p><strong>Story-Titel:</strong> ${asanaValue(extra.story_title || body.title)}</p>
+<p><strong>Fokus-Keyword:</strong> ${asanaValue(extra.focus_keyword || "selbst recherchieren/ableiten")}</p>
+<p><strong>Region:</strong> ${asanaValue(extra.region || "selbst passend waehlen")}</p>
+<p><strong>Kooperation / verkaufter Backlink:</strong> ${asanaValue(extra.cooperation_backlink)}</p>
+<p><strong>Featured-Kategorie:</strong> ${asanaValue(extra.featured_category || "Featured")}</p>
+<p>Auswahl genau eine Option stehen lassen: Keine / Featured / Top-Featured</p>
+<ul>
+<li>Keine: weder <strong>Featured</strong> noch <strong>Top-Featured</strong> setzen; falls die duplizierte Vorlage Featured enthaelt, Featured entfernen.</li>
+<li>Featured: Featured setzen/behalten; Top-Featured nicht setzen bzw. entfernen.</li>
+<li>Top-Featured: Top-Featured setzen/behalten; Featured nicht zusaetzlich setzen bzw. entfernen.</li>
+</ul>
+<p><strong>Inhalt / Quelle</strong></p>
+<p><strong>Inhalt oder Briefing:</strong></p>
+${asanaMultilineParagraphs(extra.content_source)}
+<p><strong>Moegliche Quellen:</strong></p>
+${asanaMultilineParagraphs(extra.source_links)}
+<p><strong>Umgang mit dem Inhalt:</strong> ${asanaValue(extra.content_handling || "Redaktionell umformulieren")}</p>
+<ul>
+<li>Exakt uebernehmen: Textbausteine moeglichst 1:1 verwenden und nur sauber in die Vorlage einsetzen.</li>
+<li>Redaktionell umformulieren: Inhalt sinngemaess verwenden, sprachlich verbessern und fuer Reise-Stories optimieren.</li>
+<li>Frei ausarbeiten: Thema/Titel verwenden, selbst recherchieren und einen vollstaendigen journalistischen Beitrag erstellen.</li>
+</ul>
+<p><strong>Besondere Hinweise</strong></p>
+<p><strong>Titelbild soll darstellen:</strong></p>
+${asanaMultilineParagraphs(extra.title_image_hint || "selbst passend waehlen")}
+<p><strong>Bildcredits:</strong></p>
+<p>${asanaValue(extra.image_credits || "selbst passend waehlen")}</p>
+<p><strong>Bilder im Beitrag:</strong></p>
+${asanaMultilineParagraphs(extra.article_images_hint || "selbst passend waehlen")}
+<p><strong>Button-Links:</strong></p>
+${asanaMultilineParagraphs(extra.button_links)}
+<p><strong>Interne Links:</strong></p>
+${asanaMultilineParagraphs(extra.internal_links || "selbst passende Reise-Stories-Links waehlen")}
+<p><strong>Externe Links:</strong></p>
+${asanaMultilineParagraphs(extra.external_links)}
+<p><strong>Weitere Hinweise:</strong></p>
+${asanaMultilineParagraphs(extra.additional_notes)}
+<p><strong>Anhaenge</strong></p>
+<ul>${attachmentList}</ul>
+<p><strong>Pflichtverfahren</strong></p>
+<ul>
+<li>Die Story-Vorlage muss dupliziert werden.</li>
+<li>Der Thrive-Aufbau / die Komponenten muessen exakt erhalten bleiben.</li>
+<li>Nur Inhalte innerhalb der bestehenden Komponenten ersetzen: Texte, Bilder, Bildcredits, Links, Buttons, Meta-Daten.</li>
+<li>Keine neue freie Artikelstruktur bauen.</li>
+<li>Alle Platzhalter ersetzen.</li>
+<li>Alle Bilder im Beitrag ersetzen, auch Bildslots nach DETAILS ZUR STORY.</li>
+<li>Typografie, Abstaende, Listenformatierung und Thrive-Komponenten wie in der Vorlage erhalten.</li>
+<li>Autor muss vipadmin sein.</li>
+<li>Kategorie Story muss beibehalten werden.</li>
+<li>Featured-Kategorie nach dem Block Featured-Kategorie in den Grunddaten setzen: Keine, Featured oder Top-Featured genau wie dort ausgewaehlt.</li>
+<li>Mindestens eine passende bestehende Region-Kategorie hinzufuegen.</li>
+<li>Mindestens eine passende bestehende Kategorie aus Reiseinspirationen hinzufuegen.</li>
+<li>Keine neuen Kategorien oder Regionen anlegen.</li>
+<li>Keine XML-RPC-Zugriffe nutzen.</li>
+</ul>
+<p><strong>SEO / LLM / Links</strong></p>
+<ul>
+<li>Titel nach Muster: Fokus-Keyword: Nutzenorientierter Story-Titel.</li>
+<li>Fokus-Keyword in Titel, Einleitung, passenden H2/H3, Meta-Daten und natuerlich im Text verwenden.</li>
+<li>Beitrag journalistisch hochwertig, nutzerorientiert und suchmaschinenstark ausarbeiten.</li>
+<li>Keine SEO-Anweisungen oder Ranking-Erklaerungen sichtbar in den Artikel schreiben.</li>
+<li>Meta-Title, Meta-Description, strukturierte Daten und Zwischenueberschriften optimieren.</li>
+<li>Interne Links zu passenden Reise-Stories-Beitraegen setzen, sofern sinnvoll.</li>
+<li>Wenn Kooperation / verkaufter Backlink = Ja: gewuenschte externe Links duerfen dofollow sein.</li>
+<li>Wenn Kooperation / verkaufter Backlink = Nein oder unklar: externe Links standardmaessig nofollow setzen.</li>
+</ul>
+<p><strong>Bilder</strong></p>
+<ul>
+<li>Bilder im Beitrag passend ersetzen.</li>
+<li>Bildquellen: Pexels, Unsplash oder fotorealistische KI-Bilder.</li>
+<li>Bei KI-Bildern Bildcredit: &copy; Reise-Stories.</li>
+<li>Bildcredits sichtbar und korrekt setzen.</li>
+<li>Titelbild passend zum Thema erstellen oder auswaehlen.</li>
+</ul>
+<p><strong>Abschlusspruefung</strong></p>
+<p>Vor Veroeffentlichung pruefen:</p>
+<ul>
+<li>Der Beitrag sieht optisch exakt wie die Thrive-Vorlage aus.</li>
+<li>Keine sichtbaren Platzhalter mehr vorhanden.</li>
+<li>Keine leeren Bildflaechen vorhanden.</li>
+<li>Alle Bilder und Credits sind korrekt.</li>
+<li>Empfehlungsboxen, Bulletpoints und Formatierungen entsprechen der Vorlage.</li>
+<li>Kategorie Story gesetzt; Featured-Kategorie exakt entsprechend dem Block Featured-Kategorie gesetzt.</li>
+<li>Autor-Link ist ${asanaLinkHtml("https://reise-stories.de/author/vipadmin/")}.</li>
+</ul>
+<p><strong>Nach Veroeffentlichung Redaktionsplan aktualisieren:</strong></p>
+<p>${asanaLinkHtml(
+    "https://docs.google.com/spreadsheets/d/17BbIPRBGxcNUAYPNd6AD3wnvik6s26P8fnvPDeH1UrM/edit?gid=1499992303#gid=1499992303"
+  )}</p>
+<p>Folgende Spalten befuellen:</p>
+<ul>
+<li>Spalte A: finale URL</li>
+<li>Spalte B: finaler Titel</li>
+<li>Spalte C: Story im Dropdown auswaehlen</li>
+<li>Spalte F: Veroeffentlichungsdatum im bestehenden Datumsformat</li>
+<li>Spalte G: Region in bestehender Schreibweise</li>
+<li>Spalte H: Autor, standardmaessig Reise-Redaktion</li>
+<li>Spalte I: Status Online</li>
+<li>Spalte S: Backlink verkauft per Checkbox anhaken, wenn Kooperation / verkaufter Backlink = Ja</li>
+</ul>
+<p>Zellen so befuellen, wie es die bestehende Formatierung, Dropdowns, Checkboxen und Schreibweise der jeweiligen Spalte vorsehen.</p>
+<p><strong>Final in Asana zurueckmelden:</strong></p>
+<ul>
+<li>Veroeffentlichte URL</li>
+<li>Fokus-Keyword</li>
+<li>Gesetzte Kategorien inkl. Auswahl aus Featured-Kategorie</li>
+<li>Bildquellen</li>
+<li>Ob Spalte S angehakt wurde</li>
+</ul>
+<p><strong>Update-Key:</strong> rs-story-featured-kategorie-auswahl-2026-07-02</p>
+<p>Ergaenzung 2026-07-02: Featured-Kategorie in der Aufgabe waehlen. Die Kategorie Featured wird bei manuellen RS-Story-Aufgaben nicht mehr pauschal automatisch behalten. Massgeblich ist der Block Featured-Kategorie in den Grunddaten. Genau eine Option gilt: Keine, Featured oder Top-Featured. Diese Auswahl ist exklusiv umzusetzen und im Abschlusskommentar bei den gesetzten Kategorien zu nennen.</p>
+<p><strong>Formular-Metadaten</strong></p>
+<ul>${metaList}</ul>
+<p><strong>Details aus dem allgemeinen Formularfeld</strong></p>
+${asanaMultilineParagraphs(body.description)}
+</body>`;
+}
+
+function buildIntakeTaskNotes(body, files, route = {}) {
+  if (isRsStoryIntake(body, route)) {
+    return buildRsStoryTaskNotes(body, files);
+  }
+
   const rows = [
     ["Quelle", "Oeffentliches Intake-Formular"],
     ["Form Key", body.form_key || "default"],
@@ -497,6 +772,31 @@ function buildIntakeTaskNotes(body, files) {
   )}</p><p><strong>Details</strong></p>${detailParagraphs || "<p>-</p>"}${attachments}</body>`;
 }
 
+function buildIntakeTaskName(body, route = {}) {
+  if (route.task_name) return String(route.task_name).slice(0, 250);
+  if (isRsStoryIntake(body, route)) return "(RS) Story erstellen";
+  return `Intake: ${body.category || "Allgemein"} - ${body.title}`.slice(0, 250);
+}
+
+function buildIntakeCustomFields(body, route = {}) {
+  const customFields =
+    route.custom_fields && typeof route.custom_fields === "object" && !Array.isArray(route.custom_fields)
+      ? { ...route.custom_fields }
+      : {};
+
+  if (isRsStoryIntake(body, route)) {
+    const priorityOptions = {
+      Hoch: "1163311635969185",
+      Mittel: "1163311635969186",
+      Niedrig: "1163311635969187"
+    };
+    customFields["1163311635969184"] = priorityOptions[body.priority] || priorityOptions.Mittel;
+    customFields["1200527008079359"] = "1200527008079360";
+  }
+
+  return customFields;
+}
+
 async function parseIntakeMultipartRequest(req) {
   const request = new Request(`https://vip-tools-mcp.local${req.url}`, {
     method: req.method,
@@ -525,8 +825,9 @@ async function parseIntakeMultipartRequest(req) {
 async function createIntakeAsanaTask({ body, files, route }) {
   const agentId = route.agent_id || "vip-ai-office";
   const asana = getAsana(agentId);
-  const name = `Intake: ${body.category || "Allgemein"} - ${body.title}`.slice(0, 250);
-  const notes = buildIntakeTaskNotes(body, files);
+  const name = buildIntakeTaskName(body, route);
+  const notes = buildIntakeTaskNotes(body, files, route);
+  const customFields = buildIntakeCustomFields(body, route);
 
   const data = {
     workspace: process.env.ASANA_WORKSPACE_GID || "1108802683611047",
@@ -542,8 +843,8 @@ async function createIntakeAsanaTask({ body, files, route }) {
   if (Array.isArray(route.follower_gids) && route.follower_gids.length > 0) {
     data.followers = route.follower_gids;
   }
-  if (route.custom_fields && typeof route.custom_fields === "object") {
-    data.custom_fields = route.custom_fields;
+  if (Object.keys(customFields).length > 0) {
+    data.custom_fields = customFields;
   }
   if (/^\d{4}-\d{2}-\d{2}$/.test(String(body.wanted_until || ""))) {
     data.due_on = body.wanted_until;
@@ -668,7 +969,7 @@ async function handleIntakePost(req, res) {
     }
 
     const formKey = body.form_key || "default";
-    const route = getIntakeRoute(formKey);
+    const route = resolveIntakeRoute(body);
     assertIntakeRoute(route, formKey);
     if (!isIntakeSiteAllowed(route, body.site_key)) {
       res.status(403).json({ ok: false, error: "Site key is not allowed for this form_key." });
@@ -13316,6 +13617,7 @@ app.get("/intake/health", (req, res) => {
     service: "vip-tools-mcp-intake",
     configured: Boolean(Object.keys(VIP_INTAKE_ROUTE_CONFIG).length),
     configured_form_keys: Object.keys(VIP_INTAKE_ROUTE_CONFIG),
+    signed_plugin_routing_configured: Boolean(VIP_INTAKE_ROUTING_SECRET),
     allowed_origins_count: VIP_INTAKE_ALLOWED_ORIGINS.length,
     max_files: VIP_INTAKE_MAX_FILES,
     max_file_mb: VIP_INTAKE_MAX_FILE_MB
