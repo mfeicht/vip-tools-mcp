@@ -4,6 +4,7 @@ import axios from "axios";
 import net from "net";
 import tls from "tls";
 import path from "path";
+import { Readable } from "stream";
 import { execFile } from "child_process";
 import { createHash, createSign, randomUUID } from "crypto";
 import { existsSync, readdirSync } from "fs";
@@ -22,6 +23,16 @@ const ASANA_WRITE_TIMEOUT_MS = Number(process.env.ASANA_WRITE_TIMEOUT_MS || 30_0
 const ASANA_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ASANA_RETRY_ATTEMPTS || 2));
 const ASANA_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ASANA_RETRY_BASE_DELAY_MS || 250));
 const execFileAsync = promisify(execFile);
+const VIP_INTAKE_MAX_FILES = Math.max(0, Number(process.env.VIP_INTAKE_MAX_FILES || 12));
+const VIP_INTAKE_MAX_FILE_MB = Math.max(1, Number(process.env.VIP_INTAKE_MAX_FILE_MB || 25));
+const VIP_INTAKE_MAX_FILE_BYTES = VIP_INTAKE_MAX_FILE_MB * 1024 * 1024;
+const VIP_INTAKE_RATE_LIMIT_WINDOW_MS = Math.max(
+  60_000,
+  Number(process.env.VIP_INTAKE_RATE_LIMIT_WINDOW_MS || 10 * 60 * 1000)
+);
+const VIP_INTAKE_RATE_LIMIT_MAX = Math.max(1, Number(process.env.VIP_INTAKE_RATE_LIMIT_MAX || 30));
+const VIP_INTAKE_ROUTE_CONFIG = parseJsonEnv(process.env.VIP_INTAKE_CONFIG_JSON || "{}", {});
+const VIP_INTAKE_ALLOWED_ORIGINS = parseCsvEnv(process.env.VIP_INTAKE_ALLOWED_ORIGINS || "");
 
 const ASANA_TOKEN_ENVS = {
   "vip-ai-sales": "ASANA_TOKEN_VIP_AI_SALES",
@@ -320,6 +331,7 @@ let googleTokenCache = { accessToken: null, expiresAt: 0 };
 let googleSeoTokenCache = { accessToken: null, expiresAt: 0, envPrefix: null };
 let googleAdsTokenCache = { accessToken: null, expiresAt: 0, envPrefix: null };
 const emailDraftCache = new Map();
+const intakeRateLimitCache = new Map();
 
 function getAsana(agentId = DEFAULT_AGENT_ID) {
   const envName = ASANA_TOKEN_ENVS[agentId];
@@ -361,6 +373,331 @@ async function asanaRequestWithRetry(asana, requestConfig, options = {}) {
     }
   }
   throw lastError;
+}
+
+function parseJsonEnv(raw, fallback) {
+  try {
+    const parsed = JSON.parse(String(raw || ""));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function parseCsvEnv(raw) {
+  return String(raw || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function escapeAsanaHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function asanaLinkHtml(url) {
+  const value = String(url || "").trim();
+  if (!/^https?:\/\//i.test(value)) return escapeAsanaHtml(value || "-");
+  const safeUrl = escapeAsanaHtml(value);
+  return `<a href="${safeUrl}">${safeUrl}</a>`;
+}
+
+function normalizeIntakeBodyValue(value) {
+  return Array.isArray(value) ? String(value[0] || "").trim() : String(value || "").trim();
+}
+
+function getIntakeRoute(formKey) {
+  const key = String(formKey || "default").trim() || "default";
+  return VIP_INTAKE_ROUTE_CONFIG[key] || VIP_INTAKE_ROUTE_CONFIG.default || null;
+}
+
+function assertIntakeRoute(route, formKey) {
+  if (!route || typeof route !== "object") {
+    throw Object.assign(new Error(`Unknown or unconfigured form_key: ${formKey || "default"}.`), { statusCode: 400 });
+  }
+  if (!route.project_gid) {
+    throw Object.assign(new Error(`Intake route ${formKey || "default"} has no project_gid.`), { statusCode: 400 });
+  }
+  if (!route.assignee_gid) {
+    throw Object.assign(new Error(`Intake route ${formKey || "default"} has no assignee_gid.`), { statusCode: 400 });
+  }
+  const agentId = route.agent_id || "vip-ai-office";
+  if (!ASANA_TOKEN_ENVS[agentId]) {
+    throw Object.assign(new Error(`Intake route ${formKey || "default"} has unknown agent_id ${agentId}.`), {
+      statusCode: 400
+    });
+  }
+}
+
+function isIntakeSiteAllowed(route, siteKey) {
+  if (!Array.isArray(route.allowed_site_keys) || route.allowed_site_keys.length === 0) return true;
+  return route.allowed_site_keys.includes(String(siteKey || ""));
+}
+
+function validateIntakeBody(body) {
+  const errors = [];
+  if (!body.requester_name) errors.push("Name is required.");
+  if (!body.requester_email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.requester_email)) {
+    errors.push("Valid email is required.");
+  }
+  if (!body.title) errors.push("Title is required.");
+  if (!body.description) errors.push("Description is required.");
+  if (body.consent !== "on" && body.consent !== "true" && body.consent !== "1") {
+    errors.push("Consent is required.");
+  }
+  return errors;
+}
+
+function buildIntakeTaskNotes(body, files) {
+  const rows = [
+    ["Quelle", "Oeffentliches Intake-Formular"],
+    ["Form Key", body.form_key || "default"],
+    ["Site Key", body.site_key || "-"],
+    ["Intake Type", body.intake_type || "website-intake"],
+    ["Project Key", body.project_key || "-"],
+    ["Assignee Key", body.assignee_key || "-"],
+    ["Absender", body.requester_name],
+    ["E-Mail", body.requester_email],
+    ["Firma", body.company || "-"],
+    ["Kategorie", body.category || "-"],
+    ["Prioritaet", body.priority || "Mittel"],
+    ["Wunschdatum", body.wanted_until || "-"],
+    ["Website", body.source_url || "-"],
+    ["Seitentitel", body.source_title || "-"],
+    ["Submitted At", body.submitted_at || new Date().toISOString()],
+    ["Widget Version", body.widget_version || "-"]
+  ];
+
+  const list = rows
+    .map(([label, value]) => {
+      const renderedValue = label === "Website" ? asanaLinkHtml(value) : escapeAsanaHtml(value);
+      return `<li><strong>${escapeAsanaHtml(label)}:</strong> ${renderedValue}</li>`;
+    })
+    .join("");
+
+  const detailParagraphs = String(body.description || "")
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+    .map((paragraph) => `<p>${escapeAsanaHtml(paragraph).replace(/\n/g, " ")}</p>`)
+    .join("");
+
+  const attachments =
+    files.length > 0
+      ? `<p><strong>Anhaenge:</strong> ${files.map((file) => escapeAsanaHtml(file.name)).join(", ")}</p>`
+      : "<p><strong>Anhaenge:</strong> -</p>";
+
+  return `<body><p><strong>Intake-Anfrage</strong></p><ul>${list}</ul><p><strong>Kurzbeschreibung</strong></p><p>${escapeAsanaHtml(
+    body.title
+  )}</p><p><strong>Details</strong></p>${detailParagraphs || "<p>-</p>"}${attachments}</body>`;
+}
+
+async function parseIntakeMultipartRequest(req) {
+  const request = new Request(`https://vip-tools-mcp.local${req.url}`, {
+    method: req.method,
+    headers: req.headers,
+    body: Readable.toWeb(req),
+    duplex: "half"
+  });
+  const form = await request.formData();
+  const body = {};
+  const files = [];
+
+  for (const [key, value] of form.entries()) {
+    if (typeof value === "string") {
+      body[key] = normalizeIntakeBodyValue(value);
+      continue;
+    }
+
+    const fileName = String(value?.name || "").trim();
+    if (!fileName) continue;
+    files.push(value);
+  }
+
+  return { body, files };
+}
+
+async function createIntakeAsanaTask({ body, files, route }) {
+  const agentId = route.agent_id || "vip-ai-office";
+  const asana = getAsana(agentId);
+  const name = `Intake: ${body.category || "Allgemein"} - ${body.title}`.slice(0, 250);
+  const notes = buildIntakeTaskNotes(body, files);
+
+  const data = {
+    workspace: process.env.ASANA_WORKSPACE_GID || "1108802683611047",
+    projects: [route.project_gid],
+    assignee: route.assignee_gid,
+    name,
+    html_notes: notes
+  };
+
+  if (Array.isArray(route.tags) && route.tags.length > 0) {
+    data.tags = route.tags;
+  }
+  if (Array.isArray(route.follower_gids) && route.follower_gids.length > 0) {
+    data.followers = route.follower_gids;
+  }
+  if (route.custom_fields && typeof route.custom_fields === "object") {
+    data.custom_fields = route.custom_fields;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(body.wanted_until || ""))) {
+    data.due_on = body.wanted_until;
+  }
+
+  const response = await asanaRequestWithRetry(
+    asana,
+    {
+      method: "POST",
+      url: "/tasks",
+      timeout: ASANA_WRITE_TIMEOUT_MS,
+      data: { data },
+      params: { opt_fields: "gid,permalink_url,name" }
+    },
+    { attempts: ASANA_RETRY_ATTEMPTS }
+  );
+
+  return { task: response.data?.data, agent_id: agentId };
+}
+
+async function uploadIntakeAsanaAttachment({ taskGid, file, route }) {
+  const agentId = route.agent_id || "vip-ai-office";
+  const asana = getAsana(agentId);
+  const bytes = Buffer.from(await file.arrayBuffer());
+  const form = new FormData();
+  const blob = new Blob([bytes], { type: file.type || "application/octet-stream" });
+  form.append("file", blob, file.name || "attachment");
+  form.append("parent", taskGid);
+
+  const response = await asanaRequestWithRetry(
+    asana,
+    {
+      method: "POST",
+      url: `/tasks/${encodeURIComponent(taskGid)}/attachments`,
+      timeout: ASANA_WRITE_TIMEOUT_MS,
+      data: form,
+      params: { opt_fields: "gid,name,download_url" }
+    },
+    { attempts: ASANA_RETRY_ATTEMPTS }
+  );
+
+  return response.data?.data;
+}
+
+function applyIntakeCors(req, res) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+
+  if (!VIP_INTAKE_ALLOWED_ORIGINS.includes(origin)) {
+    res.status(403).json({ ok: false, error: "Origin not allowed." });
+    return false;
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS,GET");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Accept,X-VIP-Intake-Source");
+  res.setHeader("Access-Control-Max-Age", "600");
+  return true;
+}
+
+function checkIntakeRateLimit(req, res) {
+  const now = Date.now();
+  const key =
+    req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
+    req.socket?.remoteAddress ||
+    "unknown";
+  const current = intakeRateLimitCache.get(key);
+
+  if (!current || current.resetAt <= now) {
+    intakeRateLimitCache.set(key, { count: 1, resetAt: now + VIP_INTAKE_RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+
+  current.count += 1;
+  if (current.count > VIP_INTAKE_RATE_LIMIT_MAX) {
+    res.status(429).json({ ok: false, error: "Too many intake submissions. Please try again later." });
+    return false;
+  }
+  return true;
+}
+
+async function handleIntakePost(req, res) {
+  try {
+    if (!applyIntakeCors(req, res)) return;
+    if (!checkIntakeRateLimit(req, res)) return;
+
+    if (!Object.keys(VIP_INTAKE_ROUTE_CONFIG).length) {
+      res.status(503).json({ ok: false, error: "VIP_INTAKE_CONFIG_JSON is not configured." });
+      return;
+    }
+
+    const contentType = String(req.headers["content-type"] || "");
+    if (!contentType.toLowerCase().startsWith("multipart/form-data")) {
+      res.status(415).json({ ok: false, error: "Expected multipart/form-data." });
+      return;
+    }
+
+    const { body, files } = await parseIntakeMultipartRequest(req);
+    if (body.website) {
+      res.json({ ok: true });
+      return;
+    }
+
+    const validationErrors = validateIntakeBody(body);
+    if (validationErrors.length > 0) {
+      res.status(400).json({ ok: false, error: validationErrors.join(" ") });
+      return;
+    }
+
+    if (files.length > VIP_INTAKE_MAX_FILES) {
+      res.status(400).json({ ok: false, error: `Too many files. Limit is ${VIP_INTAKE_MAX_FILES}.` });
+      return;
+    }
+    const oversized = files.find((file) => Number(file.size || 0) > VIP_INTAKE_MAX_FILE_BYTES);
+    if (oversized) {
+      res.status(400).json({
+        ok: false,
+        error: `File too large: ${oversized.name || "attachment"}. Limit is ${VIP_INTAKE_MAX_FILE_MB} MB.`
+      });
+      return;
+    }
+
+    const formKey = body.form_key || "default";
+    const route = getIntakeRoute(formKey);
+    assertIntakeRoute(route, formKey);
+    if (!isIntakeSiteAllowed(route, body.site_key)) {
+      res.status(403).json({ ok: false, error: "Site key is not allowed for this form_key." });
+      return;
+    }
+
+    const { task, agent_id } = await createIntakeAsanaTask({ body, files, route });
+    const attachmentResults = [];
+    for (const file of files) {
+      attachmentResults.push(await uploadIntakeAsanaAttachment({ taskGid: task.gid, file, route }));
+    }
+
+    res.status(201).json({
+      ok: true,
+      agent_id,
+      form_key: formKey,
+      task_gid: task.gid,
+      task_url: task.permalink_url || null,
+      attachments_uploaded: attachmentResults.length
+    });
+  } catch (error) {
+    const statusCode = Number(error.statusCode || error.response?.status || 500);
+    const message =
+      error.response?.data?.errors?.[0]?.message ||
+      error.response?.data?.error ||
+      error.message ||
+      "Intake failed.";
+    res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 500).json({ ok: false, error: message });
+  }
 }
 
 function out(data) {
@@ -12966,6 +13303,26 @@ function createServer() {
 /* ---------------- EXPRESS ---------------- */
 
 const app = express();
+
+app.options("/intake", (req, res) => {
+  if (!applyIntakeCors(req, res)) return;
+  res.status(204).send();
+});
+
+app.get("/intake/health", (req, res) => {
+  if (!applyIntakeCors(req, res)) return;
+  res.json({
+    ok: true,
+    service: "vip-tools-mcp-intake",
+    configured: Boolean(Object.keys(VIP_INTAKE_ROUTE_CONFIG).length),
+    configured_form_keys: Object.keys(VIP_INTAKE_ROUTE_CONFIG),
+    allowed_origins_count: VIP_INTAKE_ALLOWED_ORIGINS.length,
+    max_files: VIP_INTAKE_MAX_FILES,
+    max_file_mb: VIP_INTAKE_MAX_FILE_MB
+  });
+});
+
+app.post("/intake", handleIntakePost);
 
 app.use(express.json());
 
