@@ -653,6 +653,36 @@ function buildIntakeTaskNotes(body, files, route = {}) {
   )}</p><p><strong>Details</strong></p>${detailParagraphs || "<p>-</p>"}${attachments}</body>`;
 }
 
+function decodeAsanaHtmlText(value) {
+  return String(value || "")
+    .replace(/&#(\d+);/g, (_match, code) => {
+      const point = Number(code);
+      return Number.isFinite(point) ? String.fromCodePoint(point) : "";
+    })
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#039;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function asanaHtmlNotesToPlainText(html) {
+  return decodeAsanaHtmlText(
+    String(html || "")
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<li>/gi, "- ")
+      .replace(/<\/li>/gi, "\n")
+      .replace(/<\/?(ul|ol|body)[^>]*>/gi, "\n")
+      .replace(/<[^>]+>/g, "")
+  )
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
 function buildIntakeTaskName(body, route = {}) {
   if (route.task_name) return String(route.task_name).slice(0, 250);
   return `Intake: ${body.category || "Allgemein"} - ${body.title}`.slice(0, 250);
@@ -704,7 +734,7 @@ async function createIntakeAsanaTask({ body, files, route }) {
     projects: [route.project_gid],
     assignee: route.assignee_gid,
     name,
-    html_notes: notes
+    notes: asanaHtmlNotesToPlainText(notes)
   };
 
   if (Array.isArray(route.tags) && route.tags.length > 0) {
@@ -13484,6 +13514,7 @@ app.get("/intake/health", (req, res) => {
     configured_form_keys: Object.keys(VIP_INTAKE_ROUTE_CONFIG),
     signed_plugin_routing_configured: Boolean(VIP_INTAKE_ROUTING_SECRET),
     allowed_origins_count: VIP_INTAKE_ALLOWED_ORIGINS.length,
+    task_notes_mode: "plain_text",
     max_files: VIP_INTAKE_MAX_FILES,
     max_file_mb: VIP_INTAKE_MAX_FILE_MB
   });
