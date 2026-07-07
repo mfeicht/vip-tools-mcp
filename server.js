@@ -1912,6 +1912,40 @@ function assertAsanaStoryReadbackLooksSafe(story, expectedCodeSnippets = []) {
   }
 }
 
+function detectRoutineFollowUpSignals({ finalComment, completionBasis, followUpNotRequiredBasis }) {
+  const htmlText = String(finalComment?.html_text || "");
+  const combinedText = [
+    finalComment?.text || "",
+    htmlText,
+    completionBasis || "",
+    followUpNotRequiredBasis || ""
+  ]
+    .join("\n")
+    .toLowerCase()
+    .normalize("NFKC");
+  const hasMention = /<a\s+data-asana-gid="\d+"\s*\/?>/i.test(htmlText);
+  const noFollowUpClaim =
+    /\bkein(?:e|er|en)?\s+(?:aktive\s+)?(?:nacharbeit|folgeaufgabe|follow[\s-]?up|handoff|aktion)\s+(?:noetig|nötig|erforderlich|offen)\b/i.test(
+      combinedText
+    ) ||
+    /\b(?:keine|kein)\s+(?:weitere\s+)?(?:to-?dos?|aktion|aufgabe)\s+(?:noetig|nötig|erforderlich|offen)\b/i.test(
+      combinedText
+    );
+  const actionSignal =
+    /\b(?:bitte|soll|muss|kann\s+jetzt|naechster\s+schritt|nächster\s+schritt|weitergabe|handoff|follow[\s-]?up|folgeaufgabe|nacharbeit)\b/i.test(
+      combinedText
+    ) &&
+    /\b(?:pruef|prüf|freigeb|importier|weiterbearbeit|bearbeit|erledig|umsetz|einpfleg|hochlad|veroeffentlich|veröffentlich|antwort|rueckmeld|rückmeld|nachzieh|uebernehm|übernehm|anleg|erstel)\w*/i.test(
+      combinedText
+    );
+  return {
+    has_mention: hasMention,
+    has_action_signal: actionSignal,
+    no_follow_up_claim: noFollowUpClaim,
+    blocked_without_follow_up_task: hasMention || (actionSignal && !noFollowUpClaim)
+  };
+}
+
 function normalizePrivateKey(value) {
   return value.replace(/\\n/g, "\n");
 }
@@ -8114,6 +8148,16 @@ function createServer() {
           "Routine-Abschluss blockiert: Vor dem Abschluss muss entweder follow_up_task_gid gesetzt sein oder follow_up_not_required_basis konkret begruenden, warum keine Folgeaufgabe noetig ist."
         );
       }
+      const routine_follow_up_signal_check = detectRoutineFollowUpSignals({
+        finalComment: final_comment,
+        completionBasis: completion_basis,
+        followUpNotRequiredBasis: trimmedFollowUpNotRequiredBasis
+      });
+      if (routine_like_task && !hasFollowUpTask && routine_follow_up_signal_check.blocked_without_follow_up_task) {
+        throw new Error(
+          "Routine-Abschluss blockiert: Der finale Kommentar oder die Abschlussbasis enthaelt eine echte Mention oder aktive Folgearbeits-Signale, aber follow_up_task_gid fehlt. Lege zuerst eine Follow-up-Aufgabe mit asana_create_task an und uebergib deren GID. Reine FYI-Kommentare ohne Nacharbeit duerfen keine unnoetige Mention enthalten und brauchen eine konkrete follow_up_not_required_basis."
+        );
+      }
 
       let follow_up_task = null;
       if (follow_up_task_gid) {
@@ -8160,6 +8204,7 @@ function createServer() {
           follow_up_task_gid: follow_up_task_gid || null,
           follow_up_task,
           follow_up_not_required_basis: hasFollowUpTask ? null : trimmedFollowUpNotRequiredBasis || null,
+          routine_follow_up_signal_check,
           routine_like_task,
           due_gate,
           task,
@@ -8231,6 +8276,7 @@ function createServer() {
         follow_up_task_gid: follow_up_task_gid || null,
         follow_up_task,
         follow_up_not_required_basis: hasFollowUpTask ? null : trimmedFollowUpNotRequiredBasis || null,
+        routine_follow_up_signal_check,
         routine_like_task,
         due_gate,
         completion_basis,
