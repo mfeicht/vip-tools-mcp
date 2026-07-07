@@ -412,6 +412,17 @@ function normalizeIntakeBodyValue(value) {
   return Array.isArray(value) ? String(value[0] || "").trim() : String(value || "").trim();
 }
 
+function currentDateInTimeZone(timeZone = "Europe/Berlin") {
+  const parts = new Intl.DateTimeFormat("en", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
 function parseIntakeExtraFields(body) {
   const extra = {};
   try {
@@ -746,9 +757,9 @@ async function createIntakeAsanaTask({ body, files, route }) {
   if (Object.keys(customFields).length > 0) {
     data.custom_fields = customFields;
   }
-  if (/^\d{4}-\d{2}-\d{2}$/.test(String(body.wanted_until || ""))) {
-    data.due_on = body.wanted_until;
-  }
+  data.due_on = /^\d{4}-\d{2}-\d{2}$/.test(String(body.wanted_until || ""))
+    ? body.wanted_until
+    : currentDateInTimeZone("Europe/Berlin");
 
   const response = await asanaRequestWithRetry(
     asana,
@@ -13515,6 +13526,7 @@ app.get("/intake/health", (req, res) => {
     allowed_origins_count: VIP_INTAKE_ALLOWED_ORIGINS.length,
     task_notes_mode: "plain_text",
     attachment_upload_mode: "task_endpoint_without_parent_field",
+    default_due_on_mode: "today_europe_berlin",
     max_files: VIP_INTAKE_MAX_FILES,
     max_file_mb: VIP_INTAKE_MAX_FILE_MB
   });
