@@ -772,7 +772,6 @@ async function uploadIntakeAsanaAttachment({ taskGid, file, route }) {
   const form = new FormData();
   const blob = new Blob([bytes], { type: file.type || "application/octet-stream" });
   form.append("file", blob, file.name || "attachment");
-  form.append("parent", taskGid);
 
   const response = await asanaRequestWithRetry(
     asana,
@@ -13515,6 +13514,7 @@ app.get("/intake/health", (req, res) => {
     signed_plugin_routing_configured: Boolean(VIP_INTAKE_ROUTING_SECRET),
     allowed_origins_count: VIP_INTAKE_ALLOWED_ORIGINS.length,
     task_notes_mode: "plain_text",
+    attachment_upload_mode: "task_endpoint_without_parent_field",
     max_files: VIP_INTAKE_MAX_FILES,
     max_file_mb: VIP_INTAKE_MAX_FILE_MB
   });
