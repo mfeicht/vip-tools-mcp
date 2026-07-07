@@ -482,6 +482,10 @@ function verifySignedIntakeRoute(body) {
     assignee_gid: route.assignee_gid,
     task_name: route.task_name,
     description_template: route.description_template,
+    notes_template: route.notes_template,
+    standard_fields: route.standard_fields,
+    required_extra_fields: Array.isArray(route.required_extra_fields) ? route.required_extra_fields : [],
+    extra_defaults: route.extra_defaults && typeof route.extra_defaults === "object" ? route.extra_defaults : {},
     custom_fields: route.custom_fields,
     tags: Array.isArray(route.tags) ? route.tags : [],
     follower_gids: Array.isArray(route.follower_gids) ? route.follower_gids : [],
@@ -531,8 +535,16 @@ function isIntakeSiteAllowed(route, siteKey) {
   return route.allowed_site_keys.includes(String(siteKey || ""));
 }
 
-function validateIntakeBody(body) {
+function validateIntakeBody(body, route = {}) {
   const errors = [];
+  const extra = parseIntakeExtraFields(body);
+  const requiredExtraFields = Array.isArray(route.required_extra_fields) ? route.required_extra_fields : [];
+  for (const field of requiredExtraFields) {
+    const key = String(field || "").trim();
+    if (key && !extra[key]) errors.push(`Required field is missing: ${key}.`);
+  }
+  if (String(route.standard_fields || "") === "none") return errors;
+
   if (!body.requester_name) errors.push("Name is required.");
   if (!body.requester_email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.requester_email)) {
     errors.push("Valid email is required.");
@@ -542,22 +554,7 @@ function validateIntakeBody(body) {
   if (body.consent !== "on" && body.consent !== "true" && body.consent !== "1") {
     errors.push("Consent is required.");
   }
-  if (String(body.form_key || "") === "rs-story-erstellen") {
-    const extra = parseIntakeExtraFields(body);
-    if (!extra.story_title) errors.push("Story title is required.");
-    if (!extra.content_source) errors.push("Story briefing content is required.");
-    if (!extra.cooperation_backlink) errors.push("Cooperation/backlink selection is required.");
-    if (!extra.featured_category) errors.push("Featured category selection is required.");
-    if (!extra.content_handling) errors.push("Content handling selection is required.");
-  }
   return errors;
-}
-
-function isRsStoryIntake(body, route) {
-  return (
-    String(body.form_key || "") === "rs-story-erstellen" ||
-    String(route?.description_template || "") === "rs-story-erstellen"
-  );
 }
 
 function asanaMultilineParagraphs(value) {
@@ -574,159 +571,43 @@ function asanaValue(value) {
   return rendered ? escapeAsanaHtml(rendered) : "-";
 }
 
-function buildRsStoryTaskNotes(body, files) {
-  const extra = parseIntakeExtraFields(body);
-  const attachmentList =
-    files.length > 0
-      ? files.map((file) => `<li>${escapeAsanaHtml(file.name || "attachment")}</li>`).join("")
-      : "<li>-</li>";
-  const rows = [
-    ["Quelle", "Oeffentliches RS-Story-Formular"],
-    ["Form Key", body.form_key || "rs-story-erstellen"],
-    ["Site Key", body.site_key || "-"],
-    ["Absender", body.requester_name],
-    ["E-Mail", body.requester_email],
-    ["Firma", body.company || "-"],
-    ["Kategorie", body.category || "Story"],
-    ["Prioritaet", body.priority || "Mittel"],
-    ["Wunschdatum", body.wanted_until || "-"],
-    ["Website", body.source_url || "-"],
-    ["Submitted At", body.submitted_at || new Date().toISOString()]
-  ];
-  const metaList = rows
-    .map(([label, value]) => {
-      const renderedValue = label === "Website" ? asanaLinkHtml(value) : escapeAsanaHtml(value);
-      return `<li><strong>${escapeAsanaHtml(label)}:</strong> ${renderedValue}</li>`;
-    })
-    .join("");
+function renderIntakeTemplateValue(rawValue, filters) {
+  const value = String(rawValue || "").trim();
+  if (filters.includes("paragraphs")) return asanaMultilineParagraphs(value);
+  if (filters.includes("link")) return asanaLinkHtml(value);
+  return asanaValue(value);
+}
 
-  return `<body>
-<p>Bitte erstelle eine neue Reise-Stories-Story nach der bestehenden Thrive-Vorlage.</p>
-<p><strong>Vorlage:</strong></p>
-<p>${asanaLinkHtml("https://reise-stories.de/?p=147947&preview=true")}</p>
-<p><strong>Grunddaten</strong></p>
-<p><strong>Story-Titel:</strong> ${asanaValue(extra.story_title || body.title)}</p>
-<p><strong>Fokus-Keyword:</strong> ${asanaValue(extra.focus_keyword || "selbst recherchieren/ableiten")}</p>
-<p><strong>Region:</strong> ${asanaValue(extra.region || "selbst passend waehlen")}</p>
-<p><strong>Kooperation / verkaufter Backlink:</strong> ${asanaValue(extra.cooperation_backlink)}</p>
-<p><strong>Featured-Kategorie:</strong> ${asanaValue(extra.featured_category || "Featured")}</p>
-<p>Auswahl genau eine Option stehen lassen: Keine / Featured / Top-Featured</p>
-<ul>
-<li>Keine: weder <strong>Featured</strong> noch <strong>Top-Featured</strong> setzen; falls die duplizierte Vorlage Featured enthaelt, Featured entfernen.</li>
-<li>Featured: Featured setzen/behalten; Top-Featured nicht setzen bzw. entfernen.</li>
-<li>Top-Featured: Top-Featured setzen/behalten; Featured nicht zusaetzlich setzen bzw. entfernen.</li>
-</ul>
-<p><strong>Inhalt / Quelle</strong></p>
-<p><strong>Inhalt oder Briefing:</strong></p>
-${asanaMultilineParagraphs(extra.content_source)}
-<p><strong>Moegliche Quellen:</strong></p>
-${asanaMultilineParagraphs(extra.source_links)}
-<p><strong>Umgang mit dem Inhalt:</strong> ${asanaValue(extra.content_handling || "Redaktionell umformulieren")}</p>
-<ul>
-<li>Exakt uebernehmen: Textbausteine moeglichst 1:1 verwenden und nur sauber in die Vorlage einsetzen.</li>
-<li>Redaktionell umformulieren: Inhalt sinngemaess verwenden, sprachlich verbessern und fuer Reise-Stories optimieren.</li>
-<li>Frei ausarbeiten: Thema/Titel verwenden, selbst recherchieren und einen vollstaendigen journalistischen Beitrag erstellen.</li>
-</ul>
-<p><strong>Besondere Hinweise</strong></p>
-<p><strong>Titelbild soll darstellen:</strong></p>
-${asanaMultilineParagraphs(extra.title_image_hint || "selbst passend waehlen")}
-<p><strong>Bildcredits:</strong></p>
-<p>${asanaValue(extra.image_credits || "selbst passend waehlen")}</p>
-<p><strong>Bilder im Beitrag:</strong></p>
-${asanaMultilineParagraphs(extra.article_images_hint || "selbst passend waehlen")}
-<p><strong>Button-Links:</strong></p>
-${asanaMultilineParagraphs(extra.button_links)}
-<p><strong>Interne Links:</strong></p>
-${asanaMultilineParagraphs(extra.internal_links || "selbst passende Reise-Stories-Links waehlen")}
-<p><strong>Externe Links:</strong></p>
-${asanaMultilineParagraphs(extra.external_links)}
-<p><strong>Weitere Hinweise:</strong></p>
-${asanaMultilineParagraphs(extra.additional_notes)}
-<p><strong>Anhaenge</strong></p>
-<ul>${attachmentList}</ul>
-<p><strong>Pflichtverfahren</strong></p>
-<ul>
-<li>Die Story-Vorlage muss dupliziert werden.</li>
-<li>Der Thrive-Aufbau / die Komponenten muessen exakt erhalten bleiben.</li>
-<li>Nur Inhalte innerhalb der bestehenden Komponenten ersetzen: Texte, Bilder, Bildcredits, Links, Buttons, Meta-Daten.</li>
-<li>Keine neue freie Artikelstruktur bauen.</li>
-<li>Alle Platzhalter ersetzen.</li>
-<li>Alle Bilder im Beitrag ersetzen, auch Bildslots nach DETAILS ZUR STORY.</li>
-<li>Typografie, Abstaende, Listenformatierung und Thrive-Komponenten wie in der Vorlage erhalten.</li>
-<li>Autor muss vipadmin sein.</li>
-<li>Kategorie Story muss beibehalten werden.</li>
-<li>Featured-Kategorie nach dem Block Featured-Kategorie in den Grunddaten setzen: Keine, Featured oder Top-Featured genau wie dort ausgewaehlt.</li>
-<li>Mindestens eine passende bestehende Region-Kategorie hinzufuegen.</li>
-<li>Mindestens eine passende bestehende Kategorie aus Reiseinspirationen hinzufuegen.</li>
-<li>Keine neuen Kategorien oder Regionen anlegen.</li>
-<li>Keine XML-RPC-Zugriffe nutzen.</li>
-</ul>
-<p><strong>SEO / LLM / Links</strong></p>
-<ul>
-<li>Titel nach Muster: Fokus-Keyword: Nutzenorientierter Story-Titel.</li>
-<li>Fokus-Keyword in Titel, Einleitung, passenden H2/H3, Meta-Daten und natuerlich im Text verwenden.</li>
-<li>Beitrag journalistisch hochwertig, nutzerorientiert und suchmaschinenstark ausarbeiten.</li>
-<li>Keine SEO-Anweisungen oder Ranking-Erklaerungen sichtbar in den Artikel schreiben.</li>
-<li>Meta-Title, Meta-Description, strukturierte Daten und Zwischenueberschriften optimieren.</li>
-<li>Interne Links zu passenden Reise-Stories-Beitraegen setzen, sofern sinnvoll.</li>
-<li>Wenn Kooperation / verkaufter Backlink = Ja: gewuenschte externe Links duerfen dofollow sein.</li>
-<li>Wenn Kooperation / verkaufter Backlink = Nein oder unklar: externe Links standardmaessig nofollow setzen.</li>
-</ul>
-<p><strong>Bilder</strong></p>
-<ul>
-<li>Bilder im Beitrag passend ersetzen.</li>
-<li>Bildquellen: Pexels, Unsplash oder fotorealistische KI-Bilder.</li>
-<li>Bei KI-Bildern Bildcredit: &copy; Reise-Stories.</li>
-<li>Bildcredits sichtbar und korrekt setzen.</li>
-<li>Titelbild passend zum Thema erstellen oder auswaehlen.</li>
-</ul>
-<p><strong>Abschlusspruefung</strong></p>
-<p>Vor Veroeffentlichung pruefen:</p>
-<ul>
-<li>Der Beitrag sieht optisch exakt wie die Thrive-Vorlage aus.</li>
-<li>Keine sichtbaren Platzhalter mehr vorhanden.</li>
-<li>Keine leeren Bildflaechen vorhanden.</li>
-<li>Alle Bilder und Credits sind korrekt.</li>
-<li>Empfehlungsboxen, Bulletpoints und Formatierungen entsprechen der Vorlage.</li>
-<li>Kategorie Story gesetzt; Featured-Kategorie exakt entsprechend dem Block Featured-Kategorie gesetzt.</li>
-<li>Autor-Link ist ${asanaLinkHtml("https://reise-stories.de/author/vipadmin/")}.</li>
-</ul>
-<p><strong>Nach Veroeffentlichung Redaktionsplan aktualisieren:</strong></p>
-<p>${asanaLinkHtml(
-    "https://docs.google.com/spreadsheets/d/17BbIPRBGxcNUAYPNd6AD3wnvik6s26P8fnvPDeH1UrM/edit?gid=1499992303#gid=1499992303"
-  )}</p>
-<p>Folgende Spalten befuellen:</p>
-<ul>
-<li>Spalte A: finale URL</li>
-<li>Spalte B: finaler Titel</li>
-<li>Spalte C: Story im Dropdown auswaehlen</li>
-<li>Spalte F: Veroeffentlichungsdatum im bestehenden Datumsformat</li>
-<li>Spalte G: Region in bestehender Schreibweise</li>
-<li>Spalte H: Autor, standardmaessig Reise-Redaktion</li>
-<li>Spalte I: Status Online</li>
-<li>Spalte S: Backlink verkauft per Checkbox anhaken, wenn Kooperation / verkaufter Backlink = Ja</li>
-</ul>
-<p>Zellen so befuellen, wie es die bestehende Formatierung, Dropdowns, Checkboxen und Schreibweise der jeweiligen Spalte vorsehen.</p>
-<p><strong>Final in Asana zurueckmelden:</strong></p>
-<ul>
-<li>Veroeffentlichte URL</li>
-<li>Fokus-Keyword</li>
-<li>Gesetzte Kategorien inkl. Auswahl aus Featured-Kategorie</li>
-<li>Bildquellen</li>
-<li>Ob Spalte S angehakt wurde</li>
-</ul>
-<p><strong>Update-Key:</strong> rs-story-featured-kategorie-auswahl-2026-07-02</p>
-<p>Ergaenzung 2026-07-02: Featured-Kategorie in der Aufgabe waehlen. Die Kategorie Featured wird bei manuellen RS-Story-Aufgaben nicht mehr pauschal automatisch behalten. Massgeblich ist der Block Featured-Kategorie in den Grunddaten. Genau eine Option gilt: Keine, Featured oder Top-Featured. Diese Auswahl ist exklusiv umzusetzen und im Abschlusskommentar bei den gesetzten Kategorien zu nennen.</p>
-<p><strong>Formular-Metadaten</strong></p>
-<ul>${metaList}</ul>
-<p><strong>Details aus dem allgemeinen Formularfeld</strong></p>
-${asanaMultilineParagraphs(body.description)}
-</body>`;
+function renderSignedIntakeNotesTemplate(template, body, route = {}) {
+  const extra = parseIntakeExtraFields(body);
+  const defaults = route.extra_defaults && typeof route.extra_defaults === "object" ? route.extra_defaults : {};
+
+  return String(template || "").replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_match, expression) => {
+    const parts = String(expression || "")
+      .split("|")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const keyPath = parts.shift() || "";
+    let value = "";
+
+    if (keyPath.startsWith("extra.")) {
+      const key = keyPath.slice("extra.".length);
+      value = extra[key] || defaults[key] || "";
+    } else if (keyPath.startsWith("body.")) {
+      const key = keyPath.slice("body.".length);
+      value = body[key] || "";
+    } else if (keyPath.startsWith("default.")) {
+      const key = keyPath.slice("default.".length);
+      value = defaults[key] || "";
+    }
+
+    return renderIntakeTemplateValue(value, parts);
+  });
 }
 
 function buildIntakeTaskNotes(body, files, route = {}) {
-  if (isRsStoryIntake(body, route)) {
-    return buildRsStoryTaskNotes(body, files);
+  if (route.notes_template) {
+    return renderSignedIntakeNotesTemplate(route.notes_template, body, route);
   }
 
   const rows = [
@@ -774,7 +655,6 @@ function buildIntakeTaskNotes(body, files, route = {}) {
 
 function buildIntakeTaskName(body, route = {}) {
   if (route.task_name) return String(route.task_name).slice(0, 250);
-  if (isRsStoryIntake(body, route)) return "(RS) Story erstellen";
   return `Intake: ${body.category || "Allgemein"} - ${body.title}`.slice(0, 250);
 }
 
@@ -783,16 +663,6 @@ function buildIntakeCustomFields(body, route = {}) {
     route.custom_fields && typeof route.custom_fields === "object" && !Array.isArray(route.custom_fields)
       ? { ...route.custom_fields }
       : {};
-
-  if (isRsStoryIntake(body, route)) {
-    const priorityOptions = {
-      Hoch: "1163311635969185",
-      Mittel: "1163311635969186",
-      Niedrig: "1163311635969187"
-    };
-    customFields["1163311635969184"] = priorityOptions[body.priority] || priorityOptions.Mittel;
-    customFields["1200527008079359"] = "1200527008079360";
-  }
 
   return customFields;
 }
@@ -932,11 +802,6 @@ async function handleIntakePost(req, res) {
     if (!applyIntakeCors(req, res)) return;
     if (!checkIntakeRateLimit(req, res)) return;
 
-    if (!Object.keys(VIP_INTAKE_ROUTE_CONFIG).length) {
-      res.status(503).json({ ok: false, error: "VIP_INTAKE_CONFIG_JSON is not configured." });
-      return;
-    }
-
     const contentType = String(req.headers["content-type"] || "");
     if (!contentType.toLowerCase().startsWith("multipart/form-data")) {
       res.status(415).json({ ok: false, error: "Expected multipart/form-data." });
@@ -949,7 +814,15 @@ async function handleIntakePost(req, res) {
       return;
     }
 
-    const validationErrors = validateIntakeBody(body);
+    const formKey = body.form_key || "default";
+    const route = resolveIntakeRoute(body);
+    assertIntakeRoute(route, formKey);
+    if (!isIntakeSiteAllowed(route, body.site_key)) {
+      res.status(403).json({ ok: false, error: "Site key is not allowed for this form_key." });
+      return;
+    }
+
+    const validationErrors = validateIntakeBody(body, route);
     if (validationErrors.length > 0) {
       res.status(400).json({ ok: false, error: validationErrors.join(" ") });
       return;
@@ -965,14 +838,6 @@ async function handleIntakePost(req, res) {
         ok: false,
         error: `File too large: ${oversized.name || "attachment"}. Limit is ${VIP_INTAKE_MAX_FILE_MB} MB.`
       });
-      return;
-    }
-
-    const formKey = body.form_key || "default";
-    const route = resolveIntakeRoute(body);
-    assertIntakeRoute(route, formKey);
-    if (!isIntakeSiteAllowed(route, body.site_key)) {
-      res.status(403).json({ ok: false, error: "Site key is not allowed for this form_key." });
       return;
     }
 
