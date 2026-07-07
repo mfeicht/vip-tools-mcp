@@ -8008,7 +8008,7 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar, Supervisor-Follower, Routine-Due-Gate und Readback. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nicht automatisch wieder hinzugefuegt, ausser allow_routine_supervisor_readd=true.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nicht automatisch wieder hinzugefuegt, ausser allow_routine_supervisor_readd=true.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -8018,6 +8018,9 @@ function createServer() {
       ensure_supervisor_follower: z.boolean().optional().default(true),
       allow_routine_supervisor_readd: z.boolean().optional().default(false),
       supervisor_follower_gid: z.string().optional(),
+      follow_up_required: z.boolean().optional().default(false),
+      follow_up_task_gid: z.string().optional(),
+      follow_up_not_required_basis: z.string().optional(),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
     },
@@ -8031,11 +8034,15 @@ function createServer() {
       ensure_supervisor_follower,
       allow_routine_supervisor_readd,
       supervisor_follower_gid,
+      follow_up_required,
+      follow_up_task_gid,
+      follow_up_not_required_basis,
       dry_run,
       verify_after
     }) => {
       validateAsanaGid(task_gid, "task_gid");
       if (final_comment_story_gid) validateAsanaGid(final_comment_story_gid, "final_comment_story_gid");
+      if (follow_up_task_gid) validateAsanaGid(follow_up_task_gid, "follow_up_task_gid");
       if (require_final_comment && !final_comment_story_gid) {
         throw new Error(
           "asana_complete_task braucht final_comment_story_gid, wenn require_final_comment=true ist. Poste zuerst einen Abschlusskommentar mit asana_comment."
@@ -8094,6 +8101,37 @@ function createServer() {
         assertAsanaStoryReadbackLooksSafe(final_comment);
       }
 
+      const trimmedFollowUpNotRequiredBasis = String(follow_up_not_required_basis || "").trim();
+      const hasFollowUpTask = Boolean(follow_up_task_gid);
+      const hasNoFollowUpBasis = trimmedFollowUpNotRequiredBasis.length >= 20;
+      if (follow_up_required && !hasFollowUpTask) {
+        throw new Error(
+          "follow_up_required=true: asana_complete_task braucht follow_up_task_gid. Lege zuerst die Folgeaufgabe mit asana_create_task an und uebergib deren GID."
+        );
+      }
+      if (routine_like_task && !hasFollowUpTask && !hasNoFollowUpBasis) {
+        throw new Error(
+          "Routine-Abschluss blockiert: Vor dem Abschluss muss entweder follow_up_task_gid gesetzt sein oder follow_up_not_required_basis konkret begruenden, warum keine Folgeaufgabe noetig ist."
+        );
+      }
+
+      let follow_up_task = null;
+      if (follow_up_task_gid) {
+        const followUpRes = await asana.get(`/tasks/${follow_up_task_gid}`, {
+          params: {
+            opt_fields:
+              "gid,name,completed,assignee.gid,assignee.name,due_on,permalink_url,memberships.project.gid,memberships.project.name,followers.gid,followers.name"
+          }
+        });
+        follow_up_task = followUpRes.data.data;
+        if (follow_up_task.completed) {
+          throw new Error("Die angegebene Follow-up-Aufgabe ist bereits abgeschlossen; Routine-Abschluss braucht eine offene Folgeaufgabe oder eine konkrete No-Follow-up-Begruendung.");
+        }
+        if (!follow_up_task.assignee?.gid) {
+          throw new Error("Die angegebene Follow-up-Aufgabe hat keinen Assignee.");
+        }
+      }
+
       const blockedByFutureRoutineDue = routine_like_task && due_gate.blocked;
       if (blockedByFutureRoutineDue && !dry_run) {
         throw new Error(
@@ -8118,6 +8156,10 @@ function createServer() {
           supervisor_follower_present: ensure_supervisor_follower
             ? supervisor_follower_present_initially
             : null,
+          follow_up_required,
+          follow_up_task_gid: follow_up_task_gid || null,
+          follow_up_task,
+          follow_up_not_required_basis: hasFollowUpTask ? null : trimmedFollowUpNotRequiredBasis || null,
           routine_like_task,
           due_gate,
           task,
@@ -8185,6 +8227,10 @@ function createServer() {
         verified_task,
         verification_status,
         final_comment,
+        follow_up_required,
+        follow_up_task_gid: follow_up_task_gid || null,
+        follow_up_task,
+        follow_up_not_required_basis: hasFollowUpTask ? null : trimmedFollowUpNotRequiredBasis || null,
         routine_like_task,
         due_gate,
         completion_basis,
