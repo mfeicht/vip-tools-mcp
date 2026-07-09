@@ -254,7 +254,7 @@ const ASANA_TASK_TAG_WORKSPACE_OPT_FIELDS =
 const ASANA_TASK_CREATE_SOURCE_OPT_FIELDS =
   "gid,name,permalink_url,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name";
 const ASANA_TASK_CREATE_VERIFY_OPT_FIELDS =
-  "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,followers.gid,followers.name,memberships.project.gid,memberships.project.name,custom_fields.gid,custom_fields.name,custom_fields.enum_value.gid,custom_fields.enum_value.name";
+  "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,tags.gid,tags.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name,custom_fields.gid,custom_fields.name,custom_fields.enum_value.gid,custom_fields.enum_value.name";
 const ASANA_TASK_DESCRIPTION_OPT_FIELDS =
   "gid,name,completed,notes,html_notes,permalink_url,tags.gid,tags.name,assignee.gid,assignee.name,memberships.project.gid,memberships.project.name";
 const ASANA_DEFAULT_SUPERVISOR_GID =
@@ -739,17 +739,29 @@ async function createIntakeAsanaTask({ body, files, route }) {
   const name = buildIntakeTaskName(body, route);
   const notes = buildIntakeTaskNotes(body, files, route);
   const customFields = buildIntakeCustomFields(body, route);
+  const workspaceGid = process.env.ASANA_WORKSPACE_GID || "1108802683611047";
 
   const data = {
-    workspace: process.env.ASANA_WORKSPACE_GID || "1108802683611047",
+    workspace: workspaceGid,
     projects: [route.project_gid],
     assignee: route.assignee_gid,
     name,
     notes: asanaHtmlNotesToPlainText(notes)
   };
 
-  if (Array.isArray(route.tags) && route.tags.length > 0) {
-    data.tags = route.tags;
+  const routeTags = Array.isArray(route.tags) ? [...route.tags] : [];
+  const routineTaskDetected = isRoutineTaskCreationIntent({
+    name,
+    description: notes,
+    creation_basis: [route.form_key, route.template_key, route.agent_id, route.project_gid].filter(Boolean).join(" "),
+    routine_task: Boolean(route.routine_task)
+  });
+  const routineTag = routineTaskDetected ? await findAsanaRoutineTagOrThrow(asana, workspaceGid) : null;
+  if (routineTag && !routeTags.includes(routineTag.gid)) {
+    routeTags.push(routineTag.gid);
+  }
+  if (routeTags.length > 0) {
+    data.tags = routeTags;
   }
   if (Array.isArray(route.follower_gids) && route.follower_gids.length > 0) {
     data.followers = route.follower_gids;
@@ -773,7 +785,12 @@ async function createIntakeAsanaTask({ body, files, route }) {
     { attempts: ASANA_RETRY_ATTEMPTS }
   );
 
-  return { task: response.data?.data, agent_id: agentId };
+  return {
+    task: response.data?.data,
+    agent_id: agentId,
+    routine_task_detected: routineTaskDetected,
+    routine_tag_gid: routineTag?.gid || null
+  };
 }
 
 async function uploadIntakeAsanaAttachment({ taskGid, file, route }) {
@@ -1394,6 +1411,45 @@ function resolveNextFutureAsanaScheduleInput({
 function isRoutineLikeAsanaTask(task) {
   const tagNames = (task?.tags || []).map((tag) => String(tag.name || "").toLowerCase());
   return tagNames.includes("routine") || /^r\s*:/i.test(String(task?.name || "").trim());
+}
+
+function hasAsanaRoutineTag(task) {
+  return (task?.tags || []).some((tag) => normalizeAsanaLabel(tag.name) === "routine");
+}
+
+function isRoutineTaskCreationIntent({ name, description, creation_basis, routine_task }) {
+  if (routine_task) return true;
+  if (/^\s*r\s*:/i.test(String(name || ""))) return true;
+  const normalized = normalizeAsanaLabel([name, description, creation_basis].filter(Boolean).join(" "));
+  const routineSignals = [
+    "routine aufgabe",
+    "routineaufgabe",
+    "wiederkehrende aufgabe",
+    "wiederkehrend eingestellte aufgabe",
+    "regelmaessige aufgabe",
+    "taegliche aufgabe",
+    "woechentliche aufgabe",
+    "monatliche aufgabe"
+  ];
+  return routineSignals.some((signal) => normalized.includes(signal));
+}
+
+async function findAsanaRoutineTagOrThrow(asana, workspaceGid) {
+  if (!workspaceGid) {
+    throw new Error("Kein Asana-Workspace fuer Routine-Tag-Suche gefunden.");
+  }
+  const tagsRes = await asanaRequestWithRetry(asana, {
+    method: "GET",
+    url: `/workspaces/${workspaceGid}/tags`,
+    params: { limit: 100, opt_fields: "gid,name,color,workspace.gid" }
+  });
+  const routineTag = (tagsRes.data.data || []).find((tag) => normalizeAsanaLabel(tag.name) === "routine");
+  if (!routineTag) {
+    throw new Error(
+      "Wiederkehrende Aufgaben muessen den Tag Routine haben, aber im Workspace wurde kein Tag mit Name Routine gefunden."
+    );
+  }
+  return routineTag;
 }
 
 function getAsanaTaskTagNames(task) {
@@ -7561,7 +7617,7 @@ function createServer() {
 
   server.tool(
     "asana_create_task",
-    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Supervisor-Follower und bei Follow-ups einen Link zur Ausgangsaufgabe.",
+    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Routine-Tag bei Routine-Erkennung, Supervisor-Follower fuer Nicht-Routinen und bei Follow-ups einen Link zur Ausgangsaufgabe. Bei Routine-Aufgaben wird ein Default-Supervisor/Moritz nicht automatisch gereaddet, ausser allow_routine_supervisor_readd=true.",
     {
       agent_id: agentIdSchema,
       name: z.string().min(12).max(200),
@@ -7576,7 +7632,9 @@ function createServer() {
       priority_value: z.string().optional().default("Mittel"),
       status_value: z.string().optional().default("Todo"),
       require_standard_custom_fields: z.boolean().optional().default(true),
+      routine_task: z.boolean().optional().default(false),
       ensure_supervisor_follower: z.boolean().optional().default(true),
+      allow_routine_supervisor_readd: z.boolean().optional().default(false),
       supervisor_follower_gid: z.string().optional(),
       confirmed_by_asana: z.boolean().optional().default(false),
       creation_basis: z.string().min(20),
@@ -7598,7 +7656,9 @@ function createServer() {
       priority_value,
       status_value,
       require_standard_custom_fields,
+      routine_task,
       ensure_supervisor_follower,
+      allow_routine_supervisor_readd,
       supervisor_follower_gid,
       confirmed_by_asana,
       creation_basis,
@@ -7680,6 +7740,25 @@ function createServer() {
       });
       const project = projectRes.data.data;
       const finalDueOn = due_on || dueOnInBerlinDaysFromNow(due_in_days);
+      const routine_task_detected = isRoutineTaskCreationIntent({
+        name,
+        description,
+        creation_basis,
+        routine_task
+      });
+      const routine_tag = routine_task_detected
+        ? await findAsanaRoutineTagOrThrow(asana, project.workspace?.gid)
+        : null;
+      const supervisor_follower_readd_guarded =
+        ensure_supervisor_follower &&
+        routine_task_detected &&
+        isDefaultSupervisorFollowerGid(finalSupervisorFollowerGid) &&
+        !allow_routine_supervisor_readd;
+      const effective_ensure_supervisor_follower =
+        ensure_supervisor_follower && !supervisor_follower_readd_guarded;
+      const supervisor_follower_guard_reason = supervisor_follower_readd_guarded
+        ? "Routine-Aufgabe wird neu angelegt: Default-Supervisor/Moritz wird wegen Routine-do_not_readd-Schutz nicht automatisch als Follower hinzugefuegt. Fuer Blocker/Rueckfrage/kritische Beteiligung explizit allow_routine_supervisor_readd=true setzen."
+        : null;
 
       const { custom_fields, resolved, missing } = await resolveAsanaStandardCustomFields(asana, selectedProjectGid, {
         priorityValue: priority_value,
@@ -7701,6 +7780,7 @@ function createServer() {
         due_on: finalDueOn,
         html_notes
       };
+      if (routine_tag) data.tags = [routine_tag.gid];
       if (Object.keys(custom_fields).length) data.custom_fields = custom_fields;
 
       const basis_sha256 = createHash("sha256").update(creation_basis, "utf8").digest("hex");
@@ -7715,8 +7795,16 @@ function createServer() {
           source_projects,
           standard_fields: resolved,
           missing_standard_fields: missing,
+          routine_task,
+          routine_task_detected,
+          routine_tag,
+          routine_tag_required: Boolean(routine_task_detected),
           ensure_supervisor_follower,
-          supervisor_follower_gid: ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
+          effective_ensure_supervisor_follower,
+          allow_routine_supervisor_readd,
+          supervisor_follower_readd_guarded,
+          supervisor_follower_guard_reason,
+          supervisor_follower_gid: effective_ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
           creation_basis,
           creation_basis_sha256: basis_sha256
         });
@@ -7731,7 +7819,7 @@ function createServer() {
       });
 
       let supervisor_follower_add_result = null;
-      if (ensure_supervisor_follower) {
+      if (effective_ensure_supervisor_follower) {
         const followerRes = await asanaRequestWithRetry(asana, {
           method: "POST",
           url: `/tasks/${res.data.data.gid}/addFollowers`,
@@ -7767,7 +7855,10 @@ function createServer() {
         if (verified_task.due_on !== finalDueOn) {
           throw new Error(`Asana-Readback due_on=${verified_task.due_on || "null"} statt erwartet ${finalDueOn}.`);
         }
-        if (ensure_supervisor_follower) {
+        if (routine_task_detected && !hasAsanaRoutineTag(verified_task)) {
+          throw new Error("Asana-Readback zeigt bei einer Routine-Aufgabe keinen Tag Routine.");
+        }
+        if (effective_ensure_supervisor_follower) {
           const verifiedFollowerGids = getAsanaTaskFollowerGids(verified_task);
           if (!verifiedFollowerGids.includes(finalSupervisorFollowerGid)) {
             throw new Error(`Asana-Readback zeigt Supervisor-Follower ${finalSupervisorFollowerGid} nicht.`);
@@ -7787,7 +7878,11 @@ function createServer() {
         task: res.data.data,
         supervisor_follower_add_result,
         ensure_supervisor_follower,
-        supervisor_follower_gid: ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
+        effective_ensure_supervisor_follower,
+        allow_routine_supervisor_readd,
+        supervisor_follower_readd_guarded,
+        supervisor_follower_guard_reason,
+        supervisor_follower_gid: effective_ensure_supervisor_follower ? finalSupervisorFollowerGid : null,
         verified_task,
         verification_status,
         project,
@@ -7795,6 +7890,10 @@ function createServer() {
         source_projects,
         standard_fields: resolved,
         missing_standard_fields: missing,
+        routine_task,
+        routine_task_detected,
+        routine_tag,
+        routine_tag_required: Boolean(routine_task_detected),
         creation_basis,
         creation_basis_sha256: basis_sha256
       });
