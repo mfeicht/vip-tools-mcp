@@ -8617,12 +8617,39 @@ function createServer() {
           opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
         }
       });
-      const candidates = (tasksRes.data.data || []).filter((task) => {
+      let search_fallback_used = false;
+      let search_fallback_count = 0;
+      let candidates = (tasksRes.data.data || []).filter((task) => {
         if (task.gid === source_task_gid) return false;
         if (String(task.name || "") !== String(expectedName || "")) return false;
         if (expectedAssignee && task.assignee?.gid !== expectedAssignee) return false;
         return true;
       });
+      if (candidates.length === 0) {
+        const workspaceGid = source_task.workspace?.gid;
+        if (workspaceGid) {
+          const searchRes = await asanaRequestWithRetry(asana, {
+            method: "GET",
+            url: `/workspaces/${workspaceGid}/tasks/search`,
+            params: {
+              completed: false,
+              limit,
+              text: expectedName,
+              opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
+            }
+          });
+          search_fallback_used = true;
+          candidates = (searchRes.data.data || []).filter((task) => {
+            if (task.gid === source_task_gid) return false;
+            if (String(task.name || "") !== String(expectedName || "")) return false;
+            if (expectedAssignee && task.assignee?.gid !== expectedAssignee) return false;
+            const taskProjectGids = getAsanaTaskProjectGids(task);
+            if (!taskProjectGids.includes(selectedProjectGid)) return false;
+            return true;
+          });
+          search_fallback_count = candidates.length;
+        }
+      }
 
       const candidate_results = candidates.map((task) => ({
         task,
@@ -8668,6 +8695,8 @@ function createServer() {
         selected_project_gid: selectedProjectGid,
         expected_name: expectedName,
         expected_assignee_gid: expectedAssignee || null,
+        search_fallback_used,
+        search_fallback_count,
         candidate_count: candidates.length,
         exact_match_count: exactMatches.length,
         acceptable_match_count: acceptableMatches.length,
