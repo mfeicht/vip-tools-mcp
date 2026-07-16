@@ -12157,16 +12157,29 @@ function createServer() {
         WHERE customer_client.level <= ${level_max}
         LIMIT ${limit}
       `;
-      const res = await googleAdsRequest({
-        method: "POST",
-        path: `/customers/${normalizedCustomerId}/googleAds:search`,
-        login_customer_id,
-        data: { query, pageSize: Math.min(limit, 10000) }
-      });
+      let res;
+      try {
+        res = await googleAdsRequest({
+          method: "POST",
+          path: `/customers/${normalizedCustomerId}/googleAds:search`,
+          login_customer_id,
+          data: { query, pageSize: Math.min(limit, 10000) }
+        });
+      } catch (error) {
+        return out({
+          api_version: GOOGLE_ADS_API_VERSION,
+          customer_id: normalizedCustomerId,
+          login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+          query,
+          ok: false,
+          error: compactAxiosError(error)
+        });
+      }
       return out({
         api_version: GOOGLE_ADS_API_VERSION,
         customer_id: normalizedCustomerId,
         login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+        ok: true,
         request_id: res.headers?.["request-id"] || null,
         row_count: res.data.results?.length || 0,
         next_page_token: res.data.nextPageToken || null,
@@ -12192,20 +12205,33 @@ function createServer() {
       if (!/^select\s/i.test(trimmedQuery)) {
         throw new Error("google_ads_search erlaubt nur GAQL-SELECT-Queries.");
       }
-      const res = await googleAdsRequest({
-        method: "POST",
-        path: `/customers/${normalizedCustomerId}/googleAds:search`,
-        login_customer_id,
-        data: {
+      let res;
+      try {
+        res = await googleAdsRequest({
+          method: "POST",
+          path: `/customers/${normalizedCustomerId}/googleAds:search`,
+          login_customer_id,
+          data: {
+            query: trimmedQuery,
+            pageSize: page_size,
+            ...(page_token ? { pageToken: page_token } : {})
+          }
+        });
+      } catch (error) {
+        return out({
+          api_version: GOOGLE_ADS_API_VERSION,
+          customer_id: normalizedCustomerId,
+          login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
           query: trimmedQuery,
-          pageSize: page_size,
-          ...(page_token ? { pageToken: page_token } : {})
-        }
-      });
+          ok: false,
+          error: compactAxiosError(error)
+        });
+      }
       return out({
         api_version: GOOGLE_ADS_API_VERSION,
         customer_id: normalizedCustomerId,
         login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+        ok: true,
         request_id: res.headers?.["request-id"] || null,
         row_count: res.data.results?.length || 0,
         total_results_count: res.data.totalResultsCount || null,
@@ -12248,18 +12274,33 @@ function createServer() {
         ORDER BY metrics.impressions DESC
         LIMIT ${limit}
       `;
-      const res = await googleAdsRequest({
-        method: "POST",
-        path: `/customers/${normalizedCustomerId}/googleAds:search`,
-        login_customer_id,
-        data: { query, pageSize: Math.min(limit, 10000) }
-      });
+      let res;
+      try {
+        res = await googleAdsRequest({
+          method: "POST",
+          path: `/customers/${normalizedCustomerId}/googleAds:search`,
+          login_customer_id,
+          data: { query, pageSize: Math.min(limit, 10000) }
+        });
+      } catch (error) {
+        return out({
+          api_version: GOOGLE_ADS_API_VERSION,
+          customer_id: normalizedCustomerId,
+          login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+          date_start,
+          date_end,
+          query,
+          ok: false,
+          error: compactAxiosError(error)
+        });
+      }
       return out({
         api_version: GOOGLE_ADS_API_VERSION,
         customer_id: normalizedCustomerId,
         login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
         date_start,
         date_end,
+        ok: true,
         request_id: res.headers?.["request-id"] || null,
         row_count: res.data.results?.length || 0,
         next_page_token: res.data.nextPageToken || null,
