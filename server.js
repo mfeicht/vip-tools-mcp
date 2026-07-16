@@ -12163,7 +12163,7 @@ function createServer() {
           method: "POST",
           path: `/customers/${normalizedCustomerId}/googleAds:search`,
           login_customer_id,
-          data: { query, pageSize: Math.min(limit, 10000) }
+          data: { query }
         });
       } catch (error) {
         return out({
@@ -12213,7 +12213,6 @@ function createServer() {
           login_customer_id,
           data: {
             query: trimmedQuery,
-            pageSize: page_size,
             ...(page_token ? { pageToken: page_token } : {})
           }
         });
@@ -12280,7 +12279,7 @@ function createServer() {
           method: "POST",
           path: `/customers/${normalizedCustomerId}/googleAds:search`,
           login_customer_id,
-          data: { query, pageSize: Math.min(limit, 10000) }
+          data: { query }
         });
       } catch (error) {
         return out({
