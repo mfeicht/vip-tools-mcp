@@ -100,6 +100,7 @@ const GOOGLE_ADS_MUTATE_SERVICE_VALUES = [
   "campaigns",
   "adGroups",
   "adGroupAds",
+  "ads",
   "campaignCriteria",
   "adGroupCriteria",
   "customerNegativeCriteria",
