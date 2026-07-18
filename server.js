@@ -1879,6 +1879,114 @@ function collectAsanaCodeBlocks(sections = []) {
   return sections.flatMap((section) => section.code_blocks || []).filter((value) => String(value).trim());
 }
 
+const ASANA_EVIDENCE_REQUIRED_COMMENT_KINDS = new Set(["status", "result", "handoff", "completion"]);
+
+function asanaCommentHasMaterialResultSignals({ greeting, sections }) {
+  const text = [
+    greeting || "",
+    ...(sections || []).flatMap((section) => [
+      section.title || "",
+      ...(section.paragraphs || []),
+      ...(section.bullets || [])
+    ])
+  ]
+    .join("\n")
+    .normalize("NFKC")
+    .toLowerCase();
+  return /\b(?:ergebnis|abschluss|abgeschlossen|erledigt|erfolgreich|fertig|final|versendet|gesendet|veroeffentlicht|veröffentlicht|aktualisiert|importiert|erstellt|verifiziert|readback)\b/i.test(
+    text
+  );
+}
+
+function prepareAsanaEvidenceSections(commentKind, evidence, { materialResultSignals = false } = {}) {
+  const requiresEvidence = ASANA_EVIDENCE_REQUIRED_COMMENT_KINDS.has(commentKind) || materialResultSignals;
+  if (requiresEvidence && !evidence) {
+    throw new Error(
+      `asana_comment mit comment_kind=${commentKind} braucht einen Evidenzblock. Materiale Ergebnisse/Handoffs/Abschluesse duerfen nicht ohne Quellen-/Readback-Basis gepostet werden.`
+    );
+  }
+  if (!evidence) {
+    return {
+      evidence_gate_status: "not_required",
+      evidence_required_by_content: false,
+      evidence_sections: [],
+      evidence_sha256: null
+    };
+  }
+
+  const summary = String(evidence.summary || "").trim();
+  const sources = (evidence.sources || []).map((value) => String(value).trim()).filter(Boolean);
+  const verifiedClaims = (evidence.verified_claims || []).map((value) => String(value).trim()).filter(Boolean);
+  const inferences = (evidence.inferences || []).map((value) => String(value).trim()).filter(Boolean);
+  const unresolved = (evidence.unresolved || []).map((value) => String(value).trim()).filter(Boolean);
+  const noExternalFactualClaims = Boolean(evidence.no_external_factual_claims);
+
+  ensureNoUnsafeAsanaText(summary, "Asana-Evidenz-Zusammenfassung");
+  for (const source of sources) ensureNoUnsafeAsanaText(source, "Asana-Evidenz-Quelle");
+  for (const claim of verifiedClaims) ensureNoUnsafeAsanaText(claim, "Asana-verifizierter Claim");
+  for (const inference of inferences) ensureNoUnsafeAsanaText(inference, "Asana-Evidenz-Inferenz");
+  for (const gap of unresolved) ensureNoUnsafeAsanaText(gap, "Asana-Evidenzluecke");
+
+  if (!noExternalFactualClaims && sources.length === 0) {
+    throw new Error(
+      "Evidenz-Gate blockiert: Mindestens eine konkrete Quelle/ein Readback ist erforderlich oder no_external_factual_claims=true muss begruendet zutreffen."
+    );
+  }
+  if (!noExternalFactualClaims && verifiedClaims.length === 0) {
+    throw new Error("Evidenz-Gate blockiert: verified_claims muss die durch die Quellen getragenen Kernaussagen nennen.");
+  }
+  if (commentKind === "completion" && unresolved.length > 0) {
+    throw new Error(
+      "Evidenz-Gate blockiert: Ein Abschlusskommentar darf keine offenen Evidenzluecken enthalten. Erst klaeren/reparieren oder als Status/Blocker kommentieren."
+    );
+  }
+
+  const evidenceBullets = [];
+  if (noExternalFactualClaims) evidenceBullets.push("Keine externen materialen Tatsachenbehauptungen; Basis im Summary begruendet.");
+  evidenceBullets.push(...sources.map((source) => `Quelle/Readback: ${source}`));
+  evidenceBullets.push(...verifiedClaims.map((claim) => `Verifiziert: ${claim}`));
+  evidenceBullets.push(...inferences.map((inference) => `Inferenz: ${inference}`));
+
+  const evidenceSections = [
+    {
+      title: "Evidenz / Verifikation",
+      paragraphs: [summary],
+      bullets: evidenceBullets,
+      code_blocks: []
+    }
+  ];
+  if (unresolved.length > 0) {
+    evidenceSections.push({
+      title: "Offene Evidenzluecken",
+      paragraphs: [],
+      bullets: unresolved,
+      code_blocks: []
+    });
+  }
+
+  const evidenceSha256 = createHash("sha256")
+    .update(
+      JSON.stringify({
+        commentKind,
+        summary,
+        sources,
+        verifiedClaims,
+        inferences,
+        unresolved,
+        noExternalFactualClaims
+      }),
+      "utf8"
+    )
+    .digest("hex");
+
+  return {
+    evidence_gate_status: unresolved.length ? "open_gaps_visible_not_completable" : "ok",
+    evidence_required_by_content: materialResultSignals,
+    evidence_sections: evidenceSections,
+    evidence_sha256: evidenceSha256
+  };
+}
+
 function buildAsanaCommentHtml({ greeting, sections, mention_user_gid, mention_text, effort_note }) {
   validateAsanaGid(mention_user_gid, "mention_user_gid");
   if (mention_text && !mention_user_gid) {
@@ -7907,10 +8015,11 @@ function createServer() {
 
   server.tool(
     "asana_comment",
-    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback.",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock; offene Evidenzluecken blockieren Abschlusskommentare. Nur reine Fragen ohne materiale Tatsachenbehauptung duerfen ohne Evidenzblock auskommen.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
+      comment_kind: z.enum(["status", "question", "result", "handoff", "completion"]).optional().default("status"),
       greeting: z.string().optional(),
       sections: z
         .array(
@@ -7923,6 +8032,16 @@ function createServer() {
         )
         .optional()
         .default([]),
+      evidence: z
+        .object({
+          summary: z.string().min(20).max(3000),
+          sources: z.array(z.string().min(3).max(1000)).optional().default([]),
+          verified_claims: z.array(z.string().min(3).max(1000)).optional().default([]),
+          inferences: z.array(z.string().min(3).max(1000)).optional().default([]),
+          unresolved: z.array(z.string().min(3).max(1000)).optional().default([]),
+          no_external_factual_claims: z.boolean().optional().default(false)
+        })
+        .optional(),
       mention_user_gid: z.string().optional(),
       mention_text: z.string().optional(),
       effort_note: z.string().optional(),
@@ -7933,8 +8052,10 @@ function createServer() {
     async ({
       agent_id,
       task_gid,
+      comment_kind,
       greeting,
       sections,
+      evidence,
       mention_user_gid,
       mention_text,
       effort_note,
@@ -7942,14 +8063,17 @@ function createServer() {
       verify_after
     }) => {
       validateAsanaGid(task_gid, "task_gid");
+      const materialResultSignals = asanaCommentHasMaterialResultSignals({ greeting, sections });
+      const preparedEvidence = prepareAsanaEvidenceSections(comment_kind, evidence, { materialResultSignals });
+      const finalSections = [...sections, ...preparedEvidence.evidence_sections];
       const html_text = buildAsanaCommentHtml({
         greeting,
-        sections,
+        sections: finalSections,
         mention_user_gid,
         mention_text,
         effort_note
       });
-      const expectedCodeSnippets = collectAsanaCodeBlocks(sections);
+      const expectedCodeSnippets = collectAsanaCodeBlocks(finalSections);
       const html_sha256 = createHash("sha256").update(html_text, "utf8").digest("hex");
 
       if (dry_run) {
@@ -7957,6 +8081,10 @@ function createServer() {
           agent_id,
           dry_run: true,
           task_gid,
+          comment_kind,
+          evidence_gate_status: preparedEvidence.evidence_gate_status,
+          evidence_required_by_content: preparedEvidence.evidence_required_by_content,
+          evidence_sha256: preparedEvidence.evidence_sha256,
           html_text,
           html_bytes: Buffer.byteLength(html_text, "utf8"),
           html_sha256
@@ -7990,6 +8118,10 @@ function createServer() {
       return out({
         agent_id,
         task_gid,
+        comment_kind,
+        evidence_gate_status: preparedEvidence.evidence_gate_status,
+        evidence_required_by_content: preparedEvidence.evidence_required_by_content,
+        evidence_sha256: preparedEvidence.evidence_sha256,
         story: res.data.data,
         verified_story,
         verification_status,
@@ -8146,13 +8278,14 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, optional finalen Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nicht automatisch wieder hinzugefuegt, ausser allow_routine_supervisor_readd=true.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nicht automatisch wieder hinzugefuegt, ausser allow_routine_supervisor_readd=true.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
       completion_basis: z.string().min(20),
       final_comment_story_gid: z.string().optional(),
       require_final_comment: z.boolean().optional().default(true),
+      require_evidence_gate: z.boolean().optional().default(true),
       ensure_supervisor_follower: z.boolean().optional().default(true),
       allow_routine_supervisor_readd: z.boolean().optional().default(false),
       supervisor_follower_gid: z.string().optional(),
@@ -8169,6 +8302,7 @@ function createServer() {
       completion_basis,
       final_comment_story_gid,
       require_final_comment,
+      require_evidence_gate,
       ensure_supervisor_follower,
       allow_routine_supervisor_readd,
       supervisor_follower_gid,
@@ -8185,6 +8319,12 @@ function createServer() {
         throw new Error(
           "asana_complete_task braucht final_comment_story_gid, wenn require_final_comment=true ist. Poste zuerst einen Abschlusskommentar mit asana_comment."
         );
+      }
+      if (!require_final_comment) {
+        throw new Error("asana_complete_task erlaubt keinen Abschluss ohne finalen Asana-Kommentar.");
+      }
+      if (!require_evidence_gate) {
+        throw new Error("asana_complete_task erlaubt kein Deaktivieren des Evidenz-Gates.");
       }
       const finalSupervisorFollowerGid = supervisor_follower_gid || ASANA_DEFAULT_SUPERVISOR_GID;
       if (ensure_supervisor_follower) validateAsanaGid(finalSupervisorFollowerGid, "supervisor_follower_gid");
@@ -8237,6 +8377,21 @@ function createServer() {
           throw new Error("Finaler Asana-Kommentar wurde nicht vom ausfuehrenden Agenten erstellt.");
         }
         assertAsanaStoryReadbackLooksSafe(final_comment);
+        const finalCommentEvidenceText = `${final_comment.text || ""}\n${final_comment.html_text || ""}`
+          .normalize("NFKC")
+          .toLowerCase();
+        const hasEvidenceMarker = /evidenz\s*\/\s*verifikation/.test(finalCommentEvidenceText);
+        const hasOpenEvidenceGaps = /offene\s+evidenzluecken|offene\s+evidenzlücken/.test(finalCommentEvidenceText);
+        if (require_evidence_gate && !hasEvidenceMarker) {
+          throw new Error(
+            "Abschluss blockiert: Der finale Asana-Kommentar enthaelt keinen standardisierten Abschnitt Evidenz / Verifikation. Poste zuerst asana_comment mit comment_kind=completion und Evidenzblock."
+          );
+        }
+        if (require_evidence_gate && hasOpenEvidenceGaps) {
+          throw new Error(
+            "Abschluss blockiert: Der finale Asana-Kommentar enthaelt offene Evidenzluecken. Erst klaeren/reparieren oder Aufgabe offen lassen."
+          );
+        }
       }
 
       const trimmedFollowUpNotRequiredBasis = String(follow_up_not_required_basis || "").trim();
@@ -8313,6 +8468,7 @@ function createServer() {
           due_gate,
           task,
           final_comment,
+          require_evidence_gate,
           completion_basis,
           completion_basis_sha256: basis_sha256
         });
@@ -8376,6 +8532,7 @@ function createServer() {
         verified_task,
         verification_status,
         final_comment,
+        require_evidence_gate,
         follow_up_required,
         follow_up_task_gid: follow_up_task_gid || null,
         follow_up_task,

@@ -11,10 +11,13 @@ const BetriebDir = path.join(repoRoot, "VIP-AI-Memory", "03-Betrieb");
 const statePath = path.join(BetriebDir, "Watcher-State.json");
 const queuePath = path.join(BetriebDir, "Watcher-Queue.jsonl");
 const logPath = path.join(BetriebDir, "Watcher-Log.md");
+const healthPath = path.join(BetriebDir, "Watcher-Health.json");
 
 const DEFAULT_MCP_URL = "https://vip-tools-mcp.onrender.com/mcp";
 const AGENT_PREFIX = "vip-ai-";
 const LOCAL_TIME_ZONE = "Europe/Berlin";
+const WATCHER_CONNECT_TIMEOUT_MS = Number.parseInt(process.env.WATCHER_CONNECT_TIMEOUT_MS || "20000", 10);
+const WATCHER_TOOL_TIMEOUT_MS = Number.parseInt(process.env.WATCHER_TOOL_TIMEOUT_MS || "25000", 10);
 const TASK_FIELDS = [
   "gid",
   "name",
@@ -59,7 +62,8 @@ function parseArgs(argv) {
     agents: null,
     limit: 20,
     maxSignalsPerAgent: 3,
-    lookbackHours: 72
+    lookbackHours: 72,
+    selfTest: false
   };
 
   for (const arg of argv) {
@@ -90,6 +94,8 @@ function parseArgs(argv) {
       opts.lookbackHours = parsePositiveInt(arg.slice("--lookback-hours=".length), "lookback-hours");
     } else if (arg === "--help" || arg === "-h") {
       printHelpAndExit();
+    } else if (arg === "--self-test") {
+      opts.selfTest = true;
     } else {
       throw new Error(`Unbekanntes Argument: ${arg}`);
     }
@@ -159,6 +165,20 @@ function safeArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+async function withTimeout(promise, timeoutMs, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs} ms`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function readJsonOrDefault(filePath, fallback) {
   try {
     const raw = await fs.readFile(filePath, "utf8");
@@ -170,7 +190,11 @@ async function readJsonOrDefault(filePath, fallback) {
 }
 
 async function callTool(client, name, args = {}) {
-  const result = await client.callTool({ name, arguments: args });
+  const result = await withTimeout(
+    client.callTool({ name, arguments: args }),
+    WATCHER_TOOL_TIMEOUT_MS,
+    `MCP tool ${name}`
+  );
   if (result?.isError) {
     const message = result.content?.map((item) => item.text).filter(Boolean).join("\n") || "MCP tool error";
     throw new Error(message);
@@ -474,8 +498,49 @@ function sortSignals(signals) {
   });
 }
 
+function coalesceSignalsByTask(signals) {
+  const byTask = new Map();
+  for (const signal of sortSignals(signals)) {
+    const key = `${signal.agent_id}:${signal.task_gid}`;
+    const current = byTask.get(key);
+    if (!current) {
+      byTask.set(key, {
+        ...signal,
+        related_signal_types: [signal.signal_type],
+        related_signal_ids: [signal.id],
+        coalesced_signal_count: 1
+      });
+      continue;
+    }
+    if (!current.related_signal_types.includes(signal.signal_type)) {
+      current.related_signal_types.push(signal.signal_type);
+    }
+    current.related_signal_ids.push(signal.id);
+    current.coalesced_signal_count = current.related_signal_ids.length;
+  }
+  return [...byTask.values()];
+}
+
 async function run() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.selfTest) {
+    const sample = [
+      { id: "new", agent_id: "vip-ai-test", task_gid: "1", signal_type: "new_task", priority: "medium" },
+      { id: "due", agent_id: "vip-ai-test", task_gid: "1", signal_type: "overdue", priority: "high" },
+      { id: "story", agent_id: "vip-ai-test", task_gid: "1", signal_type: "new_story", priority: "normal" },
+      { id: "other", agent_id: "vip-ai-test", task_gid: "2", signal_type: "new_task", priority: "normal" }
+    ];
+    const result = coalesceSignalsByTask(sample);
+    const taskOne = result.find((signal) => signal.task_gid === "1");
+    const passed =
+      result.length === 2 &&
+      taskOne?.signal_type === "overdue" &&
+      taskOne?.coalesced_signal_count === 3 &&
+      taskOne?.related_signal_types?.length === 3;
+    console.log(JSON.stringify({ passed, result }));
+    if (!passed) process.exitCode = 1;
+    return;
+  }
   const detectedAt = nowIso();
   const state = await readJsonOrDefault(statePath, createEmptyState());
   const client = new Client({ name: "vip-asana-watcher", version: "0.1.0" });
@@ -486,13 +551,15 @@ async function run() {
     baseline: opts.baseline,
     agents_checked: 0,
     tasks_checked: 0,
+    raw_signals_found: 0,
     signals_found: 0,
     signals_queued: 0,
     agents: {}
   };
 
-  await client.connect(transport);
   try {
+    await withTimeout(client.connect(transport), WATCHER_CONNECT_TIMEOUT_MS, "MCP connect");
+    console.error(`[watcher] connected ${opts.mcpUrl}`);
     const list = await callTool(client, "asana_list_agents");
     const agentIds = safeArray(list)
       .filter((agent) => agent?.agent_id?.startsWith(AGENT_PREFIX))
@@ -503,9 +570,11 @@ async function run() {
     const allQueuedSignals = [];
 
     for (const agentId of agentIds) {
+      console.error(`[watcher] checking ${agentId}`);
       const agentState = getAgentState(state, agentId);
       const agentSummary = {
         tasks_checked: 0,
+        raw_signals_found: 0,
         signals_found: 0,
         signals_queued: 0,
         errors: []
@@ -544,23 +613,28 @@ async function run() {
           agentSummary.tasks_checked += 1;
         }
 
-        const freshSignals = sortSignals(candidateSignals).filter((signal) => !state.emitted_signals[signal.id]);
+        const freshRawSignals = sortSignals(candidateSignals).filter((signal) => !state.emitted_signals[signal.id]);
+        const freshSignals = coalesceSignalsByTask(freshRawSignals);
         const queuedSignals = opts.baseline ? [] : freshSignals.slice(0, opts.maxSignalsPerAgent);
-        const signalsToMarkSeen = opts.baseline ? freshSignals : queuedSignals;
+        const signalIdsToMarkSeen = opts.baseline
+          ? freshRawSignals.map((signal) => signal.id)
+          : queuedSignals.flatMap((signal) => signal.related_signal_ids || [signal.id]);
 
-        for (const signal of signalsToMarkSeen) {
-          state.emitted_signals[signal.id] = detectedAt;
+        for (const signalId of signalIdsToMarkSeen) {
+          state.emitted_signals[signalId] = detectedAt;
         }
 
         for (const signal of queuedSignals) {
           allQueuedSignals.push(signal);
         }
 
+        agentSummary.raw_signals_found = freshRawSignals.length;
         agentSummary.signals_found = freshSignals.length;
         agentSummary.signals_queued = queuedSignals.length;
         agentState.last_checked_at = detectedAt;
         summary.agents_checked += 1;
         summary.tasks_checked += agentSummary.tasks_checked;
+        summary.raw_signals_found += agentSummary.raw_signals_found;
         summary.signals_found += agentSummary.signals_found;
         summary.signals_queued += agentSummary.signals_queued;
       } catch (error) {
@@ -577,6 +651,23 @@ async function run() {
         await fs.appendFile(queuePath, `${allQueuedSignals.map((signal) => JSON.stringify(signal)).join("\n")}\n`);
       }
       await fs.appendFile(logPath, renderLog(summary, allQueuedSignals));
+      await fs.writeFile(
+        healthPath,
+        `${JSON.stringify(
+          {
+            generated_at: nowIso(),
+            status: "ok",
+            detected_at: detectedAt,
+            agents_checked: summary.agents_checked,
+            tasks_checked: summary.tasks_checked,
+            raw_signals_found: summary.raw_signals_found,
+            signals_found: summary.signals_found,
+            signals_queued: summary.signals_queued
+          },
+          null,
+          2
+        )}\n`
+      );
     }
 
     console.log(JSON.stringify({ summary, queued_signals: allQueuedSignals }, null, 2));
@@ -592,12 +683,15 @@ function renderLog(summary, signals) {
     `- mode: ${summary.mode}${summary.baseline ? " / baseline" : ""}`,
     `- agents_checked: ${summary.agents_checked}`,
     `- tasks_checked: ${summary.tasks_checked}`,
+    `- raw_signals_found: ${summary.raw_signals_found}`,
     `- signals_found: ${summary.signals_found}`,
     `- signals_queued: ${summary.signals_queued}`
   ];
 
   for (const [agentId, data] of Object.entries(summary.agents)) {
-    lines.push(`- ${agentId}: tasks=${data.tasks_checked}, found=${data.signals_found}, queued=${data.signals_queued}`);
+    lines.push(
+      `- ${agentId}: tasks=${data.tasks_checked}, raw=${data.raw_signals_found}, found=${data.signals_found}, queued=${data.signals_queued}`
+    );
     for (const error of data.errors.slice(0, 3)) {
       lines.push(`  - error: ${truncate(error, 220)}`);
     }
@@ -605,7 +699,10 @@ function renderLog(summary, signals) {
 
   for (const signal of signals) {
     lines.push(
-      `- queued: ${signal.agent_id} / ${signal.signal_type} / ${signal.task_gid} / ${truncate(signal.task_name, 120)}`
+      `- queued: ${signal.agent_id} / ${signal.signal_type} / ${signal.task_gid} / ${truncate(
+        signal.task_name,
+        120
+      )} / related=${(signal.related_signal_types || [signal.signal_type]).join(",")}`
     );
   }
 
@@ -613,7 +710,33 @@ function renderLog(summary, signals) {
   return `${lines.join("\n")}\n`;
 }
 
-run().catch((error) => {
+run().catch(async (error) => {
   console.error(error?.stack || error?.message || String(error));
-  process.exitCode = 1;
+  if (process.argv.includes("--write")) {
+    await fs.mkdir(BetriebDir, { recursive: true }).catch(() => {});
+    await fs
+      .writeFile(
+        healthPath,
+        `${JSON.stringify(
+          {
+            generated_at: nowIso(),
+            status: "failed",
+            error: error?.message || String(error)
+          },
+          null,
+          2
+        )}\n`
+      )
+      .catch(() => {});
+    await fs
+      .appendFile(
+        logPath,
+        `\n## ${nowIso()} - Asana Watcher Technical Failure\n\n- status: failed\n- error: ${truncate(
+          error?.message || String(error),
+          500
+        )}\n\n`
+      )
+      .catch(() => {});
+  }
+  process.exit(1);
 });

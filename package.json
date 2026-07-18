@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "postinstall": "puppeteer browsers install chrome",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node scripts/asana-watcher.mjs --self-test",
+    "test:evidence-gate": "node scripts/evidence-gate-selftest.mjs"
   },
   "keywords": [],
   "author": "",
