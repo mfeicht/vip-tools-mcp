@@ -4955,10 +4955,14 @@ function normalizeAccountingKnownFile(file) {
 
 function compareAccountingDriveMetadata(previous, current) {
   const fields = ["folder_id", "name", "mimeType", "size", "md5Checksum", "modifiedTime", "vip_sha256"];
+  const optionalSnapshotFields = new Set(["mimeType", "size", "md5Checksum", "vip_sha256"]);
   const changed_fields = [];
   for (const field of fields) {
     const beforeValue = previous[field] ?? null;
     const afterValue = current[field] ?? null;
+    if (optionalSnapshotFields.has(field) && !beforeValue) {
+      continue;
+    }
     if (beforeValue !== afterValue) {
       changed_fields.push({
         field,
