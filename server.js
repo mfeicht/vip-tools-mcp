@@ -12,6 +12,8 @@ import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 
+import { selectImapUidWindow, sortImapMessagesByUidWindow } from "./lib/imap-window.js";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
@@ -266,6 +268,8 @@ const ASANA_TASK_CREATE_VERIFY_OPT_FIELDS =
   "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,tags.gid,tags.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name,custom_fields.gid,custom_fields.name,custom_fields.enum_value.gid,custom_fields.enum_value.name";
 const ASANA_TASK_DESCRIPTION_OPT_FIELDS =
   "gid,name,completed,notes,html_notes,permalink_url,tags.gid,tags.name,assignee.gid,assignee.name,memberships.project.gid,memberships.project.name";
+const ASANA_TASK_SECTION_OPT_FIELDS =
+  "gid,name,completed,assignee.gid,assignee.name,permalink_url,workspace.gid,memberships.project.gid,memberships.project.name,memberships.section.gid,memberships.section.name";
 const ASANA_DEFAULT_SUPERVISOR_GID =
   process.env.ASANA_DEFAULT_SUPERVISOR_GID || "1108801330389276";
 const ASANA_PROJECT_OPT_FIELDS = "gid,name,workspace.gid,permalink_url";
@@ -3208,7 +3212,7 @@ async function readImapUntil(socket, state, matcher, label) {
   });
 }
 
-async function runImapReadUnseen(config, { limit, includeSnippets, snippetChars }) {
+async function runImapReadUnseen(config, { limit, offset, order, includeSnippets, snippetChars }) {
   const socket = await openImapSocket(config);
   socket.setEncoding("utf8");
   const state = { buffer: "" };
@@ -3263,7 +3267,7 @@ async function runImapReadUnseen(config, { limit, includeSnippets, snippetChars 
       .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
     const uidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
     const uids = uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
-    const selectedUids = uids.slice(0, limit);
+    const selectedUids = selectImapUidWindow(uids, { limit, offset, order });
     let messages = [];
 
     if (selectedUids.length) {
@@ -3283,12 +3287,16 @@ async function runImapReadUnseen(config, { limit, includeSnippets, snippetChars 
           preview: includeSnippets ? cleanImapPreview(segment, snippetChars) : undefined
         };
       });
+      messages = sortImapMessagesByUidWindow(messages, selectedUids);
     }
 
     await command("LOGOUT").catch(() => {});
     if (!socket.destroyed) socket.destroy();
     return {
       unseen_count: uids.length,
+      order,
+      offset,
+      selected_uids: selectedUids,
       returned_count: messages.length,
       messages
     };
@@ -8914,6 +8922,8 @@ function createServer() {
       expected_name_exact: z.string().optional(),
       expect_routine_tag: z.boolean().optional().default(true),
       allow_routine_supervisor_do_not_readd: z.boolean().optional().default(true),
+      recheck_on_zero: z.boolean().optional().default(true),
+      recheck_delay_ms: z.number().int().min(0).max(5000).optional().default(1500),
       limit: z.number().int().min(1).max(100).optional().default(100)
     },
     TOOL_READ_ONLY,
@@ -8931,6 +8941,8 @@ function createServer() {
       expected_name_exact,
       expect_routine_tag,
       allow_routine_supervisor_do_not_readd,
+      recheck_on_zero,
+      recheck_delay_ms,
       limit
     }) => {
       validateAsanaGid(source_task_gid, "source_task_gid");
@@ -8956,50 +8968,75 @@ function createServer() {
         throw new Error("Kein Projekt aus source_task ableitbar. expected_project_gid setzen.");
       }
       const expectedName = expected_name_exact || source_task.name;
-      const expectedAssignee = expected_assignee_gid || source_task.assignee?.gid;
+      const sourceAssignee = source_task.assignee?.gid;
+      const requestedExpectedAssignee = expected_assignee_gid || null;
+      const expectedAssignee = sourceAssignee || requestedExpectedAssignee;
+      const expectedAssigneeMismatchCorrected = Boolean(
+        sourceAssignee && requestedExpectedAssignee && sourceAssignee !== requestedExpectedAssignee
+      );
 
-      const tasksRes = await asanaRequestWithRetry(asana, {
-        method: "GET",
-        url: `/projects/${selectedProjectGid}/tasks`,
-        params: {
-          completed_since: "now",
-          limit,
-          opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
-        }
-      });
-      let search_fallback_used = false;
-      let search_fallback_count = 0;
-      let candidates = (tasksRes.data.data || []).filter((task) => {
-        if (task.gid === source_task_gid) return false;
-        if (String(task.name || "") !== String(expectedName || "")) return false;
-        if (expectedAssignee && task.assignee?.gid !== expectedAssignee) return false;
-        return true;
-      });
-      if (candidates.length === 0) {
-        const workspaceGid = source_task.workspace?.gid;
-        if (workspaceGid) {
-          const searchRes = await asanaRequestWithRetry(asana, {
-            method: "GET",
-            url: `/workspaces/${workspaceGid}/tasks/search`,
-            params: {
-              completed: false,
-              limit,
-              text: expectedName,
-              opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
+      const searchCandidates = async () => {
+        const tasksRes = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/projects/${selectedProjectGid}/tasks`,
+          params: {
+            completed_since: "now",
+            limit,
+            opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
+          }
+        });
+        let search_fallback_used = false;
+        let search_fallback_count = 0;
+        let search_fallback_error = null;
+        let candidates = (tasksRes.data.data || []).filter((task) => {
+          if (task.gid === source_task_gid) return false;
+          if (String(task.name || "") !== String(expectedName || "")) return false;
+          if (expectedAssignee && task.assignee?.gid !== expectedAssignee) return false;
+          return true;
+        });
+        if (candidates.length === 0) {
+          const workspaceGid = source_task.workspace?.gid;
+          if (workspaceGid) {
+            try {
+              const searchRes = await asanaRequestWithRetry(asana, {
+                method: "GET",
+                url: `/workspaces/${workspaceGid}/tasks/search`,
+                params: {
+                  completed: false,
+                  limit,
+                  text: expectedName,
+                  opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
+                }
+              });
+              search_fallback_used = true;
+              candidates = (searchRes.data.data || []).filter((task) => {
+                if (task.gid === source_task_gid) return false;
+                if (String(task.name || "") !== String(expectedName || "")) return false;
+                if (expectedAssignee && task.assignee?.gid !== expectedAssignee) return false;
+                const taskProjectGids = getAsanaTaskProjectGids(task);
+                if (!taskProjectGids.includes(selectedProjectGid)) return false;
+                return true;
+              });
+              search_fallback_count = candidates.length;
+            } catch (error) {
+              search_fallback_used = true;
+              search_fallback_error = String(error?.message || error);
             }
-          });
-          search_fallback_used = true;
-          candidates = (searchRes.data.data || []).filter((task) => {
-            if (task.gid === source_task_gid) return false;
-            if (String(task.name || "") !== String(expectedName || "")) return false;
-            if (expectedAssignee && task.assignee?.gid !== expectedAssignee) return false;
-            const taskProjectGids = getAsanaTaskProjectGids(task);
-            if (!taskProjectGids.includes(selectedProjectGid)) return false;
-            return true;
-          });
-          search_fallback_count = candidates.length;
+          }
         }
+        return { candidates, search_fallback_used, search_fallback_count, search_fallback_error };
+      };
+
+      let searchAttemptCount = 1;
+      let searchResult = await searchCandidates();
+      let recheckUsed = false;
+      if (searchResult.candidates.length === 0 && recheck_on_zero) {
+        recheckUsed = true;
+        if (recheck_delay_ms > 0) await sleep(recheck_delay_ms);
+        searchResult = await searchCandidates();
+        searchAttemptCount += 1;
       }
+      const { candidates, search_fallback_used, search_fallback_count, search_fallback_error } = searchResult;
 
       const candidate_results = candidates.map((task) => ({
         task,
@@ -9045,8 +9082,15 @@ function createServer() {
         selected_project_gid: selectedProjectGid,
         expected_name: expectedName,
         expected_assignee_gid: expectedAssignee || null,
+        requested_expected_assignee_gid: requestedExpectedAssignee,
+        source_assignee_gid: sourceAssignee || null,
+        expected_assignee_mismatch_corrected: expectedAssigneeMismatchCorrected,
+        search_attempt_count: searchAttemptCount,
+        recheck_used: recheckUsed,
+        recheck_delay_ms: recheckUsed ? recheck_delay_ms : 0,
         search_fallback_used,
         search_fallback_count,
+        search_fallback_error,
         candidate_count: candidates.length,
         exact_match_count: exactMatches.length,
         acceptable_match_count: acceptableMatches.length,
@@ -9602,6 +9646,142 @@ function createServer() {
         remove_results,
         skipped_already_present: addTags.filter((tagGid) => currentTagGids.has(tagGid)),
         skipped_not_present: removeTags.filter((tagGid) => !currentTagGids.has(tagGid)),
+        verified_task,
+        verification_status
+      });
+    }
+  );
+
+  server.tool(
+    "asana_normalize_open_task_section",
+    "Verschiebt eine offene Asana-Aufgabe idempotent in einen eindeutig benannten aktiven Projektabschnitt und verifiziert den Abschnitt per Readback. Fuer eigene Aufgaben ohne Zusatzfreigabe; projektuebergreifende Operations-Reparaturen brauchen einen verifizierten Asana- oder direkten Moritz-Auftrag.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      expected_project_gid: z.string().optional(),
+      target_section_name: z.string().min(2).max(200).optional().default("Zu erledigen"),
+      authorization_task_gid: z.string().optional(),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      authorization: actionAuthorizationSchema.optional(),
+      dry_run: z.boolean().optional().default(false),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({
+      agent_id,
+      task_gid,
+      expected_project_gid,
+      target_section_name,
+      authorization_task_gid,
+      confirmed_by_asana,
+      authorization,
+      dry_run,
+      verify_after
+    }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      validateAsanaGid(expected_project_gid, "expected_project_gid");
+      validateAsanaGid(authorization_task_gid, "authorization_task_gid");
+
+      const asana = getAsana(agent_id);
+      const [beforeRes, meRes] = await Promise.all([
+        asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${task_gid}`,
+          params: { opt_fields: ASANA_TASK_SECTION_OPT_FIELDS }
+        }),
+        asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" })
+      ]);
+      const before_task = beforeRes.data.data;
+      const me = meRes.data.data;
+      if (before_task.completed) {
+        throw new Error("Nur offene Aufgaben duerfen in den aktiven Projektabschnitt normalisiert werden.");
+      }
+
+      const projectGids = getAsanaTaskProjectGids(before_task);
+      const selectedProjectGid = expected_project_gid || projectGids[0];
+      if (!selectedProjectGid || !projectGids.includes(selectedProjectGid)) {
+        throw new Error("Aufgabe gehoert nicht zum erwarteten Projekt; Abschnitts-Normalisierung abgebrochen.");
+      }
+
+      let authorization_receipt = null;
+      const ownTask = String(before_task.assignee?.gid || "") === String(me.gid || "");
+      if (!dry_run && !ownTask) {
+        authorization_receipt = await assertActionAuthorized({
+          agentId: agent_id,
+          authorization,
+          confirmedByAsana: confirmed_by_asana,
+          asanaTaskGid: authorization_task_gid || task_gid,
+          actionName: "asana_normalize_open_task_section"
+        });
+      }
+
+      const sectionsRes = await asanaRequestWithRetry(asana, {
+        method: "GET",
+        url: `/projects/${selectedProjectGid}/sections`,
+        params: { limit: 100, opt_fields: "gid,name,project.gid" }
+      });
+      const normalizedTargetName = normalizeAsanaLabel(target_section_name);
+      const matchingSections = (sectionsRes.data.data || []).filter(
+        (section) => normalizeAsanaLabel(section.name) === normalizedTargetName
+      );
+      if (matchingSections.length !== 1) {
+        throw new Error(
+          `Zielabschnitt ${target_section_name} ist im Projekt nicht eindeutig (${matchingSections.length} Treffer).`
+        );
+      }
+      const targetSection = matchingSections[0];
+      const beforeMembership = (before_task.memberships || []).find(
+        (membership) => membership?.project?.gid === selectedProjectGid
+      );
+      const alreadyInTarget = beforeMembership?.section?.gid === targetSection.gid;
+
+      if (dry_run || alreadyInTarget) {
+        return out({
+          agent_id,
+          task_gid,
+          dry_run,
+          no_change: alreadyInTarget,
+          own_task: ownTask,
+          selected_project_gid: selectedProjectGid,
+          target_section: targetSection,
+          before_task,
+          verification_status: alreadyInTarget ? "ok" : "not_run"
+        });
+      }
+
+      await asanaRequestWithRetry(asana, {
+        method: "POST",
+        url: `/sections/${targetSection.gid}/addTask`,
+        timeout: ASANA_WRITE_TIMEOUT_MS,
+        data: { data: { task: task_gid } }
+      });
+
+      let verified_task = null;
+      let verification_status = "not_requested";
+      if (verify_after) {
+        const verifyRes = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${task_gid}`,
+          params: { opt_fields: ASANA_TASK_SECTION_OPT_FIELDS }
+        });
+        verified_task = verifyRes.data.data;
+        const verifiedMembership = (verified_task.memberships || []).find(
+          (membership) => membership?.project?.gid === selectedProjectGid
+        );
+        if (verifiedMembership?.section?.gid !== targetSection.gid) {
+          throw new Error("Asana-Readback zeigt die Aufgabe nicht im erwarteten Zielabschnitt.");
+        }
+        verification_status = "ok";
+      }
+
+      return out({
+        agent_id,
+        task_gid,
+        authorization: authorization_receipt,
+        own_task: ownTask,
+        selected_project_gid: selectedProjectGid,
+        target_section: targetSection,
+        before_task,
         verified_task,
         verification_status
       });
@@ -13917,14 +14097,18 @@ function createServer() {
     {
       agent_id: agentIdSchema,
       limit: z.number().int().min(0).max(25).optional().default(10),
+      offset: z.number().int().min(0).max(10000).optional().default(0),
+      order: z.enum(["newest_first", "oldest_first"]).optional().default("newest_first"),
       include_snippets: z.boolean().optional().default(false),
       snippet_chars: z.number().int().min(100).max(1200).optional().default(500)
     },
     TOOL_EXTERNAL_READ,
-    async ({ agent_id, limit, include_snippets, snippet_chars }) => {
+    async ({ agent_id, limit, offset, order, include_snippets, snippet_chars }) => {
       const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
       const result = await readUnseenEmailWithFallback(configs, {
         limit,
+        offset,
+        order,
         includeSnippets: include_snippets,
         snippetChars: snippet_chars
       });
@@ -13939,6 +14123,9 @@ function createServer() {
           label: result.label
         },
         unseen_count: result.unseen_count,
+        order: result.order,
+        offset: result.offset,
+        selected_uids: result.selected_uids,
         returned_count: result.returned_count,
         messages: result.messages,
         imap_attempts: result.attempts

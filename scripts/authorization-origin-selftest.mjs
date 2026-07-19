@@ -36,6 +36,7 @@ try {
     "asana_update_task_description",
     "asana_update_task_tags",
     "asana_update_task_recurrence",
+    "asana_normalize_open_task_section",
     "asana_attachment_copy_to_drive",
     "accounting_mail_scan_upload_attachment",
     "accounting_email_archive_processed",

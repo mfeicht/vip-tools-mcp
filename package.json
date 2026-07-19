@@ -7,7 +7,8 @@
     "postinstall": "puppeteer browsers install chrome",
     "test": "node scripts/asana-watcher.mjs --self-test",
     "test:evidence-gate": "node scripts/evidence-gate-selftest.mjs",
-    "test:authorization-origin": "node scripts/authorization-origin-selftest.mjs"
+    "test:authorization-origin": "node scripts/authorization-origin-selftest.mjs",
+    "test:imap-window": "node scripts/imap-window-selftest.mjs"
   },
   "keywords": [],
   "author": "",
