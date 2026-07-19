@@ -10060,6 +10060,7 @@ function createServer() {
         agent_id,
         task_gid: task_gid || attachment.parent?.gid || null,
         attachment,
+        signed_download_url: attachment.download_url || null,
         downloaded: true,
         content_type,
         content_length_header,
@@ -10068,14 +10069,14 @@ function createServer() {
         text_preview: textPreview,
         content_base64: include_base64 ? bytes.toString("base64") : undefined,
         save_hint:
-          "Base64-Inhalt in AGENT_WORKSPACE/temp speichern und danach mit passendem Dokument-/Tabellen-/PDF-Tool auswerten."
+          "Datei in AGENT_WORKSPACE/temp speichern, Dateityp und sha256 pruefen und danach mit passendem visuellen/Dokument-/Tabellen-/PDF-Tool wirklich auswerten. Wenn signed_download_url vorhanden ist, darf sie als temporaerer Direktdownload genutzt werden."
       });
     }
   );
 
   server.tool(
     "asana_attachment_fetch_chunked",
-    "Liest Asana-Anhaenge read-only in kleinen Base64-Chunks, damit Tool-Output-Limits den Inhalt nicht kuerzen. Standard fuer Screenshots, PDFs, ZIPs oder andere binaere Anhaenge, wenn asana_attachment_fetch zu gross ist.",
+    "Liest Asana-Anhaenge read-only mit signierter Download-URL, SHA256 und kleinen Base64-Chunks. Fuer Screenshots/Bilder bevorzugt die signierte URL lokal in AGENT_WORKSPACE/temp speichern, Typ/Hash pruefen und visuell auswerten; Chunk-Rekonstruktion ist der Fallback.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string().optional(),
@@ -10163,6 +10164,7 @@ function createServer() {
         agent_id,
         task_gid: task_gid || attachment.parent?.gid || null,
         attachment,
+        signed_download_url: attachment.download_url || null,
         downloaded: true,
         content_type,
         content_length_header,
@@ -10178,8 +10180,10 @@ function createServer() {
         next_chunk_index: chunk_index + 1 < totalChunks ? chunk_index + 1 : null,
         content_base64_chunk: chunk.toString("base64"),
         text_preview: textPreview,
+        preferred_visual_workflow:
+          "signed_download_url temporaer nach AGENT_WORKSPACE/temp laden, Dateityp und sha256 pruefen und die Datei danach mit einem visuellen Tool in hoher/originaler Detailstufe oeffnen. Datei-Beschaffung allein ist noch keine Inhaltsauswertung.",
         reconstruct_hint:
-          "Alle content_base64_chunk-Werte in Reihenfolge chunk_index konkatenieren und base64-dekodieren; sha256 gegen den Gesamtwert pruefen."
+          "Nur wenn der signierte Direktdownload scheitert: alle content_base64_chunk-Werte in Reihenfolge chunk_index konkatenieren, einmal base64-dekodieren und sha256 gegen den Gesamtwert pruefen."
       });
     }
   );
