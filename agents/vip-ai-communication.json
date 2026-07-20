@@ -1,0 +1,21 @@
+{
+  "agentId": "vip-ai-communication",
+  "name": "VIP AI-Communication",
+  "asanaTokenEnv": "ASANA_TOKEN_VIP_AI_COMMUNICATION",
+  "asana": {
+    "mode": "assigned_to_me"
+  },
+  "email": {
+    "address": "communication-agent@vip-studios.de",
+    "mode": "central_action_folder_owner"
+  },
+  "permissions": {
+    "asanaReadMyTasks": true,
+    "asanaReadTaskDetails": true,
+    "asanaAddComments": true,
+    "asanaCompleteTasks": true,
+    "asanaGenericRequest": true,
+    "emailReadActionFolders": true,
+    "emailSendTemplateReplies": true
+  }
+}

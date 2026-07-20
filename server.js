@@ -7,7 +7,7 @@ import path from "path";
 import { Readable } from "stream";
 import { execFile } from "child_process";
 import { createHash, createHmac, createSign, randomUUID, timingSafeEqual } from "crypto";
-import { existsSync, readdirSync } from "fs";
+import { existsSync, readdirSync, readFileSync } from "fs";
 import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
@@ -129,6 +129,13 @@ const EMAIL_DRAFT_TTL_MS = Number(process.env.EMAIL_DRAFT_TTL_MS || 60 * 60 * 10
 const SMTP_TIMEOUT_MS = Number(process.env.SMTP_TIMEOUT_MS || 15_000);
 const EMAIL_HTTP_TIMEOUT_MS = Number(process.env.EMAIL_HTTP_TIMEOUT_MS || 20_000);
 const IMAP_TIMEOUT_MS = Number(process.env.IMAP_TIMEOUT_MS || 15_000);
+const EMAIL_ACTION_CONFIG_URL = new URL("./email-actions/vip-ai-communication.actions.json", import.meta.url);
+const EMAIL_ACTION_CONTROL_AGENT_ID = "vip-ai-communication";
+const EMAIL_ACTION_MAX_EMAIL_BYTES = Number(process.env.EMAIL_ACTION_MAX_EMAIL_BYTES || 4 * 1024 * 1024);
+const EMAIL_ACTION_MAX_SCAN_MESSAGES = Number(process.env.EMAIL_ACTION_MAX_SCAN_MESSAGES || 100);
+const EMAIL_ACTION_IDEMPOTENCY_CACHE_TTL_MS = Number(
+  process.env.EMAIL_ACTION_IDEMPOTENCY_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000
+);
 const DATAFORSEO_API_BASE = (process.env.DATAFORSEO_API_BASE || "https://api.dataforseo.com/v3").replace(/\/$/, "");
 const DATAFORSEO_TIMEOUT_MS = Number(process.env.DATAFORSEO_TIMEOUT_MS || 30_000);
 const DATAFORSEO_DEFAULT_LOCATION_CODE = Number(process.env.DATAFORSEO_DEFAULT_LOCATION_CODE || 2276);
@@ -349,6 +356,7 @@ let googleTokenCache = { accessToken: null, expiresAt: 0 };
 let googleSeoTokenCache = { accessToken: null, expiresAt: 0, envPrefix: null };
 let googleAdsTokenCache = { accessToken: null, expiresAt: 0, envPrefix: null };
 const emailDraftCache = new Map();
+const emailActionIdempotencyCache = new Map();
 const intakeRateLimitCache = new Map();
 
 function getAsana(agentId = DEFAULT_AGENT_ID) {
@@ -5679,6 +5687,929 @@ async function sendSmtpEmail(configs, { to, subject, body }) {
     if (!socket.destroyed) socket.destroy();
     throw error;
   }
+}
+
+async function sendSmtpRawEmail(configs, { envelopeFrom, to, rawMessage }) {
+  const { socket, readResponse, config, attempts } = await openAuthenticatedSmtpSessionWithFallback(configs);
+
+  try {
+    writeSmtp(socket, `MAIL FROM:<${envelopeFrom || config.fromAddress}>`);
+    await expectSmtp(readResponse, [250], "mail from");
+    for (const recipient of to) {
+      writeSmtp(socket, `RCPT TO:<${recipient}>`);
+      await expectSmtp(readResponse, [250, 251], `rcpt to ${recipient}`);
+    }
+    writeSmtp(socket, "DATA");
+    await expectSmtp(readResponse, [354], "data");
+    socket.write(`${dotStuff(rawMessage)}\r\n.\r\n`);
+    const dataResponse = await expectSmtp(readResponse, [250], "send raw data");
+    await closeSmtpSession(socket, readResponse);
+    return {
+      ...publicSmtpSessionResult(config, attempts),
+      smtp_response_code: dataResponse.code,
+      smtp_response_preview: cleanImapPreview(dataResponse.text, 300)
+    };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+function normalizeActionSlug(value) {
+  const slug = String(value || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{1,100}$/.test(slug)) {
+    throw new Error(`Ungueltige E-Mail-Action-ID: ${value}`);
+  }
+  return slug;
+}
+
+function sanitizeHeaderLineValue(value, label) {
+  const text = String(value || "").trim();
+  if (!text) throw new Error(`${label} darf nicht leer sein.`);
+  if (/[\r\n]/.test(text)) throw new Error(`${label} enthaelt unzulaessige Zeilenumbrueche.`);
+  return text;
+}
+
+function extractEmailAddresses(value) {
+  return uniqueValues(
+    Array.from(String(value || "").matchAll(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)).map((match) =>
+      match[0].toLowerCase()
+    )
+  );
+}
+
+function extractSingleVerifiedReplyRecipient(headers) {
+  const replyTo = extractEmailAddresses(headers["reply-to"] || "");
+  if (replyTo.length > 1) {
+    throw new Error("Reply-To enthaelt mehrere Empfaenger; automatische Antwort blockiert.");
+  }
+  if (replyTo.length === 1) {
+    return { email: replyTo[0], source: "reply-to" };
+  }
+
+  const from = extractEmailAddresses(headers.from || "");
+  if (from.length !== 1) {
+    throw new Error("From enthaelt keine eindeutig verifizierbare einzelne Empfaengeradresse.");
+  }
+  return { email: from[0], source: "from" };
+}
+
+function parseTemplateActionSubject(subject) {
+  const decoded = decodeMimeHeaderValue(subject || "").trim();
+  if (!/^VORLAGE\s*\|/i.test(decoded)) return null;
+  const fields = {};
+  for (const segment of decoded.split("|").slice(1)) {
+    const index = segment.indexOf("=");
+    if (index <= 0) continue;
+    const key = segment.slice(0, index).trim().toUpperCase();
+    const value = segment.slice(index + 1).trim();
+    fields[key] = value;
+  }
+  if (!fields.ACTION || !fields.FROM) {
+    throw new Error("Vorlagen-Betreff braucht ACTION=<slug> und FROM=<absenderadresse>.");
+  }
+  return {
+    action_id: normalizeActionSlug(fields.ACTION),
+    from: extractEmailAddress(fields.FROM),
+    raw_subject: decoded
+  };
+}
+
+function loadEmailActionDefinitions() {
+  if (!existsSync(EMAIL_ACTION_CONFIG_URL)) {
+    return {
+      version: 0,
+      owner_agent_id: EMAIL_ACTION_CONTROL_AGENT_ID,
+      action_mailbox_root: "VIP AI/Aktionen",
+      done_mailbox_root: "VIP AI/Erledigt",
+      error_mailbox_root: "VIP AI/Fehler",
+      actions: []
+    };
+  }
+
+  const parsed = JSON.parse(readFileSync(EMAIL_ACTION_CONFIG_URL, "utf8"));
+  const actionRoot = String(parsed.action_mailbox_root || "VIP AI/Aktionen").replace(/\/+$/, "");
+  const doneRoot = String(parsed.done_mailbox_root || "VIP AI/Erledigt").replace(/\/+$/, "");
+  const errorRoot = String(parsed.error_mailbox_root || "VIP AI/Fehler").replace(/\/+$/, "");
+  const actions = (Array.isArray(parsed.actions) ? parsed.actions : []).map((action) => {
+    const actionId = normalizeActionSlug(action.id);
+    const mailbox = String(action.mailbox || `${actionRoot}/${actionId}`).trim();
+    const doneMailbox = String(action.done_mailbox || `${doneRoot}/${actionId}`).trim();
+    const errorMailbox = String(action.error_mailbox || `${errorRoot}/${actionId}`).trim();
+    const from = extractEmailAddress(action.from || "");
+    if (action.from && !from) throw new Error(`Action ${actionId} hat eine ungueltige from-Adresse.`);
+    if (action.send_agent_id && !ASANA_TOKEN_ENVS[action.send_agent_id]) {
+      throw new Error(`Action ${actionId} verweist auf unbekannte send_agent_id ${action.send_agent_id}.`);
+    }
+    return {
+      id: actionId,
+      label: String(action.label || actionId),
+      mailbox,
+      done_mailbox: doneMailbox,
+      error_mailbox: errorMailbox,
+      from: from || "",
+      send_agent_id: action.send_agent_id || "",
+      enabled: action.enabled !== false,
+      live_enabled: action.live_enabled === true,
+      template: {
+        uid: action.template?.uid ? String(action.template.uid) : "",
+        message_id: action.template?.message_id ? String(action.template.message_id).trim() : "",
+        sha256: action.template?.sha256 ? String(action.template.sha256).trim().toLowerCase() : ""
+      },
+      required_placeholders: Array.isArray(action.required_placeholders)
+        ? action.required_placeholders.map((item) => String(item).trim().toUpperCase()).filter(Boolean)
+        : [],
+      name_placeholder_mode: String(action.name_placeholder_mode || "disabled"),
+      notes: action.notes || ""
+    };
+  });
+
+  const seen = new Set();
+  for (const action of actions) {
+    if (seen.has(action.id)) throw new Error(`Doppelte E-Mail-Action-ID in Konfiguration: ${action.id}`);
+    seen.add(action.id);
+  }
+
+  return {
+    version: Number(parsed.version || 1),
+    owner_agent_id: parsed.owner_agent_id || EMAIL_ACTION_CONTROL_AGENT_ID,
+    action_mailbox_root: actionRoot,
+    done_mailbox_root: doneRoot,
+    error_mailbox_root: errorRoot,
+    actions
+  };
+}
+
+function getEmailActionDefinition(actionId) {
+  const config = loadEmailActionDefinitions();
+  const normalized = normalizeActionSlug(actionId);
+  const action = config.actions.find((item) => item.id === normalized);
+  if (!action) {
+    throw new Error(`E-Mail-Action nicht konfiguriert: ${normalized}. Neue Aktionen muessen in email-actions/*.json versioniert werden.`);
+  }
+  return { config, action };
+}
+
+function findAgentIdForEmailAddress(address) {
+  const normalized = extractEmailAddress(address);
+  if (!normalized) return "";
+  for (const agentId of Object.keys(AGENT_EMAIL_DEFAULTS)) {
+    const suffix = envSuffixForAgent(agentId);
+    const configured = process.env[`EMAIL_ADDRESS_${suffix}`] || AGENT_EMAIL_DEFAULTS[agentId];
+    if (extractEmailAddress(configured) === normalized) return agentId;
+  }
+  return "";
+}
+
+function resolveEmailActionSendAccount(action, templateFrom) {
+  const expectedFrom = extractEmailAddress(action.from || templateFrom);
+  if (!expectedFrom) throw new Error(`Action ${action.id}: FROM fehlt oder ist ungueltig.`);
+  const templateFromEmail = extractEmailAddress(templateFrom);
+  if (templateFromEmail && templateFromEmail !== expectedFrom) {
+    throw new Error(`Action ${action.id}: Vorlage FROM=${templateFromEmail} passt nicht zur Action-Konfiguration ${expectedFrom}.`);
+  }
+
+  const sendAgentId = action.send_agent_id || findAgentIdForEmailAddress(expectedFrom);
+  if (!sendAgentId) {
+    throw new Error(`Action ${action.id}: Kein konfiguriertes Agenten-Sendekonto fuer ${expectedFrom} gefunden.`);
+  }
+  const smtpDetails = getSmtpConfigDetails(sendAgentId);
+  const httpDetails = getEmailHttpConfigDetails(sendAgentId, { requireCredentials: false });
+  const configuredFrom = extractEmailAddress(smtpDetails.config.fromAddress || httpDetails.config.fromAddress);
+  if (configuredFrom !== expectedFrom) {
+    throw new Error(
+      `Action ${action.id}: send_agent_id ${sendAgentId} sendet als ${configuredFrom || "unbekannt"}, erwartet ${expectedFrom}.`
+    );
+  }
+
+  return {
+    send_agent_id: sendAgentId,
+    from: expectedFrom,
+    smtp_ready_for_send: smtpDetails.summary.ready_for_send,
+    smtp_summary: smtpDetails.summary,
+    email_http_provider: httpDetails.summary.email_http_provider,
+    email_http_ready_for_send: httpDetails.summary.email_http_ready_for_send,
+    raw_mime_transport: "smtp",
+    raw_mime_transport_ready: smtpDetails.summary.ready_for_send,
+    raw_mime_note:
+      "Vorlagenantworten mit vollstaendigem MIME/CID-Erhalt werden ueber SMTP-Raw-MIME versendet; HTTP-Provider werden nur berichtet, nicht fuer Raw-MIME-Liveversand genutzt."
+  };
+}
+
+function publicEmailAction(action) {
+  let sendAccount = null;
+  let sendAccountError = null;
+  try {
+    sendAccount = action.from ? resolveEmailActionSendAccount(action, action.from) : null;
+  } catch (error) {
+    sendAccountError = String(error?.message || error);
+  }
+  return {
+    id: action.id,
+    label: action.label,
+    mailbox: action.mailbox,
+    done_mailbox: action.done_mailbox,
+    error_mailbox: action.error_mailbox,
+    enabled: action.enabled,
+    live_enabled: action.live_enabled,
+    from: action.from || null,
+    send_agent_id: action.send_agent_id || sendAccount?.send_agent_id || null,
+    template_registered: Boolean(action.template.uid && action.template.message_id && action.template.sha256),
+    template_uid: action.template.uid || null,
+    template_message_id_hash: action.template.message_id
+      ? createHash("sha256").update(action.template.message_id).digest("hex")
+      : null,
+    template_sha256: action.template.sha256 || null,
+    raw_mime_transport_ready: sendAccount?.raw_mime_transport_ready ?? null,
+    send_account_error: sendAccountError
+  };
+}
+
+function parseImapFlagsFromFetchResponse(response) {
+  const match = /\bFLAGS\s+\(([^)]*)\)/i.exec(String(response || ""));
+  if (!match) return [];
+  return match[1].split(/\s+/).map((flag) => flag.trim()).filter(Boolean);
+}
+
+function hasImapFlag(flags, flag) {
+  return (flags || []).some((item) => item.toLowerCase() === String(flag || "").toLowerCase());
+}
+
+async function runImapActionFolderScan(config, { mailbox, maxEmailBytes, maxScanMessages }) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("binary");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    const listResponse = await command('LIST "" "*"');
+    const mailboxes = parseImapListMailboxes(listResponse);
+    const resolvedMailbox = mailboxes.find((item) => item.toLowerCase() === mailbox.toLowerCase());
+    if (!resolvedMailbox) {
+      throw new Error(`Aktionsordner ${mailbox} existiert nicht. Verfuegbar: ${mailboxes.join(", ") || "keine"}`);
+    }
+    await command(`EXAMINE ${quoteImapString(resolvedMailbox)}`);
+    const searchResponse = await command("UID SEARCH ALL");
+    const searchLine = searchResponse
+      .split(/\r?\n/)
+      .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
+    const uidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
+    const allUids = uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
+    const selectedUids = allUids.slice(-Math.max(1, maxScanMessages || EMAIL_ACTION_MAX_SCAN_MESSAGES));
+    const messages = [];
+
+    for (const uid of selectedUids) {
+      const fetchResponse = await command(`UID FETCH ${uid} (UID FLAGS BODY.PEEK[])`);
+      const raw = extractImapLiteral(fetchResponse);
+      const flags = parseImapFlagsFromFetchResponse(fetchResponse);
+      if (!raw) {
+        messages.push({ uid, flags, parse_error: "no_body_literal" });
+        continue;
+      }
+      const rawBytes = Buffer.byteLength(raw, "binary");
+      if (rawBytes > maxEmailBytes) {
+        messages.push({ uid, flags, parse_error: "message_too_large", raw_bytes: rawBytes });
+        continue;
+      }
+      const parsed = await parseRawEmail(raw, uid);
+      const templateSubject = parseTemplateActionSubject(parsed.subject);
+      messages.push({
+        uid,
+        flags,
+        raw,
+        raw_bytes: rawBytes,
+        raw_sha256: createHash("sha256").update(raw, "binary").digest("hex"),
+        parsed,
+        template_subject: templateSubject
+      });
+    }
+
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return {
+      mailbox: resolvedMailbox,
+      available_mailboxes: mailboxes,
+      total_uid_count: allUids.length,
+      scanned_uid_count: selectedUids.length,
+      messages
+    };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function scanEmailActionFolderWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapActionFolderScan(config, options);
+      return {
+        ...result,
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP Aktionsordner-Scan fehlgeschlagen: ${attempts
+      .map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`)
+      .join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
+}
+
+function resolveEmailActionTemplate(action, scan) {
+  const templates = scan.messages.filter((message) => message.template_subject);
+  if (templates.length !== 1) {
+    throw new Error(
+      `Action ${action.id}: Aktionsordner braucht genau eine Vorlage, gefunden: ${templates.length}.`
+    );
+  }
+  const template = templates[0];
+  if (template.template_subject.action_id !== action.id) {
+    throw new Error(
+      `Action ${action.id}: Vorlagen-ACTION ist ${template.template_subject.action_id}.`
+    );
+  }
+  const sendAccount = resolveEmailActionSendAccount(action, template.template_subject.from);
+  const registered = {
+    uid_ok: !action.template.uid || action.template.uid === String(template.uid),
+    message_id_ok: !action.template.message_id || action.template.message_id === String(template.parsed.message_id || ""),
+    sha256_ok: !action.template.sha256 || action.template.sha256 === template.raw_sha256,
+    complete: Boolean(action.template.uid && action.template.message_id && action.template.sha256)
+  };
+  return { template, sendAccount, registered };
+}
+
+function publicActionFolderMessage(message) {
+  const headers = message.parsed || {};
+  return {
+    uid: message.uid,
+    flags: message.flags || [],
+    from_email: headers.from_email || null,
+    subject: headers.subject || null,
+    date: headers.date || null,
+    message_id_hash: headers.message_id_hash || null,
+    raw_bytes: message.raw_bytes || null,
+    raw_sha256: message.raw_sha256 || null,
+    parse_error: message.parse_error || null
+  };
+}
+
+function getInboundHeadersForAction(raw) {
+  const { headersText } = splitHeaderAndBody(raw);
+  const headers = parseMimeHeaders(headersText);
+  return {
+    headers,
+    from: decodeMimeHeaderValue(headers.from || ""),
+    subject: decodeMimeHeaderValue(headers.subject || ""),
+    message_id: String(headers["message-id"] || "").trim(),
+    in_reply_to: String(headers["in-reply-to"] || "").trim(),
+    references: String(headers.references || "").trim()
+  };
+}
+
+function buildReplySubject(originalSubject) {
+  const subject = String(originalSubject || "").trim() || "(ohne Betreff)";
+  return /^re\s*:/i.test(subject) ? subject : `Re: ${subject}`;
+}
+
+function splitReferences(value) {
+  return Array.from(String(value || "").matchAll(/<[^>]+>/g)).map((match) => match[0]);
+}
+
+function buildReplyReferences(inbound) {
+  return uniqueValues([
+    ...splitReferences(inbound.references),
+    ...splitReferences(inbound.in_reply_to),
+    ...(inbound.message_id ? [inbound.message_id] : [])
+  ]).join(" ");
+}
+
+function displayNameFromAddressHeader(value) {
+  const decoded = decodeMimeHeaderValue(value || "");
+  const bracketIndex = decoded.indexOf("<");
+  const candidate = bracketIndex > 0 ? decoded.slice(0, bracketIndex) : decoded.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "");
+  return candidate.replace(/^["']|["']$/g, "").replace(/\s+/g, " ").trim();
+}
+
+function namePartsFromDisplayName(value) {
+  const parts = String(value || "")
+    .split(/\s+/)
+    .map((part) => part.replace(/[^\p{L}'-]/gu, ""))
+    .filter((part) => part.length >= 2);
+  if (!parts.length) return { firstName: "", lastName: "" };
+  return {
+    firstName: parts[0],
+    lastName: parts.length > 1 ? parts.slice(1).join(" ") : ""
+  };
+}
+
+function collectPlaceholders(value) {
+  return uniqueValues(
+    Array.from(String(value || "").matchAll(/\{\{\s*([A-Z_]+)\s*\}\}/gi)).map((match) =>
+      match[1].trim().toUpperCase()
+    )
+  );
+}
+
+function buildEmailActionPlaceholderValues({ inbound, recipientHeader, action, explicitValues = {} }) {
+  const values = {
+    URSPRUNGSBETREFF: inbound.subject || "",
+    ...Object.fromEntries(
+      Object.entries(explicitValues || {}).map(([key, value]) => [String(key).trim().toUpperCase(), String(value || "")])
+    )
+  };
+  if (action.name_placeholder_mode === "from_header") {
+    const displayName = displayNameFromAddressHeader(recipientHeader);
+    const { firstName, lastName } = namePartsFromDisplayName(displayName);
+    if (firstName) values.VORNAME = values.VORNAME || firstName;
+    if (lastName) values.NACHNAME = values.NACHNAME || lastName;
+  }
+  if (values.VORNAME && !values.ANREDE) values.ANREDE = values.VORNAME;
+  return values;
+}
+
+function applyEmailActionPlaceholders(templateRaw, entityBody, placeholderValues, action) {
+  const rawPlaceholders = collectPlaceholders(entityBody);
+  const decodedPlaceholders = uniqueValues(
+    parseMimeMessageTextParts(templateRaw).flatMap((part) => collectPlaceholders(part.text))
+  );
+  const encodedOnly = decodedPlaceholders.filter((name) => !rawPlaceholders.includes(name));
+  if (encodedOnly.length) {
+    throw new Error(
+      `Vorlage enthaelt Platzhalter in kodierten MIME-Parts (${encodedOnly.join(", ")}); sichere Raw-Ersetzung ist blockiert.`
+    );
+  }
+
+  const allowed = new Set(["ANREDE", "VORNAME", "NACHNAME", "URSPRUNGSBETREFF"]);
+  const required = new Set([...(action.required_placeholders || []), ...rawPlaceholders]);
+  const missing = [];
+  for (const name of required) {
+    if (!allowed.has(name)) throw new Error(`Nicht unterstuetzter Platzhalter in Vorlage: ${name}`);
+    if (!String(placeholderValues[name] || "").trim()) missing.push(name);
+  }
+  if (missing.length) {
+    throw new Error(`Pflichtplatzhalter nicht sicher aufloesbar: ${missing.join(", ")}`);
+  }
+
+  let nextBody = entityBody;
+  for (const name of rawPlaceholders) {
+    const value = String(placeholderValues[name] || "");
+    if (/[\r\n]/.test(value)) throw new Error(`Platzhalter ${name} enthaelt unzulaessige Zeilenumbrueche.`);
+    nextBody = nextBody.replace(new RegExp(`\\{\\{\\s*${name}\\s*\\}\\}`, "gi"), value);
+  }
+  return {
+    body: nextBody,
+    placeholders: rawPlaceholders,
+    placeholder_values_used: Object.fromEntries(rawPlaceholders.map((name) => [name, placeholderValues[name] || ""]))
+  };
+}
+
+function buildEmailActionIdempotencyId({ action, sourceMailbox, sourceMessage }) {
+  return createHash("sha256")
+    .update(
+      [
+        EMAIL_ACTION_CONTROL_AGENT_ID,
+        action.id,
+        sourceMailbox,
+        sourceMessage.uid,
+        sourceMessage.parsed?.message_id || "",
+        sourceMessage.raw_sha256 || ""
+      ].join("|"),
+      "utf8"
+    )
+    .digest("hex");
+}
+
+function emailActionMessageId(idempotencyId) {
+  return `<vip-action-${String(idempotencyId).slice(0, 40)}@vip-tools-mcp.vip-studios.de>`;
+}
+
+function emailActionSentFlag(idempotencyId) {
+  return `$VIPAI-SENT-${String(idempotencyId).slice(0, 24).toUpperCase()}`;
+}
+
+function emailActionProcessingFlag(idempotencyId) {
+  return `$VIPAI-LOCK-${String(idempotencyId).slice(0, 24).toUpperCase()}`;
+}
+
+function cleanupEmailActionIdempotencyCache(nowMs = Date.now()) {
+  for (const [key, value] of emailActionIdempotencyCache.entries()) {
+    if (!value?.expires_at_ms || value.expires_at_ms <= nowMs) {
+      emailActionIdempotencyCache.delete(key);
+    }
+  }
+}
+
+function getEmailActionCachedSend(idempotencyId) {
+  cleanupEmailActionIdempotencyCache();
+  return emailActionIdempotencyCache.get(idempotencyId) || null;
+}
+
+function rememberEmailActionSend(idempotencyId, data) {
+  cleanupEmailActionIdempotencyCache();
+  emailActionIdempotencyCache.set(idempotencyId, {
+    ...data,
+    cached_at: new Date().toISOString(),
+    expires_at_ms: Date.now() + EMAIL_ACTION_IDEMPOTENCY_CACHE_TTL_MS
+  });
+}
+
+function buildRawTemplateReply({ action, templateMessage, sourceMessage, sendAccount, placeholderValues = {} }) {
+  const inbound = getInboundHeadersForAction(sourceMessage.raw);
+  if (!inbound.message_id) {
+    throw new Error(`UID ${sourceMessage.uid}: Message-ID fehlt; echte Thread-Antwort blockiert.`);
+  }
+  const recipient = extractSingleVerifiedReplyRecipient(inbound.headers);
+  const idempotencyId = buildEmailActionIdempotencyId({
+    action,
+    sourceMailbox: action.mailbox,
+    sourceMessage
+  });
+  const messageId = emailActionMessageId(idempotencyId);
+  const { headersText, body } = splitHeaderAndBody(templateMessage.raw);
+  const templateHeaders = parseMimeHeaders(headersText);
+  const contentType = sanitizeHeaderLineValue(templateHeaders["content-type"] || "text/html; charset=utf-8", "Content-Type");
+  const isMultipart = /^multipart\//i.test(contentType);
+  if (isMultipart && !/boundary=/i.test(contentType)) {
+    throw new Error(`Action ${action.id}: Multipart-Vorlage ohne Boundary ist nicht versendbar.`);
+  }
+  const cte = templateHeaders["content-transfer-encoding"]
+    ? sanitizeHeaderLineValue(templateHeaders["content-transfer-encoding"], "Content-Transfer-Encoding")
+    : "";
+  const values = buildEmailActionPlaceholderValues({
+    inbound,
+    recipientHeader: inbound.headers["reply-to"] || inbound.headers.from || "",
+    action,
+    explicitValues: placeholderValues
+  });
+  const rendered = applyEmailActionPlaceholders(templateMessage.raw, body, values, action);
+  const subject = buildReplySubject(inbound.subject);
+  const references = buildReplyReferences(inbound);
+  const headers = [
+    `From: <${sendAccount.from}>`,
+    `To: <${recipient.email}>`,
+    `Subject: ${encodeHeader(sanitizeHeaderLineValue(subject, "Subject"))}`,
+    `Date: ${new Date().toUTCString()}`,
+    `Message-ID: ${messageId}`,
+    `In-Reply-To: ${sanitizeHeaderLineValue(inbound.message_id, "In-Reply-To")}`,
+    ...(references ? [`References: ${sanitizeHeaderLineValue(references, "References")}`] : []),
+    "MIME-Version: 1.0",
+    `Content-Type: ${contentType}`,
+    ...(!isMultipart && cte ? [`Content-Transfer-Encoding: ${cte}`] : [])
+  ];
+  const rawMessage = `${headers.join("\r\n")}\r\n\r\n${rendered.body}`;
+
+  return {
+    idempotency_id: idempotencyId,
+    sent_flag: emailActionSentFlag(idempotencyId),
+    processing_flag: emailActionProcessingFlag(idempotencyId),
+    raw_message: rawMessage,
+    raw_message_bytes: Buffer.byteLength(rawMessage, "binary"),
+    raw_message_sha256: createHash("sha256").update(rawMessage, "binary").digest("hex"),
+    message_id: messageId,
+    from: sendAccount.from,
+    to: recipient.email,
+    recipient_source: recipient.source,
+    subject,
+    in_reply_to: inbound.message_id,
+    references,
+    content_type: contentType,
+    template_sha256: templateMessage.raw_sha256,
+    template_uid: templateMessage.uid,
+    source_uid: sourceMessage.uid,
+    source_message_id_hash: sourceMessage.parsed?.message_id_hash || null,
+    placeholders: rendered.placeholders,
+    placeholder_values_used: rendered.placeholder_values_used
+  };
+}
+
+async function runImapAddKeyword(config, { mailbox, uid, flag, expectedRawSha256 }) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("binary");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    await command(`SELECT ${quoteImapString(mailbox)}`);
+    const fetchResponse = await command(`UID FETCH ${uid} (UID FLAGS BODY.PEEK[])`);
+    const raw = extractImapLiteral(fetchResponse);
+    if (!raw) throw new Error(`UID ${uid} konnte vor Keyword-Marker nicht gelesen werden.`);
+    const rawSha = createHash("sha256").update(raw, "binary").digest("hex");
+    if (expectedRawSha256 && rawSha !== expectedRawSha256) {
+      throw new Error(`UID ${uid}: Raw-SHA256 hat sich geaendert; Keyword-Marker blockiert.`);
+    }
+    await command(`UID STORE ${uid} +FLAGS.SILENT (${flag})`);
+    const verifyResponse = await command(`UID FETCH ${uid} (UID FLAGS)`);
+    const flags = parseImapFlagsFromFetchResponse(verifyResponse);
+    if (!hasImapFlag(flags, flag)) {
+      throw new Error(`IMAP Keyword ${flag} wurde nicht verifiziert.`);
+    }
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return { uid, flag, flags };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function addEmailActionKeywordWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapAddKeyword(config, options);
+      return { ...result, host: config.host, port: config.port, secure: config.secure, attempts };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP Keyword-Marker fehlgeschlagen: ${attempts
+      .map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`)
+      .join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
+}
+
+async function runImapMoveUidBetweenMailboxes(config, {
+  sourceMailbox,
+  targetMailbox,
+  uid,
+  expectedRawSha256,
+  expectedMessageId,
+  createTargetMailbox,
+  dryRun,
+  verifyAfter
+}) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("binary");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    const listResponse = await command('LIST "" "*"');
+    let mailboxes = parseImapListMailboxes(listResponse);
+    const exact = (name) => mailboxes.find((mailbox) => mailbox.toLowerCase() === String(name || "").toLowerCase());
+    const resolvedSource = exact(sourceMailbox);
+    if (!resolvedSource) throw new Error(`Quellordner ${sourceMailbox} existiert nicht.`);
+    let resolvedTarget = exact(targetMailbox);
+    let targetCreated = false;
+    if (!resolvedTarget) {
+      if (!createTargetMailbox) throw new Error(`Zielordner ${targetMailbox} existiert nicht.`);
+      if (!dryRun) {
+        await command(`CREATE ${quoteImapString(targetMailbox)}`);
+        targetCreated = true;
+        const relist = await command('LIST "" "*"');
+        mailboxes = parseImapListMailboxes(relist);
+      }
+      resolvedTarget = targetMailbox;
+    }
+
+    await command(`SELECT ${quoteImapString(resolvedSource)}`);
+    const fetchResponse = await command(`UID FETCH ${uid} (UID FLAGS BODY.PEEK[])`);
+    const raw = extractImapLiteral(fetchResponse);
+    if (!raw) {
+      await command("LOGOUT").catch(() => {});
+      if (!socket.destroyed) socket.destroy();
+      return { status: "source_not_found", uid, source_mailbox: resolvedSource, target_mailbox: resolvedTarget };
+    }
+    const rawSha = createHash("sha256").update(raw, "binary").digest("hex");
+    const parsed = await parseRawEmail(raw, uid);
+    if (expectedRawSha256 && rawSha !== expectedRawSha256) {
+      throw new Error(`UID ${uid}: Raw-SHA256 hat sich vor Move geaendert.`);
+    }
+    if (expectedMessageId && String(parsed.message_id || "") !== String(expectedMessageId || "")) {
+      throw new Error(`UID ${uid}: Message-ID hat sich vor Move geaendert.`);
+    }
+
+    if (dryRun) {
+      await command("LOGOUT").catch(() => {});
+      if (!socket.destroyed) socket.destroy();
+      return {
+        status: "ready_for_move",
+        dry_run: true,
+        uid,
+        source_mailbox: resolvedSource,
+        target_mailbox: resolvedTarget,
+        target_created: false,
+        target_create_planned: !exact(targetMailbox) && createTargetMailbox,
+        message_id_hash: parsed.message_id_hash || null
+      };
+    }
+
+    const moveResponse = await command(`UID MOVE ${uid} ${quoteImapString(resolvedTarget)}`);
+    let inSourceAfterMove = null;
+    let foundInTarget = null;
+    if (verifyAfter) {
+      const verifySource = await command(`UID FETCH ${uid} (UID FLAGS)`);
+      inSourceAfterMove = new RegExp(`\\bUID\\s+${uid}\\b`).test(verifySource);
+      if (parsed.message_id) {
+        await command(`SELECT ${quoteImapString(resolvedTarget)}`);
+        const targetSearch = await command(`UID SEARCH HEADER Message-ID ${quoteImapString(parsed.message_id)}`);
+        const searchLine = targetSearch
+          .split(/\r?\n/)
+          .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
+        const targetUidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
+        foundInTarget = Boolean(targetUidText);
+      }
+    }
+
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return {
+      status: inSourceAfterMove || foundInTarget === false ? "move_verification_failed" : "moved",
+      dry_run: false,
+      uid,
+      source_mailbox: resolvedSource,
+      target_mailbox: resolvedTarget,
+      target_created: targetCreated,
+      message_id_hash: parsed.message_id_hash || null,
+      move_response_preview: cleanImapPreview(moveResponse, 300),
+      in_source_after_move: inSourceAfterMove,
+      found_in_target_after_move: foundInTarget
+    };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function moveEmailActionMessageWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapMoveUidBetweenMailboxes(config, options);
+      return {
+        ...result,
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP Move fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
 }
 
 function isMoritzIdentityLabel(value) {
@@ -14279,6 +15210,534 @@ function createServer() {
         returned_count: result.returned_count,
         messages: result.messages,
         imap_attempts: result.attempts
+      });
+    }
+  );
+
+  server.tool(
+    "email_action_list_actions",
+    "Listet die versionierten E-Mail-Aktionsordner fuer VIP AI-Communication und prueft die Sendekonto-Zuordnung ohne IMAP-Zugriff, Versand oder Verschiebung.",
+    {
+      agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id }) => {
+      const config = loadEmailActionDefinitions();
+      return out({
+        agent_id,
+        version: config.version,
+        owner_agent_id: config.owner_agent_id,
+        action_mailbox_root: config.action_mailbox_root,
+        done_mailbox_root: config.done_mailbox_root,
+        error_mailbox_root: config.error_mailbox_root,
+        action_count: config.actions.length,
+        actions: config.actions.map(publicEmailAction),
+        note:
+          "Neue Aktionen brauchen nur einen versionierten JSON-Eintrag plus Template-Readback; keine neuen Render-Variablen pro Aktion."
+      });
+    }
+  );
+
+  server.tool(
+    "email_action_template_readback",
+    "Liest einen konfigurierten IMAP-Aktionsordner read-only, identifiziert exakt eine Vorlage anhand des VORLAGE-Betreffs und gibt UID, Message-ID-Hash und SHA256 fuer die Registrierung zurueck. Sendet und verschiebt nichts.",
+    {
+      agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      action_id: z.string(),
+      max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
+      max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, action_id, max_scan_messages, max_email_bytes }) => {
+      const { action } = getEmailActionDefinition(action_id);
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const scan = await scanEmailActionFolderWithFallback(configs, {
+        mailbox: action.mailbox,
+        maxEmailBytes: max_email_bytes,
+        maxScanMessages: max_scan_messages
+      });
+      const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
+      const inbound = scan.messages.filter((message) => !message.template_subject);
+      const doneExists = scan.available_mailboxes.some((mailbox) => mailbox.toLowerCase() === action.done_mailbox.toLowerCase());
+      const errorExists = scan.available_mailboxes.some((mailbox) => mailbox.toLowerCase() === action.error_mailbox.toLowerCase());
+
+      return out({
+        agent_id,
+        action: publicEmailAction(action),
+        imap: {
+          ...summary,
+          connection: {
+            host: scan.host,
+            port: scan.port,
+            secure: scan.secure,
+            label: scan.label
+          },
+          attempts: scan.attempts
+        },
+        folder_readback: {
+          mailbox: scan.mailbox,
+          total_uid_count: scan.total_uid_count,
+          scanned_uid_count: scan.scanned_uid_count,
+          template_count: 1,
+          inbound_count: inbound.length,
+          done_mailbox_exists: doneExists,
+          error_mailbox_exists: errorExists
+        },
+        template_readback: {
+          uid: template.uid,
+          message_id_hash: template.parsed.message_id_hash || null,
+          message_id: template.parsed.message_id || null,
+          sha256: template.raw_sha256,
+          raw_bytes: template.raw_bytes,
+          subject: template.parsed.subject,
+          from: template.template_subject.from,
+          action_id: template.template_subject.action_id,
+          content_types: uniqueValues(parseMimeMessageTextParts(template.raw).map((part) => part.content_type)),
+          inline_resource_count: parseMimeMessageInlineResources(template.raw).length,
+          placeholders: uniqueValues(parseMimeMessageTextParts(template.raw).flatMap((part) => collectPlaceholders(part.text)))
+        },
+        registry_check: {
+          registered_complete: registered.complete,
+          uid_ok: registered.uid_ok,
+          message_id_ok: registered.message_id_ok,
+          sha256_ok: registered.sha256_ok,
+          needs_registry_update:
+            !registered.complete || !registered.uid_ok || !registered.message_id_ok || !registered.sha256_ok,
+          proposed_template_registry: {
+            uid: template.uid,
+            message_id: template.parsed.message_id || "",
+            sha256: template.raw_sha256
+          }
+        },
+        send_account: {
+          send_agent_id: sendAccount.send_agent_id,
+          from: sendAccount.from,
+          raw_mime_transport: sendAccount.raw_mime_transport,
+          raw_mime_transport_ready: sendAccount.raw_mime_transport_ready,
+          smtp_ready_for_send: sendAccount.smtp_ready_for_send,
+          email_http_provider: sendAccount.email_http_provider,
+          email_http_ready_for_send: sendAccount.email_http_ready_for_send,
+          note: sendAccount.raw_mime_note
+        }
+      });
+    }
+  );
+
+  server.tool(
+    "email_action_shadow_run",
+    "Erzeugt deterministisch Raw-MIME-Antwortplaene fuer Eingangsnachrichten in einem Aktionsordner. Shadow-Run: kein Live-Versand, keine IMAP-Verschiebung, kein Gelesen-Markieren.",
+    {
+      agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      action_id: z.string(),
+      message_uid: z.string().optional(),
+      limit: z.number().int().min(1).max(25).optional().default(5),
+      allow_unregistered_template: z.boolean().optional().default(false),
+      placeholder_values_by_uid: z.record(z.string(), z.record(z.string(), z.string())).optional().default({}),
+      max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
+      max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({
+      agent_id,
+      action_id,
+      message_uid,
+      limit,
+      allow_unregistered_template,
+      placeholder_values_by_uid,
+      max_scan_messages,
+      max_email_bytes
+    }) => {
+      const { action } = getEmailActionDefinition(action_id);
+      if (!action.enabled) throw new Error(`Action ${action.id} ist deaktiviert.`);
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const scan = await scanEmailActionFolderWithFallback(configs, {
+        mailbox: action.mailbox,
+        maxEmailBytes: max_email_bytes,
+        maxScanMessages: max_scan_messages
+      });
+      const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
+      const registryOk = registered.complete && registered.uid_ok && registered.message_id_ok && registered.sha256_ok;
+      if (!registryOk && !allow_unregistered_template) {
+        return out({
+          agent_id,
+          action: publicEmailAction(action),
+          shadow_run: false,
+          status: "template_registration_required",
+          registry_check: {
+            registered_complete: registered.complete,
+            uid_ok: registered.uid_ok,
+            message_id_ok: registered.message_id_ok,
+            sha256_ok: registered.sha256_ok,
+            proposed_template_registry: {
+              uid: template.uid,
+              message_id: template.parsed.message_id || "",
+              sha256: template.raw_sha256
+            }
+          }
+        });
+      }
+
+      const candidates = scan.messages
+        .filter((message) => !message.template_subject)
+        .filter((message) => !message_uid || String(message.uid) === String(message_uid))
+        .slice(0, limit);
+      const results = [];
+      for (const message of candidates) {
+        if (message.parse_error) {
+          results.push({ uid: message.uid, status: "blocked", reason: message.parse_error });
+          continue;
+        }
+        try {
+          const plan = buildRawTemplateReply({
+            action,
+            templateMessage: template,
+            sourceMessage: message,
+            sendAccount,
+            placeholderValues: placeholder_values_by_uid[String(message.uid)] || {}
+          });
+          results.push({
+            uid: message.uid,
+            status: "ready",
+            idempotency_id: plan.idempotency_id,
+            from: plan.from,
+            to: plan.to,
+            recipient_source: plan.recipient_source,
+            subject: plan.subject,
+            message_id: plan.message_id,
+            in_reply_to: plan.in_reply_to,
+            references: plan.references,
+            content_type: plan.content_type,
+            raw_message_bytes: plan.raw_message_bytes,
+            raw_message_sha256: plan.raw_message_sha256,
+            template_uid: plan.template_uid,
+            template_sha256: plan.template_sha256,
+            source_message: publicActionFolderMessage(message),
+            placeholders: plan.placeholders,
+            inline_resource_count: parseMimeMessageInlineResources(template.raw).length,
+            validation: {
+              sends_live_email: false,
+              moves_source_message: false,
+              marks_seen: false,
+              cc_bcc_copied: false,
+              raw_mime_preserved_from_template_entity: true,
+              thread_headers_present: Boolean(plan.in_reply_to && plan.references)
+            }
+          });
+        } catch (error) {
+          results.push({
+            uid: message.uid,
+            status: "blocked",
+            reason: String(error?.message || error),
+            source_message: publicActionFolderMessage(message)
+          });
+        }
+      }
+
+      return out({
+        agent_id,
+        action: publicEmailAction(action),
+        shadow_run: true,
+        registry_ok: registryOk,
+        imap: {
+          ...summary,
+          connection: {
+            host: scan.host,
+            port: scan.port,
+            secure: scan.secure,
+            label: scan.label
+          }
+        },
+        template: {
+          uid: template.uid,
+          sha256: template.raw_sha256,
+          message_id_hash: template.parsed.message_id_hash || null,
+          content_types: uniqueValues(parseMimeMessageTextParts(template.raw).map((part) => part.content_type)),
+          inline_resource_count: parseMimeMessageInlineResources(template.raw).length
+        },
+        returned_count: results.length,
+        results
+      });
+    }
+  );
+
+  server.tool(
+    "email_action_process_folder",
+    "Verarbeitet E-Mail-Aktionsordner fuer VIP AI-Communication. Default ist Shadow-Run. Live sendet nur bei registrierter unveraenderter Vorlage, live_enabled-Action, Moritz-Freigabeparameter, Message-Lock, Send-Readback und anschliessendem IMAP-Move-Readback.",
+    {
+      agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      action_id: z.string(),
+      mode: z.enum(["shadow_run", "live"]).optional().default("shadow_run"),
+      message_uid: z.string().optional(),
+      limit: z.number().int().min(1).max(10).optional().default(3),
+      confirm_live_send: z.boolean().optional().default(false),
+      moritz_authorization_note: z.string().max(1000).optional(),
+      create_missing_result_folders: z.boolean().optional().default(false),
+      move_failed_to_error: z.boolean().optional().default(false),
+      placeholder_values_by_uid: z.record(z.string(), z.record(z.string(), z.string())).optional().default({}),
+      max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
+      max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      action_id,
+      mode,
+      message_uid,
+      limit,
+      confirm_live_send,
+      moritz_authorization_note,
+      create_missing_result_folders,
+      move_failed_to_error,
+      placeholder_values_by_uid,
+      max_scan_messages,
+      max_email_bytes
+    }) => {
+      const { action } = getEmailActionDefinition(action_id);
+      if (!action.enabled) throw new Error(`Action ${action.id} ist deaktiviert.`);
+      const { configs } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const scan = await scanEmailActionFolderWithFallback(configs, {
+        mailbox: action.mailbox,
+        maxEmailBytes: max_email_bytes,
+        maxScanMessages: max_scan_messages
+      });
+      const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
+      const registryOk = registered.complete && registered.uid_ok && registered.message_id_ok && registered.sha256_ok;
+
+      if (mode === "live") {
+        if (!confirm_live_send || !isMoritzIdentityLabel("Moritz Feichtmeyer")) {
+          throw new Error("Live-Verarbeitung braucht confirm_live_send=true und aktuelle Moritz-Freigabe.");
+        }
+        if (!String(moritz_authorization_note || "").trim()) {
+          throw new Error("Live-Verarbeitung braucht moritz_authorization_note mit Test-/Live-Freigabekontext.");
+        }
+        if (!action.live_enabled) {
+          throw new Error(`Action ${action.id} ist nicht live_enabled. Erst nach Shadow-Run und Registry-Freigabe aktivieren.`);
+        }
+        if (!registryOk) {
+          throw new Error(`Action ${action.id}: registrierte Vorlage passt nicht zum Readback.`);
+        }
+        if (!sendAccount.raw_mime_transport_ready) {
+          throw new Error(`Action ${action.id}: SMTP-Raw-MIME-Versandkonto ${sendAccount.send_agent_id} ist nicht bereit.`);
+        }
+      }
+
+      const candidates = scan.messages
+        .filter((message) => !message.template_subject)
+        .filter((message) => !message_uid || String(message.uid) === String(message_uid))
+        .slice(0, limit);
+      const results = [];
+
+      for (const message of candidates) {
+        if (message.parse_error) {
+          results.push({ uid: message.uid, status: "blocked", reason: message.parse_error });
+          continue;
+        }
+
+        let plan;
+        try {
+          plan = buildRawTemplateReply({
+            action,
+            templateMessage: template,
+            sourceMessage: message,
+            sendAccount,
+            placeholderValues: placeholder_values_by_uid[String(message.uid)] || {}
+          });
+        } catch (error) {
+          const blocked = {
+            uid: message.uid,
+            status: "blocked_before_send",
+            reason: String(error?.message || error),
+            moved_to_error: false
+          };
+          if (mode === "live" && move_failed_to_error) {
+            try {
+              blocked.error_move = await moveEmailActionMessageWithFallback(configs, {
+                sourceMailbox: action.mailbox,
+                targetMailbox: action.error_mailbox,
+                uid: message.uid,
+                expectedRawSha256: message.raw_sha256,
+                expectedMessageId: message.parsed?.message_id || "",
+                createTargetMailbox: create_missing_result_folders,
+                dryRun: false,
+                verifyAfter: true
+              });
+              blocked.moved_to_error = blocked.error_move.status === "moved";
+            } catch (moveError) {
+              blocked.error_move_error = String(moveError?.message || moveError);
+            }
+          }
+          results.push(blocked);
+          continue;
+        }
+
+        if (mode !== "live") {
+          results.push({
+            uid: message.uid,
+            status: "shadow_ready",
+            idempotency_id: plan.idempotency_id,
+            from: plan.from,
+            to: plan.to,
+            subject: plan.subject,
+            message_id: plan.message_id,
+            raw_message_sha256: plan.raw_message_sha256,
+            template_sha256: plan.template_sha256,
+            sends_live_email: false,
+            moves_source_message: false
+          });
+          continue;
+        }
+
+        cleanupAgentOperationLocks();
+        const lockKey = buildAgentOperationLockKey({
+          scope: "resource",
+          agent_id,
+          resource_key: `email-action:${plan.idempotency_id}`
+        });
+        const nowMs = Date.now();
+        const existingLock = AGENT_OPERATION_LOCKS.get(lockKey);
+        if (existingLock && existingLock.expires_at_ms > nowMs) {
+          results.push({
+            uid: message.uid,
+            status: "locked",
+            reason: "message_lock_already_held",
+            active_lock: serializeAgentOperationLock(existingLock, nowMs)
+          });
+          continue;
+        }
+        const lock = {
+          key: lockKey,
+          scope: "resource",
+          agent_id,
+          resource_key: `email-action:${plan.idempotency_id}`,
+          run_id: `email-action-${randomUUID()}`,
+          lock_token: randomUUID(),
+          holder: "email_action_process_folder",
+          purpose: `Process ${action.id} UID ${message.uid}`,
+          acquired_at_ms: nowMs,
+          renewed_at_ms: nowMs,
+          expires_at_ms: nowMs + 10 * 60 * 1000
+        };
+        AGENT_OPERATION_LOCKS.set(lockKey, lock);
+
+        try {
+          const cachedSend = getEmailActionCachedSend(plan.idempotency_id);
+          const alreadySentByFlag = hasImapFlag(message.flags, plan.sent_flag);
+          let transport = cachedSend?.transport || null;
+          let sentNow = false;
+          let processingMarker = null;
+          let sentMarker = null;
+
+          if (!cachedSend && !alreadySentByFlag) {
+            processingMarker = await addEmailActionKeywordWithFallback(configs, {
+              mailbox: action.mailbox,
+              uid: message.uid,
+              flag: plan.processing_flag,
+              expectedRawSha256: message.raw_sha256
+            });
+            const { configs: smtpConfigs } = getSmtpConfigCandidates(sendAccount.send_agent_id, { requireCredentials: true });
+            transport = {
+              type: "smtp_raw_mime",
+              ...(await sendSmtpRawEmail(smtpConfigs, {
+                envelopeFrom: plan.from,
+                to: [plan.to],
+                rawMessage: plan.raw_message
+              }))
+            };
+            sentNow = true;
+            rememberEmailActionSend(plan.idempotency_id, {
+              transport,
+              provider_message_id: plan.message_id,
+              action_id: action.id,
+              source_uid: message.uid
+            });
+            sentMarker = await addEmailActionKeywordWithFallback(configs, {
+              mailbox: action.mailbox,
+              uid: message.uid,
+              flag: plan.sent_flag,
+              expectedRawSha256: message.raw_sha256
+            });
+          }
+
+          let moveResult;
+          try {
+            moveResult = await moveEmailActionMessageWithFallback(configs, {
+              sourceMailbox: action.mailbox,
+              targetMailbox: action.done_mailbox,
+              uid: message.uid,
+              expectedRawSha256: message.raw_sha256,
+              expectedMessageId: message.parsed?.message_id || "",
+              createTargetMailbox: create_missing_result_folders,
+              dryRun: false,
+              verifyAfter: true
+            });
+          } catch (moveError) {
+            results.push({
+              uid: message.uid,
+              status: "sent_but_move_failed",
+              sent: true,
+              sent_now: sentNow,
+              already_sent_by_cache: Boolean(cachedSend),
+              already_sent_by_imap_flag: alreadySentByFlag,
+              idempotency_id: plan.idempotency_id,
+              provider_message_id: plan.message_id,
+              transport,
+              processing_marker: processingMarker,
+              sent_marker: sentMarker,
+              move_error: String(moveError?.message || moveError),
+              retry_instruction:
+                "Retry darf wegen Idempotency-Cache/IMAP-Sent-Flag keine zweite E-Mail senden; zuerst Done-Move erneut versuchen."
+            });
+            continue;
+          }
+
+          results.push({
+            uid: message.uid,
+            status: moveResult.status === "moved" ? "sent_and_moved" : "sent_move_verification_failed",
+            sent: true,
+            sent_now: sentNow,
+            already_sent_by_cache: Boolean(cachedSend),
+            already_sent_by_imap_flag: alreadySentByFlag,
+            idempotency_id: plan.idempotency_id,
+            provider_message_id: plan.message_id,
+            from: plan.from,
+            to: plan.to,
+            subject: plan.subject,
+            template_sha256: plan.template_sha256,
+            raw_message_sha256: plan.raw_message_sha256,
+            transport,
+            processing_marker: processingMarker,
+            sent_marker: sentMarker,
+            move: moveResult
+          });
+        } catch (error) {
+          results.push({
+            uid: message.uid,
+            status: "failed",
+            sent: false,
+            idempotency_id: plan.idempotency_id,
+            reason: String(error?.message || error)
+          });
+        } finally {
+          const current = AGENT_OPERATION_LOCKS.get(lockKey);
+          if (current?.lock_token === lock.lock_token) {
+            AGENT_OPERATION_LOCKS.delete(lockKey);
+          }
+        }
+      }
+
+      return out({
+        agent_id,
+        action: publicEmailAction(action),
+        mode,
+        live: mode === "live",
+        registry_ok: registryOk,
+        template: {
+          uid: template.uid,
+          sha256: template.raw_sha256,
+          message_id_hash: template.parsed.message_id_hash || null
+        },
+        returned_count: results.length,
+        results
       });
     }
   );
