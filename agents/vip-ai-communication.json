@@ -15,6 +15,7 @@
     "asanaAddComments": true,
     "asanaCompleteTasks": true,
     "asanaGenericRequest": true,
+    "emailReadBccLearning": true,
     "emailReadActionFolders": true,
     "emailSendTemplateReplies": true
   }
