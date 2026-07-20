@@ -258,12 +258,12 @@ const ACCOUNTING_ARCHIVE_MAILBOX_CANDIDATES = [
 const ASANA_TASK_SCHEDULE_OPT_FIELDS =
   "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url";
 const ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS =
-  "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,start_on,start_at,permalink_url,tags.gid,tags.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name,modified_at";
+  "gid,name,completed,completed_at,assignee.gid,assignee.name,due_on,due_at,start_on,start_at,permalink_url,tags.gid,tags.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name,modified_at";
 const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
 const ASANA_TASK_TAG_WORKSPACE_OPT_FIELDS =
   "gid,name,completed,tags.gid,tags.name,workspace.gid,permalink_url";
 const ASANA_TASK_CREATE_SOURCE_OPT_FIELDS =
-  "gid,name,permalink_url,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name";
+  "gid,name,completed,completed_at,modified_at,permalink_url,tags.gid,tags.name,assignee.gid,assignee.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name";
 const ASANA_TASK_CREATE_VERIFY_OPT_FIELDS =
   "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,tags.gid,tags.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name,custom_fields.gid,custom_fields.name,custom_fields.enum_value.gid,custom_fields.enum_value.name";
 const ASANA_TASK_DESCRIPTION_OPT_FIELDS =
@@ -272,6 +272,10 @@ const ASANA_TASK_SECTION_OPT_FIELDS =
   "gid,name,completed,assignee.gid,assignee.name,permalink_url,workspace.gid,memberships.project.gid,memberships.project.name,memberships.section.gid,memberships.section.name";
 const ASANA_DEFAULT_SUPERVISOR_GID =
   process.env.ASANA_DEFAULT_SUPERVISOR_GID || "1108801330389276";
+const ASANA_RECURRENCE_GENERATION_GRACE_SECONDS = Math.min(
+  Math.max(Number(process.env.ASANA_RECURRENCE_GENERATION_GRACE_SECONDS || 600), 60),
+  1800
+);
 const ASANA_PROJECT_OPT_FIELDS = "gid,name,workspace.gid,permalink_url";
 const ASANA_PROJECT_CUSTOM_FIELD_OPT_FIELDS =
   "gid,project.gid,custom_field.gid,custom_field.name,custom_field.resource_subtype,custom_field.enum_options.gid,custom_field.enum_options.name";
@@ -1479,6 +1483,83 @@ function getAsanaTaskProjectGids(task) {
 
 function getAsanaTaskFollowerGids(task) {
   return uniqueValues((task?.followers || []).map((follower) => follower?.gid).filter(Boolean));
+}
+
+function asanaTaskCompletionAgeSeconds(task, nowMs = Date.now()) {
+  const completedAtMs = Date.parse(String(task?.completed_at || ""));
+  if (!Number.isFinite(completedAtMs)) return null;
+  return Math.max(0, Math.floor((nowMs - completedAtMs) / 1000));
+}
+
+function isRoutineInstanceMissingAlarmIntent({ name, description, creation_basis }) {
+  const text = normalizeAsanaLabel([name, description, creation_basis].filter(Boolean).join(" "));
+  const routineSignal = ["routine", "folgeinstanz", "wiederholung", "recurrence"].some((term) =>
+    text.includes(term)
+  );
+  const missingSignal = ["fehlt", "fehlend", "nicht erstellt", "nicht erzeugt", "missing"].some((term) =>
+    text.includes(term)
+  );
+  return routineSignal && missingSignal;
+}
+
+async function findAsanaNextRoutineCandidates({
+  asana,
+  sourceTask,
+  sourceTaskGid,
+  projectGid,
+  expectedName,
+  expectedAssigneeGid,
+  limit = 100
+}) {
+  const tasksRes = await asanaRequestWithRetry(asana, {
+    method: "GET",
+    url: `/projects/${projectGid}/tasks`,
+    params: {
+      completed_since: "now",
+      limit,
+      opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
+    }
+  });
+  const matches = (tasks) => (tasks || []).filter((task) => {
+    if (task.gid === sourceTaskGid) return false;
+    if (String(task.name || "") !== String(expectedName || "")) return false;
+    if (expectedAssigneeGid && task.assignee?.gid !== expectedAssigneeGid) return false;
+    return true;
+  });
+
+  let candidates = matches(tasksRes.data.data);
+  let search_fallback_used = false;
+  let search_fallback_count = 0;
+  let search_fallback_error = null;
+  if (candidates.length === 0) {
+    const workspaceGid = sourceTask?.workspace?.gid;
+    if (!workspaceGid) {
+      search_fallback_used = true;
+      search_fallback_error = "Kein Workspace aus source_task ableitbar.";
+    } else {
+      try {
+        const searchRes = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/workspaces/${workspaceGid}/tasks/search`,
+          params: {
+            completed: false,
+            limit,
+            text: expectedName,
+            opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
+          }
+        });
+        search_fallback_used = true;
+        candidates = matches(searchRes.data.data).filter((task) =>
+          getAsanaTaskProjectGids(task).includes(projectGid)
+        );
+        search_fallback_count = candidates.length;
+      } catch (error) {
+        search_fallback_used = true;
+        search_fallback_error = String(error?.message || error);
+      }
+    }
+  }
+  return { candidates, search_fallback_used, search_fallback_count, search_fallback_error };
 }
 
 function isDefaultSupervisorFollowerGid(followerGid) {
@@ -7999,6 +8080,17 @@ function createServer() {
         );
       }
 
+      const routineInstanceMissingAlarmIntent = isRoutineInstanceMissingAlarmIntent({
+        name,
+        description,
+        creation_basis
+      });
+      if (routineInstanceMissingAlarmIntent && !source_task_gid) {
+        throw new Error(
+          "Orchestrierungsalarm blockiert: Fuer 'Routine-Folgeinstanz fehlt' ist source_task_gid der abgeschlossenen Routine erforderlich."
+        );
+      }
+
       let selectedProjectGid = project_gid;
       if (!selectedProjectGid) {
         if (source_projects.length === 1) {
@@ -8028,6 +8120,45 @@ function createServer() {
         throw new Error(
           "project_selection_reason ist erforderlich, wenn kein sichtbares Ausgangsprojekt genutzt werden kann oder bewusst ein anderes Projekt gewaehlt wird."
         );
+      }
+
+      if (routineInstanceMissingAlarmIntent) {
+        if (!source_task?.completed) {
+          throw new Error(
+            "Orchestrierungsalarm blockiert: Die Ausgangsroutine ist noch nicht abgeschlossen; eine Folgeinstanz darf noch nicht erwartet werden."
+          );
+        }
+        const recurrenceProbe = await findAsanaNextRoutineCandidates({
+          asana,
+          sourceTask: source_task,
+          sourceTaskGid: source_task_gid,
+          projectGid: selectedProjectGid,
+          expectedName: source_task.name,
+          expectedAssigneeGid: source_task.assignee?.gid,
+          limit: 100
+        });
+        if (recurrenceProbe.candidates.length > 0) {
+          throw new Error(
+            `Orchestrierungsalarm als Fehlalarm blockiert: ${recurrenceProbe.candidates.length} passende offene Folgeinstanz(en) sind bereits sichtbar.`
+          );
+        }
+        if (recurrenceProbe.search_fallback_error) {
+          throw new Error(
+            "Orchestrierungsalarm blockiert: Die belastbare Workspace-Zweitsuche ist nicht verfuegbar. Keine fehlende Folgeinstanz behaupten; spaeter erneut pruefen."
+          );
+        }
+        const completionAgeSeconds = asanaTaskCompletionAgeSeconds(source_task);
+        if (
+          completionAgeSeconds === null ||
+          completionAgeSeconds < ASANA_RECURRENCE_GENERATION_GRACE_SECONDS
+        ) {
+          const retryAfter = completionAgeSeconds === null
+            ? ASANA_RECURRENCE_GENERATION_GRACE_SECONDS
+            : ASANA_RECURRENCE_GENERATION_GRACE_SECONDS - completionAgeSeconds;
+          throw new Error(
+            `Orchestrierungsalarm blockiert: Asana-Generierungsfrist laeuft noch. Fruehestens in ${Math.max(1, retryAfter)} Sekunden erneut pruefen; bis dahin kein Kommentar und keine Aufgabe.`
+          );
+        }
       }
 
       const projectRes = await asanaRequestWithRetry(asana, {
@@ -8923,7 +9054,15 @@ function createServer() {
       expect_routine_tag: z.boolean().optional().default(true),
       allow_routine_supervisor_do_not_readd: z.boolean().optional().default(true),
       recheck_on_zero: z.boolean().optional().default(true),
-      recheck_delay_ms: z.number().int().min(0).max(5000).optional().default(1500),
+      recheck_attempts: z.number().int().min(1).max(5).optional().default(3),
+      recheck_delay_ms: z.number().int().min(0).max(10000).optional().default(2500),
+      generation_grace_seconds: z
+        .number()
+        .int()
+        .min(60)
+        .max(1800)
+        .optional()
+        .default(ASANA_RECURRENCE_GENERATION_GRACE_SECONDS),
       limit: z.number().int().min(1).max(100).optional().default(100)
     },
     TOOL_READ_ONLY,
@@ -8942,7 +9081,9 @@ function createServer() {
       expect_routine_tag,
       allow_routine_supervisor_do_not_readd,
       recheck_on_zero,
+      recheck_attempts,
       recheck_delay_ms,
+      generation_grace_seconds,
       limit
     }) => {
       validateAsanaGid(source_task_gid, "source_task_gid");
@@ -8975,64 +9116,24 @@ function createServer() {
         sourceAssignee && requestedExpectedAssignee && sourceAssignee !== requestedExpectedAssignee
       );
 
-      const searchCandidates = async () => {
-        const tasksRes = await asanaRequestWithRetry(asana, {
-          method: "GET",
-          url: `/projects/${selectedProjectGid}/tasks`,
-          params: {
-            completed_since: "now",
-            limit,
-            opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
-          }
-        });
-        let search_fallback_used = false;
-        let search_fallback_count = 0;
-        let search_fallback_error = null;
-        let candidates = (tasksRes.data.data || []).filter((task) => {
-          if (task.gid === source_task_gid) return false;
-          if (String(task.name || "") !== String(expectedName || "")) return false;
-          if (expectedAssignee && task.assignee?.gid !== expectedAssignee) return false;
-          return true;
-        });
-        if (candidates.length === 0) {
-          const workspaceGid = source_task.workspace?.gid;
-          if (workspaceGid) {
-            try {
-              const searchRes = await asanaRequestWithRetry(asana, {
-                method: "GET",
-                url: `/workspaces/${workspaceGid}/tasks/search`,
-                params: {
-                  completed: false,
-                  limit,
-                  text: expectedName,
-                  opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS
-                }
-              });
-              search_fallback_used = true;
-              candidates = (searchRes.data.data || []).filter((task) => {
-                if (task.gid === source_task_gid) return false;
-                if (String(task.name || "") !== String(expectedName || "")) return false;
-                if (expectedAssignee && task.assignee?.gid !== expectedAssignee) return false;
-                const taskProjectGids = getAsanaTaskProjectGids(task);
-                if (!taskProjectGids.includes(selectedProjectGid)) return false;
-                return true;
-              });
-              search_fallback_count = candidates.length;
-            } catch (error) {
-              search_fallback_used = true;
-              search_fallback_error = String(error?.message || error);
-            }
-          }
-        }
-        return { candidates, search_fallback_used, search_fallback_count, search_fallback_error };
-      };
+      const searchCandidates = () => findAsanaNextRoutineCandidates({
+        asana,
+        sourceTask: source_task,
+        sourceTaskGid: source_task_gid,
+        projectGid: selectedProjectGid,
+        expectedName,
+        expectedAssigneeGid: expectedAssignee,
+        limit
+      });
 
       let searchAttemptCount = 1;
       let searchResult = await searchCandidates();
       let recheckUsed = false;
-      if (searchResult.candidates.length === 0 && recheck_on_zero) {
+      const maxSearchAttempts = recheck_on_zero ? recheck_attempts : 1;
+      while (searchResult.candidates.length === 0 && searchAttemptCount < maxSearchAttempts) {
         recheckUsed = true;
-        if (recheck_delay_ms > 0) await sleep(recheck_delay_ms);
+        const currentDelayMs = Math.min(recheck_delay_ms * searchAttemptCount, 10000);
+        if (currentDelayMs > 0) await sleep(currentDelayMs);
         searchResult = await searchCandidates();
         searchAttemptCount += 1;
       }
@@ -9064,7 +9165,7 @@ function createServer() {
         (candidate) => candidate.verification_status === "ok_with_warnings"
       );
       const acceptableMatches = [...exactMatches, ...acceptableWarningMatches];
-      const verification_status =
+      let verification_status =
         exactMatches.length === 1
           ? "ok"
           : exactMatches.length > 1
@@ -9074,6 +9175,37 @@ function createServer() {
               : acceptableMatches.length > 1
                 ? "ambiguous"
                 : "failed";
+      const sourceCompletionAgeSeconds = asanaTaskCompletionAgeSeconds(source_task);
+      const generationGraceActive = Boolean(
+        candidates.length === 0 &&
+        source_task.completed &&
+        (sourceCompletionAgeSeconds === null || sourceCompletionAgeSeconds < generation_grace_seconds)
+      );
+      const candidateContractRecheckRequired = Boolean(
+        candidates.length > 0 && verification_status === "failed"
+      );
+      let incident_classification = verification_status;
+      if (!source_task.completed) {
+        verification_status = "source_not_completed";
+        incident_classification = "source_not_completed";
+      } else if (generationGraceActive) {
+        verification_status = "pending_generation";
+        incident_classification = "pending_asana_generation";
+      } else if (candidates.length === 0 && search_fallback_error) {
+        verification_status = "verification_unavailable";
+        incident_classification = "search_fallback_unavailable";
+      } else if (candidateContractRecheckRequired) {
+        incident_classification = "candidate_contract_recheck_required";
+      } else if (candidates.length === 0 && verification_status === "failed") {
+        incident_classification = "missing_after_generation_grace";
+      }
+      const alertTaskCreationAllowed =
+        incident_classification === "missing_after_generation_grace" && !search_fallback_error;
+      const nextRecheckAfterSeconds = generationGraceActive
+        ? Math.max(30, generation_grace_seconds - (sourceCompletionAgeSeconds || 0))
+        : candidateContractRecheckRequired
+          ? 0
+          : null;
 
       return out({
         agent_id,
@@ -9087,7 +9219,13 @@ function createServer() {
         expected_assignee_mismatch_corrected: expectedAssigneeMismatchCorrected,
         search_attempt_count: searchAttemptCount,
         recheck_used: recheckUsed,
+        recheck_attempts_requested: maxSearchAttempts,
         recheck_delay_ms: recheckUsed ? recheck_delay_ms : 0,
+        generation_grace_seconds,
+        source_completed_at: source_task.completed_at || null,
+        source_completion_age_seconds: sourceCompletionAgeSeconds,
+        generation_grace_active: generationGraceActive,
+        next_recheck_after_seconds: nextRecheckAfterSeconds,
         search_fallback_used,
         search_fallback_count,
         search_fallback_error,
@@ -9095,6 +9233,8 @@ function createServer() {
         exact_match_count: exactMatches.length,
         acceptable_match_count: acceptableMatches.length,
         verification_status,
+        incident_classification,
+        alert_task_creation_allowed: alertTaskCreationAllowed,
         production_ready_claim_allowed: verification_status === "ok",
         candidates: candidate_results,
         note:
@@ -9102,7 +9242,13 @@ function createServer() {
             ? "Naechste Routine-Instanz ist API-seitig gegen den erwarteten Vertrag verifiziert."
             : verification_status === "ok_with_warnings"
               ? "Naechste Routine-Instanz wurde gefunden, hat aber Warnungen. Reine Default-Supervisor/Moritz-Warnungen auf bestehenden Routinen sind kein automatischer Re-Add-Auftrag."
-            : "Naechste Routine-Instanz nicht eindeutig korrekt verifiziert. Nicht behaupten, dass Wiederholung/Fortsetzung sauber ist."
+            : verification_status === "pending_generation"
+              ? "Asana darf die Folgeinstanz noch asynchron erzeugen. Dies ist kein Fehler: keine Asana-Orchestrierungsaufgabe, keinen Blocker und keinen Kommentar erzeugen; erst nach next_recheck_after_seconds erneut pruefen."
+              : verification_status === "verification_unavailable"
+                ? "Die belastbare Zweitsuche ist technisch nicht verfuegbar. Keinen Fehlalarm oder Orchestrierungstask erzeugen; spaeter erneut pruefen."
+                : candidateContractRecheckRequired
+                  ? "Eine Folgeinstanz existiert, aber der erwartete Vertrag passt nicht. Erst mit den realen Kandidatenwerten erneut pruefen; nicht als fehlende Folgeinstanz melden."
+                  : "Nach abgelaufener Asana-Generierungsfrist und belastbarer Projekt-/Workspace-Suche fehlt weiterhin eine passende Folgeinstanz. Ein deduplizierter Orchestrierungsalarm ist jetzt erlaubt."
       });
     }
   );
