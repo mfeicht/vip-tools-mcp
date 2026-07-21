@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 import {
   __test,
@@ -19,6 +20,28 @@ assert.equal(isPrivateOrReservedIp("10.0.0.1"), true);
 assert.equal(isPrivateOrReservedIp("169.254.1.1"), true);
 assert.equal(isPrivateOrReservedIp("8.8.8.8"), false);
 assert.equal(normalizePublicUrl("https://example.com/a#fragment"), "https://example.com/a");
+
+const incompleteChromeExecutable = path.join(
+  process.cwd(),
+  ".cache",
+  "puppeteer",
+  "chrome",
+  "linux-test-build",
+  "chrome-linux64",
+  "chrome"
+);
+assert.equal(
+  __test.resolveIncompleteBrowserInstallDir({
+    default: { executablePath: () => incompleteChromeExecutable }
+  }),
+  path.dirname(path.dirname(incompleteChromeExecutable))
+);
+assert.equal(
+  __test.resolveIncompleteBrowserInstallDir({
+    default: { executablePath: () => "/tmp/unrelated/chrome-linux64/chrome" }
+  }),
+  ""
+);
 
 const pages = new Map([
   [

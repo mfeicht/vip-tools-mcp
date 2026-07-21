@@ -6166,9 +6166,14 @@ function parseTemplateActionSubject(subject) {
   if (!fields.ACTION || !fields.FROM) {
     throw new Error("Vorlagen-Betreff braucht ACTION=<slug> und FROM=<absenderadresse>.");
   }
+  const language = String(fields.LANG || "").trim().toLowerCase();
+  if (language && !/^[a-z]{2}(?:-[a-z]{2})?$/.test(language)) {
+    throw new Error(`Vorlagen-Betreff hat ungueltiges LANG=${fields.LANG}.`);
+  }
   return {
     action_id: normalizeActionSlug(fields.ACTION),
     from: extractEmailAddress(fields.FROM),
+    language: language || null,
     raw_subject: decoded
   };
 }
@@ -6251,6 +6256,18 @@ function loadEmailActionDefinitions() {
     if (sendAccountId && !loadEmailActionSendAccounts().accounts.some((account) => account.id === sendAccountId)) {
       throw new Error(`Action ${actionId} verweist auf unbekannte send_account_id ${sendAccountId}.`);
     }
+    const responseMode = String(action.response_mode || "deterministic").trim().toLowerCase();
+    if (!["deterministic", "agent_assisted"].includes(responseMode)) {
+      throw new Error(`Action ${actionId} hat ungueltigen response_mode=${action.response_mode}.`);
+    }
+    const inboundLanguage = String(action.inbound_language || "").trim().toLowerCase();
+    if (inboundLanguage && !["de", "en"].includes(inboundLanguage)) {
+      throw new Error(`Action ${actionId} hat ungueltige inbound_language=${action.inbound_language}.`);
+    }
+    const templateLanguage = String(action.template_language || inboundLanguage).trim().toLowerCase();
+    if (templateLanguage && !["de", "en"].includes(templateLanguage)) {
+      throw new Error(`Action ${actionId} hat ungueltige template_language=${action.template_language}.`);
+    }
     return {
       id: actionId,
       label: String(action.label || actionId),
@@ -6260,6 +6277,14 @@ function loadEmailActionDefinitions() {
       from: from || "",
       send_agent_id: action.send_agent_id || "",
       send_account_id: sendAccountId,
+      response_mode: responseMode,
+      inbound_language: inboundLanguage || "",
+      template_language: templateLanguage || "",
+      agent_allowed_adjustments: uniqueValues(
+        (Array.isArray(action.agent_allowed_adjustments) ? action.agent_allowed_adjustments : [])
+          .map((item) => String(item || "").trim().toLowerCase())
+          .filter(Boolean)
+      ),
       enabled: action.enabled !== false,
       live_enabled: action.live_enabled === true,
       template: {
@@ -6410,6 +6435,10 @@ function publicEmailAction(action) {
     error_mailbox: action.error_mailbox,
     enabled: action.enabled,
     live_enabled: action.live_enabled,
+    response_mode: action.response_mode,
+    inbound_language: action.inbound_language || null,
+    template_language: action.template_language || null,
+    agent_allowed_adjustments: action.agent_allowed_adjustments || [],
     from: action.from || null,
     send_agent_id: action.send_agent_id || sendAccount?.send_agent_id || null,
     send_account_id: action.send_account_id || sendAccount?.send_account_id || null,
@@ -6574,16 +6603,26 @@ async function scanEmailActionFolderWithFallback(configs, options) {
 }
 
 function resolveEmailActionTemplate(action, scan) {
-  const templates = scan.messages.filter((message) => message.template_subject);
+  const templates = scan.messages.filter(
+    (message) => message.template_subject?.action_id === action.id
+  );
   if (templates.length !== 1) {
     throw new Error(
-      `Action ${action.id}: Aktionsordner braucht genau eine Vorlage, gefunden: ${templates.length}.`
+      `Action ${action.id}: Aktionsordner braucht genau eine passende Vorlage, gefunden: ${templates.length}.`
     );
   }
   const template = templates[0];
   if (template.template_subject.action_id !== action.id) {
     throw new Error(
       `Action ${action.id}: Vorlagen-ACTION ist ${template.template_subject.action_id}.`
+    );
+  }
+  if (
+    action.template_language &&
+    template.template_subject.language !== action.template_language
+  ) {
+    throw new Error(
+      `Action ${action.id}: Vorlagen-LANG ist ${template.template_subject.language || "nicht gesetzt"}, erwartet ${action.template_language}.`
     );
   }
   const sendAccount = resolveEmailActionSendAccount(action, template.template_subject.from);
