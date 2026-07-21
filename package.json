@@ -11,7 +11,9 @@
     "test:imap-window": "node scripts/imap-window-selftest.mjs",
     "test:email-action-self-bcc": "node scripts/email-action-self-bcc-selftest.mjs",
     "test:attachment-visual-contract": "node scripts/attachment-visual-contract-selftest.mjs",
-    "test:recurrence-settle": "node scripts/recurrence-settle-selftest.mjs"
+    "test:recurrence-settle": "node scripts/recurrence-settle-selftest.mjs",
+    "test:web-research": "node scripts/web-research-selftest.mjs",
+    "shadow:web-research": "node scripts/web-research-live-shadow.mjs"
   },
   "keywords": [],
   "author": "",
@@ -22,11 +24,13 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "axios": "^1.15.2",
+    "axios": "^1.18.1",
+    "cheerio": "^1.0.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "pdf-parse": "^2.4.5",
     "puppeteer": "^24.15.0",
+    "robots-parser": "^3.0.1",
     "zod": "^4.3.6"
   }
 }

@@ -13,6 +13,16 @@ import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 
 import { selectImapUidWindow, sortImapMessagesByUidWindow } from "./lib/imap-window.js";
+import {
+  WEB_RESEARCH_INCLUDE_VALUES,
+  WEB_RESEARCH_PURPOSE_VALUES,
+  WEB_RESEARCH_RENDER_MODE_VALUES,
+  getWebResearchConfig,
+  runWebResearchCrawl,
+  runWebResearchExtract,
+  runWebResearchListings,
+  runWebResearchMonitor
+} from "./lib/web-research.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -209,6 +219,30 @@ const WEB_PAGE_SECTION_VALUES = [
   "all"
 ];
 const WEB_PAGE_DEFAULT_SECTIONS = ["seo", "headings", "links", "schema", "text"];
+const webResearchAgentIdSchema = z.string().trim().min(3).max(100);
+const webResearchPurposeSchema = z.enum(WEB_RESEARCH_PURPOSE_VALUES);
+const webResearchRenderModeSchema = z.enum(WEB_RESEARCH_RENDER_MODE_VALUES).optional().default("http");
+const webResearchIncludeSchema = z.array(z.enum(WEB_RESEARCH_INCLUDE_VALUES)).max(6).optional();
+const webResearchFieldSchema = z
+  .object({
+    name: z.string().trim().regex(/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/),
+    selector: z.string().max(500).optional().default(""),
+    attribute: z.string().trim().max(100).optional().default("text"),
+    multiple: z.boolean().optional().default(false),
+    required: z.boolean().optional().default(false),
+    max_values: z.number().int().min(1).max(100).optional().default(20),
+    max_chars: z.number().int().min(20).max(5_000).optional().default(2_000)
+  })
+  .strict();
+const webResearchSnapshotSchema = z
+  .object({
+    url: z.string().max(2_000).optional(),
+    captured_at: z.string().max(100).optional(),
+    html_sha256: z.string().max(128).optional(),
+    normalized_text_sha256: z.string().max(128).optional(),
+    fields: z.record(z.string(), z.array(z.string().max(5_000)).max(100)).optional().default({})
+  })
+  .strict();
 const ASANA_ATTACHMENT_DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const ASANA_ATTACHMENT_HARD_MAX_BYTES = 8 * 1024 * 1024;
 const ASANA_ATTACHMENT_DEFAULT_CHUNK_BYTES = 24 * 1024;
@@ -12690,6 +12724,109 @@ function createServer() {
         verified_task,
         verification_status
       });
+    }
+  );
+
+  server.tool(
+    "web_research_check_config",
+    "Prueft den schlanken VIP-Web-Research-Layer read-only. Zeigt Limits, Browser-Verfuegbarkeit und Sicherheitsgrenzen ohne Secrets oder externen Webseitenabruf.",
+    {},
+    TOOL_READ_ONLY,
+    async () => out(getWebResearchConfig())
+  );
+
+  server.tool(
+    "web_research_extract",
+    "Extrahiert oeffentliche Webseiten read-only als strukturierte Evidenz. Geeignet fuer gezielte Felder, SEO-/Content-Research und dynamische Seiten; keine Logins, Cookies, Formulare oder Schreibaktionen. Fuer eine einzelne normale Seitenpruefung bleibt web_page_inspect der bevorzugte leichte Pfad.",
+    {
+      agent_id: webResearchAgentIdSchema,
+      purpose: webResearchPurposeSchema,
+      url: z.string().max(2_000),
+      render_mode: webResearchRenderModeSchema,
+      include: webResearchIncludeSchema,
+      fields: z.array(webResearchFieldSchema).max(30).optional().default([]),
+      text_max_chars: z.number().int().min(0).max(50_000).optional().default(5_000),
+      html_max_chars: z.number().int().min(0).max(200_000).optional().default(20_000),
+      max_links: z.number().int().min(0).max(500).optional().default(100),
+      max_images: z.number().int().min(0).max(500).optional().default(100),
+      timeout_ms: z.number().int().min(2_000).max(60_000).optional().default(25_000)
+    },
+    TOOL_EXTERNAL_READ,
+    async (args) => {
+      const names = args.fields.map((field) => field.name);
+      if (new Set(names).size !== names.length) throw new Error("Feldnamen muessen eindeutig sein.");
+      return out(await runWebResearchExtract(args));
+    }
+  );
+
+  server.tool(
+    "web_research_crawl",
+    "Crawlt eine oeffentliche Website read-only innerhalb derselben Origin. Liefert pro Seite Quelle, Fetch-Zeit, Hash und kompakte SEO-/Heading-/Textdaten. Robots.txt, DNS-/SSRF-Schutz, Tiefen-, Seiten- und Delay-Limits sind verpflichtend; keine Logins oder externen Linkketten.",
+    {
+      agent_id: webResearchAgentIdSchema,
+      purpose: webResearchPurposeSchema,
+      start_url: z.string().max(2_000),
+      render_mode: webResearchRenderModeSchema,
+      include: z.array(z.enum(["seo", "headings", "text"])).max(3).optional(),
+      include_patterns: z.array(z.string().min(1).max(200)).max(20).optional().default([]),
+      exclude_patterns: z.array(z.string().min(1).max(200)).max(20).optional().default([]),
+      max_pages: z.number().int().min(1).max(50).optional().default(10),
+      max_depth: z.number().int().min(0).max(4).optional().default(1),
+      delay_ms: z.number().int().min(250).max(5_000).optional().default(500),
+      text_max_chars: z.number().int().min(0).max(15_000).optional().default(2_000),
+      timeout_ms: z.number().int().min(2_000).max(60_000).optional().default(25_000)
+    },
+    TOOL_EXTERNAL_READ,
+    async (args) => out(await runWebResearchCrawl(args))
+  );
+
+  server.tool(
+    "web_research_listings",
+    "Extrahiert wiederholte Eintraege aus oeffentlichen Listen, Verzeichnissen oder Suchseiten read-only. Folgt optional einer CSS-Next-Page-Navigation nur innerhalb derselben Origin und liefert Quellen-/Hash-Evidenz. Keine Logins, Formulare oder Kontaktaktionen.",
+    {
+      agent_id: webResearchAgentIdSchema,
+      purpose: webResearchPurposeSchema,
+      start_url: z.string().max(2_000),
+      render_mode: webResearchRenderModeSchema,
+      item_selector: z.string().trim().min(1).max(500),
+      fields: z.array(webResearchFieldSchema).min(1).max(30),
+      next_page_selector: z.string().trim().max(500).optional().default(""),
+      dedupe_by: z.string().trim().max(64).optional().default(""),
+      max_pages: z.number().int().min(1).max(50).optional().default(3),
+      max_items: z.number().int().min(1).max(1_000).optional().default(100),
+      delay_ms: z.number().int().min(250).max(5_000).optional().default(500),
+      timeout_ms: z.number().int().min(2_000).max(60_000).optional().default(25_000)
+    },
+    TOOL_EXTERNAL_READ,
+    async (args) => {
+      const names = args.fields.map((field) => field.name);
+      if (new Set(names).size !== names.length) throw new Error("Feldnamen muessen eindeutig sein.");
+      if (args.dedupe_by && !names.includes(args.dedupe_by)) {
+        throw new Error("dedupe_by muss auf einen definierten Feldnamen zeigen.");
+      }
+      return out(await runWebResearchListings(args));
+    }
+  );
+
+  server.tool(
+    "web_research_monitor",
+    "Erstellt oder vergleicht einen stateless Snapshot einer oeffentlichen Webseite. Vergleicht normalisierten Text, HTML-Hash und optionale strukturierte Felder; der Agent speichert den Snapshot im eigenen Runtime-State. Keine serverseitig versteckten Dauerjobs und keine Schreibaktionen.",
+    {
+      agent_id: webResearchAgentIdSchema,
+      purpose: webResearchPurposeSchema,
+      url: z.string().max(2_000),
+      render_mode: webResearchRenderModeSchema,
+      include: z.array(z.enum(["seo", "text"])).max(2).optional(),
+      fields: z.array(webResearchFieldSchema).max(30).optional().default([]),
+      previous_snapshot: webResearchSnapshotSchema.optional(),
+      text_max_chars: z.number().int().min(0).max(15_000).optional().default(5_000),
+      timeout_ms: z.number().int().min(2_000).max(60_000).optional().default(25_000)
+    },
+    TOOL_EXTERNAL_READ,
+    async (args) => {
+      const names = args.fields.map((field) => field.name);
+      if (new Set(names).size !== names.length) throw new Error("Feldnamen muessen eindeutig sein.");
+      return out(await runWebResearchMonitor(args));
     }
   );
 
