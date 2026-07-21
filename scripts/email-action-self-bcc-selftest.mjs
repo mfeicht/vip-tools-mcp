@@ -31,6 +31,9 @@ try {
   const contactActions = (actions.actions || []).filter((action) =>
     ["rs-contact-de", "rs-contact-en"].includes(action.id)
   );
+  const discountActions = (actions.actions || []).filter((action) =>
+    ["rs-contact-rabatt-de", "rs-contact-rabatt-en"].includes(action.id)
+  );
   const report = {
     discovery_tool_present: names.has("email_action_discover_folders"),
     send_account_tool_present: names.has("email_action_list_send_accounts"),
@@ -49,6 +52,28 @@ try {
     adaptive_contact_live_disabled:
       contactActions.length === 2 &&
       contactActions.every((action) => action.response_mode === "agent_assisted" && action.live_enabled === false),
+    contact_use_case_routing_present:
+      contactActions.length === 2 &&
+      contactActions.every(
+        (action) =>
+          action.selection_group === "rs-contact" &&
+          action.use_case === "initial-link-or-article-cooperation" &&
+          Boolean(action.routing_description)
+      ),
+    discount_actions_safely_prepared:
+      discountActions.length === 2 &&
+      discountActions.every(
+        (action) =>
+          action.selection_group === "rs-contact" &&
+          action.use_case === "discount-follow-up-after-cooperation-offer" &&
+          action.enabled === false &&
+          action.live_enabled === false
+      ),
+    every_template_marker_is_excluded_from_inbound:
+      source.includes("function isTemplateActionSubjectMarked") &&
+      source.includes("function isEmailActionInboundMessage") &&
+      source.includes("invalid_template_count") &&
+      source.includes("template_subject_error"),
     adaptive_placeholder_guard_present:
       source.includes("validateEmailActionAgentPlaceholderValues") &&
       source.includes("agent_template_fit_confirmation_required"),

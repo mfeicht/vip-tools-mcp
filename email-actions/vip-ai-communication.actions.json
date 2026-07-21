@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "owner_agent_id": "vip-ai-communication",
   "action_mailbox_root": "INBOX.E-Mail-Automatisierung",
   "done_mailbox_root": "INBOX.VIP AI.Erledigt",
@@ -17,6 +17,9 @@
       "inbound_language": "de",
       "template_language": "de",
       "idempotency_scope": "rs-contact",
+      "selection_group": "rs-contact",
+      "use_case": "initial-link-or-article-cooperation",
+      "routing_description": "Erste Antwort auf eine neue Anfrage zu Linkkooperation, Beitragskooperation, Gastbeitrag oder vergleichbarer Zusammenarbeit; nicht fuer eine nachgelagerte Rabattfrage.",
       "agent_allowed_adjustments": [
         "language_selection",
         "template_fit_check",
@@ -46,6 +49,9 @@
       "inbound_language": "en",
       "template_language": "en",
       "idempotency_scope": "rs-contact",
+      "selection_group": "rs-contact",
+      "use_case": "initial-link-or-article-cooperation",
+      "routing_description": "Initial reply to a new link cooperation, article cooperation, guest post or comparable collaboration inquiry; not for a later discount request.",
       "agent_allowed_adjustments": [
         "language_selection",
         "template_fit_check",
@@ -62,6 +68,70 @@
       "required_placeholders": [],
       "name_placeholder_mode": "from_header",
       "notes": "Agent waehlt diese Variante nur fuer englische Eingangsmails, bestaetigt die fachliche Passung und darf ausschliesslich sichere Namens-/Anrede-Platzhalter anpassen."
+    },
+    {
+      "id": "rs-contact-rabatt-de",
+      "label": "Reise-Stories Contact - Rabatt-Nachfrage - Deutsch",
+      "mailbox": "INBOX.E-Mail-Automatisierung.RS | Contact",
+      "done_mailbox": "INBOX.VIP AI.Erledigt.rs-contact",
+      "error_mailbox": "INBOX.VIP AI.Fehler.rs-contact",
+      "from": "contact@reise-stories.de",
+      "send_account_id": "rs-contact",
+      "response_mode": "agent_assisted",
+      "inbound_language": "de",
+      "template_language": "de",
+      "idempotency_scope": "rs-contact",
+      "selection_group": "rs-contact",
+      "use_case": "discount-follow-up-after-cooperation-offer",
+      "routing_description": "Antwort auf eine nachgelagerte Rabatt- oder Preisnachlassfrage innerhalb einer bereits bestehenden Kooperationsanfrage; nicht fuer die erste Kooperationsanfrage.",
+      "agent_allowed_adjustments": [
+        "language_selection",
+        "template_fit_check",
+        "personal_salutation",
+        "safe_name_placeholders"
+      ],
+      "enabled": false,
+      "live_enabled": false,
+      "template": {
+        "uid": "",
+        "message_id": "",
+        "sha256": ""
+      },
+      "required_placeholders": [],
+      "name_placeholder_mode": "from_header",
+      "notes": "Vorbereitete Action. Erst nach Vorlagen-Readback, Registrierung und Shadow-Run aktivieren."
+    },
+    {
+      "id": "rs-contact-rabatt-en",
+      "label": "Reise-Stories Contact - Discount Follow-up - English",
+      "mailbox": "INBOX.E-Mail-Automatisierung.RS | Contact",
+      "done_mailbox": "INBOX.VIP AI.Erledigt.rs-contact",
+      "error_mailbox": "INBOX.VIP AI.Fehler.rs-contact",
+      "from": "contact@reise-stories.de",
+      "send_account_id": "rs-contact",
+      "response_mode": "agent_assisted",
+      "inbound_language": "en",
+      "template_language": "en",
+      "idempotency_scope": "rs-contact",
+      "selection_group": "rs-contact",
+      "use_case": "discount-follow-up-after-cooperation-offer",
+      "routing_description": "Reply to a later discount request within an existing cooperation inquiry; not for the initial cooperation inquiry.",
+      "agent_allowed_adjustments": [
+        "language_selection",
+        "template_fit_check",
+        "personal_salutation",
+        "safe_name_placeholders"
+      ],
+      "enabled": false,
+      "live_enabled": false,
+      "template": {
+        "uid": "",
+        "message_id": "",
+        "sha256": ""
+      },
+      "required_placeholders": [],
+      "name_placeholder_mode": "from_header",
+      "notes": "Prepared action. Enable only after template readback, registration and shadow run."
     }
   ]
 }

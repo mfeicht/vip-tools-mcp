@@ -6152,9 +6152,17 @@ function extractSingleVerifiedReplyRecipient(headers) {
   return { email: from[0], source: "from" };
 }
 
+function isTemplateActionSubjectMarked(subject) {
+  const decoded = decodeMimeHeaderValue(subject || "").trim();
+  return /^VORLAGE\b/iu.test(decoded);
+}
+
 function parseTemplateActionSubject(subject) {
   const decoded = decodeMimeHeaderValue(subject || "").trim();
-  if (!/^VORLAGE\s*\|/i.test(decoded)) return null;
+  if (!isTemplateActionSubjectMarked(decoded)) return null;
+  if (!/^VORLAGE\s*\|/i.test(decoded)) {
+    throw new Error("Vorlagen-Betreff braucht das Format VORLAGE | ACTION=<slug> | FROM=<absenderadresse>.");
+  }
   const fields = {};
   for (const segment of decoded.split("|").slice(1)) {
     const index = segment.indexOf("=");
@@ -6271,6 +6279,9 @@ function loadEmailActionDefinitions() {
     const idempotencyScope = action.idempotency_scope
       ? normalizeActionSlug(action.idempotency_scope)
       : actionId;
+    const selectionGroup = action.selection_group
+      ? normalizeActionSlug(action.selection_group)
+      : idempotencyScope;
     return {
       id: actionId,
       label: String(action.label || actionId),
@@ -6284,6 +6295,9 @@ function loadEmailActionDefinitions() {
       inbound_language: inboundLanguage || "",
       template_language: templateLanguage || "",
       idempotency_scope: idempotencyScope,
+      selection_group: selectionGroup,
+      use_case: String(action.use_case || actionId).trim(),
+      routing_description: String(action.routing_description || "").trim(),
       agent_allowed_adjustments: uniqueValues(
         (Array.isArray(action.agent_allowed_adjustments) ? action.agent_allowed_adjustments : [])
           .map((item) => String(item || "").trim().toLowerCase())
@@ -6443,6 +6457,9 @@ function publicEmailAction(action) {
     inbound_language: action.inbound_language || null,
     template_language: action.template_language || null,
     idempotency_scope: action.idempotency_scope,
+    selection_group: action.selection_group,
+    use_case: action.use_case,
+    routing_description: action.routing_description || null,
     agent_allowed_adjustments: action.agent_allowed_adjustments || [],
     from: action.from || null,
     send_agent_id: action.send_agent_id || sendAccount?.send_agent_id || null,
@@ -6547,7 +6564,16 @@ async function runImapActionFolderScan(config, { mailbox, maxEmailBytes, maxScan
         continue;
       }
       const parsed = await parseRawEmail(raw, uid);
-      const templateSubject = parseTemplateActionSubject(parsed.subject);
+      const templateMarker = isTemplateActionSubjectMarked(parsed.subject);
+      let templateSubject = null;
+      let templateSubjectError = null;
+      if (templateMarker) {
+        try {
+          templateSubject = parseTemplateActionSubject(parsed.subject);
+        } catch (error) {
+          templateSubjectError = String(error?.message || error);
+        }
+      }
       messages.push({
         uid,
         flags,
@@ -6555,7 +6581,9 @@ async function runImapActionFolderScan(config, { mailbox, maxEmailBytes, maxScan
         raw_bytes: rawBytes,
         raw_sha256: createHash("sha256").update(raw, "binary").digest("hex"),
         parsed,
-        template_subject: templateSubject
+        template_marker: templateMarker,
+        template_subject: templateSubject,
+        template_subject_error: templateSubjectError
       });
     }
 
@@ -6638,6 +6666,10 @@ function resolveEmailActionTemplate(action, scan) {
     complete: Boolean(action.template.uid && action.template.message_id && action.template.sha256)
   };
   return { template, sendAccount, registered };
+}
+
+function isEmailActionInboundMessage(message) {
+  return message?.template_marker !== true;
 }
 
 function publicActionFolderMessage(message) {
@@ -16098,14 +16130,18 @@ function createServer() {
             maxScanMessages: max_scan_messages_per_folder
           });
           const templates = scan.messages.filter((message) => message.template_subject);
-          const unrecognizedMessages = scan.messages.filter((message) => !message.template_subject);
+          const invalidTemplates = scan.messages.filter(
+            (message) => message.template_marker && !message.template_subject
+          );
+          const inboundMessages = scan.messages.filter(isEmailActionInboundMessage);
           folders.push({
             mailbox,
             relative_path: mailbox.toLowerCase() === rootLower ? "" : mailbox.slice(root.length + 1),
             total_uid_count: scan.total_uid_count,
             scanned_uid_count: scan.scanned_uid_count,
             template_count: templates.length,
-            inbound_count: unrecognizedMessages.length,
+            inbound_count: inboundMessages.length,
+            invalid_template_count: invalidTemplates.length,
             templates: templates.map((template) => ({
               uid: template.uid,
               action_id: template.template_subject.action_id,
@@ -16122,7 +16158,11 @@ function createServer() {
                 parseMimeMessageTextParts(template.raw).flatMap((part) => collectPlaceholders(part.text))
               )
             })),
-            unrecognized_messages: unrecognizedMessages.map((message) => ({
+            invalid_templates: invalidTemplates.map((message) => ({
+              ...publicActionFolderMessage(message),
+              template_subject_error: message.template_subject_error || "invalid_template_subject"
+            })),
+            unrecognized_messages: inboundMessages.map((message) => ({
               ...publicActionFolderMessage(message),
               language_detection: detectEmailActionLanguage(message)
             }))
@@ -16205,7 +16245,7 @@ function createServer() {
         maxScanMessages: max_scan_messages
       });
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
-      const inbound = scan.messages.filter((message) => !message.template_subject);
+      const inbound = scan.messages.filter(isEmailActionInboundMessage);
       const doneExists = scan.available_mailboxes.some((mailbox) => mailbox.toLowerCase() === action.done_mailbox.toLowerCase());
       const errorExists = scan.available_mailboxes.some((mailbox) => mailbox.toLowerCase() === action.error_mailbox.toLowerCase());
 
@@ -16385,7 +16425,7 @@ function createServer() {
         });
       }
       const sourceMessage = scan.messages.find(
-        (message) => !message.template_subject && String(message.uid) === String(message_uid)
+        (message) => isEmailActionInboundMessage(message) && String(message.uid) === String(message_uid)
       );
       if (!sourceMessage) {
         throw new Error(`Action ${action.id}: Eingangsnachricht UID ${message_uid} nicht gefunden.`);
@@ -16536,7 +16576,7 @@ function createServer() {
       }
 
       const evaluatedCandidates = scan.messages
-        .filter((message) => !message.template_subject)
+        .filter(isEmailActionInboundMessage)
         .filter((message) => !message_uid || String(message.uid) === String(message_uid))
         .map((message) => ({
           message,
@@ -16749,7 +16789,7 @@ function createServer() {
       }
 
       const evaluatedCandidates = scan.messages
-        .filter((message) => !message.template_subject)
+        .filter(isEmailActionInboundMessage)
         .filter((message) => !message_uid || String(message.uid) === String(message_uid))
         .map((message) => ({
           message,
