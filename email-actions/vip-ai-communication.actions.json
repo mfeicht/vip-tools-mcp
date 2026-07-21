@@ -1,7 +1,7 @@
 {
-  "version": 1,
+  "version": 2,
   "owner_agent_id": "vip-ai-communication",
-  "action_mailbox_root": "VIP AI/Aktionen",
+  "action_mailbox_root": "E-Mail-Automatisierung",
   "done_mailbox_root": "VIP AI/Erledigt",
   "error_mailbox_root": "VIP AI/Fehler",
   "actions": []
