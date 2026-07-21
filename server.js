@@ -15821,12 +15821,16 @@ function createServer() {
       const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
       const listed = await listImapMailboxesWithFallback(configs);
       const rootLower = root.toLowerCase();
-      const matching = listed.mailboxes
-        .filter((mailbox) => {
-          const lower = mailbox.toLowerCase();
-          return lower === rootLower || lower.startsWith(`${rootLower}/`);
-        })
-        .slice(0, max_folders);
+      const isAtOrBelowRoot = (mailbox) => {
+        const lower = mailbox.toLowerCase();
+        return (
+          lower === rootLower ||
+          lower.startsWith(`${rootLower}/`) ||
+          lower.startsWith(`${rootLower}.`)
+        );
+      };
+      const matchingMailboxes = listed.mailboxes.filter(isAtOrBelowRoot);
+      const matching = matchingMailboxes.slice(0, max_folders);
       const folders = [];
       for (const mailbox of matching) {
         try {
@@ -15869,10 +15873,7 @@ function createServer() {
         mailbox_root: root,
         root_exists: listed.mailboxes.some((mailbox) => mailbox.toLowerCase() === rootLower),
         matching_folder_count: matching.length,
-        truncated_by_max_folders: matching.length < listed.mailboxes.filter((mailbox) => {
-          const lower = mailbox.toLowerCase();
-          return lower === rootLower || lower.startsWith(`${rootLower}/`);
-        }).length,
+        truncated_by_max_folders: matching.length < matchingMailboxes.length,
         folders,
         available_mailboxes: listed.mailboxes,
         imap: {
@@ -16142,6 +16143,10 @@ function createServer() {
             idempotency_id: plan.idempotency_id,
             from: plan.from,
             to: plan.to,
+            bcc: plan.bcc,
+            bcc_source: plan.bcc_source,
+            bcc_visible_in_mime_headers: plan.bcc_visible_in_mime_headers,
+            envelope_recipient_count: plan.envelope_recipients.length,
             recipient_source: plan.recipient_source,
             subject: plan.subject,
             message_id: plan.message_id,
@@ -16160,6 +16165,7 @@ function createServer() {
               moves_source_message: false,
               marks_seen: false,
               cc_bcc_copied: false,
+              mandatory_self_bcc_matches_from: plan.bcc === plan.from,
               raw_mime_preserved_from_template_entity: true,
               thread_headers_present: Boolean(plan.in_reply_to && plan.references)
             }
