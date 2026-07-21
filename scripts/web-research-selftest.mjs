@@ -210,6 +210,7 @@ assert.equal(config.safety.public_http_https_only, true);
 assert.equal(config.safety.authenticated_sessions_supported, false);
 assert.equal(config.safety.non_get_browser_requests_blocked, true);
 assert.equal(config.safety.browser_downloads_blocked, true);
+assert.equal(config.browser_runtime_recovery_enabled, true);
 assert.equal(config.mode, "synchronous_stateless_read_only");
 
 const serverSource = await readFile(new URL("../server.js", import.meta.url), "utf8");
@@ -225,5 +226,9 @@ for (const toolName of [
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 assert.equal(packageJson.scripts["test:web-research"], "node scripts/web-research-selftest.mjs");
+assert.equal(packageJson.scripts.postinstall, "puppeteer browsers install chrome");
+
+const puppeteerConfig = await readFile(new URL("../.puppeteerrc.cjs", import.meta.url), "utf8");
+assert.match(puppeteerConfig, /\.cache.*puppeteer/);
 
 console.log("web research self-test passed");
