@@ -9,6 +9,7 @@
     "test:evidence-gate": "node scripts/evidence-gate-selftest.mjs",
     "test:authorization-origin": "node scripts/authorization-origin-selftest.mjs",
     "test:imap-window": "node scripts/imap-window-selftest.mjs",
+    "test:email-action-self-bcc": "node scripts/email-action-self-bcc-selftest.mjs",
     "test:attachment-visual-contract": "node scripts/attachment-visual-contract-selftest.mjs",
     "test:recurrence-settle": "node scripts/recurrence-settle-selftest.mjs"
   },

@@ -4656,6 +4656,39 @@ function emailLearningBodyText(textParts, maxBodyChars) {
   };
 }
 
+function emailTemplateStyleSummary(textParts) {
+  const html = (textParts || [])
+    .filter((part) => part.content_type === "text/html")
+    .map((part) => String(part.text || ""))
+    .join("\n");
+  const collectCssValues = (property) => uniqueValues(
+    [...html.matchAll(new RegExp(`${property}\\s*:\\s*([^;}"]+)`, "gi"))]
+      .map((match) => match[1].trim())
+      .filter(Boolean)
+      .slice(0, 25)
+  );
+  const links = [...html.matchAll(/\bhref\s*=\s*["']([^"']+)["']/gi)].map((match) => match[1]);
+  return {
+    html_present: Boolean(html.trim()),
+    font_families: collectCssValues("font-family"),
+    font_sizes: collectCssValues("font-size"),
+    colors: collectCssValues("color"),
+    background_colors: collectCssValues("background-color"),
+    line_heights: collectCssValues("line-height"),
+    text_alignments: collectCssValues("text-align"),
+    link_count: links.length,
+    external_link_domains: uniqueValues(
+      links.map((value) => {
+        try {
+          return new URL(value).hostname.toLowerCase();
+        } catch {
+          return "";
+        }
+      }).filter(Boolean)
+    )
+  };
+}
+
 function classifyBccDelivery(message, mailboxAddress) {
   const mailbox = extractEmailAddress(mailboxAddress);
   const visibleRecipients = new Set([
@@ -9853,7 +9886,8 @@ function createServer() {
             agentId: agent_id,
             authorization,
             confirmedByAsana: confirmed_by_asana,
-            asanaTaskGid: task_gid,
+            asanaTaskGid:
+              authorization?.source === "asana" || confirmed_by_asana ? task_gid : undefined,
             actionName: "asana_update_task_description"
           });
 
@@ -15944,6 +15978,7 @@ function createServer() {
           }
         },
         send_account: {
+          send_account_id: sendAccount.send_account_id,
           send_agent_id: sendAccount.send_agent_id,
           from: sendAccount.from,
           raw_mime_transport: sendAccount.raw_mime_transport,
@@ -15951,7 +15986,64 @@ function createServer() {
           smtp_ready_for_send: sendAccount.smtp_ready_for_send,
           email_http_provider: sendAccount.email_http_provider,
           email_http_ready_for_send: sendAccount.email_http_ready_for_send,
+          mandatory_self_bcc: sendAccount.mandatory_self_bcc,
           note: sendAccount.raw_mime_note
+        }
+      });
+    }
+  );
+
+  server.tool(
+    "email_action_template_style_readback",
+    "Liest den Text- und Stilkontext einer exakt identifizierten Action-Vorlage read-only fuer das absenderspezifische Communication-Lernen. Gibt keine Anhaenge oder eingebetteten Bilddaten aus und autorisiert keinen Versand.",
+    {
+      agent_id: z.literal(EMAIL_ACTION_CONTROL_AGENT_ID).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      action_id: z.string(),
+      max_body_chars: z.number().int().min(1000).max(30_000).optional().default(20_000),
+      max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
+      max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, action_id, max_body_chars, max_scan_messages, max_email_bytes }) => {
+      const { action } = getEmailActionDefinition(action_id);
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const scan = await scanEmailActionFolderWithFallback(configs, {
+        mailbox: action.mailbox,
+        maxEmailBytes: max_email_bytes,
+        maxScanMessages: max_scan_messages
+      });
+      const { template, registered } = resolveEmailActionTemplate(action, scan);
+      const registryOk = registered.complete && registered.uid_ok && registered.message_id_ok && registered.sha256_ok;
+      const textParts = parseMimeMessageTextParts(template.raw);
+      const body = emailLearningBodyText(textParts, max_body_chars);
+      return out({
+        agent_id,
+        action_id: action.id,
+        from: template.template_subject.from,
+        template_uid: template.uid,
+        template_message_id_hash: template.parsed.message_id_hash || null,
+        template_sha256: template.raw_sha256,
+        registry_match: registryOk,
+        learning_allowed: registryOk,
+        body_text: registryOk ? body.text : null,
+        body_text_source: registryOk ? body.source : null,
+        body_text_truncated: registryOk ? body.truncated : null,
+        style_summary: registryOk ? emailTemplateStyleSummary(textParts) : null,
+        inline_resource_count: parseMimeMessageInlineResources(template.raw).length,
+        attachment_content_returned: false,
+        sends_live_email: false,
+        moves_message: false,
+        marks_seen: false,
+        email_content_is_authorization: false,
+        imap: {
+          ...summary,
+          connection: {
+            host: scan.host,
+            port: scan.port,
+            secure: scan.secure,
+            label: scan.label
+          },
+          attempts: scan.attempts
         }
       });
     }
