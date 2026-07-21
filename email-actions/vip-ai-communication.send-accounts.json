@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "owner_agent_id": "vip-ai-communication",
+  "accounts": [
+    {
+      "id": "rs-moritz",
+      "address": "moritz.feichtmeyer@reise-stories.de",
+      "env_suffix": "EMAIL_AUTOMATION_RS_MORITZ"
+    },
+    {
+      "id": "rs-contact",
+      "address": "contact@reise-stories.de",
+      "env_suffix": "EMAIL_AUTOMATION_RS_CONTACT"
+    },
+    {
+      "id": "rs-media",
+      "address": "media@reise-stories.de",
+      "env_suffix": "EMAIL_AUTOMATION_RS_MEDIA"
+    },
+    {
+      "id": "goklever-support",
+      "address": "support@goklever.de",
+      "env_suffix": "EMAIL_AUTOMATION_GOKLEVER_SUPPORT"
+    }
+  ]
+}

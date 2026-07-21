@@ -130,6 +130,10 @@ const SMTP_TIMEOUT_MS = Number(process.env.SMTP_TIMEOUT_MS || 15_000);
 const EMAIL_HTTP_TIMEOUT_MS = Number(process.env.EMAIL_HTTP_TIMEOUT_MS || 20_000);
 const IMAP_TIMEOUT_MS = Number(process.env.IMAP_TIMEOUT_MS || 15_000);
 const EMAIL_ACTION_CONFIG_URL = new URL("./email-actions/vip-ai-communication.actions.json", import.meta.url);
+const EMAIL_ACTION_SEND_ACCOUNT_CONFIG_URL = new URL(
+  "./email-actions/vip-ai-communication.send-accounts.json",
+  import.meta.url
+);
 const EMAIL_ACTION_CONTROL_AGENT_ID = "vip-ai-communication";
 const EMAIL_ACTION_MAX_EMAIL_BYTES = Number(process.env.EMAIL_ACTION_MAX_EMAIL_BYTES || 4 * 1024 * 1024);
 const EMAIL_ACTION_MAX_SCAN_MESSAGES = Number(process.env.EMAIL_ACTION_MAX_SCAN_MESSAGES || 100);
@@ -3116,6 +3120,89 @@ function getSmtpConfigCandidates(agentId, { requireCredentials = true } = {}) {
   };
 }
 
+function getSmtpConfigCandidatesForEmailActionAccount(account, { requireCredentials = true } = {}) {
+  const suffix = String(account?.env_suffix || "").trim();
+  const expectedFrom = extractEmailAddress(account?.address || "");
+  if (!suffix || !/^[A-Z0-9_]+$/.test(suffix)) {
+    throw new Error(`E-Mail-Sendekonto ${account?.id || "unbekannt"}: env_suffix ist ungueltig.`);
+  }
+  if (!expectedFrom) {
+    throw new Error(`E-Mail-Sendekonto ${account?.id || "unbekannt"}: address ist ungueltig.`);
+  }
+
+  const configuredFrom = process.env[`EMAIL_ADDRESS_${suffix}`] || expectedFrom;
+  if (extractEmailAddress(configuredFrom) !== expectedFrom) {
+    throw new Error(
+      `E-Mail-Sendekonto ${account.id}: EMAIL_ADDRESS_${suffix} passt nicht zur registrierten Adresse ${expectedFrom}.`
+    );
+  }
+  const configuredHost = process.env[`SMTP_HOST_${suffix}`] || process.env.SMTP_HOST || "";
+  const defaultHost = defaultSmtpHostForAddress(expectedFrom);
+  const host = configuredHost || defaultHost;
+  const rawPort = process.env[`SMTP_PORT_${suffix}`] || process.env.SMTP_PORT || "";
+  const port = Number(rawPort || 465);
+  const rawSecure = process.env[`SMTP_SECURE_${suffix}`] || process.env.SMTP_SECURE || "";
+  const secure = parseBooleanEnv(rawSecure, port === 465);
+  const configuredUser = process.env[`SMTP_USER_${suffix}`] || "";
+  const user = configuredUser || expectedFrom;
+  const passwordEnvName = process.env[`SMTP_PASSWORD_${suffix}`]
+    ? `SMTP_PASSWORD_${suffix}`
+    : process.env[`EMAIL_PASSWORD_${suffix}`]
+      ? `EMAIL_PASSWORD_${suffix}`
+      : "";
+  const password = passwordEnvName ? process.env[passwordEnvName] : "";
+  const summary = {
+    send_account_id: account.id,
+    from: expectedFrom,
+    env_suffix: suffix,
+    host_configured: Boolean(host),
+    host_source: configuredHost ? "env" : defaultHost ? "default_vip_studios_domain" : "missing",
+    port,
+    port_source: rawPort ? "env" : "default",
+    secure,
+    secure_source: rawSecure ? "env" : "default",
+    user_configured: Boolean(configuredUser),
+    user,
+    password_configured: Boolean(password),
+    password_env_name: passwordEnvName || null,
+    ready_for_send: Boolean(expectedFrom && host && password)
+  };
+
+  if (requireCredentials) {
+    if (!host) throw new Error(`SMTP_HOST_${suffix} oder SMTP_HOST fehlt im MCP-Environment.`);
+    if (!password) {
+      throw new Error(`SMTP_PASSWORD_${suffix} oder EMAIL_PASSWORD_${suffix} fehlt im MCP-Environment.`);
+    }
+  }
+
+  const config = { fromAddress: expectedFrom, host, port, secure, user, password };
+  const candidates = [{ ...config, label: "primary" }];
+  const hasExplicitPort = summary.port_source === "env";
+  const isVipStudiosHost = /^vip-studios\.vip-studios\.de$/i.test(host || "");
+  if (!hasExplicitPort && isVipStudiosHost && port === 465) {
+    candidates.push({ ...config, port: 587, secure: false, label: "vip_studios_587_starttls_fallback" });
+  }
+  const uniqueCandidates = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = `${candidate.host}:${candidate.port}:${candidate.secure}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueCandidates.push(candidate);
+  }
+
+  return {
+    suffix,
+    configs: uniqueCandidates,
+    primaryConfig: uniqueCandidates[0],
+    summary: {
+      ...summary,
+      smtp_timeout_ms: SMTP_TIMEOUT_MS,
+      smtp_candidates: uniqueCandidates.map(publicSmtpConfig)
+    }
+  };
+}
+
 function getSmtpConfig(agentId, { requireCredentials = true } = {}) {
   return getSmtpConfigCandidates(agentId, { requireCredentials }).primaryConfig;
 }
@@ -4718,6 +4805,93 @@ function parseImapListMailboxes(response) {
   return uniqueValues(mailboxes);
 }
 
+async function runImapListMailboxes(config) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("utf8");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    const listResponse = await command('LIST "" "*"');
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return { mailboxes: parseImapListMailboxes(listResponse) };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function listImapMailboxesWithFallback(configs) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapListMailboxes(config);
+      return {
+        ...result,
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP Mailbox-Liste fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
+}
+
 function resolveArchiveMailbox(mailboxes, preferredMailbox) {
   const available = uniqueValues(mailboxes);
   const exact = (candidate) =>
@@ -5932,6 +6106,40 @@ function parseTemplateActionSubject(subject) {
   };
 }
 
+function loadEmailActionSendAccounts() {
+  if (!existsSync(EMAIL_ACTION_SEND_ACCOUNT_CONFIG_URL)) {
+    return { version: 0, owner_agent_id: EMAIL_ACTION_CONTROL_AGENT_ID, accounts: [] };
+  }
+  const parsed = JSON.parse(readFileSync(EMAIL_ACTION_SEND_ACCOUNT_CONFIG_URL, "utf8"));
+  const seenIds = new Set();
+  const seenAddresses = new Set();
+  const accounts = (Array.isArray(parsed.accounts) ? parsed.accounts : []).map((account) => {
+    const id = normalizeActionSlug(account.id);
+    const address = extractEmailAddress(account.address || "");
+    const envSuffix = String(account.env_suffix || "").trim();
+    if (!address) throw new Error(`E-Mail-Sendekonto ${id}: address ist ungueltig.`);
+    if (!/^[A-Z0-9_]+$/.test(envSuffix)) {
+      throw new Error(`E-Mail-Sendekonto ${id}: env_suffix ist ungueltig.`);
+    }
+    if (seenIds.has(id)) throw new Error(`Doppelte E-Mail-Sendekonto-ID: ${id}`);
+    if (seenAddresses.has(address)) throw new Error(`Doppelte E-Mail-Sendeadresse: ${address}`);
+    seenIds.add(id);
+    seenAddresses.add(address);
+    return { id, address, env_suffix: envSuffix };
+  });
+  return {
+    version: Number(parsed.version || 1),
+    owner_agent_id: parsed.owner_agent_id || EMAIL_ACTION_CONTROL_AGENT_ID,
+    accounts
+  };
+}
+
+function findEmailActionSendAccountByAddress(address) {
+  const normalized = extractEmailAddress(address);
+  if (!normalized) return null;
+  return loadEmailActionSendAccounts().accounts.find((account) => account.address === normalized) || null;
+}
+
 function loadEmailActionDefinitions() {
   if (!existsSync(EMAIL_ACTION_CONFIG_URL)) {
     return {
@@ -5958,6 +6166,10 @@ function loadEmailActionDefinitions() {
     if (action.send_agent_id && !ASANA_TOKEN_ENVS[action.send_agent_id]) {
       throw new Error(`Action ${actionId} verweist auf unbekannte send_agent_id ${action.send_agent_id}.`);
     }
+    const sendAccountId = action.send_account_id ? normalizeActionSlug(action.send_account_id) : "";
+    if (sendAccountId && !loadEmailActionSendAccounts().accounts.some((account) => account.id === sendAccountId)) {
+      throw new Error(`Action ${actionId} verweist auf unbekannte send_account_id ${sendAccountId}.`);
+    }
     return {
       id: actionId,
       label: String(action.label || actionId),
@@ -5966,6 +6178,7 @@ function loadEmailActionDefinitions() {
       error_mailbox: errorMailbox,
       from: from || "",
       send_agent_id: action.send_agent_id || "",
+      send_account_id: sendAccountId,
       enabled: action.enabled !== false,
       live_enabled: action.live_enabled === true,
       template: {
@@ -6026,6 +6239,35 @@ function resolveEmailActionSendAccount(action, templateFrom) {
     throw new Error(`Action ${action.id}: Vorlage FROM=${templateFromEmail} passt nicht zur Action-Konfiguration ${expectedFrom}.`);
   }
 
+  const standaloneAccount = action.send_account_id
+    ? loadEmailActionSendAccounts().accounts.find((account) => account.id === action.send_account_id)
+    : findEmailActionSendAccountByAddress(expectedFrom);
+  if (standaloneAccount) {
+    if (standaloneAccount.address !== expectedFrom) {
+      throw new Error(
+        `Action ${action.id}: send_account_id ${standaloneAccount.id} sendet als ${standaloneAccount.address}, erwartet ${expectedFrom}.`
+      );
+    }
+    const smtpDetails = getSmtpConfigCandidatesForEmailActionAccount(standaloneAccount, {
+      requireCredentials: false
+    });
+    return {
+      send_account_id: standaloneAccount.id,
+      send_agent_id: null,
+      env_suffix: standaloneAccount.env_suffix,
+      from: expectedFrom,
+      smtp_ready_for_send: smtpDetails.summary.ready_for_send,
+      smtp_summary: smtpDetails.summary,
+      email_http_provider: null,
+      email_http_ready_for_send: false,
+      raw_mime_transport: "smtp",
+      raw_mime_transport_ready: smtpDetails.summary.ready_for_send,
+      mandatory_self_bcc: true,
+      raw_mime_note:
+        "Vorlagenantworten mit vollstaendigem MIME/CID-Erhalt werden ueber SMTP-Raw-MIME versendet; die verifizierte FROM-Adresse wird verpflichtend als unsichtbarer Self-BCC-Envelope-Empfaenger gesetzt."
+    };
+  }
+
   const sendAgentId = action.send_agent_id || findAgentIdForEmailAddress(expectedFrom);
   if (!sendAgentId) {
     throw new Error(`Action ${action.id}: Kein konfiguriertes Agenten-Sendekonto fuer ${expectedFrom} gefunden.`);
@@ -6041,6 +6283,7 @@ function resolveEmailActionSendAccount(action, templateFrom) {
 
   return {
     send_agent_id: sendAgentId,
+    send_account_id: null,
     from: expectedFrom,
     smtp_ready_for_send: smtpDetails.summary.ready_for_send,
     smtp_summary: smtpDetails.summary,
@@ -6048,9 +6291,26 @@ function resolveEmailActionSendAccount(action, templateFrom) {
     email_http_ready_for_send: httpDetails.summary.email_http_ready_for_send,
     raw_mime_transport: "smtp",
     raw_mime_transport_ready: smtpDetails.summary.ready_for_send,
+    mandatory_self_bcc: true,
     raw_mime_note:
       "Vorlagenantworten mit vollstaendigem MIME/CID-Erhalt werden ueber SMTP-Raw-MIME versendet; HTTP-Provider werden nur berichtet, nicht fuer Raw-MIME-Liveversand genutzt."
   };
+}
+
+function getEmailActionSmtpConfigCandidates(sendAccount) {
+  if (sendAccount?.send_account_id) {
+    const account = loadEmailActionSendAccounts().accounts.find(
+      (item) => item.id === sendAccount.send_account_id
+    );
+    if (!account) {
+      throw new Error(`Unbekanntes E-Mail-Sendekonto: ${sendAccount.send_account_id}`);
+    }
+    return getSmtpConfigCandidatesForEmailActionAccount(account, { requireCredentials: true });
+  }
+  if (!sendAccount?.send_agent_id) {
+    throw new Error("E-Mail-Action hat weder send_account_id noch send_agent_id.");
+  }
+  return getSmtpConfigCandidates(sendAccount.send_agent_id, { requireCredentials: true });
 }
 
 function publicEmailAction(action) {
@@ -6071,6 +6331,8 @@ function publicEmailAction(action) {
     live_enabled: action.live_enabled,
     from: action.from || null,
     send_agent_id: action.send_agent_id || sendAccount?.send_agent_id || null,
+    send_account_id: action.send_account_id || sendAccount?.send_account_id || null,
+    mandatory_self_bcc: sendAccount?.mandatory_self_bcc ?? true,
     template_registered: Boolean(action.template.uid && action.template.message_id && action.template.sha256),
     template_uid: action.template.uid || null,
     template_message_id_hash: action.template.message_id
@@ -6472,6 +6734,11 @@ function buildRawTemplateReply({ action, templateMessage, sourceMessage, sendAcc
     ...(!isMultipart && cte ? [`Content-Transfer-Encoding: ${cte}`] : [])
   ];
   const rawMessage = `${headers.join("\r\n")}\r\n\r\n${rendered.body}`;
+  const selfBcc = extractEmailAddress(sendAccount.from);
+  if (!selfBcc) {
+    throw new Error(`Action ${action.id}: verifizierte FROM-Adresse fuer Self-BCC fehlt.`);
+  }
+  const envelopeRecipients = uniqueValues([recipient.email, selfBcc]);
 
   return {
     idempotency_id: idempotencyId,
@@ -6483,6 +6750,10 @@ function buildRawTemplateReply({ action, templateMessage, sourceMessage, sendAcc
     message_id: messageId,
     from: sendAccount.from,
     to: recipient.email,
+    bcc: selfBcc,
+    bcc_source: "verified_from_address",
+    bcc_visible_in_mime_headers: false,
+    envelope_recipients: envelopeRecipients,
     recipient_source: recipient.source,
     subject,
     in_reply_to: inbound.message_id,
@@ -15438,6 +15709,146 @@ function createServer() {
   );
 
   server.tool(
+    "email_action_list_send_accounts",
+    "Listet die versionierten Versandkonten fuer die Communication-E-Mail-Automatisierung und prueft deren SMTP-Bereitschaft ohne Anmeldung oder Versand. Gibt nur Env-Variablennamen, niemals Secret-Werte aus.",
+    {
+      agent_id: z.literal(EMAIL_ACTION_CONTROL_AGENT_ID).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id }) => {
+      const config = loadEmailActionSendAccounts();
+      return out({
+        agent_id,
+        version: config.version,
+        owner_agent_id: config.owner_agent_id,
+        account_count: config.accounts.length,
+        accounts: config.accounts.map((account) => {
+          let details;
+          let error = null;
+          try {
+            details = getSmtpConfigCandidatesForEmailActionAccount(account, { requireCredentials: false });
+          } catch (caught) {
+            error = String(caught?.message || caught);
+          }
+          return {
+            id: account.id,
+            address: account.address,
+            env_suffix: account.env_suffix,
+            smtp_ready_for_send: details?.summary?.ready_for_send ?? false,
+            host_configured: details?.summary?.host_configured ?? false,
+            password_configured: details?.summary?.password_configured ?? false,
+            password_env_name: details?.summary?.password_env_name ?? null,
+            required_env_names: {
+              address_optional: `EMAIL_ADDRESS_${account.env_suffix}`,
+              host: `SMTP_HOST_${account.env_suffix}`,
+              port_optional: `SMTP_PORT_${account.env_suffix}`,
+              secure_optional: `SMTP_SECURE_${account.env_suffix}`,
+              user_optional: `SMTP_USER_${account.env_suffix}`,
+              password_one_of: [
+                `SMTP_PASSWORD_${account.env_suffix}`,
+                `EMAIL_PASSWORD_${account.env_suffix}`
+              ]
+            },
+            mandatory_self_bcc: account.address,
+            error
+          };
+        })
+      });
+    }
+  );
+
+  server.tool(
+    "email_action_discover_folders",
+    "Liest die IMAP-Ordnerhierarchie der Communication-E-Mail-Automatisierung read-only, sucht Vorlagenbetreffe und liefert UID/Message-ID/SHA256 sowie MIME-Metadaten fuer die versionierte Registrierung. Gibt keine Mailtexte oder Anhaenge aus und veraendert keine Nachricht.",
+    {
+      agent_id: z.literal(EMAIL_ACTION_CONTROL_AGENT_ID).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      mailbox_root: z.string().min(1).max(500).optional().default("E-Mail-Automatisierung"),
+      max_folders: z.number().int().min(1).max(100).optional().default(50),
+      max_scan_messages_per_folder: z.number().int().min(1).max(500).optional().default(100),
+      max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, mailbox_root, max_folders, max_scan_messages_per_folder, max_email_bytes }) => {
+      const root = String(mailbox_root || "").trim().replace(/\/+$/, "");
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const listed = await listImapMailboxesWithFallback(configs);
+      const rootLower = root.toLowerCase();
+      const matching = listed.mailboxes
+        .filter((mailbox) => {
+          const lower = mailbox.toLowerCase();
+          return lower === rootLower || lower.startsWith(`${rootLower}/`);
+        })
+        .slice(0, max_folders);
+      const folders = [];
+      for (const mailbox of matching) {
+        try {
+          const scan = await scanEmailActionFolderWithFallback(configs, {
+            mailbox,
+            maxEmailBytes: max_email_bytes,
+            maxScanMessages: max_scan_messages_per_folder
+          });
+          const templates = scan.messages.filter((message) => message.template_subject);
+          folders.push({
+            mailbox,
+            relative_path: mailbox.toLowerCase() === rootLower ? "" : mailbox.slice(root.length + 1),
+            total_uid_count: scan.total_uid_count,
+            scanned_uid_count: scan.scanned_uid_count,
+            template_count: templates.length,
+            inbound_count: scan.messages.filter((message) => !message.template_subject).length,
+            templates: templates.map((template) => ({
+              uid: template.uid,
+              action_id: template.template_subject.action_id,
+              from: template.template_subject.from,
+              subject: template.parsed.subject,
+              message_id: template.parsed.message_id || null,
+              message_id_hash: template.parsed.message_id_hash || null,
+              sha256: template.raw_sha256,
+              raw_bytes: template.raw_bytes,
+              content_types: uniqueValues(parseMimeMessageTextParts(template.raw).map((part) => part.content_type)),
+              inline_resource_count: parseMimeMessageInlineResources(template.raw).length,
+              placeholders: uniqueValues(
+                parseMimeMessageTextParts(template.raw).flatMap((part) => collectPlaceholders(part.text))
+              )
+            }))
+          });
+        } catch (error) {
+          folders.push({ mailbox, scan_error: String(error?.message || error) });
+        }
+      }
+      return out({
+        agent_id,
+        mode: "readonly_email_action_folder_discovery",
+        mailbox_root: root,
+        root_exists: listed.mailboxes.some((mailbox) => mailbox.toLowerCase() === rootLower),
+        matching_folder_count: matching.length,
+        truncated_by_max_folders: matching.length < listed.mailboxes.filter((mailbox) => {
+          const lower = mailbox.toLowerCase();
+          return lower === rootLower || lower.startsWith(`${rootLower}/`);
+        }).length,
+        folders,
+        imap: {
+          ...summary,
+          connection: {
+            host: listed.host,
+            port: listed.port,
+            secure: listed.secure,
+            label: listed.label
+          },
+          attempts: listed.attempts
+        },
+        safety: {
+          read_only: true,
+          marks_seen: false,
+          moves_messages: false,
+          sends_messages: false,
+          returns_body_text: false,
+          returns_attachment_content: false
+        }
+      });
+    }
+  );
+
+  server.tool(
     "email_action_list_actions",
     "Listet die versionierten E-Mail-Aktionsordner fuer VIP AI-Communication und prueft die Sendekonto-Zuordnung ohne IMAP-Zugriff, Versand oder Verschiebung.",
     {
@@ -15800,6 +16211,10 @@ function createServer() {
             idempotency_id: plan.idempotency_id,
             from: plan.from,
             to: plan.to,
+            bcc: plan.bcc,
+            bcc_source: plan.bcc_source,
+            bcc_visible_in_mime_headers: plan.bcc_visible_in_mime_headers,
+            envelope_recipient_count: plan.envelope_recipients.length,
             subject: plan.subject,
             message_id: plan.message_id,
             raw_message_sha256: plan.raw_message_sha256,
@@ -15857,12 +16272,15 @@ function createServer() {
               flag: plan.processing_flag,
               expectedRawSha256: message.raw_sha256
             });
-            const { configs: smtpConfigs } = getSmtpConfigCandidates(sendAccount.send_agent_id, { requireCredentials: true });
+            const { configs: smtpConfigs } = getEmailActionSmtpConfigCandidates(sendAccount);
+            if (plan.bcc !== plan.from || !plan.envelope_recipients.includes(plan.bcc)) {
+              throw new Error(`Action ${action.id}: verpflichtender Self-BCC stimmt nicht mit FROM ueberein.`);
+            }
             transport = {
               type: "smtp_raw_mime",
               ...(await sendSmtpRawEmail(smtpConfigs, {
                 envelopeFrom: plan.from,
-                to: [plan.to],
+                to: plan.envelope_recipients,
                 rawMessage: plan.raw_message
               }))
             };
@@ -15924,6 +16342,9 @@ function createServer() {
             provider_message_id: plan.message_id,
             from: plan.from,
             to: plan.to,
+            bcc: plan.bcc,
+            bcc_source: plan.bcc_source,
+            bcc_visible_in_mime_headers: plan.bcc_visible_in_mime_headers,
             subject: plan.subject,
             template_sha256: plan.template_sha256,
             raw_message_sha256: plan.raw_message_sha256,
