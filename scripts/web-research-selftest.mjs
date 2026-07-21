@@ -234,6 +234,7 @@ assert.equal(config.safety.authenticated_sessions_supported, false);
 assert.equal(config.safety.non_get_browser_requests_blocked, true);
 assert.equal(config.safety.browser_downloads_blocked, true);
 assert.equal(config.browser_runtime_recovery_enabled, true);
+assert.equal(config.browser_executable_resolution, "verified_explicit_path");
 assert.equal(config.mode, "synchronous_stateless_read_only");
 
 const serverSource = await readFile(new URL("../server.js", import.meta.url), "utf8");
