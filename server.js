@@ -3137,12 +3137,12 @@ function getSmtpConfigCandidatesForEmailActionAccount(account, { requireCredenti
     );
   }
   const configuredHost = process.env[`SMTP_HOST_${suffix}`] || process.env.SMTP_HOST || "";
-  const defaultHost = defaultSmtpHostForAddress(expectedFrom);
+  const defaultHost = String(account.smtp_host || "").trim() || defaultSmtpHostForAddress(expectedFrom);
   const host = configuredHost || defaultHost;
   const rawPort = process.env[`SMTP_PORT_${suffix}`] || process.env.SMTP_PORT || "";
-  const port = Number(rawPort || 465);
+  const port = Number(rawPort || account.smtp_port || 465);
   const rawSecure = process.env[`SMTP_SECURE_${suffix}`] || process.env.SMTP_SECURE || "";
-  const secure = parseBooleanEnv(rawSecure, port === 465);
+  const secure = parseBooleanEnv(rawSecure, typeof account.smtp_secure === "boolean" ? account.smtp_secure : port === 465);
   const configuredUser = process.env[`SMTP_USER_${suffix}`] || "";
   const user = configuredUser || expectedFrom;
   const passwordEnvName = process.env[`SMTP_PASSWORD_${suffix}`]
@@ -3156,11 +3156,11 @@ function getSmtpConfigCandidatesForEmailActionAccount(account, { requireCredenti
     from: expectedFrom,
     env_suffix: suffix,
     host_configured: Boolean(host),
-    host_source: configuredHost ? "env" : defaultHost ? "default_vip_studios_domain" : "missing",
+    host_source: configuredHost ? "env" : account.smtp_host ? "versioned_account_config" : defaultHost ? "default_vip_studios_domain" : "missing",
     port,
-    port_source: rawPort ? "env" : "default",
+    port_source: rawPort ? "env" : account.smtp_port ? "versioned_account_config" : "default",
     secure,
-    secure_source: rawSecure ? "env" : "default",
+    secure_source: rawSecure ? "env" : typeof account.smtp_secure === "boolean" ? "versioned_account_config" : "default",
     user_configured: Boolean(configuredUser),
     user,
     password_configured: Boolean(password),
@@ -6158,7 +6158,21 @@ function loadEmailActionSendAccounts() {
     if (seenAddresses.has(address)) throw new Error(`Doppelte E-Mail-Sendeadresse: ${address}`);
     seenIds.add(id);
     seenAddresses.add(address);
-    return { id, address, env_suffix: envSuffix };
+    const smtpHost = String(account.smtp_host || "").trim();
+    const smtpPort = Number(account.smtp_port || 465);
+    const smtpSecure = typeof account.smtp_secure === "boolean" ? account.smtp_secure : smtpPort === 465;
+    if (!smtpHost) throw new Error(`E-Mail-Sendekonto ${id}: smtp_host fehlt.`);
+    if (!Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535) {
+      throw new Error(`E-Mail-Sendekonto ${id}: smtp_port ist ungueltig.`);
+    }
+    return {
+      id,
+      address,
+      env_suffix: envSuffix,
+      smtp_host: smtpHost,
+      smtp_port: smtpPort,
+      smtp_secure: smtpSecure
+    };
   });
   return {
     version: Number(parsed.version || 1),
@@ -15774,7 +15788,7 @@ function createServer() {
             password_env_name: details?.summary?.password_env_name ?? null,
             required_env_names: {
               address_optional: `EMAIL_ADDRESS_${account.env_suffix}`,
-              host: `SMTP_HOST_${account.env_suffix}`,
+              host_optional: `SMTP_HOST_${account.env_suffix}`,
               port_optional: `SMTP_PORT_${account.env_suffix}`,
               secure_optional: `SMTP_SECURE_${account.env_suffix}`,
               user_optional: `SMTP_USER_${account.env_suffix}`,
@@ -15860,6 +15874,7 @@ function createServer() {
           return lower === rootLower || lower.startsWith(`${rootLower}/`);
         }).length,
         folders,
+        available_mailboxes: listed.mailboxes,
         imap: {
           ...summary,
           connection: {

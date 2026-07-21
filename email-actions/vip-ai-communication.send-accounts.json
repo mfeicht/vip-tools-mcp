@@ -5,22 +5,34 @@
     {
       "id": "rs-moritz",
       "address": "moritz.feichtmeyer@reise-stories.de",
-      "env_suffix": "EMAIL_AUTOMATION_RS_MORITZ"
+      "env_suffix": "EMAIL_AUTOMATION_RS_MORITZ",
+      "smtp_host": "vip-studios.vip-studios.de",
+      "smtp_port": 465,
+      "smtp_secure": true
     },
     {
       "id": "rs-contact",
       "address": "contact@reise-stories.de",
-      "env_suffix": "EMAIL_AUTOMATION_RS_CONTACT"
+      "env_suffix": "EMAIL_AUTOMATION_RS_CONTACT",
+      "smtp_host": "vip-studios.vip-studios.de",
+      "smtp_port": 465,
+      "smtp_secure": true
     },
     {
       "id": "rs-media",
       "address": "media@reise-stories.de",
-      "env_suffix": "EMAIL_AUTOMATION_RS_MEDIA"
+      "env_suffix": "EMAIL_AUTOMATION_RS_MEDIA",
+      "smtp_host": "vip-studios.vip-studios.de",
+      "smtp_port": 465,
+      "smtp_secure": true
     },
     {
       "id": "goklever-support",
       "address": "support@goklever.de",
-      "env_suffix": "EMAIL_AUTOMATION_GOKLEVER_SUPPORT"
+      "env_suffix": "EMAIL_AUTOMATION_GOKLEVER_SUPPORT",
+      "smtp_host": "vip-studios.vip-studios.de",
+      "smtp_port": 465,
+      "smtp_secure": true
     }
   ]
 }
