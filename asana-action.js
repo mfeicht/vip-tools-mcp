@@ -23,7 +23,7 @@ const asana = axios.create({
 const [action, taskGid, ...rest] = args;
 
 if (!action || !taskGid) {
-  throw new Error("Nutzung: node asana-action.js [--agent=vip-ai-sales] comment|complete|update TASK_GID ...");
+  throw new Error("Nutzung: node asana-action.js [--agent=vip-ai-sales] comment|complete|update|append-notes TASK_GID ...");
 }
 
 function escapeHtml(value) {
@@ -80,6 +80,26 @@ else if (action === "update") {
   });
 
   console.log(JSON.stringify({ ok: true, action, result: res.data.data }, null, 2));
+}
+
+else if (action === "append-notes") {
+  const text = rest.join(" ").trim();
+  if (!text) throw new Error("Notiztext fehlt");
+
+  const task = await asana.get(`/tasks/${taskGid}`, {
+    params: { opt_fields: "gid,name,notes" },
+  });
+  const currentNotes = task.data.data.notes || "";
+  const marker = text.split("\n").find((line) => line.startsWith("Update-Key:")) || text.slice(0, 120);
+  if (currentNotes.includes(marker)) {
+    console.log(JSON.stringify({ ok: true, action, skipped: true, marker, task: task.data.data }, null, 2));
+  } else {
+    const notes = `${currentNotes.replace(/\s+$/g, "")}\n\n\n${text}`;
+    const res = await asana.put(`/tasks/${taskGid}`, {
+      data: { notes },
+    });
+    console.log(JSON.stringify({ ok: true, action, marker, result: res.data.data }, null, 2));
+  }
 }
 
 else {
