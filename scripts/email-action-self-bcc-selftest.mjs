@@ -23,15 +23,35 @@ try {
     name: "email_action_list_send_accounts",
     arguments: { agent_id: "vip-ai-communication" }
   }));
+  const actions = parse(await client.callTool({
+    name: "email_action_list_actions",
+    arguments: { agent_id: "vip-ai-communication" }
+  }));
   const source = readFileSync(new URL("../server.js", import.meta.url), "utf8");
+  const contactActions = (actions.actions || []).filter((action) =>
+    ["rs-contact-de", "rs-contact-en"].includes(action.id)
+  );
   const report = {
     discovery_tool_present: names.has("email_action_discover_folders"),
     send_account_tool_present: names.has("email_action_list_send_accounts"),
     template_style_tool_present: names.has("email_action_template_style_readback"),
+    adaptive_context_tool_present: names.has("email_action_agent_context"),
     four_accounts_registered: accounts.account_count === 4,
     every_account_has_self_bcc: (accounts.accounts || []).every(
       (account) => account.mandatory_self_bcc === account.address
     ),
+    two_contact_language_actions_registered:
+      contactActions.length === 2 &&
+      new Set(contactActions.map((action) => action.inbound_language)).size === 2,
+    contact_actions_share_idempotency_scope:
+      contactActions.length === 2 &&
+      contactActions.every((action) => action.idempotency_scope === "rs-contact"),
+    adaptive_contact_live_disabled:
+      contactActions.length === 2 &&
+      contactActions.every((action) => action.response_mode === "agent_assisted" && action.live_enabled === false),
+    adaptive_placeholder_guard_present:
+      source.includes("validateEmailActionAgentPlaceholderValues") &&
+      source.includes("agent_template_fit_confirmation_required"),
     envelope_send_uses_self_bcc_plan:
       source.includes("to: plan.envelope_recipients") &&
       source.includes("plan.bcc !== plan.from") &&
