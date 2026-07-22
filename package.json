@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "postinstall": "puppeteer browsers install chrome",
+    "postinstall": "node scripts/install-browser-runtime.mjs",
     "test": "node scripts/asana-watcher.mjs --self-test",
     "test:evidence-gate": "node scripts/evidence-gate-selftest.mjs",
     "test:authorization-origin": "node scripts/authorization-origin-selftest.mjs",
@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@sparticuz/chromium": "138.0.2",
     "axios": "^1.18.1",
     "cheerio": "^1.0.0",
     "dotenv": "^17.4.2",

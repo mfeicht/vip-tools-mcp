@@ -234,7 +234,11 @@ assert.equal(config.safety.authenticated_sessions_supported, false);
 assert.equal(config.safety.non_get_browser_requests_blocked, true);
 assert.equal(config.safety.browser_downloads_blocked, true);
 assert.equal(config.browser_runtime_recovery_enabled, true);
-assert.equal(config.browser_executable_resolution, "verified_explicit_path");
+assert.equal(config.browser_executable_resolution, "verified_explicit_path_v2");
+assert.equal(
+  config.browser_runtime_provider,
+  process.platform === "linux" ? "sparticuz_chromium_138" : "puppeteer_managed"
+);
 assert.equal(config.mode, "synchronous_stateless_read_only");
 
 const serverSource = await readFile(new URL("../server.js", import.meta.url), "utf8");
@@ -250,7 +254,12 @@ for (const toolName of [
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 assert.equal(packageJson.scripts["test:web-research"], "node scripts/web-research-selftest.mjs");
-assert.equal(packageJson.scripts.postinstall, "puppeteer browsers install chrome");
+assert.equal(packageJson.scripts.postinstall, "node scripts/install-browser-runtime.mjs");
+assert.equal(packageJson.dependencies["@sparticuz/chromium"], "138.0.2");
+
+const browserInstaller = await readFile(new URL("./install-browser-runtime.mjs", import.meta.url), "utf8");
+assert.match(browserInstaller, /process\.platform === "linux"/);
+assert.match(browserInstaller, /@sparticuz\/chromium/);
 
 const puppeteerConfig = await readFile(new URL("../.puppeteerrc.cjs", import.meta.url), "utf8");
 assert.match(puppeteerConfig, /\.cache.*puppeteer/);
