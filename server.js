@@ -17833,6 +17833,7 @@ function dashboardLocalServices(now, telemetry) {
   const checkedAt = telemetry?.generatedAt || null;
   const codex = telemetry?.codex || null;
   const finance = telemetry?.finance || null;
+  const resources = telemetry?.resources || null;
   return [
     {
       id: "codex-runtime",
@@ -17866,6 +17867,17 @@ function dashboardLocalServices(now, telemetry) {
           : "Keine Verbindung auf dem Finance-Gateway-Port"
         : "Keine frische lokale Telemetrie",
       status: finance?.gatewayConnected ? "healthy" : "critical",
+      checkedAt
+    },
+    {
+      id: "codex-capacity",
+      name: "Codex Kapazität",
+      detail: resources
+        ? `${resources.plan?.usedPercent ?? "–"} % genutzt · Forecast ${
+            resources.forecast?.projectedUsedPercent ?? "–"
+          } % bis Reset`
+        : "Keine frische Kapazitätstelemetrie",
+      status: resources?.forecast?.status || "attention",
       checkedAt
     }
   ];
@@ -17950,6 +17962,28 @@ async function buildVipDashboardSnapshot() {
           "Finance kann ohne Gateway-Verbindung keine frischen Broker-Readbacks und keine freigegebenen Handelswege ausführen."
       });
     }
+    if (
+      telemetry.resources?.forecast?.status === "critical" ||
+      telemetry.resources?.forecast?.status === "attention"
+    ) {
+      const forecast = telemetry.resources.forecast;
+      const plan = telemetry.resources.plan;
+      alerts.push({
+        id: "codex-capacity-forecast",
+        level: forecast.status,
+        title:
+          forecast.status === "critical"
+            ? "Codex-Kapazität reicht im aktuellen Tempo voraussichtlich nicht"
+            : "Codex-Kapazität nähert sich der Sicherheitsgrenze",
+        detail: `${plan?.usedPercent ?? "–"} % genutzt; konservativer Forecast ${
+          forecast.projectedUsedPercent ?? "–"
+        } % bis zum Reset. ${
+          forecast.depletionAt
+            ? `Voraussichtliche Ausschöpfung: ${forecast.depletionAt}.`
+            : "Kein vorzeitiger Ausschöpfungszeitpunkt erkannt."
+        }`
+      });
+    }
   }
   if (marketing.status !== "healthy") {
     alerts.push({
@@ -17993,6 +18027,7 @@ async function buildVipDashboardSnapshot() {
     alerts,
     operations: telemetry?.codex || null,
     finance: telemetry?.finance || null,
+    resources: telemetry?.resources || null,
     marketing
   };
 }

@@ -11,7 +11,11 @@ const telemetry = {
   generatedAt: new Date(now).toISOString(),
   nonce: "dashboard-selftest-123",
   codex: { status: "healthy" },
-  finance: { gatewayConnected: true }
+  finance: { gatewayConnected: true },
+  resources: {
+    plan: { usedPercent: 48 },
+    forecast: { status: "critical", projectedUsedPercent: 157 }
+  }
 };
 const payload = Buffer.from(JSON.stringify(telemetry));
 const signature = sign(null, payload, privateKey);
@@ -22,6 +26,8 @@ const decoded = decodeAndVerifyDashboardTelemetry({
   now
 });
 assert.equal(decoded.nonce, telemetry.nonce);
+assert.equal(decoded.resources.plan.usedPercent, 48);
+assert.equal(decoded.resources.forecast.projectedUsedPercent, 157);
 
 assert.throws(() =>
   decodeAndVerifyDashboardTelemetry({
