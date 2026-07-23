@@ -46,6 +46,13 @@ const VIP_INTAKE_RATE_LIMIT_MAX = Math.max(1, Number(process.env.VIP_INTAKE_RATE
 const VIP_INTAKE_ROUTE_CONFIG = parseJsonEnv(process.env.VIP_INTAKE_CONFIG_JSON || "{}", {});
 const VIP_INTAKE_ALLOWED_ORIGINS = parseCsvEnv(process.env.VIP_INTAKE_ALLOWED_ORIGINS || "");
 const VIP_INTAKE_ROUTING_SECRET = String(process.env.VIP_INTAKE_ROUTING_SECRET || "");
+const VIP_DASHBOARD_FEED_TOKEN = String(
+  process.env.VIP_DASHBOARD_FEED_TOKEN || process.env.VIP_INTAKE_ROUTING_SECRET || ""
+);
+const VIP_DASHBOARD_CACHE_TTL_MS = Math.max(
+  30_000,
+  Number(process.env.VIP_DASHBOARD_CACHE_TTL_MS || 2 * 60 * 1000)
+);
 
 const ASANA_TOKEN_ENVS = {
   "vip-ai-sales": "ASANA_TOKEN_VIP_AI_SALES",
@@ -75,6 +82,27 @@ const ASANA_TOKEN_ENVS = {
 };
 
 const agentIdSchema = z.enum(Object.keys(ASANA_TOKEN_ENVS)).optional().default(DEFAULT_AGENT_ID);
+const VIP_DASHBOARD_AGENT_NAMES = {
+  "vip-ai-operations": ["VIP AI-Operations", "Operations"],
+  "vip-ai-content": ["VIP AI-Content", "Content"],
+  "vip-ai-sales": ["VIP AI-Sales", "Sales"],
+  "vip-ai-marketing": ["VIP AI-Marketing", "Marketing"],
+  "vip-ai-office": ["VIP AI-Office", "Office"],
+  "vip-ai-developer": ["VIP AI-Developer", "Development"],
+  "vip-ai-support": ["VIP AI-Support", "Support"],
+  "vip-ai-design": ["VIP AI-Design", "Design"],
+  "vip-ai-social-media": ["VIP AI-Social-Media", "Social Media"],
+  "vip-ai-memory": ["VIP AI-Memory", "Memory"],
+  "vip-ai-review": ["VIP AI-Review", "Review"],
+  "vip-ai-strategy": ["VIP AI-Strategy", "Strategy"],
+  "vip-ai-monitoring": ["VIP AI-Monitoring", "Monitoring"],
+  "vip-ai-communication": ["VIP AI-Communication", "Communication"],
+  "vip-ai-research": ["VIP AI-Research", "Research"],
+  "vip-ai-project-manager": ["VIP AI-Project-Manager", "Project Management"],
+  "vip-ai-business-developer": ["VIP AI-Business-Developer", "Business Development"],
+  "vip-ai-finance": ["VIP AI-Finance", "Finance"],
+  "vip-ai-accounting": ["VIP AI-Accounting", "Accounting"]
+};
 const actionAuthorizationSchema = z
   .object({
     source: z.enum(["asana", "direct_codex"]),
@@ -17461,6 +17489,305 @@ function createServer() {
 /* ---------------- EXPRESS ---------------- */
 
 const app = express();
+let vipDashboardSnapshotCache = {
+  expires_at: 0,
+  value: null
+};
+
+function dashboardBearerToken(req) {
+  const authorization = String(req.headers.authorization || "");
+  if (/^Bearer\s+/i.test(authorization)) {
+    return authorization.replace(/^Bearer\s+/i, "").trim();
+  }
+  return String(req.headers["x-vip-dashboard-token"] || "").trim();
+}
+
+function hasValidDashboardFeedToken(req) {
+  const supplied = dashboardBearerToken(req);
+  if (!VIP_DASHBOARD_FEED_TOKEN || !supplied) return false;
+  const expectedBuffer = Buffer.from(VIP_DASHBOARD_FEED_TOKEN);
+  const suppliedBuffer = Buffer.from(supplied);
+  return (
+    expectedBuffer.length === suppliedBuffer.length &&
+    timingSafeEqual(expectedBuffer, suppliedBuffer)
+  );
+}
+
+function berlinDateKey(value = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Berlin",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(value);
+}
+
+function summarizeDashboardTasks(tasks, now = new Date()) {
+  const today = berlinDateKey(now);
+  let overdueTasks = 0;
+  let dueTodayTasks = 0;
+
+  for (const task of tasks) {
+    const dueAt = task?.due_at ? new Date(task.due_at) : null;
+    const dueDate = dueAt && !Number.isNaN(dueAt.getTime()) ? berlinDateKey(dueAt) : task?.due_on || null;
+    if (!dueDate) continue;
+
+    if (dueAt && !Number.isNaN(dueAt.getTime())) {
+      if (dueAt.getTime() < now.getTime()) overdueTasks += 1;
+      if (dueDate === today) dueTodayTasks += 1;
+      continue;
+    }
+
+    if (dueDate < today) overdueTasks += 1;
+    if (dueDate === today) dueTodayTasks += 1;
+  }
+
+  return {
+    open_tasks: tasks.length,
+    overdue_tasks: overdueTasks,
+    due_today_tasks: dueTodayTasks
+  };
+}
+
+async function mapWithConcurrency(values, concurrency, mapper) {
+  const results = new Array(values.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (cursor < values.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await mapper(values[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function readDashboardAgentHealth(agentId, now) {
+  const [name, area] = VIP_DASHBOARD_AGENT_NAMES[agentId] || [agentId, "Agent"];
+  const envName = ASANA_TOKEN_ENVS[agentId];
+  const configured = Boolean(envName && process.env[envName]);
+  const activeLocks = [...AGENT_OPERATION_LOCKS.values()].filter(
+    (lock) => lock.agent_id === agentId && lock.expires_at_ms > now.getTime()
+  ).length;
+
+  if (!configured) {
+    return {
+      id: agentId,
+      name,
+      area,
+      configured: false,
+      asanaStatus: "critical",
+      openTasks: null,
+      overdueTasks: null,
+      dueTodayTasks: null,
+      activeLocks,
+      lastSeen: null
+    };
+  }
+
+  try {
+    const asana = getAsana(agentId);
+    const userResponse = await asanaRequestWithRetry(asana, {
+      method: "GET",
+      url: "/users/me"
+    });
+    const workspace = userResponse.data.data.workspaces?.[0]?.gid;
+    if (!workspace) throw new Error("Kein Asana-Workspace gefunden.");
+
+    const taskResponse = await asanaRequestWithRetry(asana, {
+      method: "GET",
+      url: "/tasks",
+      params: {
+        assignee: "me",
+        workspace,
+        completed_since: "now",
+        limit: 100,
+        opt_fields: "gid,name,due_on,due_at,modified_at"
+      }
+    });
+    const tasks = taskResponse.data.data || [];
+    const taskSummary = summarizeDashboardTasks(tasks, now);
+
+    return {
+      id: agentId,
+      name,
+      area,
+      configured: true,
+      asanaStatus: taskSummary.overdue_tasks > 0 ? "attention" : "healthy",
+      openTasks: taskSummary.open_tasks,
+      overdueTasks: taskSummary.overdue_tasks,
+      dueTodayTasks: taskSummary.due_today_tasks,
+      activeLocks,
+      lastSeen: now.toISOString()
+    };
+  } catch (error) {
+    return {
+      id: agentId,
+      name,
+      area,
+      configured: true,
+      asanaStatus: "critical",
+      openTasks: null,
+      overdueTasks: null,
+      dueTodayTasks: null,
+      activeLocks,
+      lastSeen: null,
+      error: String(error?.message || "Asana-Readback fehlgeschlagen.").slice(0, 240)
+    };
+  }
+}
+
+function dashboardIntegrationServices(now, agents) {
+  const checkedAt = now.toISOString();
+  const asanaHealthy = agents.every((agent) => agent.asanaStatus !== "critical");
+  const driveConfigured = Boolean(
+    process.env.GOOGLE_SERVICE_ACCOUNT_JSON ||
+      process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 ||
+      (process.env.GOOGLE_DRIVE_OAUTH_CLIENT_ID &&
+        process.env.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET &&
+        process.env.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN)
+  );
+  const dataForSeo = getDataForSeoConfigDetails("vip-ai-marketing", {
+    requireCredentials: false
+  });
+  const emailConfigured = Object.keys(VIP_DASHBOARD_AGENT_NAMES).filter((agentId) => {
+    try {
+      const details = getEmailHttpConfigDetails(agentId, { requireCredentials: false });
+      return Boolean(details?.summary?.email_http_ready_for_send);
+    } catch {
+      return false;
+    }
+  }).length;
+
+  return [
+    {
+      id: "remote-mcp",
+      name: "Remote MCP",
+      detail: `Service aktiv · Uptime ${Math.floor(process.uptime() / 60)} Minuten`,
+      status: "healthy",
+      checkedAt
+    },
+    {
+      id: "asana",
+      name: "Asana",
+      detail: `${agents.filter((agent) => agent.configured).length}/${agents.length} VIP-Agenten konfiguriert`,
+      status: asanaHealthy ? "healthy" : "attention",
+      checkedAt
+    },
+    {
+      id: "google-drive",
+      name: "Google Drive / Sheets",
+      detail: driveConfigured ? "Remote-Zugang konfiguriert" : "Kein Remote-Zugang erkannt",
+      status: driveConfigured ? "healthy" : "attention",
+      checkedAt
+    },
+    {
+      id: "email",
+      name: "E-Mail HTTP",
+      detail: `${emailConfigured}/${agents.length} VIP-Agentenkonten mit Provider-Konfiguration`,
+      status: emailConfigured === agents.length ? "healthy" : "attention",
+      checkedAt
+    },
+    {
+      id: "dataforseo",
+      name: "DataForSEO",
+      detail: `Primary ${dataForSeo.summary?.primary_ready_for_live_calls ? "bereit" : "fehlt"} · Fallback ${
+        dataForSeo.summary?.fallback_ready_for_live_calls ? "bereit" : "fehlt"
+      }`,
+      status:
+        dataForSeo.summary?.primary_ready_for_live_calls &&
+        dataForSeo.summary?.fallback_ready_for_live_calls
+          ? "healthy"
+          : "attention",
+      checkedAt
+    },
+    {
+      id: "intake",
+      name: "Asana Intake",
+      detail: `${Object.keys(VIP_INTAKE_ROUTE_CONFIG).length} Formularrouten konfiguriert`,
+      status:
+        Object.keys(VIP_INTAKE_ROUTE_CONFIG).length && VIP_INTAKE_ROUTING_SECRET
+          ? "healthy"
+          : "attention",
+      checkedAt
+    }
+  ];
+}
+
+async function buildVipDashboardSnapshot() {
+  const now = new Date();
+  cleanupAgentOperationLocks(now.getTime());
+  const agentIds = Object.keys(VIP_DASHBOARD_AGENT_NAMES);
+  const agents = await mapWithConcurrency(agentIds, 4, (agentId) =>
+    readDashboardAgentHealth(agentId, now)
+  );
+  const openTasks = agents.reduce((sum, agent) => sum + (agent.openTasks || 0), 0);
+  const overdueTasks = agents.reduce((sum, agent) => sum + (agent.overdueTasks || 0), 0);
+  const failedAgents = agents.filter((agent) => agent.asanaStatus === "critical");
+  const alerts = [];
+
+  if (failedAgents.length) {
+    alerts.push({
+      id: "asana-agent-readback",
+      level: "critical",
+      title: `${failedAgents.length} Agenten ohne erfolgreichen Asana-Readback`,
+      detail: failedAgents.map((agent) => agent.name).join(", ")
+    });
+  }
+  if (overdueTasks > 0) {
+    alerts.push({
+      id: "overdue-agent-tasks",
+      level: "attention",
+      title: `${overdueTasks} überfällige Aufgaben im Agentennetzwerk`,
+      detail: "Die Aufgaben sind read-only erfasst und werden im Dashboard keinem automatischen Abschluss unterzogen."
+    });
+  }
+
+  return {
+    generatedAt: now.toISOString(),
+    source: "remote-mcp",
+    systemStatus: failedAgents.length ? "critical" : overdueTasks ? "attention" : "healthy",
+    summary: {
+      agentsTotal: agents.length,
+      agentsConfigured: agents.filter((agent) => agent.configured).length,
+      automationsActive: null,
+      automationsTotal: null,
+      gateCoverage: null,
+      watcherFresh: null,
+      openTasks,
+      overdueTasks
+    },
+    brain: {
+      files: null,
+      links: null,
+      deadLinks: null,
+      orphanCandidates: null,
+      gatesNeedingAttention: null,
+      splitRequired: null,
+      sizeWarnings: null
+    },
+    agents,
+    services: dashboardIntegrationServices(now, agents),
+    alerts
+  };
+}
+
+async function getVipDashboardSnapshot() {
+  const now = Date.now();
+  if (
+    vipDashboardSnapshotCache.value &&
+    vipDashboardSnapshotCache.expires_at > now
+  ) {
+    return vipDashboardSnapshotCache.value;
+  }
+  const value = await buildVipDashboardSnapshot();
+  vipDashboardSnapshotCache = {
+    value,
+    expires_at: now + VIP_DASHBOARD_CACHE_TTL_MS
+  };
+  return value;
+}
 
 app.options("/intake", (req, res) => {
   if (!applyIntakeCors(req, res)) return;
@@ -17485,6 +17812,26 @@ app.get("/intake/health", (req, res) => {
 });
 
 app.post("/intake", handleIntakePost);
+
+app.get("/dashboard/health", async (req, res) => {
+  if (!hasValidDashboardFeedToken(req)) {
+    res.set("cache-control", "no-store");
+    return res.status(401).json({ ok: false, error: "Unauthorized." });
+  }
+
+  try {
+    const snapshot = await getVipDashboardSnapshot();
+    res.set("cache-control", "private, no-store");
+    return res.json(snapshot);
+  } catch (error) {
+    console.error("DASHBOARD HEALTH ERROR:", error);
+    res.set("cache-control", "no-store");
+    return res.status(503).json({
+      ok: false,
+      error: "Dashboard health snapshot could not be generated."
+    });
+  }
+});
 
 app.use(express.json());
 
