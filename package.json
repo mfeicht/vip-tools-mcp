@@ -12,6 +12,7 @@
     "test:email-action-self-bcc": "node scripts/email-action-self-bcc-selftest.mjs",
     "test:attachment-visual-contract": "node scripts/attachment-visual-contract-selftest.mjs",
     "test:recurrence-settle": "node scripts/recurrence-settle-selftest.mjs",
+    "test:dashboard-health": "node scripts/dashboard-health-selftest.mjs",
     "test:web-research": "node scripts/web-research-selftest.mjs",
     "shadow:web-research": "node scripts/web-research-live-shadow.mjs"
   },

@@ -23,6 +23,12 @@ import {
   runWebResearchListings,
   runWebResearchMonitor
 } from "./lib/web-research.js";
+import {
+  buildGoogleAdsComparison,
+  dashboardTelemetryFresh,
+  dateKeyShift,
+  decodeAndVerifyDashboardTelemetry
+} from "./lib/dashboard-health.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -53,6 +59,14 @@ const VIP_DASHBOARD_CACHE_TTL_MS = Math.max(
   30_000,
   Number(process.env.VIP_DASHBOARD_CACHE_TTL_MS || 2 * 60 * 1000)
 );
+const VIP_DASHBOARD_TELEMETRY_PUBLIC_KEY = Buffer.from(
+  "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQUdhYXZZT2VzYVJBTUQzSlFKeU5TblVCVWxOU0xyTkJXN21PaSt5SEREV0k9Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=",
+  "base64"
+).toString("utf8");
+const VIP_DASHBOARD_GOOGLE_ADS_CUSTOMER_ID =
+  process.env.VIP_DASHBOARD_GOOGLE_ADS_CUSTOMER_ID || "6274435735";
+const VIP_DASHBOARD_GOOGLE_ADS_CAMPAIGN =
+  process.env.VIP_DASHBOARD_GOOGLE_ADS_CAMPAIGN || "[D]-[Suche]-[Autoverwertung]-[Lokal]";
 
 const ASANA_TOKEN_ENVS = {
   "vip-ai-sales": "ASANA_TOKEN_VIP_AI_SALES",
@@ -17493,6 +17507,8 @@ let vipDashboardSnapshotCache = {
   expires_at: 0,
   value: null
 };
+let vipDashboardTelemetry = null;
+const vipDashboardTelemetryNonces = new Map();
 
 function dashboardBearerToken(req) {
   const authorization = String(req.headers.authorization || "");
@@ -17526,26 +17542,56 @@ function summarizeDashboardTasks(tasks, now = new Date()) {
   const today = berlinDateKey(now);
   let overdueTasks = 0;
   let dueTodayTasks = 0;
+  const routineBacklog = [];
+  const routineTagMissing = [];
 
   for (const task of tasks) {
     const dueAt = task?.due_at ? new Date(task.due_at) : null;
     const dueDate = dueAt && !Number.isNaN(dueAt.getTime()) ? berlinDateKey(dueAt) : task?.due_on || null;
     if (!dueDate) continue;
+    const hasRoutineTag = (task?.tags || []).some(
+      (tag) => String(tag?.name || "").trim().toLowerCase() === "routine"
+    );
+    const hasRoutineTitle = /^R:\s*/i.test(String(task?.name || ""));
+    const isRoutine = hasRoutineTag || hasRoutineTitle;
+    const overdue =
+      dueAt && !Number.isNaN(dueAt.getTime())
+        ? dueAt.getTime() < now.getTime()
+        : dueDate < today;
 
     if (dueAt && !Number.isNaN(dueAt.getTime())) {
-      if (dueAt.getTime() < now.getTime()) overdueTasks += 1;
+      if (overdue) overdueTasks += 1;
       if (dueDate === today) dueTodayTasks += 1;
-      continue;
+    } else {
+      if (overdue) overdueTasks += 1;
+      if (dueDate === today) dueTodayTasks += 1;
     }
 
-    if (dueDate < today) overdueTasks += 1;
-    if (dueDate === today) dueTodayTasks += 1;
+    if (isRoutine && overdue) {
+      routineBacklog.push({
+        gid: task.gid,
+        name: task.name,
+        dueAt: task.due_at || null,
+        dueOn: task.due_on || null,
+        permalinkUrl: task.permalink_url || `https://app.asana.com/0/0/${task.gid}`,
+        routineEvidence: hasRoutineTag ? "tag" : "title"
+      });
+    }
+    if (hasRoutineTitle && !hasRoutineTag) {
+      routineTagMissing.push({
+        gid: task.gid,
+        name: task.name,
+        permalinkUrl: task.permalink_url || `https://app.asana.com/0/0/${task.gid}`
+      });
+    }
   }
 
   return {
     open_tasks: tasks.length,
     overdue_tasks: overdueTasks,
-    due_today_tasks: dueTodayTasks
+    due_today_tasks: dueTodayTasks,
+    routine_backlog: routineBacklog,
+    routine_tag_missing: routineTagMissing
   };
 }
 
@@ -17581,6 +17627,9 @@ async function readDashboardAgentHealth(agentId, now) {
       openTasks: null,
       overdueTasks: null,
       dueTodayTasks: null,
+      routineOverdueTasks: null,
+      routineBacklog: [],
+      routineTagMissing: [],
       activeLocks,
       lastSeen: null
     };
@@ -17603,7 +17652,7 @@ async function readDashboardAgentHealth(agentId, now) {
         workspace,
         completed_since: "now",
         limit: 100,
-        opt_fields: "gid,name,due_on,due_at,modified_at"
+        opt_fields: "gid,name,due_on,due_at,modified_at,permalink_url,tags.gid,tags.name"
       }
     });
     const tasks = taskResponse.data.data || [];
@@ -17614,10 +17663,16 @@ async function readDashboardAgentHealth(agentId, now) {
       name,
       area,
       configured: true,
-      asanaStatus: taskSummary.overdue_tasks > 0 ? "attention" : "healthy",
+      asanaStatus:
+        taskSummary.routine_backlog.length > 0 || taskSummary.routine_tag_missing.length > 0
+          ? "attention"
+          : "healthy",
       openTasks: taskSummary.open_tasks,
       overdueTasks: taskSummary.overdue_tasks,
       dueTodayTasks: taskSummary.due_today_tasks,
+      routineOverdueTasks: taskSummary.routine_backlog.length,
+      routineBacklog: taskSummary.routine_backlog,
+      routineTagMissing: taskSummary.routine_tag_missing,
       activeLocks,
       lastSeen: now.toISOString()
     };
@@ -17631,6 +17686,9 @@ async function readDashboardAgentHealth(agentId, now) {
       openTasks: null,
       overdueTasks: null,
       dueTodayTasks: null,
+      routineOverdueTasks: null,
+      routineBacklog: [],
+      routineTagMissing: [],
       activeLocks,
       lastSeen: null,
       error: String(error?.message || "Asana-Readback fehlgeschlagen.").slice(0, 240)
@@ -17715,6 +17773,104 @@ function dashboardIntegrationServices(now, agents) {
   ];
 }
 
+async function readDashboardMarketing(now) {
+  const endDate = dateKeyShift(berlinDateKey(now), -1);
+  const startDate = dateKeyShift(endDate, -59);
+  const normalizedCustomerId = normalizeGoogleAdsCustomerId(VIP_DASHBOARD_GOOGLE_ADS_CUSTOMER_ID);
+  const query = `
+    SELECT
+      segments.date,
+      campaign.id,
+      campaign.name,
+      campaign.status,
+      metrics.impressions,
+      metrics.clicks,
+      metrics.cost_micros,
+      metrics.conversions,
+      metrics.conversions_value
+    FROM campaign
+    WHERE campaign.name = '${escapeGaqlString(VIP_DASHBOARD_GOOGLE_ADS_CAMPAIGN)}'
+      AND segments.date BETWEEN '${startDate}' AND '${endDate}'
+    ORDER BY segments.date ASC
+  `;
+
+  try {
+    const response = await googleAdsRequest({
+      method: "POST",
+      path: `/customers/${normalizedCustomerId}/googleAds:search`,
+      login_customer_id: normalizedCustomerId,
+      data: { query, pageSize: 1000 }
+    });
+    const rows = response.data.results || [];
+    const campaign = rows.find((row) => row.campaign)?.campaign || null;
+    return {
+      status: "healthy",
+      checkedAt: now.toISOString(),
+      campaign: {
+        id: campaign?.id || null,
+        name: campaign?.name || VIP_DASHBOARD_GOOGLE_ADS_CAMPAIGN,
+        deliveryStatus: campaign?.status || "UNKNOWN",
+        currency: "EUR",
+        ...buildGoogleAdsComparison(rows, endDate)
+      }
+    };
+  } catch (error) {
+    return {
+      status: "attention",
+      checkedAt: now.toISOString(),
+      campaign: null,
+      error: compactAxiosError(error)
+    };
+  }
+}
+
+function currentDashboardTelemetry(now) {
+  if (!dashboardTelemetryFresh(vipDashboardTelemetry, now.getTime())) return null;
+  return vipDashboardTelemetry;
+}
+
+function dashboardLocalServices(now, telemetry) {
+  const checkedAt = telemetry?.generatedAt || null;
+  const codex = telemetry?.codex || null;
+  const finance = telemetry?.finance || null;
+  return [
+    {
+      id: "codex-runtime",
+      name: "Codex Agentenläufe",
+      detail: codex
+        ? `${codex.activeAutomations ?? "–"} aktiv · Watcher ${
+            codex.watcherFresh ? "frisch" : "nicht frisch"
+          }`
+        : "Keine frische lokale Telemetrie",
+      status: codex?.status || "attention",
+      checkedAt
+    },
+    {
+      id: "automation-gates",
+      name: "Automation Gates",
+      detail: codex
+        ? `${codex.directGateCount ?? "–"} von ${codex.fachautomationen ?? "–"} aktiven Fachautomationen mit direktem Startknoten`
+        : "Keine frische lokale Telemetrie",
+      status:
+        codex && codex.directGateCount === codex.fachautomationen
+          ? "healthy"
+          : "attention",
+      checkedAt
+    },
+    {
+      id: "ib-gateway",
+      name: "IB Gateway",
+      detail: finance
+        ? finance.gatewayConnected
+          ? `Verbunden · Broker-Readback ${finance.brokerAgeMinutes ?? "–"} Min. alt`
+          : "Keine Verbindung auf dem Finance-Gateway-Port"
+        : "Keine frische lokale Telemetrie",
+      status: finance?.gatewayConnected ? "healthy" : "critical",
+      checkedAt
+    }
+  ];
+}
+
 async function buildVipDashboardSnapshot() {
   const now = new Date();
   cleanupAgentOperationLocks(now.getTime());
@@ -17724,7 +17880,16 @@ async function buildVipDashboardSnapshot() {
   );
   const openTasks = agents.reduce((sum, agent) => sum + (agent.openTasks || 0), 0);
   const overdueTasks = agents.reduce((sum, agent) => sum + (agent.overdueTasks || 0), 0);
+  const routineOverdueTasks = agents.reduce(
+    (sum, agent) => sum + (agent.routineOverdueTasks || 0),
+    0
+  );
+  const routineTagMissing = agents.flatMap((agent) =>
+    (agent.routineTagMissing || []).map((task) => ({ ...task, agentName: agent.name }))
+  );
   const failedAgents = agents.filter((agent) => agent.asanaStatus === "critical");
+  const telemetry = currentDashboardTelemetry(now);
+  const marketing = await readDashboardMarketing(now);
   const alerts = [];
 
   if (failedAgents.length) {
@@ -17735,28 +17900,81 @@ async function buildVipDashboardSnapshot() {
       detail: failedAgents.map((agent) => agent.name).join(", ")
     });
   }
-  if (overdueTasks > 0) {
+  if (routineOverdueTasks > 0) {
     alerts.push({
-      id: "overdue-agent-tasks",
+      id: "overdue-routine-backlog",
       level: "attention",
-      title: `${overdueTasks} überfällige Aufgaben im Agentennetzwerk`,
-      detail: "Die Aufgaben sind read-only erfasst und werden im Dashboard keinem automatischen Abschluss unterzogen."
+      title: `${routineOverdueTasks} überfällige Routine-Aufgaben im Rückstau`,
+      detail: agents
+        .filter((agent) => (agent.routineOverdueTasks || 0) > 0)
+        .map((agent) => `${agent.name}: ${agent.routineOverdueTasks}`)
+        .join(" · ")
+    });
+  }
+  if (routineTagMissing.length > 0) {
+    alerts.push({
+      id: "routine-tag-missing",
+      level: "attention",
+      title: `${routineTagMissing.length} mögliche Routinen ohne Routine-Tag`,
+      detail: routineTagMissing
+        .slice(0, 5)
+        .map((task) => `${task.agentName}: ${task.name}`)
+        .join(" · ")
+    });
+  }
+  if (!telemetry) {
+    alerts.push({
+      id: "local-telemetry-stale",
+      level: "critical",
+      title: "Codex- und Finance-Livestatus nicht aktuell",
+      detail:
+        "Der lokale, tokenfreie Statuskanal hat seit mehr als 15 Minuten kein gültiges Signal geliefert."
+    });
+  } else {
+    if (telemetry.codex?.status !== "healthy") {
+      alerts.push({
+        id: "codex-runtime-problem",
+        level: "critical",
+        title: "Codex-Agentenläufe benötigen Aufmerksamkeit",
+        detail:
+          telemetry.codex?.detail ||
+          "Watcher, Automationen oder Start-Gates melden keinen vollständig gesunden Zustand."
+      });
+    }
+    if (!telemetry.finance?.gatewayConnected) {
+      alerts.push({
+        id: "ib-gateway-disconnected",
+        level: "critical",
+        title: "IB Gateway ist getrennt",
+        detail:
+          "Finance kann ohne Gateway-Verbindung keine frischen Broker-Readbacks und keine freigegebenen Handelswege ausführen."
+      });
+    }
+  }
+  if (marketing.status !== "healthy") {
+    alerts.push({
+      id: "marketing-kpi-readback",
+      level: "attention",
+      title: "Google-Ads-KPIs konnten nicht live gelesen werden",
+      detail: String(marketing.error?.message || "Google-Ads-Readback fehlgeschlagen.").slice(0, 220)
     });
   }
 
+  const hasCriticalAlert = alerts.some((alert) => alert.level === "critical");
   return {
     generatedAt: now.toISOString(),
     source: "remote-mcp",
-    systemStatus: failedAgents.length ? "critical" : overdueTasks ? "attention" : "healthy",
+    systemStatus: hasCriticalAlert ? "critical" : alerts.length ? "attention" : "healthy",
     summary: {
       agentsTotal: agents.length,
       agentsConfigured: agents.filter((agent) => agent.configured).length,
-      automationsActive: null,
-      automationsTotal: null,
-      gateCoverage: null,
-      watcherFresh: null,
+      automationsActive: telemetry?.codex?.activeAutomations ?? null,
+      automationsTotal: telemetry?.codex?.totalAutomations ?? null,
+      gateCoverage: telemetry?.codex?.gateCoverage ?? null,
+      watcherFresh: telemetry?.codex?.watcherFresh ?? null,
       openTasks,
-      overdueTasks
+      overdueTasks,
+      routineOverdueTasks
     },
     brain: {
       files: null,
@@ -17768,8 +17986,14 @@ async function buildVipDashboardSnapshot() {
       sizeWarnings: null
     },
     agents,
-    services: dashboardIntegrationServices(now, agents),
-    alerts
+    services: [
+      ...dashboardLocalServices(now, telemetry),
+      ...dashboardIntegrationServices(now, agents)
+    ],
+    alerts,
+    operations: telemetry?.codex || null,
+    finance: telemetry?.finance || null,
+    marketing
   };
 }
 
@@ -17812,6 +18036,44 @@ app.get("/intake/health", (req, res) => {
 });
 
 app.post("/intake", handleIntakePost);
+
+app.post(
+  "/dashboard/telemetry",
+  express.json({ limit: "320kb" }),
+  (req, res) => {
+    try {
+      const now = Date.now();
+      for (const [nonce, seenAt] of vipDashboardTelemetryNonces.entries()) {
+        if (now - seenAt > 20 * 60 * 1000) vipDashboardTelemetryNonces.delete(nonce);
+      }
+      const telemetry = decodeAndVerifyDashboardTelemetry({
+        payloadBase64: req.body?.payload,
+        signatureBase64: req.body?.signature,
+        publicKeyPem: VIP_DASHBOARD_TELEMETRY_PUBLIC_KEY,
+        now
+      });
+      if (vipDashboardTelemetryNonces.has(telemetry.nonce)) {
+        return res.status(409).json({ ok: false, error: "Telemetry replay rejected." });
+      }
+
+      vipDashboardTelemetryNonces.set(telemetry.nonce, now);
+      vipDashboardTelemetry = telemetry;
+      vipDashboardSnapshotCache = { expires_at: 0, value: null };
+      res.set("cache-control", "no-store");
+      return res.json({
+        ok: true,
+        receivedAt: new Date(now).toISOString(),
+        generatedAt: telemetry.generatedAt
+      });
+    } catch (error) {
+      res.set("cache-control", "no-store");
+      return res.status(400).json({
+        ok: false,
+        error: String(error?.message || "Invalid telemetry.")
+      });
+    }
+  }
+);
 
 app.get("/dashboard/health", async (req, res) => {
   if (!hasValidDashboardFeedToken(req)) {
