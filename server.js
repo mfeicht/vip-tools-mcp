@@ -8553,19 +8553,49 @@ function getBufferChannelConfig(projectKey, channel, { requireChannelId = true }
   const channelSuffix = bufferChannelEnvSuffix(normalizedChannel);
   const envName = `BUFFER_CHANNEL_ID_${projectSuffix}_${channelSuffix}`;
   const channelId = process.env[envName] || "";
+  const channelIdConfigured = Boolean(channelId);
+  const channelIdValid = !channelIdConfigured || isValidBufferChannelId(channelId);
   if (requireChannelId && !channelId) {
     throw new Error(`Buffer Channel-ID fehlt fuer ${normalizedProjectKey}/${normalizedChannel}. Setze ${envName}.`);
+  }
+  if (requireChannelId && !channelIdValid) {
+    throw new Error(bufferChannelIdFormatMessage({
+      projectKey: normalizedProjectKey,
+      channel: normalizedChannel,
+      envName,
+      channelId
+    }));
   }
   return {
     channel: normalizedChannel,
     channel_id: channelId || null,
-    channel_id_configured: Boolean(channelId),
+    channel_id_configured: channelIdConfigured,
+    channel_id_valid: channelIdValid,
+    channel_id_length: channelIdConfigured ? String(channelId).length : 0,
     channel_id_env_name: envName
   };
 }
 
 function getBufferConfiguredChannels(projectKey, channels = ["instagram", "pinterest", "linkedin"]) {
   return channels.map((channel) => getBufferChannelConfig(projectKey, channel, { requireChannelId: false }));
+}
+
+function isValidBufferChannelId(value) {
+  return /^[a-f0-9]{24}$/i.test(String(value || ""));
+}
+
+function bufferChannelIdFormatMessage({ projectKey, channel, envName, channelId }) {
+  return `Buffer Channel-ID in ${envName} fuer ${projectKey}/${channel} ist ungueltig: erwartet werden 24 hexadezimale Zeichen, erhalten wurden ${String(channelId || "").length}. Bitte den exakten Channel aus buffer_list_channels uebernehmen.`;
+}
+
+function assertBufferChannelConfigsValid(channelConfigs) {
+  const invalid = channelConfigs.filter((channel) => channel.channel_id_configured && !channel.channel_id_valid);
+  if (!invalid.length) return;
+  throw new Error(
+    `Ungueltige Buffer Channel-ID-Konfiguration: ${invalid
+      .map((channel) => `${channel.channel} (${channel.channel_id_env_name}, Laenge ${channel.channel_id_length})`)
+      .join(", ")}. Erwartet werden Buffer-IDs mit 24 hexadezimalen Zeichen.`
+  );
 }
 
 function getBufferPinterestDefaults(projectKey) {
@@ -8661,6 +8691,12 @@ async function fetchBufferChannels(projectKey, organizationId) {
 
 async function fetchBufferScheduledPosts(projectKey, { organizationId, channelIds = [], first = 100 }) {
   const safeFirst = Math.min(Math.max(Number(first) || 20, 1), 100);
+  const invalidChannelIds = channelIds.filter((id) => id && !isValidBufferChannelId(id));
+  if (invalidChannelIds.length) {
+    throw new Error(
+      `Buffer Scheduled-Posts-Read blockiert: ${invalidChannelIds.length} Channel-ID(s) haben kein gueltiges Buffer-Format. Erwartet werden 24 hexadezimale Zeichen.`
+    );
+  }
   const channelFilter = channelIds.length
     ? `, channelIds: [${channelIds.map((id) => `"${escapeGraphqlString(id)}"`).join(", ")}]`
     : "";
@@ -13259,6 +13295,9 @@ function createServer() {
       });
       const cloudinaryDetails = getCloudinaryConfigDetails({ requireCredentials: false });
       const configuredChannels = getBufferConfiguredChannels(project_key);
+      const invalidChannelConfigs = configuredChannels.filter(
+        (channel) => channel.channel_id_configured && !channel.channel_id_valid
+      );
       const pinterestDefaults = getBufferPinterestDefaults(project_key);
       const result = {
         agent_id,
@@ -13266,6 +13305,13 @@ function createServer() {
         cloudinary: cloudinaryDetails.summary,
         pinterest: pinterestDefaults.summary,
         channels: configuredChannels,
+        channel_configs_valid: invalidChannelConfigs.length === 0,
+        invalid_channel_configs: invalidChannelConfigs.map((channel) => ({
+          channel: channel.channel,
+          channel_id_env_name: channel.channel_id_env_name,
+          channel_id_length: channel.channel_id_length,
+          expected_format: "24 hexadezimale Zeichen"
+        })),
         fetch_organizations,
         fetch_channels
       };
@@ -13438,6 +13484,7 @@ function createServer() {
       const channelConfigs = (channels || ["instagram", "pinterest", "linkedin"]).map((channel) =>
         getBufferChannelConfig(project_key, channel, { requireChannelId: false })
       );
+      assertBufferChannelConfigsValid(channelConfigs);
       const channelIds = channelConfigs.map((channel) => channel.channel_id).filter(Boolean);
       const posts = await fetchBufferScheduledPosts(project_key, {
         organizationId: config.organizationId,
@@ -13532,6 +13579,7 @@ function createServer() {
       const channelConfigs = normalizedChannels.map((channel) =>
         getBufferChannelConfig(normalizedProjectKey, channel, { requireChannelId: !dry_run })
       );
+      assertBufferChannelConfigsValid(channelConfigs);
       const { config: bufferConfig } = getBufferProjectConfigDetails(normalizedProjectKey, {
         requireApiKey: !dry_run,
         requireOrganizationId: !dry_run || auto_next_free_slot
