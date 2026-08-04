@@ -11643,7 +11643,7 @@ function createServer() {
             agentId: agent_id,
             authorization,
             confirmedByAsana: confirmed_by_asana,
-            asanaTaskGid: task_gid,
+            asanaTaskGid: authorization?.source === "direct_codex" ? undefined : task_gid,
             actionName: "asana_update_task_recurrence",
             requireMoritz: true
           });

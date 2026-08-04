@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { readFileSync } from "node:fs";
 
 const port = process.env.AUTHORIZATION_ORIGIN_TEST_PORT || "3008";
 process.env.PORT = port;
@@ -92,6 +93,7 @@ try {
   const missingAsanaBasis = await preflight({ source: "asana" });
 
   const validText = text(validDirect);
+  const source = readFileSync(new URL("../server.js", import.meta.url), "utf8");
   const report = {
     authorization_tool_schema_coverage:
       missingAuthorizationSchema.length === 0 &&
@@ -104,6 +106,9 @@ try {
     foreign_direct_blocked: Boolean(foreignDirect.isError),
     embedded_name_spoof_blocked: Boolean(embeddedNameSpoof.isError),
     mixed_origin_blocked: Boolean(mixedOrigin.isError),
+    recurrence_direct_origin_not_mixed:
+      source.includes('asanaTaskGid: authorization?.source === "direct_codex" ? undefined : task_gid') &&
+      source.includes('actionName: "asana_update_task_recurrence"'),
     vague_direct_blocked: Boolean(vagueDirect.isError),
     asana_without_basis_blocked: Boolean(missingAsanaBasis.isError)
   };
