@@ -18178,6 +18178,16 @@ app.get("/dashboard/health", async (req, res) => {
   }
 });
 
+app.get(["/", "/health"], (req, res) => {
+  res.set("cache-control", "no-store");
+  res.json({
+    ok: true,
+    service: "vip-tools-mcp",
+    uptime_seconds: Math.floor(process.uptime()),
+    checked_at: new Date().toISOString()
+  });
+});
+
 app.use(express.json());
 
 app.all("/mcp", async (req, res) => {
