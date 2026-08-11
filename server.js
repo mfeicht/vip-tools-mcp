@@ -9313,10 +9313,15 @@ function summarizeUnsplashPhoto(photo) {
 
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
+const MCP_SERVER_INSTRUCTIONS =
+  "VIP Tools Remote is the canonical VIP integration. For Asana, always use this server's asana_* tools with the explicit agent_id of the active agent; every agent_id maps to a separate Asana identity. Never suggest, install, connect, or use the public Asana plugin as a fallback. If this server or a required tool is unavailable, follow only the documented bounded retry path and report remote_mcp_tool_context_unavailable. Never fall back to another agent_id or a shared Asana account.";
+
 function createServer() {
   const server = new McpServer({
     name: "vip-tools-remote",
     version: "1.0.0"
+  }, {
+    instructions: MCP_SERVER_INSTRUCTIONS
   });
 
   server.tool(
