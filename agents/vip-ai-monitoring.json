@@ -1,0 +1,15 @@
+{
+  "agentId": "vip-ai-monitoring",
+  "name": "VIP AI-Monitoring",
+  "asanaTokenEnv": "ASANA_TOKEN_VIP_AI_MONITORING",
+  "asana": {
+    "mode": "assigned_to_me"
+  },
+  "permissions": {
+    "asanaReadMyTasks": true,
+    "asanaReadTaskDetails": true,
+    "asanaAddComments": true,
+    "asanaCompleteTasks": true,
+    "asanaGenericRequest": true
+  }
+}

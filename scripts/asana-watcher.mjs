@@ -18,6 +18,10 @@ const AGENT_PREFIX = "vip-ai-";
 const LOCAL_TIME_ZONE = "Europe/Berlin";
 const WATCHER_CONNECT_TIMEOUT_MS = Number.parseInt(process.env.WATCHER_CONNECT_TIMEOUT_MS || "20000", 10);
 const WATCHER_TOOL_TIMEOUT_MS = Number.parseInt(process.env.WATCHER_TOOL_TIMEOUT_MS || "25000", 10);
+const WATCHER_TRANSIENT_RETRY_DELAY_MS = Number.parseInt(
+  process.env.WATCHER_TRANSIENT_RETRY_DELAY_MS || "10000",
+  10
+);
 const TASK_FIELDS = [
   "gid",
   "name",
@@ -161,6 +165,39 @@ function truncate(value, max = 180) {
   return `${text.slice(0, max - 3)}...`;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientMcpError(error) {
+  const message = String(error?.message || error || "");
+  return (
+    /\b(502|503|504)\b/.test(message) ||
+    message.includes("Streamable HTTP error") ||
+    message.includes("Error POSTing to endpoint") ||
+    message.includes("fetch failed") ||
+    message.includes("ECONNRESET") ||
+    message.includes("ETIMEDOUT") ||
+    message.includes("timeout after")
+  );
+}
+
+async function retryTransient(label, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!isTransientMcpError(error)) throw error;
+    console.error(
+      `[watcher] ${label} transient failure: ${truncate(
+        error?.message || String(error),
+        220
+      )}; retrying in ${WATCHER_TRANSIENT_RETRY_DELAY_MS} ms`
+    );
+    await sleep(WATCHER_TRANSIENT_RETRY_DELAY_MS);
+    return operation();
+  }
+}
+
 function safeArray(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -190,18 +227,20 @@ async function readJsonOrDefault(filePath, fallback) {
 }
 
 async function callTool(client, name, args = {}) {
-  const result = await withTimeout(
-    client.callTool({ name, arguments: args }),
-    WATCHER_TOOL_TIMEOUT_MS,
-    `MCP tool ${name}`
-  );
-  if (result?.isError) {
-    const message = result.content?.map((item) => item.text).filter(Boolean).join("\n") || "MCP tool error";
-    throw new Error(message);
-  }
-  const text = result?.content?.find((item) => item.type === "text")?.text;
-  if (!text) return {};
-  return JSON.parse(text);
+  return retryTransient(`MCP tool ${name}`, async () => {
+    const result = await withTimeout(
+      client.callTool({ name, arguments: args }),
+      WATCHER_TOOL_TIMEOUT_MS,
+      `MCP tool ${name}`
+    );
+    if (result?.isError) {
+      const message = result.content?.map((item) => item.text).filter(Boolean).join("\n") || "MCP tool error";
+      throw new Error(message);
+    }
+    const text = result?.content?.find((item) => item.type === "text")?.text;
+    if (!text) return {};
+    return JSON.parse(text);
+  });
 }
 
 async function asanaGet(client, agentId, pathName, params = {}) {
@@ -543,8 +582,18 @@ async function run() {
   }
   const detectedAt = nowIso();
   const state = await readJsonOrDefault(statePath, createEmptyState());
-  const client = new Client({ name: "vip-asana-watcher", version: "0.1.0" });
-  const transport = new StreamableHTTPClientTransport(new URL(opts.mcpUrl));
+  let client;
+  const connectClient = async () => {
+    const nextClient = new Client({ name: "vip-asana-watcher", version: "0.1.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(opts.mcpUrl));
+    try {
+      await withTimeout(nextClient.connect(transport), WATCHER_CONNECT_TIMEOUT_MS, "MCP connect");
+      return nextClient;
+    } catch (error) {
+      await nextClient.close().catch(() => {});
+      throw error;
+    }
+  };
   const summary = {
     detected_at: detectedAt,
     mode: opts.write ? "write" : "dry-run",
@@ -558,7 +607,7 @@ async function run() {
   };
 
   try {
-    await withTimeout(client.connect(transport), WATCHER_CONNECT_TIMEOUT_MS, "MCP connect");
+    client = await retryTransient("MCP connect", connectClient);
     console.error(`[watcher] connected ${opts.mcpUrl}`);
     const list = await callTool(client, "asana_list_agents");
     const agentIds = safeArray(list)
@@ -672,7 +721,7 @@ async function run() {
 
     console.log(JSON.stringify({ summary, queued_signals: allQueuedSignals }, null, 2));
   } finally {
-    await client.close().catch(() => {});
+    if (client) await client.close().catch(() => {});
   }
 }
 
