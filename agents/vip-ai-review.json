@@ -1,0 +1,15 @@
+{
+  "agentId": "vip-ai-review",
+  "name": "VIP AI-Review",
+  "asanaTokenEnv": "ASANA_TOKEN_VIP_AI_REVIEW",
+  "asana": {
+    "mode": "assigned_to_me"
+  },
+  "permissions": {
+    "asanaReadMyTasks": true,
+    "asanaReadTaskDetails": true,
+    "asanaAddComments": true,
+    "asanaCompleteTasks": true,
+    "asanaGenericRequest": true
+  }
+}
