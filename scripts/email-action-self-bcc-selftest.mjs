@@ -34,6 +34,7 @@ try {
   const discountActions = (actions.actions || []).filter((action) =>
     ["rs-contact-rabatt-de", "rs-contact-rabatt-en"].includes(action.id)
   );
+  const accountById = new Map((accounts.accounts || []).map((account) => [account.id, account]));
   const report = {
     discovery_tool_present: names.has("email_action_discover_folders"),
     send_account_tool_present: names.has("email_action_list_send_accounts"),
@@ -43,6 +44,16 @@ try {
     every_account_has_self_bcc: (accounts.accounts || []).every(
       (account) => account.mandatory_self_bcc === account.address
     ),
+    domain_scoped_resend_env_names_present:
+      accountById.get("rs-contact")?.required_env_names?.resend_api_key ===
+        "RESEND_API_KEY_REISE_STORIES_DE" &&
+      accountById.get("rs-moritz")?.required_env_names?.resend_api_key ===
+        "RESEND_API_KEY_REISE_STORIES_DE" &&
+      accountById.get("rs-media")?.required_env_names?.resend_api_key ===
+        "RESEND_API_KEY_REISE_STORIES_DE" &&
+      accountById.get("goklever-support")?.required_env_names?.resend_api_key ===
+        "RESEND_API_KEY_GOKLEVER_DE" &&
+      source.includes('"vip-studios.de": "RESEND_API_KEY_VIP_STUDIOS_DE"'),
     two_contact_language_actions_registered:
       contactActions.length === 2 &&
       new Set(contactActions.map((action) => action.inbound_language)).size === 2,

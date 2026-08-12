@@ -5772,10 +5772,54 @@ function normalizeEmailHttpProvider(value) {
   throw new Error(`Unbekannter EMAIL_HTTP_PROVIDER: ${provider}. Erlaubt: resend, brevo.`);
 }
 
-function getEmailHttpConfigDetails(agentId, { requireCredentials = true } = {}) {
+const RESEND_API_KEY_ENV_BY_DOMAIN = Object.freeze({
+  "reise-stories.de": "RESEND_API_KEY_REISE_STORIES_DE",
+  "vip-studios.de": "RESEND_API_KEY_VIP_STUDIOS_DE",
+  "goklever.de": "RESEND_API_KEY_GOKLEVER_DE"
+});
+
+function emailDomainFromAddress(address) {
+  return extractEmailAddress(address).split("@")[1] || "";
+}
+
+function resendApiKeyEnvNameForAddress(address) {
+  return RESEND_API_KEY_ENV_BY_DOMAIN[emailDomainFromAddress(address)] || "";
+}
+
+function getResendApiKeyDetails({ fromAddress, suffix, genericApiKey }) {
+  const domain = emailDomainFromAddress(fromAddress);
+  const domainEnvName = resendApiKeyEnvNameForAddress(fromAddress);
+  const agentEnvName = `RESEND_API_KEY_${suffix}`;
+  const genericAgentEnvName = `EMAIL_HTTP_API_KEY_${suffix}`;
+  const candidates = [
+    ...(domainEnvName ? [{ envName: domainEnvName, scope: "domain" }] : []),
+    { envName: agentEnvName, scope: "agent" },
+    { envName: "RESEND_API_KEY", scope: "global" },
+    ...(genericApiKey
+      ? [
+          { envName: genericAgentEnvName, scope: "generic_agent" },
+          { envName: "EMAIL_HTTP_API_KEY", scope: "generic_global" }
+        ]
+      : [])
+  ];
+  const selected = candidates.find((candidate) => Boolean(process.env[candidate.envName]));
+  return {
+    apiKey: selected ? process.env[selected.envName] : "",
+    apiKeyEnvName: selected?.envName || "",
+    apiKeyScope: selected?.scope || null,
+    domain: domain || null,
+    domainApiKeyEnvName: domainEnvName || null
+  };
+}
+
+function getEmailHttpConfigDetails(
+  agentId,
+  { requireCredentials = true, fromAddressOverride = "" } = {}
+) {
   const suffix = envSuffixForAgent(agentId);
-  const fromAddress =
-    process.env[`EMAIL_ADDRESS_${suffix}`] || AGENT_EMAIL_DEFAULTS[agentId];
+  const fromAddress = extractEmailAddress(
+    fromAddressOverride || process.env[`EMAIL_ADDRESS_${suffix}`] || AGENT_EMAIL_DEFAULTS[agentId]
+  );
   const provider = normalizeEmailHttpProvider(
     getEnvWithAgentFallback("EMAIL_HTTP_PROVIDER", agentId) ||
       getEnvWithAgentFallback("EMAIL_PROVIDER", agentId)
@@ -5784,18 +5828,15 @@ function getEmailHttpConfigDetails(agentId, { requireCredentials = true } = {}) 
   const genericApiKey = getEnvWithAgentFallback("EMAIL_HTTP_API_KEY", agentId);
   let apiKeyEnvName = "";
   let apiKey = "";
+  let apiKeyScope = null;
+  let domainApiKeyEnvName = null;
 
   if (provider === "resend") {
-    apiKeyEnvName = process.env[`RESEND_API_KEY_${suffix}`]
-      ? `RESEND_API_KEY_${suffix}`
-      : process.env.RESEND_API_KEY
-        ? "RESEND_API_KEY"
-        : genericApiKey
-          ? process.env[`EMAIL_HTTP_API_KEY_${suffix}`]
-            ? `EMAIL_HTTP_API_KEY_${suffix}`
-            : "EMAIL_HTTP_API_KEY"
-          : "";
-    apiKey = apiKeyEnvName ? process.env[apiKeyEnvName] : "";
+    const resendKey = getResendApiKeyDetails({ fromAddress, suffix, genericApiKey });
+    apiKeyEnvName = resendKey.apiKeyEnvName;
+    apiKey = resendKey.apiKey;
+    apiKeyScope = resendKey.apiKeyScope;
+    domainApiKeyEnvName = resendKey.domainApiKeyEnvName;
   } else if (provider === "brevo") {
     apiKeyEnvName = process.env[`BREVO_API_KEY_${suffix}`]
       ? `BREVO_API_KEY_${suffix}`
@@ -5820,6 +5861,8 @@ function getEmailHttpConfigDetails(agentId, { requireCredentials = true } = {}) 
       email_http_provider_configured: Boolean(provider),
       email_http_api_key_configured: Boolean(apiKey),
       email_http_api_key_env_name: apiKeyEnvName || null,
+      email_http_api_key_scope: apiKeyScope,
+      email_http_domain_api_key_env_name: domainApiKeyEnvName,
       email_http_from_name: fromName || null,
       email_http_ready_for_send: Boolean(provider && apiKey && fromAddress),
       email_http_timeout_ms: EMAIL_HTTP_TIMEOUT_MS
@@ -6668,7 +6711,8 @@ function getEmailActionHttpConfig(sendAccount, { requireCredentials = true } = {
   const fromAddress = extractEmailAddress(sendAccount?.from || "");
   if (!fromAddress) throw new Error("E-Mail-Action hat keine verifizierte FROM-Adresse.");
   const details = getEmailHttpConfigDetails(EMAIL_ACTION_CONTROL_AGENT_ID, {
-    requireCredentials: false
+    requireCredentials: false,
+    fromAddressOverride: fromAddress
   });
   const readyForSend = Boolean(
     details.config.provider === "resend" && details.config.apiKey && fromAddress
@@ -16472,9 +16516,6 @@ function createServer() {
     TOOL_READ_ONLY,
     async ({ agent_id }) => {
       const config = loadEmailActionSendAccounts();
-      const centralHttp = getEmailHttpConfigDetails(EMAIL_ACTION_CONTROL_AGENT_ID, {
-        requireCredentials: false
-      });
       return out({
         agent_id,
         version: config.version,
@@ -16482,9 +16523,14 @@ function createServer() {
         account_count: config.accounts.length,
         accounts: config.accounts.map((account) => {
           let details;
+          let httpDetails;
           let error = null;
           try {
             details = getSmtpConfigCandidatesForEmailActionAccount(account, { requireCredentials: false });
+            httpDetails = getEmailActionHttpConfig(
+              { from: account.address },
+              { requireCredentials: false }
+            );
           } catch (caught) {
             error = String(caught?.message || caught);
           }
@@ -16493,14 +16539,14 @@ function createServer() {
             address: account.address,
             env_suffix: account.env_suffix,
             smtp_ready_for_send: details?.summary?.ready_for_send ?? false,
-            email_http_provider: centralHttp.summary.email_http_provider,
-            email_http_ready_for_send: Boolean(
-              centralHttp.summary.email_http_provider === "resend" &&
-              centralHttp.summary.email_http_api_key_configured
-            ),
+            email_http_provider: httpDetails?.summary?.email_http_provider ?? null,
+            email_http_ready_for_send: httpDetails?.summary?.email_http_ready_for_send ?? false,
+            email_http_api_key_env_name:
+              httpDetails?.summary?.email_http_api_key_env_name ?? null,
+            email_http_api_key_scope:
+              httpDetails?.summary?.email_http_api_key_scope ?? null,
             preferred_transport:
-              centralHttp.summary.email_http_provider === "resend" &&
-              centralHttp.summary.email_http_api_key_configured
+              httpDetails?.summary?.email_http_ready_for_send
                 ? "resend_http_mime_equivalent"
                 : "smtp_raw_mime",
             host_configured: details?.summary?.host_configured ?? false,
@@ -16512,6 +16558,7 @@ function createServer() {
               port_optional: `SMTP_PORT_${account.env_suffix}`,
               secure_optional: `SMTP_SECURE_${account.env_suffix}`,
               user_optional: `SMTP_USER_${account.env_suffix}`,
+              resend_api_key: resendApiKeyEnvNameForAddress(account.address) || null,
               password_one_of: [
                 `SMTP_PASSWORD_${account.env_suffix}`,
                 `EMAIL_PASSWORD_${account.env_suffix}`
