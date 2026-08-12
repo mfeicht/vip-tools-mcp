@@ -49,9 +49,11 @@ try {
     contact_actions_share_idempotency_scope:
       contactActions.length === 2 &&
       contactActions.every((action) => action.idempotency_scope === "rs-contact"),
-    adaptive_contact_live_disabled:
+    only_authorized_contact_action_live:
       contactActions.length === 2 &&
-      contactActions.every((action) => action.response_mode === "agent_assisted" && action.live_enabled === false),
+      contactActions.every((action) => action.response_mode === "agent_assisted") &&
+      contactActions.find((action) => action.id === "rs-contact-de")?.live_enabled === true &&
+      contactActions.find((action) => action.id === "rs-contact-en")?.live_enabled === false,
     contact_use_case_routing_present:
       contactActions.length === 2 &&
       contactActions.every(

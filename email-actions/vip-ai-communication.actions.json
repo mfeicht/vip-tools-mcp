@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 7,
   "owner_agent_id": "vip-ai-communication",
   "action_mailbox_root": "INBOX.E-Mail-Automatisierung",
   "done_mailbox_root": "INBOX.VIP AI.Erledigt",
@@ -27,7 +27,7 @@
         "safe_name_placeholders"
       ],
       "enabled": true,
-      "live_enabled": false,
+      "live_enabled": true,
       "template": {
         "uid": "4",
         "message_id": "<8C9E0C92-7FA8-41C7-9C76-E59C12237172@reise-stories.de>",
