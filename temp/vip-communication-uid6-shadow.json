@@ -1,0 +1,14 @@
+{
+  "agent_id": "vip-ai-communication",
+  "action_id": "rs-contact-de",
+  "message_uid": "6",
+  "limit": 1,
+  "agent_decisions_by_uid": {
+    "6": {
+      "language": "de",
+      "template_fit_confirmed": true,
+      "review_note": "Deutsche erste Kooperationsanfrage; registrierte deutsche Vorlage passt. Name ist widerspruechlich, daher keine Personalisierung.",
+      "placeholder_values": {}
+    }
+  }
+}

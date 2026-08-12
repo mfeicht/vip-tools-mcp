@@ -1,0 +1,19 @@
+{
+  "agent_id": "vip-ai-communication",
+  "action_id": "rs-contact-de",
+  "mode": "live",
+  "message_uid": "6",
+  "limit": 1,
+  "confirm_live_send": true,
+  "moritz_authorization_note": "Direkte Freigabe von Moritz Feichtmeyer in diesem Codex-Task: Die vorbereitete Antwort darf live versendet werden.",
+  "create_missing_result_folders": true,
+  "move_failed_to_error": false,
+  "agent_decisions_by_uid": {
+    "6": {
+      "language": "de",
+      "template_fit_confirmed": true,
+      "review_note": "Deutsche erste Kooperationsanfrage; registrierte deutsche Vorlage passt. Name ist widerspruechlich, daher keine Personalisierung.",
+      "placeholder_values": {}
+    }
+  }
+}
