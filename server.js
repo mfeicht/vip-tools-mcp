@@ -27,7 +27,8 @@ import {
   buildGoogleAdsComparison,
   dashboardTelemetryFresh,
   dateKeyShift,
-  decodeAndVerifyDashboardTelemetry
+  decodeAndVerifyDashboardTelemetry,
+  verifyDashboardRefreshPoll
 } from "./lib/dashboard-health.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -55,9 +56,9 @@ const VIP_INTAKE_ROUTING_SECRET = String(process.env.VIP_INTAKE_ROUTING_SECRET |
 const VIP_DASHBOARD_FEED_TOKEN = String(
   process.env.VIP_DASHBOARD_FEED_TOKEN || process.env.VIP_INTAKE_ROUTING_SECRET || ""
 );
-const VIP_DASHBOARD_CACHE_TTL_MS = Math.max(
-  30_000,
-  Number(process.env.VIP_DASHBOARD_CACHE_TTL_MS || 2 * 60 * 1000)
+const VIP_DASHBOARD_REFRESH_REQUEST_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.VIP_DASHBOARD_REFRESH_REQUEST_TTL_MS || 10 * 60 * 1000)
 );
 const VIP_DASHBOARD_TELEMETRY_PUBLIC_KEY = Buffer.from(
   "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQUdhYXZZT2VzYVJBTUQzSlFKeU5TblVCVWxOU0xyTkJXN21PaSt5SEREV0k9Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=",
@@ -18438,11 +18439,12 @@ function createServer() {
 
 const app = express();
 let vipDashboardSnapshotCache = {
-  expires_at: 0,
   value: null
 };
 let vipDashboardTelemetry = null;
 const vipDashboardTelemetryNonces = new Map();
+const vipDashboardRefreshPollNonces = new Map();
+const vipDashboardRefreshRequests = new Map();
 
 function dashboardBearerToken(req) {
   const authorization = String(req.headers.authorization || "");
@@ -18461,6 +18463,34 @@ function hasValidDashboardFeedToken(req) {
     expectedBuffer.length === suppliedBuffer.length &&
     timingSafeEqual(expectedBuffer, suppliedBuffer)
   );
+}
+
+function cleanupDashboardRefreshState(now = Date.now()) {
+  for (const [nonce, seenAt] of vipDashboardRefreshPollNonces.entries()) {
+    if (now - seenAt > 10 * 60 * 1000) vipDashboardRefreshPollNonces.delete(nonce);
+  }
+  for (const [requestId, request] of vipDashboardRefreshRequests.entries()) {
+    if (request.status === "pending" && request.expiresAtMs <= now) {
+      request.status = "expired";
+      request.completedAt = new Date(now).toISOString();
+    }
+    if (request.expiresAtMs + VIP_DASHBOARD_REFRESH_REQUEST_TTL_MS <= now) {
+      vipDashboardRefreshRequests.delete(requestId);
+    }
+  }
+}
+
+function dashboardRefreshResponse(request) {
+  return {
+    ok: true,
+    requestId: request.id,
+    status: request.status,
+    requestedAt: request.requestedAt,
+    expiresAt: request.expiresAt,
+    completedAt: request.completedAt || null,
+    snapshotGeneratedAt: request.snapshotGeneratedAt || null,
+    error: request.error || null
+  };
 }
 
 function berlinDateKey(value = new Date()) {
@@ -18967,19 +18997,9 @@ async function buildVipDashboardSnapshot() {
 }
 
 async function getVipDashboardSnapshot() {
-  const now = Date.now();
-  if (
-    vipDashboardSnapshotCache.value &&
-    vipDashboardSnapshotCache.expires_at > now
-  ) {
-    return vipDashboardSnapshotCache.value;
-  }
-  const value = await buildVipDashboardSnapshot();
-  vipDashboardSnapshotCache = {
-    value,
-    expires_at: now + VIP_DASHBOARD_CACHE_TTL_MS
-  };
-  return value;
+  // Live reads are manual-only. Opening the dashboard never triggers Asana,
+  // Google Ads, Finance or Codex collection by itself.
+  return vipDashboardSnapshotCache.value;
 }
 
 app.options("/intake", (req, res) => {
@@ -19006,15 +19026,88 @@ app.get("/intake/health", (req, res) => {
 
 app.post("/intake", handleIntakePost);
 
+app.post("/dashboard/refresh", (req, res) => {
+  res.set("cache-control", "no-store");
+  if (!hasValidDashboardFeedToken(req)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized." });
+  }
+
+  const now = Date.now();
+  cleanupDashboardRefreshState(now);
+  const existing = [...vipDashboardRefreshRequests.values()].find(
+    (request) => request.status === "pending" && request.expiresAtMs > now
+  );
+  if (existing) return res.status(202).json(dashboardRefreshResponse(existing));
+
+  const requestId = randomUUID();
+  const request = {
+    id: requestId,
+    status: "pending",
+    requestedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + VIP_DASHBOARD_REFRESH_REQUEST_TTL_MS).toISOString(),
+    expiresAtMs: now + VIP_DASHBOARD_REFRESH_REQUEST_TTL_MS,
+    completedAt: null,
+    snapshotGeneratedAt: null,
+    error: null
+  };
+  vipDashboardRefreshRequests.set(requestId, request);
+  return res.status(202).json(dashboardRefreshResponse(request));
+});
+
+app.get("/dashboard/refresh/:requestId", (req, res) => {
+  res.set("cache-control", "no-store");
+  if (!hasValidDashboardFeedToken(req)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized." });
+  }
+  cleanupDashboardRefreshState();
+  const request = vipDashboardRefreshRequests.get(String(req.params.requestId || ""));
+  if (!request) {
+    return res.status(404).json({ ok: false, error: "Refresh request not found." });
+  }
+  return res.json(dashboardRefreshResponse(request));
+});
+
+app.get("/dashboard/telemetry/request", (req, res) => {
+  res.set("cache-control", "no-store");
+  try {
+    const now = Date.now();
+    const poll = verifyDashboardRefreshPoll({
+      timestamp: String(req.headers["x-vip-dashboard-timestamp"] || ""),
+      nonce: String(req.headers["x-vip-dashboard-nonce"] || ""),
+      signatureBase64: String(req.headers["x-vip-dashboard-signature"] || ""),
+      publicKeyPem: VIP_DASHBOARD_TELEMETRY_PUBLIC_KEY,
+      now
+    });
+    cleanupDashboardRefreshState(now);
+    if (vipDashboardRefreshPollNonces.has(poll.nonce)) {
+      return res.status(409).json({ ok: false, error: "Refresh poll replay rejected." });
+    }
+    vipDashboardRefreshPollNonces.set(poll.nonce, now);
+
+    const pending = [...vipDashboardRefreshRequests.values()]
+      .filter((request) => request.status === "pending" && request.expiresAtMs > now)
+      .sort((left, right) => left.requestedAt.localeCompare(right.requestedAt))[0];
+    if (!pending) return res.status(204).end();
+    return res.json(dashboardRefreshResponse(pending));
+  } catch (error) {
+    return res.status(401).json({
+      ok: false,
+      error: String(error?.message || "Refresh poll authentication failed.")
+    });
+  }
+});
+
 app.post(
   "/dashboard/telemetry",
   express.json({ limit: "320kb" }),
-  (req, res) => {
+  async (req, res) => {
+    let refreshRequest = null;
     try {
       const now = Date.now();
       for (const [nonce, seenAt] of vipDashboardTelemetryNonces.entries()) {
         if (now - seenAt > 20 * 60 * 1000) vipDashboardTelemetryNonces.delete(nonce);
       }
+      cleanupDashboardRefreshState(now);
       const telemetry = decodeAndVerifyDashboardTelemetry({
         payloadBase64: req.body?.payload,
         signatureBase64: req.body?.signature,
@@ -19025,16 +19118,41 @@ app.post(
         return res.status(409).json({ ok: false, error: "Telemetry replay rejected." });
       }
 
+      refreshRequest = vipDashboardRefreshRequests.get(
+        String(telemetry.refreshRequestId || "")
+      );
+      if (
+        !refreshRequest ||
+        refreshRequest.status !== "pending" ||
+        refreshRequest.expiresAtMs <= now
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error: "Telemetry requires a current manual dashboard refresh request."
+        });
+      }
+
       vipDashboardTelemetryNonces.set(telemetry.nonce, now);
       vipDashboardTelemetry = telemetry;
-      vipDashboardSnapshotCache = { expires_at: 0, value: null };
+      const snapshot = await buildVipDashboardSnapshot();
+      vipDashboardSnapshotCache = { value: snapshot };
+      refreshRequest.status = "completed";
+      refreshRequest.completedAt = new Date().toISOString();
+      refreshRequest.snapshotGeneratedAt = snapshot.generatedAt;
       res.set("cache-control", "no-store");
       return res.json({
         ok: true,
-        receivedAt: new Date(now).toISOString(),
-        generatedAt: telemetry.generatedAt
+        receivedAt: refreshRequest.completedAt,
+        generatedAt: telemetry.generatedAt,
+        snapshotGeneratedAt: snapshot.generatedAt,
+        refreshRequestId: refreshRequest.id
       });
     } catch (error) {
+      if (refreshRequest?.status === "pending") {
+        refreshRequest.status = "failed";
+        refreshRequest.completedAt = new Date().toISOString();
+        refreshRequest.error = String(error?.message || "Dashboard refresh failed.").slice(0, 300);
+      }
       res.set("cache-control", "no-store");
       return res.status(400).json({
         ok: false,
@@ -19052,6 +19170,13 @@ app.get("/dashboard/health", async (req, res) => {
 
   try {
     const snapshot = await getVipDashboardSnapshot();
+    if (!snapshot) {
+      res.set("cache-control", "private, no-store");
+      return res.status(503).json({
+        ok: false,
+        error: "No manually refreshed dashboard snapshot is available."
+      });
+    }
     res.set("cache-control", "private, no-store");
     return res.json(snapshot);
   } catch (error) {

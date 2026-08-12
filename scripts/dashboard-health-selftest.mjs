@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
 import {
   buildGoogleAdsComparison,
-  decodeAndVerifyDashboardTelemetry
+  dashboardRefreshPollMessage,
+  decodeAndVerifyDashboardTelemetry,
+  verifyDashboardRefreshPoll
 } from "../lib/dashboard-health.js";
 
 const now = Date.now();
@@ -28,6 +30,31 @@ const decoded = decodeAndVerifyDashboardTelemetry({
 assert.equal(decoded.nonce, telemetry.nonce);
 assert.equal(decoded.resources.plan.usedPercent, 48);
 assert.equal(decoded.resources.forecast.projectedUsedPercent, 157);
+
+const pollTimestamp = new Date(now).toISOString();
+const pollNonce = "dashboard-poll-selftest-123";
+const pollSignature = sign(
+  null,
+  dashboardRefreshPollMessage({ timestamp: pollTimestamp, nonce: pollNonce }),
+  privateKey
+);
+const verifiedPoll = verifyDashboardRefreshPoll({
+  timestamp: pollTimestamp,
+  nonce: pollNonce,
+  signatureBase64: pollSignature.toString("base64"),
+  publicKeyPem: publicKey.export({ type: "spki", format: "pem" }),
+  now
+});
+assert.equal(verifiedPoll.nonce, pollNonce);
+assert.throws(() =>
+  verifyDashboardRefreshPoll({
+    timestamp: pollTimestamp,
+    nonce: `${pollNonce}x`,
+    signatureBase64: pollSignature.toString("base64"),
+    publicKeyPem: publicKey.export({ type: "spki", format: "pem" }),
+    now
+  })
+);
 
 assert.throws(() =>
   decodeAndVerifyDashboardTelemetry({
