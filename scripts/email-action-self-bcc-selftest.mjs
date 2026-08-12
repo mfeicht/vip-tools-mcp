@@ -40,7 +40,7 @@ try {
     send_account_tool_present: names.has("email_action_list_send_accounts"),
     template_style_tool_present: names.has("email_action_template_style_readback"),
     adaptive_context_tool_present: names.has("email_action_agent_context"),
-    four_accounts_registered: accounts.account_count === 4,
+    five_accounts_registered: accounts.account_count === 5,
     every_account_has_self_bcc: (accounts.accounts || []).every(
       (account) => account.mandatory_self_bcc === account.address
     ),
@@ -53,6 +53,11 @@ try {
         "RESEND_API_KEY_REISE_STORIES_DE" &&
       accountById.get("goklever-support")?.required_env_names?.resend_api_key ===
         "RESEND_API_KEY_GOKLEVER_DE" &&
+      accountById.get("vip-moritz")?.required_env_names?.resend_api_key ===
+        "RESEND_API_KEY_VIP_STUDIOS_DE" &&
+      accountById.get("vip-moritz")?.required_env_names?.password_one_of?.includes(
+        "SMTP_PASSWORD_EMAIL_AUTOMATION_VIP_MORITZ"
+      ) &&
       source.includes('"vip-studios.de": "RESEND_API_KEY_VIP_STUDIOS_DE"'),
     two_contact_language_actions_registered:
       contactActions.length === 2 &&

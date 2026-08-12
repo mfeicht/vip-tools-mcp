@@ -33,6 +33,14 @@
       "smtp_host": "vip-studios.vip-studios.de",
       "smtp_port": 465,
       "smtp_secure": true
+    },
+    {
+      "id": "vip-moritz",
+      "address": "moritz.feichtmeyer@vip-studios.de",
+      "env_suffix": "EMAIL_AUTOMATION_VIP_MORITZ",
+      "smtp_host": "vip-studios.vip-studios.de",
+      "smtp_port": 465,
+      "smtp_secure": true
     }
   ]
 }
