@@ -82,7 +82,22 @@ try {
     envelope_send_uses_self_bcc_plan:
       source.includes("to: plan.envelope_recipients") &&
       source.includes("plan.bcc !== plan.from") &&
-      source.includes('bcc_visible_in_mime_headers: false')
+      source.includes('bcc_visible_in_mime_headers: false'),
+    connected_resend_action_transport_present:
+      source.includes("sendEmailActionViaResend") &&
+      source.includes("getEmailActionHttpConfig") &&
+      source.includes('type: "resend_http_mime_equivalent"'),
+    resend_preserves_self_bcc_and_thread_headers:
+      source.includes("bcc: [plan.bcc]") &&
+      source.includes('"In-Reply-To": plan.in_reply_to') &&
+      source.includes("References: plan.references"),
+    resend_preserves_cid_and_idempotency:
+      source.includes("content_id: attachment.content_id") &&
+      source.includes('"Idempotency-Key": plan.idempotency_id'),
+    resend_provider_readback_and_persistent_id_present:
+      source.includes("readEmailActionResendResult") &&
+      source.includes("emailActionResendProviderFlag") &&
+      source.includes('status: "sent_but_provider_readback_failed"')
   };
   console.log(JSON.stringify(report));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);

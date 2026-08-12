@@ -3878,6 +3878,68 @@ function parseMimeMessageInlineResources(raw, depth = 0) {
   ];
 }
 
+function mimeFileExtension(contentType) {
+  const extensions = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/svg+xml": "svg",
+    "application/pdf": "pdf",
+    "message/rfc822": "eml"
+  };
+  return extensions[String(contentType || "").toLowerCase()] || "bin";
+}
+
+function parseMimeMessageResendAttachments(raw, depth = 0) {
+  if (depth > 20) throw new Error("MIME-Verschachtelung ist fuer sicheren Resend-Versand zu tief.");
+  const { headersText, body } = splitHeaderAndBody(raw);
+  const headers = parseMimeHeaders(headersText);
+  const contentType = parseHeaderParams(headers["content-type"] || "text/plain");
+  const disposition = parseHeaderParams(headers["content-disposition"] || "");
+
+  if (contentType.value.startsWith("multipart/") && contentType.params.boundary) {
+    return splitMultipartBody(body, contentType.params.boundary).flatMap((part) =>
+      parseMimeMessageResendAttachments(part, depth + 1)
+    );
+  }
+
+  const mimeType = contentType.value.toLowerCase();
+  const contentId = stripMimeContentId(headers["content-id"]);
+  const rawFileName =
+    disposition.params.filename ||
+    disposition.params["filename*"] ||
+    contentType.params.name ||
+    contentType.params["name*"] ||
+    "";
+  const isBodyText =
+    ["text/plain", "text/html"].includes(mimeType) &&
+    disposition.value !== "attachment" &&
+    !rawFileName &&
+    !contentId;
+  const isAttachment =
+    !isBodyText &&
+    (disposition.value === "attachment" ||
+      disposition.value === "inline" ||
+      Boolean(rawFileName) ||
+      Boolean(contentId));
+  if (!isAttachment) return [];
+
+  const bytes = decodeMimePartBody(body, headers["content-transfer-encoding"]);
+  const contentSha256 = createHash("sha256").update(bytes).digest("hex");
+  const fallbackName = `${contentId ? "inline" : "attachment"}-${contentSha256.slice(0, 12)}.${mimeFileExtension(mimeType)}`;
+  return [
+    {
+      filename: safeAttachmentFileName(rawFileName, fallbackName),
+      content_type: mimeType || "application/octet-stream",
+      content_id: contentId || null,
+      byte_length: bytes.length,
+      sha256: contentSha256,
+      content_base64: bytes.toString("base64")
+    }
+  ];
+}
+
 function fileExtension(fileName) {
   const match = /\.([A-Za-z0-9]+)$/.exec(String(fileName || ""));
   return match ? match[1].toLowerCase() : "";
@@ -5840,6 +5902,211 @@ async function sendEmailViaHttpProvider(config, { to, subject, body, idempotency
   throw new Error("Kein EMAIL_HTTP_PROVIDER konfiguriert.");
 }
 
+function normalizeProviderRecipientList(value) {
+  const values = Array.isArray(value) ? value : value ? [value] : [];
+  return uniqueValues(values.map(extractEmailAddress).filter(Boolean)).sort();
+}
+
+function sameProviderRecipientList(actual, expected) {
+  const normalizedActual = normalizeProviderRecipientList(actual);
+  const normalizedExpected = normalizeProviderRecipientList(expected);
+  return (
+    normalizedActual.length === normalizedExpected.length &&
+    normalizedActual.every((value, index) => value === normalizedExpected[index])
+  );
+}
+
+function selectSingleEmailActionTextPart(parts, contentType, { required = false } = {}) {
+  const candidates = uniqueValues(
+    parts
+      .filter((part) => part.content_type === contentType)
+      .map((part) => part.text)
+  );
+  if (required && candidates.length === 0) {
+    throw new Error(`Resend-Versand braucht einen ${contentType}-Part aus der registrierten Vorlage.`);
+  }
+  if (candidates.length > 1) {
+    throw new Error(`Mehrere unterschiedliche ${contentType}-Parts koennen nicht deterministisch versendet werden.`);
+  }
+  return candidates[0] || "";
+}
+
+function buildEmailActionResendPayload(plan) {
+  const textParts = parseMimeMessageTextParts(plan.raw_message);
+  const html = selectSingleEmailActionTextPart(textParts, "text/html", { required: true });
+  const plainText = selectSingleEmailActionTextPart(textParts, "text/plain");
+  const attachments = parseMimeMessageResendAttachments(plan.raw_message);
+  const contentIds = new Set();
+  for (const attachment of attachments) {
+    if (!attachment.content_id) continue;
+    const normalized = attachment.content_id.toLowerCase();
+    if (contentIds.has(normalized)) {
+      throw new Error(`Doppelte CID in der Vorlage: ${attachment.content_id}`);
+    }
+    contentIds.add(normalized);
+  }
+  const referencedContentIds = uniqueValues(
+    Array.from(html.matchAll(/\bcid:([^"'\s)>]+)/gi)).map((match) =>
+      stripMimeContentId(match[1]).toLowerCase()
+    )
+  );
+  const missingContentIds = referencedContentIds.filter((contentId) => !contentIds.has(contentId));
+  if (missingContentIds.length) {
+    throw new Error(`HTML verweist auf nicht vorhandene CID-Anhaenge: ${missingContentIds.join(", ")}`);
+  }
+
+  const payload = {
+    from: plan.from,
+    to: [plan.to],
+    bcc: [plan.bcc],
+    subject: plan.subject,
+    html,
+    ...(plainText ? { text: plainText } : {}),
+    headers: {
+      "In-Reply-To": plan.in_reply_to,
+      ...(plan.references ? { References: plan.references } : {})
+    },
+    ...(attachments.length
+      ? {
+          attachments: attachments.map((attachment) => ({
+            filename: attachment.filename,
+            content: attachment.content_base64,
+            ...(attachment.content_id ? { content_id: attachment.content_id } : {})
+          }))
+        }
+      : {})
+  };
+  return {
+    payload,
+    payload_sha256: createHash("sha256").update(JSON.stringify(payload), "utf8").digest("hex"),
+    html_sha256: createHash("sha256").update(html, "utf8").digest("hex"),
+    text_sha256: plainText ? createHash("sha256").update(plainText, "utf8").digest("hex") : null,
+    attachment_manifest: attachments.map((attachment) => ({
+      filename: attachment.filename,
+      content_type: attachment.content_type,
+      content_id: attachment.content_id,
+      byte_length: attachment.byte_length,
+      sha256: attachment.sha256
+    }))
+  };
+}
+
+function resendReadbackChecks(data, plan, outbound) {
+  const responseHeaders =
+    data?.headers && typeof data.headers === "object" && !Array.isArray(data.headers)
+      ? data.headers
+      : {};
+  const normalizedHeaders = Object.fromEntries(
+    Object.entries(responseHeaders).map(([key, value]) => [String(key).toLowerCase(), String(value)])
+  );
+  const checks = {
+    provider_id: Boolean(data?.id),
+    from: extractEmailAddress(data?.from) === extractEmailAddress(plan.from),
+    to: sameProviderRecipientList(data?.to, [plan.to]),
+    bcc: sameProviderRecipientList(data?.bcc, [plan.bcc]),
+    subject: String(data?.subject || "") === plan.subject,
+    html: String(data?.html || "") === outbound.payload.html,
+    text:
+      !Object.hasOwn(outbound.payload, "text") ||
+      String(data?.text || "") === outbound.payload.text,
+    in_reply_to_submitted: outbound.payload.headers["In-Reply-To"] === plan.in_reply_to,
+    references_submitted:
+      String(outbound.payload.headers.References || "") === String(plan.references || "")
+  };
+  if (Object.keys(normalizedHeaders).length) {
+    checks.in_reply_to_readback = normalizedHeaders["in-reply-to"] === plan.in_reply_to;
+    checks.references_readback =
+      String(normalizedHeaders.references || "") === String(plan.references || "");
+  }
+  if (Array.isArray(data?.attachments)) {
+    checks.attachment_count = data.attachments.length === outbound.attachment_manifest.length;
+  }
+  return checks;
+}
+
+async function readEmailActionResendResult(config, plan, providerMessageId, outbound) {
+  let lastError = null;
+  for (const delayMs of [0, 500, 1500]) {
+    if (delayMs) await sleep(delayMs);
+    try {
+      const response = await axios.get(
+        `https://api.resend.com/emails/${encodeURIComponent(providerMessageId)}`,
+        {
+          timeout: EMAIL_HTTP_TIMEOUT_MS,
+          headers: { Authorization: `Bearer ${config.apiKey}` }
+        }
+      );
+      const data = response.data || {};
+      const checks = resendReadbackChecks(data, plan, outbound);
+      return {
+        readback_verified: Object.values(checks).every(Boolean),
+        readback_checks: checks,
+        provider_last_event: data.last_event || null,
+        internet_message_id: data.message_id || null,
+        readback_error: null
+      };
+    } catch (error) {
+      lastError = formatEmailHttpError("resend readback", error);
+    }
+  }
+  return {
+    readback_verified: false,
+    readback_checks: null,
+    provider_last_event: null,
+    internet_message_id: null,
+    readback_error: lastError || "Resend-Readback fehlgeschlagen."
+  };
+}
+
+async function sendEmailActionViaResend(config, plan) {
+  if (config.provider !== "resend" || !config.apiKey) {
+    throw new Error("Resend-HTTPS-Transport ist fuer die E-Mail-Action nicht bereit.");
+  }
+  const outbound = buildEmailActionResendPayload(plan);
+  const response = await axios.post("https://api.resend.com/emails", outbound.payload, {
+    timeout: EMAIL_HTTP_TIMEOUT_MS,
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": plan.idempotency_id
+    }
+  }).catch((error) => {
+    throw new Error(formatEmailHttpError("resend", error));
+  });
+  const providerMessageId = String(response?.data?.id || "").trim();
+  if (!providerMessageId) {
+    throw new Error("Resend hat den Versand ohne Provider-ID bestaetigt; sicherer Erfolgsstatus ist blockiert.");
+  }
+  const readback = await readEmailActionResendResult(config, plan, providerMessageId, outbound);
+  return {
+    type: "resend_http_mime_equivalent",
+    provider: "resend",
+    accepted: true,
+    provider_message_id: providerMessageId,
+    outbound_payload_sha256: outbound.payload_sha256,
+    html_sha256: outbound.html_sha256,
+    text_sha256: outbound.text_sha256,
+    attachment_manifest: outbound.attachment_manifest,
+    self_bcc_submitted: plan.bcc,
+    thread_headers_submitted: {
+      in_reply_to: plan.in_reply_to,
+      references: plan.references || null
+    },
+    ...readback
+  };
+}
+
+async function refreshEmailActionResendReadback(config, plan, transport) {
+  const outbound = buildEmailActionResendPayload(plan);
+  const readback = await readEmailActionResendResult(
+    config,
+    plan,
+    transport.provider_message_id,
+    outbound
+  );
+  return { ...transport, ...readback };
+}
+
 function cleanupExpiredEmailDrafts() {
   const now = Date.now();
   for (const [draftId, draft] of emailDraftCache.entries()) {
@@ -6397,6 +6664,35 @@ function findAgentIdForEmailAddress(address) {
   return "";
 }
 
+function getEmailActionHttpConfig(sendAccount, { requireCredentials = true } = {}) {
+  const fromAddress = extractEmailAddress(sendAccount?.from || "");
+  if (!fromAddress) throw new Error("E-Mail-Action hat keine verifizierte FROM-Adresse.");
+  const details = getEmailHttpConfigDetails(EMAIL_ACTION_CONTROL_AGENT_ID, {
+    requireCredentials: false
+  });
+  const readyForSend = Boolean(
+    details.config.provider === "resend" && details.config.apiKey && fromAddress
+  );
+  if (requireCredentials && !readyForSend) {
+    throw new Error(
+      "Zentraler Resend-HTTPS-Transport fuer VIP AI-Communication ist nicht vollstaendig konfiguriert."
+    );
+  }
+  return {
+    config: {
+      ...details.config,
+      fromAddress,
+      fromName: ""
+    },
+    summary: {
+      ...details.summary,
+      email_http_from_address: fromAddress,
+      email_http_transport_owner_agent_id: EMAIL_ACTION_CONTROL_AGENT_ID,
+      email_http_ready_for_send: readyForSend
+    }
+  };
+}
+
 function resolveEmailActionSendAccount(action, templateFrom) {
   const expectedFrom = extractEmailAddress(action.from || templateFrom);
   if (!expectedFrom) throw new Error(`Action ${action.id}: FROM fehlt oder ist ungueltig.`);
@@ -6417,6 +6713,8 @@ function resolveEmailActionSendAccount(action, templateFrom) {
     const smtpDetails = getSmtpConfigCandidatesForEmailActionAccount(standaloneAccount, {
       requireCredentials: false
     });
+    const httpDetails = getEmailActionHttpConfig({ from: expectedFrom }, { requireCredentials: false });
+    const httpReady = httpDetails.summary.email_http_ready_for_send;
     return {
       send_account_id: standaloneAccount.id,
       send_agent_id: null,
@@ -6424,13 +6722,13 @@ function resolveEmailActionSendAccount(action, templateFrom) {
       from: expectedFrom,
       smtp_ready_for_send: smtpDetails.summary.ready_for_send,
       smtp_summary: smtpDetails.summary,
-      email_http_provider: null,
-      email_http_ready_for_send: false,
-      raw_mime_transport: "smtp",
-      raw_mime_transport_ready: smtpDetails.summary.ready_for_send,
+      email_http_provider: httpDetails.summary.email_http_provider,
+      email_http_ready_for_send: httpReady,
+      raw_mime_transport: httpReady ? "resend_http_mime_equivalent" : "smtp_raw_mime",
+      raw_mime_transport_ready: httpReady || smtpDetails.summary.ready_for_send,
       mandatory_self_bcc: true,
       raw_mime_note:
-        "Vorlagenantworten mit vollstaendigem MIME/CID-Erhalt werden ueber SMTP-Raw-MIME versendet; die verifizierte FROM-Adresse wird verpflichtend als unsichtbarer Self-BCC-Envelope-Empfaenger gesetzt."
+        "Der zentrale Communication-Workflow bevorzugt Resend HTTPS und erhaelt HTML, Plain-Text-Alternative, CID-Anhaenge, Thread-Header und unsichtbaren Self-BCC; SMTP-Raw-MIME bleibt als Transport-Fallback verfuegbar."
     };
   }
 
@@ -6439,7 +6737,7 @@ function resolveEmailActionSendAccount(action, templateFrom) {
     throw new Error(`Action ${action.id}: Kein konfiguriertes Agenten-Sendekonto fuer ${expectedFrom} gefunden.`);
   }
   const smtpDetails = getSmtpConfigDetails(sendAgentId);
-  const httpDetails = getEmailHttpConfigDetails(sendAgentId, { requireCredentials: false });
+  const httpDetails = getEmailActionHttpConfig({ from: expectedFrom }, { requireCredentials: false });
   const configuredFrom = extractEmailAddress(smtpDetails.config.fromAddress || httpDetails.config.fromAddress);
   if (configuredFrom !== expectedFrom) {
     throw new Error(
@@ -6455,11 +6753,14 @@ function resolveEmailActionSendAccount(action, templateFrom) {
     smtp_summary: smtpDetails.summary,
     email_http_provider: httpDetails.summary.email_http_provider,
     email_http_ready_for_send: httpDetails.summary.email_http_ready_for_send,
-    raw_mime_transport: "smtp",
-    raw_mime_transport_ready: smtpDetails.summary.ready_for_send,
+    raw_mime_transport: httpDetails.summary.email_http_ready_for_send
+      ? "resend_http_mime_equivalent"
+      : "smtp_raw_mime",
+    raw_mime_transport_ready:
+      httpDetails.summary.email_http_ready_for_send || smtpDetails.summary.ready_for_send,
     mandatory_self_bcc: true,
     raw_mime_note:
-      "Vorlagenantworten mit vollstaendigem MIME/CID-Erhalt werden ueber SMTP-Raw-MIME versendet; HTTP-Provider werden nur berichtet, nicht fuer Raw-MIME-Liveversand genutzt."
+      "Der zentrale Communication-Workflow bevorzugt Resend HTTPS und erhaelt HTML, Plain-Text-Alternative, CID-Anhaenge, Thread-Header und unsichtbaren Self-BCC; SMTP-Raw-MIME bleibt als Transport-Fallback verfuegbar."
   };
 }
 
@@ -6942,6 +7243,27 @@ function emailActionSentFlag(idempotencyId) {
 
 function emailActionProcessingFlag(idempotencyId) {
   return `$VIPAI-LOCK-${String(idempotencyId).slice(0, 24).toUpperCase()}`;
+}
+
+function emailActionResendProviderFlag(providerMessageId) {
+  const encoded = Buffer.from(String(providerMessageId || ""), "utf8").toString("base64url");
+  if (!encoded || encoded.length > 120) {
+    throw new Error("Resend-Provider-ID kann nicht sicher als IMAP-Keyword persistiert werden.");
+  }
+  return `$VIPAI-RID-${encoded}`;
+}
+
+function emailActionResendProviderIdFromFlags(flags) {
+  const prefix = "$VIPAI-RID-";
+  const flag = (flags || []).find((item) =>
+    String(item || "").toUpperCase().startsWith(prefix)
+  );
+  if (!flag) return "";
+  try {
+    return Buffer.from(String(flag).slice(prefix.length), "base64url").toString("utf8");
+  } catch {
+    return "";
+  }
 }
 
 function cleanupEmailActionIdempotencyCache(nowMs = Date.now()) {
@@ -16143,13 +16465,16 @@ function createServer() {
 
   server.tool(
     "email_action_list_send_accounts",
-    "Listet die versionierten Versandkonten fuer die Communication-E-Mail-Automatisierung und prueft deren SMTP-Bereitschaft ohne Anmeldung oder Versand. Gibt nur Env-Variablennamen, niemals Secret-Werte aus.",
+    "Listet die versionierten Versandkonten fuer die Communication-E-Mail-Automatisierung und prueft deren zentrale Resend-HTTPS- sowie SMTP-Bereitschaft ohne Anmeldung oder Versand. Gibt nur Env-Variablennamen, niemals Secret-Werte aus.",
     {
       agent_id: z.literal(EMAIL_ACTION_CONTROL_AGENT_ID).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID)
     },
     TOOL_READ_ONLY,
     async ({ agent_id }) => {
       const config = loadEmailActionSendAccounts();
+      const centralHttp = getEmailHttpConfigDetails(EMAIL_ACTION_CONTROL_AGENT_ID, {
+        requireCredentials: false
+      });
       return out({
         agent_id,
         version: config.version,
@@ -16168,6 +16493,16 @@ function createServer() {
             address: account.address,
             env_suffix: account.env_suffix,
             smtp_ready_for_send: details?.summary?.ready_for_send ?? false,
+            email_http_provider: centralHttp.summary.email_http_provider,
+            email_http_ready_for_send: Boolean(
+              centralHttp.summary.email_http_provider === "resend" &&
+              centralHttp.summary.email_http_api_key_configured
+            ),
+            preferred_transport:
+              centralHttp.summary.email_http_provider === "resend" &&
+              centralHttp.summary.email_http_api_key_configured
+                ? "resend_http_mime_equivalent"
+                : "smtp_raw_mime",
             host_configured: details?.summary?.host_configured ?? false,
             password_configured: details?.summary?.password_configured ?? false,
             password_env_name: details?.summary?.password_env_name ?? null,
@@ -16879,7 +17214,9 @@ function createServer() {
           throw new Error(`Action ${action.id}: registrierte Vorlage passt nicht zum Readback.`);
         }
         if (!sendAccount.raw_mime_transport_ready) {
-          throw new Error(`Action ${action.id}: SMTP-Raw-MIME-Versandkonto ${sendAccount.send_agent_id} ist nicht bereit.`);
+          throw new Error(
+            `Action ${action.id}: Weder zentraler Resend-HTTPS- noch SMTP-Raw-MIME-Transport ist bereit.`
+          );
         }
       }
 
@@ -16975,6 +17312,37 @@ function createServer() {
         }
 
         if (mode !== "live") {
+          let resendShadow = null;
+          if (sendAccount.email_http_provider === "resend" && sendAccount.email_http_ready_for_send) {
+            try {
+              const outbound = buildEmailActionResendPayload(plan);
+              resendShadow = {
+                transport: "resend_http_mime_equivalent",
+                payload_sha256: outbound.payload_sha256,
+                html_sha256: outbound.html_sha256,
+                text_sha256: outbound.text_sha256,
+                attachment_manifest: outbound.attachment_manifest,
+                from: plan.from,
+                to: [plan.to],
+                bcc: [plan.bcc],
+                subject: plan.subject,
+                thread_headers: {
+                  in_reply_to: plan.in_reply_to,
+                  references: plan.references || null
+                },
+                idempotency_key: plan.idempotency_id,
+                sends_live_email: false
+              };
+            } catch (error) {
+              results.push({
+                uid: message.uid,
+                status: "blocked_before_send",
+                reason: `resend_shadow_validation_failed: ${String(error?.message || error)}`,
+                sent: false
+              });
+              continue;
+            }
+          }
           results.push({
             uid: message.uid,
             status: "shadow_ready",
@@ -16995,6 +17363,7 @@ function createServer() {
               review_note_sha256: createHash("sha256").update(agentDecision.review_note, "utf8").digest("hex"),
               review_note_bytes: Buffer.byteLength(agentDecision.review_note, "utf8")
             } : null,
+            resend_shadow: resendShadow,
             sends_live_email: false,
             moves_source_message: false
           });
@@ -17036,43 +17405,153 @@ function createServer() {
         try {
           const cachedSend = getEmailActionCachedSend(plan.idempotency_id);
           const alreadySentByFlag = hasImapFlag(message.flags, plan.sent_flag);
+          const providerIdFromFlag = emailActionResendProviderIdFromFlags(message.flags);
           let transport = cachedSend?.transport || null;
           let sentNow = false;
           let processingMarker = null;
+          let providerMarker = null;
           let sentMarker = null;
 
-          if (!cachedSend && !alreadySentByFlag) {
+          if (plan.bcc !== plan.from || !plan.envelope_recipients.includes(plan.bcc)) {
+            throw new Error(`Action ${action.id}: verpflichtender Self-BCC stimmt nicht mit FROM ueberein.`);
+          }
+
+          if (!transport && providerIdFromFlag) {
+            const { config: httpConfig } = getEmailActionHttpConfig(sendAccount, {
+              requireCredentials: true
+            });
+            transport = await refreshEmailActionResendReadback(httpConfig, plan, {
+              type: "resend_http_mime_equivalent",
+              provider: "resend",
+              accepted: true,
+              provider_message_id: providerIdFromFlag
+            });
+            rememberEmailActionSend(plan.idempotency_id, {
+              transport,
+              provider_message_id: providerIdFromFlag,
+              action_id: action.id,
+              source_uid: message.uid
+            });
+          } else if (transport?.type === "resend_http_mime_equivalent" && !transport.readback_verified) {
+            const { config: httpConfig } = getEmailActionHttpConfig(sendAccount, {
+              requireCredentials: true
+            });
+            transport = await refreshEmailActionResendReadback(httpConfig, plan, transport);
+            rememberEmailActionSend(plan.idempotency_id, {
+              transport,
+              provider_message_id: transport.provider_message_id,
+              action_id: action.id,
+              source_uid: message.uid
+            });
+          }
+
+          if (!transport && alreadySentByFlag) {
+            results.push({
+              uid: message.uid,
+              status: "sent_marker_without_provider_readback",
+              sent: true,
+              sent_now: false,
+              idempotency_id: plan.idempotency_id,
+              reason: "Persistenter Sent-Marker ist vorhanden, aber die Provider-ID fehlt; kein erneuter Versand und kein Move.",
+              retry_instruction: "Provider-ID manuell zuordnen und Readback verifizieren; niemals erneut senden."
+            });
+            continue;
+          }
+
+          if (!transport) {
             processingMarker = await addEmailActionKeywordWithFallback(configs, {
               mailbox: action.mailbox,
               uid: message.uid,
               flag: plan.processing_flag,
               expectedRawSha256: message.raw_sha256
             });
-            const { configs: smtpConfigs } = getEmailActionSmtpConfigCandidates(sendAccount);
-            if (plan.bcc !== plan.from || !plan.envelope_recipients.includes(plan.bcc)) {
-              throw new Error(`Action ${action.id}: verpflichtender Self-BCC stimmt nicht mit FROM ueberein.`);
+            if (sendAccount.email_http_provider === "resend" && sendAccount.email_http_ready_for_send) {
+              const { config: httpConfig } = getEmailActionHttpConfig(sendAccount, {
+                requireCredentials: true
+              });
+              transport = await sendEmailActionViaResend(httpConfig, plan);
+            } else {
+              const { configs: smtpConfigs } = getEmailActionSmtpConfigCandidates(sendAccount);
+              transport = {
+                type: "smtp_raw_mime",
+                provider: "smtp",
+                accepted: true,
+                readback_verified: true,
+                provider_message_id: plan.message_id,
+                ...(await sendSmtpRawEmail(smtpConfigs, {
+                  envelopeFrom: plan.from,
+                  to: plan.envelope_recipients,
+                  rawMessage: plan.raw_message
+                }))
+              };
             }
-            transport = {
-              type: "smtp_raw_mime",
-              ...(await sendSmtpRawEmail(smtpConfigs, {
-                envelopeFrom: plan.from,
-                to: plan.envelope_recipients,
-                rawMessage: plan.raw_message
-              }))
-            };
             sentNow = true;
             rememberEmailActionSend(plan.idempotency_id, {
               transport,
-              provider_message_id: plan.message_id,
+              provider_message_id: transport.provider_message_id || plan.message_id,
               action_id: action.id,
               source_uid: message.uid
             });
-            sentMarker = await addEmailActionKeywordWithFallback(configs, {
-              mailbox: action.mailbox,
+          }
+
+          const markerErrors = [];
+          if (transport.type === "resend_http_mime_equivalent" && !providerIdFromFlag) {
+            try {
+              providerMarker = await addEmailActionKeywordWithFallback(configs, {
+                mailbox: action.mailbox,
+                uid: message.uid,
+                flag: emailActionResendProviderFlag(transport.provider_message_id),
+                expectedRawSha256: message.raw_sha256
+              });
+            } catch (error) {
+              markerErrors.push(`provider_marker: ${String(error?.message || error)}`);
+            }
+          }
+          if (!alreadySentByFlag) {
+            try {
+              sentMarker = await addEmailActionKeywordWithFallback(configs, {
+                mailbox: action.mailbox,
+                uid: message.uid,
+                flag: plan.sent_flag,
+                expectedRawSha256: message.raw_sha256
+              });
+            } catch (error) {
+              markerErrors.push(`sent_marker: ${String(error?.message || error)}`);
+            }
+          }
+          if (markerErrors.length) {
+            results.push({
               uid: message.uid,
-              flag: plan.sent_flag,
-              expectedRawSha256: message.raw_sha256
+              status: "sent_but_marker_failed",
+              sent: true,
+              sent_now: sentNow,
+              idempotency_id: plan.idempotency_id,
+              provider_message_id: transport.provider_message_id || plan.message_id,
+              transport,
+              processing_marker: processingMarker,
+              provider_marker: providerMarker,
+              sent_marker: sentMarker,
+              marker_errors: markerErrors,
+              retry_instruction: "Nicht erneut senden; persistente Marker und Provider-Readback vervollstaendigen."
             });
+            continue;
+          }
+
+          if (!transport.readback_verified) {
+            results.push({
+              uid: message.uid,
+              status: "sent_but_provider_readback_failed",
+              sent: true,
+              sent_now: sentNow,
+              idempotency_id: plan.idempotency_id,
+              provider_message_id: transport.provider_message_id || plan.message_id,
+              transport,
+              processing_marker: processingMarker,
+              provider_marker: providerMarker,
+              sent_marker: sentMarker,
+              retry_instruction: "Nicht erneut senden; Resend-Readback anhand des Provider-Markers wiederholen."
+            });
+            continue;
           }
 
           let moveResult;
@@ -17096,9 +17575,10 @@ function createServer() {
               already_sent_by_cache: Boolean(cachedSend),
               already_sent_by_imap_flag: alreadySentByFlag,
               idempotency_id: plan.idempotency_id,
-              provider_message_id: plan.message_id,
+              provider_message_id: transport.provider_message_id || plan.message_id,
               transport,
               processing_marker: processingMarker,
+              provider_marker: providerMarker,
               sent_marker: sentMarker,
               move_error: String(moveError?.message || moveError),
               retry_instruction:
@@ -17115,7 +17595,7 @@ function createServer() {
             already_sent_by_cache: Boolean(cachedSend),
             already_sent_by_imap_flag: alreadySentByFlag,
             idempotency_id: plan.idempotency_id,
-            provider_message_id: plan.message_id,
+            provider_message_id: transport.provider_message_id || plan.message_id,
             from: plan.from,
             to: plan.to,
             bcc: plan.bcc,
@@ -17132,6 +17612,7 @@ function createServer() {
             raw_message_sha256: plan.raw_message_sha256,
             transport,
             processing_marker: processingMarker,
+            provider_marker: providerMarker,
             sent_marker: sentMarker,
             move: moveResult
           });
