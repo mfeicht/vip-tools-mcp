@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "owner_agent_id": "vip-ai-communication",
   "action_mailbox_root": "INBOX.E-Mail-Automatisierung",
   "done_mailbox_root": "INBOX.VIP AI.Erledigt",
@@ -29,9 +29,9 @@
       "enabled": true,
       "live_enabled": false,
       "template": {
-        "uid": "",
-        "message_id": "",
-        "sha256": ""
+        "uid": "4",
+        "message_id": "<8C9E0C92-7FA8-41C7-9C76-E59C12237172@reise-stories.de>",
+        "sha256": "3483a948fca9c9aca5e83a7ac764bb8396db83abf490f38aa0c123dbcc00952c"
       },
       "required_placeholders": [],
       "name_placeholder_mode": "from_header",
@@ -61,9 +61,9 @@
       "enabled": true,
       "live_enabled": false,
       "template": {
-        "uid": "",
-        "message_id": "",
-        "sha256": ""
+        "uid": "5",
+        "message_id": "<59F507F7-F925-41E5-8402-591CE0490D91@reise-stories.de>",
+        "sha256": "4e3beb5a0c98d307a0ab8424823145afa310f71115e245bec18b4d27d2763d87"
       },
       "required_placeholders": [],
       "name_placeholder_mode": "from_header",
