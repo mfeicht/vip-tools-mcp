@@ -6034,6 +6034,92 @@ function buildEmailActionResendPayload(plan) {
   };
 }
 
+function countLiteralOccurrences(value, marker) {
+  if (!marker) return 0;
+  return String(value || "").split(marker).length - 1;
+}
+
+function validateEmailTemplateCidReferences(html, attachments) {
+  const contentIds = new Set();
+  for (const attachment of attachments) {
+    if (!attachment.content_id) continue;
+    const normalized = attachment.content_id.toLowerCase();
+    if (contentIds.has(normalized)) {
+      throw new Error(`Doppelte CID in der Vorlage: ${attachment.content_id}`);
+    }
+    contentIds.add(normalized);
+  }
+  const referencedContentIds = uniqueValues(
+    Array.from(String(html || "").matchAll(/\bcid:([^"'\s)>]+)/gi)).map((match) =>
+      stripMimeContentId(match[1]).toLowerCase()
+    )
+  );
+  const missingContentIds = referencedContentIds.filter((contentId) => !contentIds.has(contentId));
+  if (missingContentIds.length) {
+    throw new Error(`HTML verweist auf nicht vorhandene CID-Anhaenge: ${missingContentIds.join(", ")}`);
+  }
+}
+
+function buildDraftTemplateResendPayload({
+  templateRaw,
+  from,
+  to,
+  bcc,
+  subject,
+  body,
+  bodyMarker
+}) {
+  const textParts = parseMimeMessageTextParts(templateRaw);
+  const htmlTemplate = selectSingleEmailActionTextPart(textParts, "text/html", { required: true });
+  const plainTemplate = selectSingleEmailActionTextPart(textParts, "text/plain");
+  const htmlMarkerCount = countLiteralOccurrences(htmlTemplate, bodyMarker);
+  const plainMarkerCount = plainTemplate ? countLiteralOccurrences(plainTemplate, bodyMarker) : 0;
+  if (htmlMarkerCount !== 1) {
+    throw new Error(`HTML-Vorlage muss den Einsetzpunkt ${bodyMarker} exakt einmal enthalten, gefunden: ${htmlMarkerCount}.`);
+  }
+  if (plainTemplate && plainMarkerCount !== 1) {
+    throw new Error(`Plain-Text-Vorlage muss den Einsetzpunkt ${bodyMarker} exakt einmal enthalten, gefunden: ${plainMarkerCount}.`);
+  }
+
+  const htmlBody = escapeAccountingHtml(body).replace(/\r?\n/g, "<br>");
+  const html = htmlTemplate.replace(bodyMarker, htmlBody);
+  const text = plainTemplate ? plainTemplate.replace(bodyMarker, body) : body;
+  const attachments = parseMimeMessageResendAttachments(templateRaw);
+  validateEmailTemplateCidReferences(html, attachments);
+  const payload = {
+    from,
+    to: [to],
+    bcc: [bcc],
+    subject,
+    html,
+    text,
+    ...(attachments.length
+      ? {
+          attachments: attachments.map((attachment) => ({
+            filename: attachment.filename,
+            content: attachment.content_base64,
+            ...(attachment.content_id ? { content_id: attachment.content_id } : {})
+          }))
+        }
+      : {})
+  };
+  return {
+    payload,
+    payload_sha256: createHash("sha256").update(JSON.stringify(payload), "utf8").digest("hex"),
+    html_sha256: createHash("sha256").update(html, "utf8").digest("hex"),
+    text_sha256: createHash("sha256").update(text, "utf8").digest("hex"),
+    html_marker_count: htmlMarkerCount,
+    plain_marker_count: plainMarkerCount,
+    attachment_manifest: attachments.map((attachment) => ({
+      filename: attachment.filename,
+      content_type: attachment.content_type,
+      content_id: attachment.content_id,
+      byte_length: attachment.byte_length,
+      sha256: attachment.sha256
+    }))
+  };
+}
+
 function resendReadbackChecks(data, plan, outbound) {
   const responseHeaders =
     data?.headers && typeof data.headers === "object" && !Array.isArray(data.headers)
@@ -6051,12 +6137,15 @@ function resendReadbackChecks(data, plan, outbound) {
     html: String(data?.html || "") === outbound.payload.html,
     text:
       !Object.hasOwn(outbound.payload, "text") ||
-      String(data?.text || "") === outbound.payload.text,
-    in_reply_to_submitted: outbound.payload.headers["In-Reply-To"] === plan.in_reply_to,
-    references_submitted:
-      String(outbound.payload.headers.References || "") === String(plan.references || "")
+      String(data?.text || "") === outbound.payload.text
   };
-  if (Object.keys(normalizedHeaders).length) {
+  if (outbound.payload.headers && plan.in_reply_to) {
+    checks.in_reply_to_submitted =
+      outbound.payload.headers["In-Reply-To"] === plan.in_reply_to;
+    checks.references_submitted =
+      String(outbound.payload.headers.References || "") === String(plan.references || "");
+  }
+  if (Object.keys(normalizedHeaders).length && plan.in_reply_to) {
     checks.in_reply_to_readback = normalizedHeaders["in-reply-to"] === plan.in_reply_to;
     checks.references_readback =
       String(normalizedHeaders.references || "") === String(plan.references || "");
@@ -6135,6 +6224,39 @@ async function sendEmailActionViaResend(config, plan) {
       in_reply_to: plan.in_reply_to,
       references: plan.references || null
     },
+    ...readback
+  };
+}
+
+async function sendDraftTemplateViaResend(config, plan, outbound) {
+  if (config.provider !== "resend" || !config.apiKey) {
+    throw new Error("Resend-HTTPS-Transport ist fuer den Vorlagen-Testversand nicht bereit.");
+  }
+  const response = await axios.post("https://api.resend.com/emails", outbound.payload, {
+    timeout: EMAIL_HTTP_TIMEOUT_MS,
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": plan.idempotency_id
+    }
+  }).catch((error) => {
+    throw new Error(formatEmailHttpError("resend", error));
+  });
+  const providerMessageId = String(response?.data?.id || "").trim();
+  if (!providerMessageId) {
+    throw new Error("Resend hat den Testversand ohne Provider-ID bestaetigt; sicherer Erfolgsstatus ist blockiert.");
+  }
+  const readback = await readEmailActionResendResult(config, plan, providerMessageId, outbound);
+  return {
+    type: "resend_http_template",
+    provider: "resend",
+    accepted: true,
+    provider_message_id: providerMessageId,
+    outbound_payload_sha256: outbound.payload_sha256,
+    html_sha256: outbound.html_sha256,
+    text_sha256: outbound.text_sha256,
+    attachment_manifest: outbound.attachment_manifest,
+    self_bcc_submitted: plan.bcc,
     ...readback
   };
 }
@@ -16844,6 +16966,237 @@ function createServer() {
           },
           attempts: scan.attempts
         }
+      });
+    }
+  );
+
+  server.tool(
+    "email_action_send_test_from_draft_template",
+    "Sendet nach einem Shadow-Readback genau eine direkt von Moritz freigegebene Testmail aus einem versionierten Communication-Sendekonto. Verwendet eine explizit per IMAP-UID und SHA256 gebundene Draft-Vorlage, ersetzt genau einen TEXT-Einsetzpunkt in HTML und Plain Text, erhaelt CID-Anhaenge, setzt Self-BCC und veraendert die Vorlage nicht.",
+    {
+      agent_id: z.literal(EMAIL_ACTION_CONTROL_AGENT_ID).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      mailbox: z.string().min(1).max(500),
+      template_uid: z.string().regex(/^\d+$/),
+      expected_template_sha256: z.string().regex(/^[a-f0-9]{64}$/i),
+      send_account_id: z.string().min(2).max(100),
+      to: z.string(),
+      subject: z.string(),
+      body: z.string(),
+      body_marker: z.string().min(2).max(100).optional().default("TEXT"),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional(),
+      max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
+      max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      mailbox,
+      template_uid,
+      expected_template_sha256,
+      send_account_id,
+      to,
+      subject,
+      body,
+      body_marker,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      authorization,
+      max_scan_messages,
+      max_email_bytes
+    }) => {
+      const normalizedMailbox = String(mailbox || "").trim();
+      const allowedMailboxRoot = "INBOX.E-Mail-Automatisierung";
+      if (
+        normalizedMailbox.toLowerCase() !== allowedMailboxRoot.toLowerCase() &&
+        !normalizedMailbox.toLowerCase().startsWith(`${allowedMailboxRoot.toLowerCase()}.`)
+      ) {
+        throw new Error(`Vorlagen-Testversand ist nur unter ${allowedMailboxRoot} erlaubt.`);
+      }
+      const validated = validateEmailPayload({ to, subject, body });
+      if (validated.recipients.length !== 1) {
+        throw new Error("Vorlagen-Testversand erlaubt genau einen direkten Empfaenger.");
+      }
+      const marker = sanitizeHeaderLineValue(body_marker, "body_marker");
+      const account = loadEmailActionSendAccounts().accounts.find(
+        (candidate) => candidate.id === String(send_account_id || "").trim()
+      );
+      if (!account) {
+        throw new Error(`Unbekanntes Communication-Sendekonto: ${send_account_id}`);
+      }
+
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const scan = await scanEmailActionFolderWithFallback(configs, {
+        mailbox: normalizedMailbox,
+        maxEmailBytes: max_email_bytes,
+        maxScanMessages: max_scan_messages
+      });
+      const template = scan.messages.find((message) => String(message.uid) === String(template_uid));
+      if (!template || template.parse_error) {
+        throw new Error(`Draft-Vorlage UID ${template_uid} wurde nicht sicher gelesen.`);
+      }
+      if (!hasImapFlag(template.flags, "\\Draft")) {
+        throw new Error(`UID ${template_uid} ist nicht als IMAP-Draft markiert.`);
+      }
+      if (template.raw_sha256 !== expected_template_sha256.toLowerCase()) {
+        throw new Error("Draft-Vorlagen-Hash stimmt nicht mit dem expliziten Readback ueberein.");
+      }
+      if (extractEmailAddress(template.parsed.from_email) !== account.address) {
+        throw new Error(
+          `Draft-Vorlage sendet als ${template.parsed.from_email || "unbekannt"}, Sendekonto erwartet ${account.address}.`
+        );
+      }
+
+      const recipient = validated.recipients[0];
+      const selfBcc = account.address;
+      const outbound = buildDraftTemplateResendPayload({
+        templateRaw: template.raw,
+        from: account.address,
+        to: recipient,
+        bcc: selfBcc,
+        subject: validated.subject,
+        body,
+        bodyMarker: marker
+      });
+      const idempotencyId = createHash("sha256")
+        .update(
+          [
+            "draft-template-test-v1",
+            account.address,
+            recipient,
+            validated.subject,
+            validated.body_sha256,
+            template.raw_sha256
+          ].join("\n"),
+          "utf8"
+        )
+        .digest("hex");
+      const plan = {
+        idempotency_id: idempotencyId,
+        from: account.address,
+        to: recipient,
+        bcc: selfBcc,
+        subject: validated.subject,
+        in_reply_to: "",
+        references: ""
+      };
+      const httpDetails = getEmailActionHttpConfig({ from: account.address }, { requireCredentials: false });
+      const templateText = emailLearningBodyText(parseMimeMessageTextParts(template.raw), 20_000);
+      const common = {
+        agent_id,
+        mailbox: scan.mailbox,
+        template: {
+          uid: template.uid,
+          sha256: template.raw_sha256,
+          message_id_hash: template.parsed.message_id_hash || null,
+          subject: template.parsed.subject,
+          from: account.address,
+          flags: template.flags,
+          body_marker: marker,
+          html_marker_count: outbound.html_marker_count,
+          plain_marker_count: outbound.plain_marker_count,
+          body_text: templateText.text,
+          body_text_source: templateText.source,
+          inline_resource_count: parseMimeMessageInlineResources(template.raw).length,
+          attachment_manifest: outbound.attachment_manifest
+        },
+        message: {
+          from: account.address,
+          to: recipient,
+          bcc: selfBcc,
+          bcc_visible_in_message_headers: false,
+          subject: validated.subject,
+          body_bytes: validated.body_bytes,
+          body_sha256: validated.body_sha256,
+          html_sha256: outbound.html_sha256,
+          text_sha256: outbound.text_sha256,
+          idempotency_id: idempotencyId
+        },
+        transport: {
+          provider: httpDetails.summary.email_http_provider,
+          ready_for_send: httpDetails.summary.email_http_ready_for_send,
+          api_key_env_name: httpDetails.summary.email_http_api_key_env_name
+        },
+        imap: {
+          ...summary,
+          connection: {
+            host: scan.host,
+            port: scan.port,
+            secure: scan.secure,
+            label: scan.label
+          },
+          attempts: scan.attempts
+        }
+      };
+
+      if (dry_run) {
+        return out({
+          ...common,
+          dry_run: true,
+          status: "shadow_ready",
+          sends_live_email: false,
+          moves_template: false,
+          marks_template_seen: false
+        });
+      }
+
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "email_action_send_test_from_draft_template",
+        requireMoritz: true
+      });
+      const cachedSend = getEmailActionCachedSend(idempotencyId);
+      let transport = cachedSend?.transport || null;
+      let sentNow = false;
+      if (!transport) {
+        const { config: httpConfig } = getEmailActionHttpConfig(
+          { from: account.address },
+          { requireCredentials: true }
+        );
+        transport = await sendDraftTemplateViaResend(httpConfig, plan, outbound);
+        sentNow = true;
+        rememberEmailActionSend(idempotencyId, {
+          transport,
+          provider_message_id: transport.provider_message_id,
+          source: "email_action_send_test_from_draft_template"
+        });
+      }
+
+      const verifyScan = await scanEmailActionFolderWithFallback(configs, {
+        mailbox: normalizedMailbox,
+        maxEmailBytes: max_email_bytes,
+        maxScanMessages: max_scan_messages
+      });
+      const verifyTemplate = verifyScan.messages.find(
+        (message) => String(message.uid) === String(template_uid)
+      );
+      const templateReadbackVerified = Boolean(
+        verifyTemplate &&
+        hasImapFlag(verifyTemplate.flags, "\\Draft") &&
+        verifyTemplate.raw_sha256 === template.raw_sha256
+      );
+      return out({
+        ...common,
+        dry_run: false,
+        status:
+          transport.readback_verified && templateReadbackVerified
+            ? sentNow
+              ? "sent_and_verified"
+              : "already_sent_and_verified"
+            : "sent_but_readback_incomplete",
+        sent: true,
+        sent_now: sentNow,
+        authorization: authorizationReceipt,
+        provider: transport,
+        template_readback_verified: templateReadbackVerified,
+        template_unchanged: templateReadbackVerified,
+        moves_template: false
       });
     }
   );

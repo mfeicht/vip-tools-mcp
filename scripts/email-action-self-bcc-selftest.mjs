@@ -39,6 +39,7 @@ try {
     discovery_tool_present: names.has("email_action_discover_folders"),
     send_account_tool_present: names.has("email_action_list_send_accounts"),
     template_style_tool_present: names.has("email_action_template_style_readback"),
+    draft_template_test_send_tool_present: names.has("email_action_send_test_from_draft_template"),
     adaptive_context_tool_present: names.has("email_action_agent_context"),
     five_accounts_registered: accounts.account_count === 5,
     every_account_has_self_bcc: (accounts.accounts || []).every(
@@ -113,7 +114,12 @@ try {
     resend_provider_readback_and_persistent_id_present:
       source.includes("readEmailActionResendResult") &&
       source.includes("emailActionResendProviderFlag") &&
-      source.includes('status: "sent_but_provider_readback_failed"')
+      source.includes('status: "sent_but_provider_readback_failed"'),
+    draft_template_send_is_hash_bound_and_non_mutating:
+      source.includes("expected_template_sha256") &&
+      source.includes('hasImapFlag(template.flags, "\\\\Draft")') &&
+      source.includes('moves_template: false') &&
+      source.includes("buildDraftTemplateResendPayload")
   };
   console.log(JSON.stringify(report));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);
