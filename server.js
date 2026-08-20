@@ -357,7 +357,7 @@ const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permali
 const ASANA_TASK_TAG_WORKSPACE_OPT_FIELDS =
   "gid,name,completed,tags.gid,tags.name,workspace.gid,permalink_url";
 const ASANA_TASK_CREATE_SOURCE_OPT_FIELDS =
-  "gid,name,completed,completed_at,modified_at,permalink_url,tags.gid,tags.name,assignee.gid,assignee.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name";
+  "gid,name,completed,completed_at,modified_at,permalink_url,tags.gid,tags.name,created_by.gid,created_by.name,assignee.gid,assignee.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name";
 const ASANA_TASK_CREATE_VERIFY_OPT_FIELDS =
   "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,tags.gid,tags.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name,custom_fields.gid,custom_fields.name,custom_fields.enum_value.gid,custom_fields.enum_value.name";
 const ASANA_TASK_DESCRIPTION_OPT_FIELDS =
@@ -366,6 +366,12 @@ const ASANA_TASK_SECTION_OPT_FIELDS =
   "gid,name,completed,assignee.gid,assignee.name,permalink_url,workspace.gid,memberships.project.gid,memberships.project.name,memberships.section.gid,memberships.section.name";
 const ASANA_DEFAULT_SUPERVISOR_GID =
   process.env.ASANA_DEFAULT_SUPERVISOR_GID || "1108801330389276";
+const ASANA_GOVERNANCE_AGENT_IDS = new Set([
+  "vip-ai-operations",
+  "vip-ai-memory",
+  "vip-ai-monitoring",
+  "vip-ai-review"
+]);
 const ASANA_RECURRENCE_GENERATION_GRACE_SECONDS = Math.min(
   Math.max(Number(process.env.ASANA_RECURRENCE_GENERATION_GRACE_SECONDS || 600), 60),
   1800
@@ -1544,6 +1550,31 @@ function isRoutineTaskCreationIntent({ name, description, creation_basis, routin
     "monatliche aufgabe"
   ];
   return routineSignals.some((signal) => normalized.includes(signal));
+}
+
+function isGovernanceTaskCreationIntent({ agentId, name, description, creationBasis }) {
+  if (!ASANA_GOVERNANCE_AGENT_IDS.has(String(agentId || ""))) return false;
+  const normalized = normalizeAsanaLabel([name, description, creationBasis].filter(Boolean).join(" "));
+  const governanceSignals = [
+    "system",
+    "prozess",
+    "automation",
+    "mcp",
+    "memory",
+    "regel",
+    "governance",
+    "review",
+    "monitoring",
+    "qualitaet",
+    "qa",
+    "regression",
+    "drift",
+    "infrastruktur",
+    "konnektor",
+    "schnittstelle",
+    "tool"
+  ];
+  return governanceSignals.some((signal) => normalized.includes(signal));
 }
 
 async function findAsanaRoutineTagOrThrow(asana, workspaceGid) {
@@ -8300,6 +8331,14 @@ async function assertActionAuthorized({
     throw new Error(`${actionName}: approved_by widerspricht dem verifizierten Moritz-Autor.`);
   }
 
+  const authorizationStoryHtml = String(authorizationStory?.html_text || "");
+  const authorizationStoryMentionsAgent = Boolean(
+    authorizationStory &&
+      new RegExp(`data-asana-gid=["']${String(me.gid).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`).test(
+        authorizationStoryHtml
+      )
+  );
+
   return {
     authorization_status: "verified",
     source: "asana",
@@ -8309,6 +8348,8 @@ async function assertActionAuthorized({
     asana_task_url: task.permalink_url || null,
     authorization_basis: authorizationBasis,
     authorization_story_gid: authorizationStory?.gid || null,
+    authorization_story_resource_subtype: authorizationStory?.resource_subtype || null,
+    authorization_story_mentions_agent: authorizationStoryMentionsAgent,
     authorized_by_gid: authorizationActor.gid,
     authorized_by_name: authorizationActor.name || null,
     claimed_approved_by: approvedBy || null,
@@ -10566,7 +10607,7 @@ function createServer() {
 
   server.tool(
     "asana_create_task",
-    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Routine-Tag bei Routine-Erkennung, Supervisor-Follower fuer Nicht-Routinen und bei Follow-ups einen Link zur Ausgangsaufgabe. Bei Routine-Aufgaben wird ein Default-Supervisor/Moritz nicht automatisch gereaddet, ausser allow_routine_supervisor_readd=true.",
+    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Routine-Tag bei Routine-Erkennung und bei Follow-ups einen Link zur Ausgangsaufgabe. Eine blosse Follower-/Beobachterrolle in der Ausgangsaufgabe berechtigt nicht zur Aufgabenanlage; noetig sind Assignee-/Creator-Rolle, eine echte Asana-Mention, eine direkte Moritz-Anweisung oder der eng dokumentierte Governance-Auftrag von Operations/Memory/Monitoring/Review. Bei Routinen wird Moritz nie ueber einen Bool-Override automatisch hinzugefuegt; eine konkrete Problem-Mention ist der einzige Reaktivierungspfad.",
     {
       agent_id: agentIdSchema,
       name: z.string().min(12).max(200),
@@ -10645,6 +10686,7 @@ function createServer() {
       const asana = getAsana(agent_id);
       let source_task;
       let source_projects = [];
+      let source_task_authority = null;
 
       if (source_task_gid) {
         const sourceRes = await asanaRequestWithRetry(asana, {
@@ -10656,6 +10698,65 @@ function createServer() {
         source_projects = uniqueObjectsByGid(
           (source_task.memberships || []).map((membership) => membership.project).filter(Boolean)
         );
+
+        const meRes = await asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" });
+        const me = meRes.data.data;
+        const isSourceAssignee = String(source_task.assignee?.gid || "") === String(me.gid);
+        const isSourceCreator = String(source_task.created_by?.gid || "") === String(me.gid);
+        const governanceScope = isGovernanceTaskCreationIntent({
+          agentId: agent_id,
+          name,
+          description,
+          creationBasis: creation_basis
+        });
+        source_task_authority = {
+          agent_user_gid: me.gid,
+          is_source_assignee: isSourceAssignee,
+          is_source_creator: isSourceCreator,
+          governance_scope: governanceScope,
+          basis: isSourceAssignee
+            ? "source_assignee"
+            : isSourceCreator
+              ? "source_creator"
+              : governanceScope
+                ? "documented_governance_scope"
+                : null
+        };
+
+        if (!source_task_authority.basis) {
+          if (authorization?.source === "direct_codex") {
+            authorization_receipt = await assertActionAuthorized({
+              agentId: agent_id,
+              authorization,
+              confirmedByAsana: confirmed_by_asana,
+              asanaTaskGid: undefined,
+              actionName: "asana_create_task_observer_gate"
+            });
+            source_task_authority.basis = "direct_codex";
+          } else {
+            if (!authorization?.asana_authorization_story_gid) {
+              throw new Error(
+                "Beobachter-Gate: Der Agent ist in der Ausgangsaufgabe weder Assignee noch Creator. Eine blosse Followerrolle berechtigt nicht zur Folgeaufgabe. Erforderlich ist ein echter Asana-Kommentar, der den Agenten per GID erwaehnt, oder eine direkte aktuelle Moritz-Anweisung."
+              );
+            }
+            authorization_receipt = await assertActionAuthorized({
+              agentId: agent_id,
+              authorization,
+              confirmedByAsana: confirmed_by_asana,
+              asanaTaskGid: source_task_gid,
+              actionName: "asana_create_task_observer_gate"
+            });
+            if (
+              authorization_receipt.authorization_basis !== "task_story" ||
+              !authorization_receipt.authorization_story_mentions_agent
+            ) {
+              throw new Error(
+                "Beobachter-Gate: Der angegebene Asana-Kommentar erwaehnt den Agenten nicht mit einer echten Asana-GID-Mention. Keine Folgeaufgabe anlegen."
+              );
+            }
+            source_task_authority.basis = "explicit_asana_mention";
+          }
+        }
       }
 
       const routineInstanceMissingAlarmIntent = isRoutineInstanceMissingAlarmIntent({
@@ -10758,12 +10859,11 @@ function createServer() {
       const supervisor_follower_readd_guarded =
         ensure_supervisor_follower &&
         routine_task_detected &&
-        isDefaultSupervisorFollowerGid(finalSupervisorFollowerGid) &&
-        !allow_routine_supervisor_readd;
+        isDefaultSupervisorFollowerGid(finalSupervisorFollowerGid);
       const effective_ensure_supervisor_follower =
         ensure_supervisor_follower && !supervisor_follower_readd_guarded;
       const supervisor_follower_guard_reason = supervisor_follower_readd_guarded
-        ? "Routine-Aufgabe wird neu angelegt: Default-Supervisor/Moritz wird wegen Routine-do_not_readd-Schutz nicht automatisch als Follower hinzugefuegt. Fuer Blocker/Rueckfrage/kritische Beteiligung explizit allow_routine_supervisor_readd=true setzen."
+        ? "Routine-Aufgabe wird neu angelegt: Default-Supervisor/Moritz wird wegen Routine-do_not_readd-Schutz nicht automatisch als Follower hinzugefuegt. allow_routine_supervisor_readd ist kein Bypass; bei einem echten Problem Moritz ausschliesslich im konkreten Problemkommentar erwaehnen."
         : null;
 
       const { custom_fields, resolved, missing } = await resolveAsanaStandardCustomFields(asana, selectedProjectGid, {
@@ -10798,6 +10898,7 @@ function createServer() {
           data,
           project,
           source_task,
+          source_task_authority,
           source_projects,
           standard_fields: resolved,
           missing_standard_fields: missing,
@@ -10898,6 +10999,7 @@ function createServer() {
         verification_status,
         project,
         source_task,
+        source_task_authority,
         source_projects,
         standard_fields: resolved,
         missing_standard_fields: missing,
@@ -10913,7 +11015,7 @@ function createServer() {
 
   server.tool(
     "asana_comment",
-    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock; offene Evidenzluecken blockieren Abschlusskommentare. Nur reine Fragen ohne materiale Tatsachenbehauptung duerfen ohne Evidenzblock auskommen.",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -10942,6 +11044,11 @@ function createServer() {
         .optional(),
       mention_user_gid: z.string().optional(),
       mention_text: z.string().optional(),
+      routine_supervisor_mention_reason: z
+        .enum(["blocker", "question", "critical_anomaly", "decision_required"])
+        .optional(),
+      keep_routine_observer_subscription: z.boolean().optional().default(false),
+      keep_routine_observer_basis: z.string().min(20).optional(),
       effort_note: z.string().optional(),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
@@ -10956,14 +11063,166 @@ function createServer() {
       evidence,
       mention_user_gid,
       mention_text,
+      routine_supervisor_mention_reason,
+      keep_routine_observer_subscription,
+      keep_routine_observer_basis,
       effort_note,
       dry_run,
       verify_after
     }) => {
       validateAsanaGid(task_gid, "task_gid");
+      validateAsanaGid(mention_user_gid, "mention_user_gid");
       const materialResultSignals = asanaCommentHasMaterialResultSignals({ greeting, sections });
       const preparedEvidence = prepareAsanaEvidenceSections(comment_kind, evidence, { materialResultSignals });
       const finalSections = [...sections, ...preparedEvidence.evidence_sections];
+      if (dry_run && !mention_user_gid && !keep_routine_observer_subscription) {
+        const html_text = buildAsanaCommentHtml({
+          greeting,
+          sections: finalSections,
+          mention_user_gid,
+          mention_text,
+          effort_note
+        });
+        const html_sha256 = createHash("sha256").update(html_text, "utf8").digest("hex");
+        return out({
+          agent_id,
+          dry_run: true,
+          task_gid,
+          comment_kind,
+          evidence_gate_status: preparedEvidence.evidence_gate_status,
+          evidence_required_by_content: preparedEvidence.evidence_required_by_content,
+          evidence_sha256: preparedEvidence.evidence_sha256,
+          routine_supervisor_mention_gate: {
+            applicable: false,
+            status: "not_applicable",
+            reason: null
+          },
+          routine_observer_gate: {
+            applicable: null,
+            status: "not_evaluated_dry_run",
+            reason: "Kein Live-Task-Readback fuer reinen Kommentar-Dry-Run."
+          },
+          html_text,
+          html_bytes: Buffer.byteLength(html_text, "utf8"),
+          html_sha256
+        });
+      }
+      const asana = getAsana(agent_id);
+      const [commentTaskRes, commentMeRes] = await Promise.all([
+        asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/tasks/${task_gid}`,
+          params: {
+            opt_fields:
+              "gid,name,tags.gid,tags.name,created_by.gid,created_by.name,assignee.gid,assignee.name,followers.gid,followers.name,permalink_url"
+          }
+        }),
+        asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" })
+      ]);
+      const commentTask = commentTaskRes.data.data;
+      const commentAgentUser = commentMeRes.data.data;
+      const routineCommentTask = isRoutineLikeAsanaTask(commentTask);
+      const temporaryRoutineObserver =
+        routineCommentTask &&
+        String(commentTask.assignee?.gid || "") !== String(commentAgentUser.gid) &&
+        String(commentTask.created_by?.gid || "") !== String(commentAgentUser.gid);
+      if (keep_routine_observer_subscription && !temporaryRoutineObserver) {
+        throw new Error(
+          "keep_routine_observer_subscription ist nur fuer eine temporaere Nebenrolle in einer fremden Routine zulaessig."
+        );
+      }
+      if (
+        keep_routine_observer_subscription &&
+        String(keep_routine_observer_basis || "").trim().length < 20
+      ) {
+        throw new Error(
+          "Ein dauerhaftes Verbleiben als Routine-Beobachter braucht keep_routine_observer_basis mit einem konkreten Monitoring-/Lernauftrag."
+        );
+      }
+      const observerHasOpenThread =
+        comment_kind === "question" || (evidence?.unresolved?.length || 0) > 0;
+      const observer_should_leave_after_comment = Boolean(
+        temporaryRoutineObserver &&
+          !keep_routine_observer_subscription &&
+          !observerHasOpenThread
+      );
+      const routine_observer_gate = {
+        applicable: temporaryRoutineObserver,
+        status: !temporaryRoutineObserver
+          ? "not_applicable"
+          : observer_should_leave_after_comment
+            ? "auto_leave_after_comment"
+            : keep_routine_observer_subscription
+              ? "retained_with_documented_basis"
+              : "temporarily_retained_for_open_thread",
+        agent_user_gid: commentAgentUser.gid,
+        keep_subscription: keep_routine_observer_subscription,
+        keep_basis: keep_routine_observer_basis || null,
+        open_thread: observerHasOpenThread
+      };
+      let routine_supervisor_mention_gate = {
+        applicable: false,
+        status: "not_applicable",
+        reason: routine_supervisor_mention_reason || null
+      };
+      if (isDefaultSupervisorFollowerGid(mention_user_gid)) {
+        if (routineCommentTask) {
+          routine_supervisor_mention_gate = {
+            applicable: true,
+            status: "checking",
+            reason: routine_supervisor_mention_reason || null,
+            task_gid: commentTask.gid,
+            task_name: commentTask.name
+          };
+          if (!routine_supervisor_mention_reason) {
+            throw new Error(
+              "Routine-Supervisor-Gate: Moritz darf in einer Routine nicht routinemaessig erwaehnt werden. Setze nur bei echtem Problem routine_supervisor_mention_reason=blocker|question|critical_anomaly|decision_required."
+            );
+          }
+          const unresolvedCount = evidence?.unresolved?.length || 0;
+          const verifiedClaimCount = evidence?.verified_claims?.length || 0;
+          const normalizedComment = normalizeAsanaLabel(
+            [greeting, JSON.stringify(sections || []), evidence?.summary].filter(Boolean).join(" ")
+          );
+          if (
+            ["blocker", "decision_required"].includes(routine_supervisor_mention_reason) &&
+            unresolvedCount === 0
+          ) {
+            throw new Error(
+              "Routine-Supervisor-Gate: blocker/decision_required braucht mindestens eine konkrete offene Evidenzluecke in evidence.unresolved."
+            );
+          }
+          if (
+            routine_supervisor_mention_reason === "question" &&
+            comment_kind !== "question" &&
+            unresolvedCount === 0
+          ) {
+            throw new Error(
+              "Routine-Supervisor-Gate: question braucht comment_kind=question oder eine konkrete offene Evidenzluecke."
+            );
+          }
+          if (
+            routine_supervisor_mention_reason === "critical_anomaly" &&
+            (verifiedClaimCount === 0 ||
+              !["auffaellig", "abweich", "fehler", "risiko", "anomal", "kritisch", "besonder"].some(
+                (signal) => normalizedComment.includes(signal)
+              ))
+          ) {
+            throw new Error(
+              "Routine-Supervisor-Gate: critical_anomaly braucht mindestens einen verifizierten Claim und eine konkret benannte Auffaelligkeit/Abweichung/Risiko."
+            );
+          }
+          routine_supervisor_mention_gate.status = "verified_problem_context";
+        } else if (routine_supervisor_mention_reason) {
+          throw new Error(
+            "routine_supervisor_mention_reason ist nur fuer eine Moritz-Mention in einer Routine-Aufgabe zulaessig."
+          );
+        }
+      } else if (routine_supervisor_mention_reason) {
+        throw new Error(
+          "routine_supervisor_mention_reason ist nur zusammen mit mention_user_gid=Moritz in einer Routine-Aufgabe zulaessig."
+        );
+      }
       const html_text = buildAsanaCommentHtml({
         greeting,
         sections: finalSections,
@@ -10983,18 +11242,35 @@ function createServer() {
           evidence_gate_status: preparedEvidence.evidence_gate_status,
           evidence_required_by_content: preparedEvidence.evidence_required_by_content,
           evidence_sha256: preparedEvidence.evidence_sha256,
+          routine_supervisor_mention_gate,
+          routine_observer_gate,
           html_text,
           html_bytes: Buffer.byteLength(html_text, "utf8"),
           html_sha256
         });
       }
 
-      const asana = getAsana(agent_id);
       const res = await asana.post(
         `/tasks/${task_gid}/stories`,
         { data: { html_text } },
         { params: { opt_fields: "gid,text,html_text,created_at,created_by" } }
       );
+
+      let observer_leave_result = null;
+      let observer_leave_error = null;
+      if (observer_should_leave_after_comment) {
+        try {
+          const leaveRes = await asanaRequestWithRetry(asana, {
+            method: "POST",
+            url: `/tasks/${task_gid}/removeFollowers`,
+            timeout: ASANA_WRITE_TIMEOUT_MS,
+            data: { data: { followers: [commentAgentUser.gid] } }
+          });
+          observer_leave_result = leaveRes.data;
+        } catch (error) {
+          observer_leave_error = String(error?.message || error);
+        }
+      }
 
       let verified_story;
       let verification_status = "not_requested";
@@ -11013,6 +11289,26 @@ function createServer() {
         }
       }
 
+      let observer_leave_verification = "not_requested";
+      if (observer_should_leave_after_comment && verify_after && !observer_leave_error) {
+        try {
+          const observerVerifyRes = await asanaRequestWithRetry(asana, {
+            method: "GET",
+            url: `/tasks/${task_gid}`,
+            params: { opt_fields: "gid,followers.gid,followers.name" }
+          });
+          const followerGids = getAsanaTaskFollowerGids(observerVerifyRes.data.data);
+          observer_leave_verification = followerGids.includes(String(commentAgentUser.gid))
+            ? "failed_still_follower_do_not_retry_comment"
+            : "ok";
+        } catch (error) {
+          observer_leave_verification = "verification_failed_do_not_retry_comment";
+          observer_leave_error = String(error?.message || error);
+        }
+      } else if (observer_leave_error) {
+        observer_leave_verification = "leave_failed_do_not_retry_comment";
+      }
+
       return out({
         agent_id,
         task_gid,
@@ -11020,11 +11316,18 @@ function createServer() {
         evidence_gate_status: preparedEvidence.evidence_gate_status,
         evidence_required_by_content: preparedEvidence.evidence_required_by_content,
         evidence_sha256: preparedEvidence.evidence_sha256,
+        routine_supervisor_mention_gate,
+        routine_observer_gate,
+        observer_leave_result,
+        observer_leave_error,
+        observer_leave_verification,
         story: res.data.data,
         verified_story,
         verification_status,
         verification_error,
-        must_not_retry_comment: verification_status === "posted_but_verification_failed_do_not_retry",
+        must_not_retry_comment:
+          verification_status === "posted_but_verification_failed_do_not_retry" ||
+          observer_leave_verification.includes("do_not_retry_comment"),
         html_bytes: Buffer.byteLength(html_text, "utf8"),
         html_sha256
       });
@@ -11184,7 +11487,7 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nicht automatisch wieder hinzugefuegt, ausser allow_routine_supervisor_readd=true.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden vorab ausschliesslich per problemgebundener Asana-Mention adressiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -11253,12 +11556,11 @@ function createServer() {
       const supervisor_follower_readd_guarded =
         ensure_supervisor_follower &&
         !supervisor_follower_present_initially &&
-        isRoutineSupervisorDoNotReaddCandidate(task, finalSupervisorFollowerGid) &&
-        !allow_routine_supervisor_readd;
+        isRoutineSupervisorDoNotReaddCandidate(task, finalSupervisorFollowerGid);
       const effective_ensure_supervisor_follower =
         ensure_supervisor_follower && !supervisor_follower_readd_guarded;
       const supervisor_follower_readd_guard_reason = supervisor_follower_readd_guarded
-        ? "Routine-Aufgabe ohne Default-Supervisor-Follower: als moeglicher do_not_readd-Fall behandelt. Kein automatisches Re-Add bei normal erfolgreichem Abschluss; fuer Blocker/Rueckfrage explizit allow_routine_supervisor_readd=true setzen."
+        ? "Routine-Aufgabe ohne Default-Supervisor-Follower: do_not_readd ist verbindlich. allow_routine_supervisor_readd ist kein Bypass; bei einem echten Problem Moritz vorab ausschliesslich per problemgebundener Asana-Mention adressieren."
         : null;
 
       if (!task.assignee?.gid) {
@@ -11996,7 +12298,7 @@ function createServer() {
 
   server.tool(
     "asana_ensure_task_followers",
-    "Stellt idempotent sicher, dass bestimmte Asana-Nutzer als Beteiligte/Follower einer Aufgabe gesetzt sind, und verifiziert den Readback. Standard fuer Hauptvorgesetzten-/Moritz-Beteiligung; nicht per rohem asana_request nutzen. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nicht automatisch wieder hinzugefuegt, ausser allow_routine_supervisor_readd=true.",
+    "Stellt idempotent sicher, dass bestimmte Asana-Nutzer als Beteiligte/Follower einer Aufgabe gesetzt sind, und verifiziert den Readback. Nicht per rohem asana_request nutzen. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden per problemgebundener Asana-Mention adressiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -12024,11 +12326,11 @@ function createServer() {
       const toAdd = followersToEnsure.filter((followerGid) => !currentFollowerGids.includes(followerGid));
       const guardedSkipFollowerGids = toAdd.filter(
         (followerGid) =>
-          isRoutineSupervisorDoNotReaddCandidate(before_task, followerGid) && !allow_routine_supervisor_readd
+          isRoutineSupervisorDoNotReaddCandidate(before_task, followerGid)
       );
       const finalToAdd = toAdd.filter((followerGid) => !guardedSkipFollowerGids.includes(followerGid));
       const guardedSkipReason = guardedSkipFollowerGids.length
-        ? "Routine-Aufgabe ohne Default-Supervisor-Follower: als moeglicher do_not_readd-Fall behandelt. Kein automatisches Re-Add; fuer Blocker/Rueckfrage explizit allow_routine_supervisor_readd=true setzen."
+        ? "Routine-Aufgabe ohne Default-Supervisor-Follower: do_not_readd ist verbindlich. allow_routine_supervisor_readd ist kein Bypass; bei einem echten Problem Moritz ausschliesslich per problemgebundener Asana-Mention adressieren."
         : null;
 
       if (dry_run) {
