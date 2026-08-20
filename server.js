@@ -3143,6 +3143,18 @@ function accountingExtractionRank(extraction) {
   );
 }
 
+function accountingAmountsPlausible(extraction) {
+  const netAmount = Number(extraction?.net_amount);
+  const vatAmount = Number(extraction?.vat_amount);
+  const grossAmount = Number(extraction?.gross_amount);
+  if (![netAmount, vatAmount, grossAmount].every(Number.isFinite)) return false;
+  if (netAmount < 0 || vatAmount < 0 || grossAmount <= 0) return false;
+  if (netAmount === 0 && vatAmount > 0) return false;
+  if (Math.abs(netAmount + vatAmount - grossAmount) > 0.02) return false;
+  if (netAmount > 0 && vatAmount > netAmount * 0.3 + 0.02) return false;
+  return true;
+}
+
 function chooseAccountingOcrExtraction(directExtraction, ocrExtraction) {
   const amountFields = ["net_amount", "vat_amount", "gross_amount"];
   const conflicts = amountFields.filter((field) => {
@@ -3163,14 +3175,17 @@ function chooseAccountingOcrExtraction(directExtraction, ocrExtraction) {
   const useOcr = accountingExtractionRank(ocrExtraction) > accountingExtractionRank(directExtraction);
   const selected = useOcr ? ocrExtraction : directExtraction;
   const source = useOcr ? "google_drive_ocr" : "embedded_pdf_text";
+  const amountsPlausible = accountingAmountsPlausible(selected);
   const safeForWrite = Boolean(
     selected?.status === "extracted" &&
       selected.invoice_date &&
-      selected.recipient_confidence === "high"
+      selected.recipient_confidence === "high" &&
+      amountsPlausible
   );
   return {
     status: selected?.status || "not_extracted",
     safe_for_write: safeForWrite,
+    amounts_plausible: amountsPlausible,
     source,
     conflicting_fields: [],
     extraction: selected || null
@@ -5527,10 +5542,29 @@ async function findAccountingDriveDuplicate({ folderId, sha256, fileName }, goog
 
 function parseEuroAmount(value) {
   if (!/\d/.test(String(value || ""))) return null;
-  const normalized = String(value || "")
+  let normalized = String(value || "")
     .replace(/\s/g, "")
-    .replace(/\./g, "")
-    .replace(",", ".");
+    .replace(/[^\d.,-]/g, "");
+  const lastComma = normalized.lastIndexOf(",");
+  const lastDot = normalized.lastIndexOf(".");
+  if (lastComma >= 0 && lastDot >= 0) {
+    const decimalSeparator = lastComma > lastDot ? "," : ".";
+    const thousandsSeparator = decimalSeparator === "," ? "." : ",";
+    normalized = normalized.replaceAll(thousandsSeparator, "").replace(decimalSeparator, ".");
+  } else if (lastComma >= 0) {
+    const commaIsDecimal = /,\d{2}$/.test(normalized);
+    normalized = commaIsDecimal
+      ? normalized.replaceAll(".", "").replace(/,(?=[^,]*$)/, ".").replaceAll(",", "")
+      : normalized.replaceAll(",", "");
+  } else if (lastDot >= 0) {
+    const dotIsDecimal = /\.\d{2}$/.test(normalized);
+    if (dotIsDecimal) {
+      const [integerPart, decimalPart] = [normalized.slice(0, lastDot), normalized.slice(lastDot + 1)];
+      normalized = `${integerPart.replaceAll(".", "").replaceAll(",", "")}.${decimalPart}`;
+    } else {
+      normalized = normalized.replaceAll(".", "");
+    }
+  }
   const amount = Number(normalized);
   if (!Number.isFinite(amount)) return null;
   return Math.round(amount * 100) / 100;
@@ -5632,6 +5666,53 @@ function parseGermanTextualDateToNumeric(text) {
   return `${String(match[1]).padStart(2, "0")}.${month}.${match[3]}`;
 }
 
+function parseEnglishTextualDateToNumeric(text) {
+  const monthNames = {
+    jan: "01",
+    january: "01",
+    feb: "02",
+    february: "02",
+    mar: "03",
+    march: "03",
+    apr: "04",
+    april: "04",
+    may: "05",
+    jun: "06",
+    june: "06",
+    jul: "07",
+    july: "07",
+    aug: "08",
+    august: "08",
+    sep: "09",
+    sept: "09",
+    september: "09",
+    oct: "10",
+    october: "10",
+    nov: "11",
+    november: "11",
+    dec: "12",
+    december: "12"
+  };
+  const match = String(text || "").match(/\b([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})\b/);
+  const month = monthNames[String(match?.[1] || "").toLowerCase()];
+  if (!match || !month) return null;
+  return `${String(match[2]).padStart(2, "0")}.${month}.${match[3]}`;
+}
+
+function parseIsoDateToNumeric(text) {
+  const match = String(text || "").match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  return match ? `${match[3]}.${match[2]}.${match[1]}` : null;
+}
+
+function parseUsSlashDateToNumeric(text) {
+  const match = String(text || "").match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/);
+  if (!match) return null;
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return `${String(day).padStart(2, "0")}.${String(month).padStart(2, "0")}.${match[3]}`;
+}
+
 function parseFirstEuroAmountFromText(text, patterns) {
   for (const pattern of patterns) {
     const amount = parseEuroAmount(String(text || "").match(pattern)?.[1]);
@@ -5642,14 +5723,22 @@ function parseFirstEuroAmountFromText(text, patterns) {
 
 function extractFirstGermanInvoiceDate(text) {
   const value = String(text || "");
+  const englishDateValue = value.match(
+    /\b(?:Invoice Date|Date of issue|Billing date|Issue date)\b\s*:?\s*([^\n]{4,40})/i
+  )?.[1];
   return (
     value.match(/Rechnungsnr\.?:\s*[^\n]*?\bDatum\s+(\d{2}\.\d{2}\.\d{4})/i)?.[1] ||
     value.match(/\b(?:Rechnungsdatum|Datum der Rechnung|Belegdatum|Invoice Date|Datum)\b\s*:?\s*(\d{2}\.\d{2}\.\d{4})/i)?.[1] ||
     parseGermanTextualDateToNumeric(
       value.match(/\b(?:Rechnungsdatum|Datum der Rechnung|Belegdatum|Invoice Date|Datum)\b\s*:?\s*(\d{1,2}\.\s*[A-Za-zÄÖÜäöü]+\.?\s+\d{4})/i)?.[1]
     ) ||
+    parseIsoDateToNumeric(englishDateValue) ||
+    parseUsSlashDateToNumeric(englishDateValue) ||
+    parseEnglishTextualDateToNumeric(englishDateValue) ||
     value.match(/\b(\d{2}\.\d{2}\.\d{4})\b/)?.[1] ||
+    parseIsoDateToNumeric(value) ||
     parseGermanTextualDateToNumeric(value) ||
+    parseEnglishTextualDateToNumeric(value) ||
     null
   );
 }
@@ -5682,13 +5771,31 @@ function extractAccountingPdfRecipient(rawText) {
       : [];
   const firmLine = lines.find((line) => /^Firmen-ID:/i.test(line)) || "";
 
+  if (recipientLines[0]) {
+    return {
+      recipient_name: recipientLines[0],
+      recipient_address: recipientLines.slice(1),
+      recipient_firm_id: firmLine.match(/Firmen-ID:\s*([^\s]+)/i)?.[1] || null,
+      recipient_vat_id: firmLine.match(/USt-ID:\s*([A-Z]{2}[A-Z0-9]+)/i)?.[1] || null,
+      recipient_confidence: "high",
+      recipient_source: "invoice_address_block",
+      payment_organization: null,
+      payment_account_alias: null
+    };
+  }
+
+  const looksLikeVipIssuedInvoice =
+    senderReferenceIndex >= 0 && lines.some((line) => /^Firmen-ID:/i.test(line));
+  const knownVipRecipient = !looksLikeVipIssuedInvoice && lines.some(
+    (line) => /\bVIP[- ]?Studios\b/i.test(line) || /\bMoritz\s+Feichtmeyer\b/i.test(line)
+  );
   return {
-    recipient_name: recipientLines[0] || null,
-    recipient_address: recipientLines.slice(1),
-    recipient_firm_id: firmLine.match(/Firmen-ID:\s*([^\s]+)/i)?.[1] || null,
-    recipient_vat_id: firmLine.match(/USt-ID:\s*([A-Z]{2}[A-Z0-9]+)/i)?.[1] || null,
-    recipient_confidence: recipientLines[0] ? "high" : "low",
-    recipient_source: recipientLines[0] ? "invoice_address_block" : "not_found",
+    recipient_name: knownVipRecipient ? "VIP-Studios / Moritz Feichtmeyer" : null,
+    recipient_address: [],
+    recipient_firm_id: null,
+    recipient_vat_id: null,
+    recipient_confidence: knownVipRecipient ? "high" : "low",
+    recipient_source: knownVipRecipient ? "known_accounting_recipient_identity" : "not_found",
     payment_organization: null,
     payment_account_alias: null
   };
@@ -5717,16 +5824,16 @@ function extractInvoiceAmountsFromPdfText(rawText) {
 
   const invoiceDate = extractFirstGermanInvoiceDate(text);
   const rawNetInvoice = parseFirstEuroAmountFromText(text, [
-    /\bSumme\s*:?\s*(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i,
-    /\b(?:Nettobetrag|Netto(?:summe|betrag)?|Summe\s+netto|Zwischensumme)\b[^\n€]{0,120}(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i
+    /\bSumme\s*:?\s*(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i,
+    /\b(?:Nettobetrag|Netto(?:summe|betrag)?|Summe\s+netto|Zwischensumme|Subtotal(?:\s+before\s+tax)?|Net\s+amount)\b[^\n€$]{0,80}(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i
   ]);
   const vatInvoice = parseFirstEuroAmountFromText(text, [
-    /\bMwSt\.?\s*(?:\([^)]*\))?\s*(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i,
-    /\b(?:USt\.?|Umsatzsteuer|Mehrwertsteuer|VAT)\b[^\n€]{0,120}(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i
+    /\bMwSt\.?\s*(?:\([^)]*\))?\s*(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i,
+    /\b(?:USt\.?|Umsatzsteuer|Mehrwertsteuer|VAT|Sales\s+tax|Tax(?:\s+amount)?)\b[^\n€$]{0,80}(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i
   ]);
   const grossInvoice = parseFirstEuroAmountFromText(text, [
-    /\bGesamtsumme\s*:?\s*(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i,
-    /\b(?:Gesamtbetrag|Rechnungsbetrag|Betrag\s+zu\s+zahlen|Zu\s+zahlen|Amount\s+due|Total)\b[^\n€]{0,120}(-?\s*[\d.]+,\d{2})\s*(?:€|EUR)?/i
+    /\bGesamtsumme\s*:?\s*(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i,
+    /\b(?:Gesamtbetrag|Rechnungsbetrag|Betrag\s+zu\s+zahlen|Zu\s+zahlen|Amount\s+due|Balance\s+due|Grand\s+total|Total(?!\s+(?:tax|vat)))\b[^\n€$]{0,80}(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i
   ]);
   let netInvoice = rawNetInvoice;
   if (
@@ -13281,6 +13388,7 @@ function createServer() {
             status: selection.status,
             selected_source: selection.source,
             safe_for_write: safeForWrite,
+            amounts_plausible: selection.amounts_plausible,
             month_matches_expected: monthMatches,
             conflicting_fields: selection.conflicting_fields,
             selected_extraction: publicAccountingExtraction(selected),

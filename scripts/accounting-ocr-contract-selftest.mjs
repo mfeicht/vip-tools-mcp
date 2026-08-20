@@ -32,5 +32,8 @@ assert.match(toolBlock, /active_transient_document_count/);
 assert.match(toolBlock, /Keinen parallelen oder doppelten OCR-Lauf starten/);
 assert.match(toolBlock, /Kein Volltext wird ausgegeben oder lokal gespeichert/);
 assert.doesNotMatch(toolBlock, /ocrText\s*:/);
+assert.match(source, /function accountingAmountsPlausible\(/);
+assert.match(source, /amounts_plausible:\s*amountsPlausible/);
+assert.match(source, /selection\.amounts_plausible/);
 
 console.log("accounting OCR contract self-test passed");
