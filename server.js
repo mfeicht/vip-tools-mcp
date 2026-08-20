@@ -5805,6 +5805,61 @@ async function listAccountingDriveFolderPdfFiles(folderId, maxFiles, googleConte
   return files.filter((file) => file.mimeType === "application/pdf").slice(0, maxFiles);
 }
 
+async function listAccountingDriveSubfolders(parentFolderId, maxFolders, googleContext = {}) {
+  await assertAllowedAccountingFolder(parentFolderId, googleContext);
+  const res = await googleRequest(
+    {
+      method: "GET",
+      url: "https://www.googleapis.com/drive/v3/files",
+      params: {
+        q:
+          `'${escapeGoogleDriveQueryString(parentFolderId)}' in parents and trashed = false and ` +
+          `mimeType = 'application/vnd.google-apps.folder'`,
+        fields: "files(id,name,mimeType,createdTime,modifiedTime,parents,webViewLink)",
+        pageSize: maxFolders,
+        orderBy: "name",
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
+      }
+    },
+    googleContext
+  );
+  return (res.data.files || []).slice(0, maxFolders);
+}
+
+function accountingMonthFolderMatches(folderName, monthKey) {
+  const [month, shortYear] = String(monthKey || "").split("/");
+  if (!month || !shortYear) return false;
+  const monthNumber = Number(month);
+  const longYear = `20${shortYear}`;
+  const germanMonthNames = [
+    "januar",
+    "februar",
+    "maerz",
+    "april",
+    "mai",
+    "juni",
+    "juli",
+    "august",
+    "september",
+    "oktober",
+    "november",
+    "dezember"
+  ];
+  const normalized = String(folderName || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("ä", "ae")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  const monthTokens = new Set([month, String(monthNumber), germanMonthNames[monthNumber - 1]]);
+  const hasMonth = tokens.some((token) => monthTokens.has(token));
+  const hasYear = tokens.includes(shortYear) || tokens.includes(longYear);
+  const isBareMonth = tokens.length === 1 && hasMonth;
+  return hasMonth && (hasYear || isBareMonth);
+}
+
 function isAccountingDriveInvoiceCandidateFile(file) {
   const mimeType = String(file?.mimeType || "").split(";")[0].trim().toLowerCase();
   const ext = fileExtension(file?.name || "");
@@ -12878,6 +12933,58 @@ function createServer() {
         copied_file: uploaded,
         verified_file: verifiedFile,
         verification_status: verificationStatus
+      });
+    }
+  );
+
+  server.tool(
+    "accounting_drive_resolve_month_folder",
+    "Accounting-Ordnerresolver: listet ausschliesslich direkte Unterordner eines freigegebenen Accounting-Drive-Ordners und markiert den eindeutigen Monatsordner read-only. Keine Dateien oder Beleginhalte werden gelesen.",
+    {
+      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      parent_folder_id: z.string(),
+      expected_month_key: z.string().regex(/^\d{2}\/\d{2}$/),
+      max_folders: z.number().int().positive().max(100).optional().default(100)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id, parent_folder_id, expected_month_key, max_folders }) => {
+      const googleContext = { agent_id };
+      const parent = await getDriveFile(
+        parent_folder_id,
+        "id,name,mimeType,parents,webViewLink",
+        googleContext
+      );
+      if (parent.mimeType !== "application/vnd.google-apps.folder") {
+        throw new Error(`Accounting parent_folder_id ist kein Ordner: ${parent_folder_id}`);
+      }
+      await assertAllowedAccountingFolder(parent_folder_id, googleContext);
+      const folders = await listAccountingDriveSubfolders(parent_folder_id, max_folders, googleContext);
+      const publicFolders = folders.map((folder) => ({
+        id: folder.id,
+        name: folder.name,
+        createdTime: folder.createdTime || null,
+        modifiedTime: folder.modifiedTime || null,
+        webViewLink: folder.webViewLink || null,
+        month_match: accountingMonthFolderMatches(folder.name, expected_month_key)
+      }));
+      const matches = publicFolders.filter((folder) => folder.month_match);
+      return out({
+        agent_id,
+        parent_folder: {
+          id: parent.id,
+          name: parent.name,
+          webViewLink: parent.webViewLink || null
+        },
+        expected_month_key,
+        direct_subfolder_count: publicFolders.length,
+        match_count: matches.length,
+        resolution_status:
+          matches.length === 1 ? "resolved" : matches.length === 0 ? "not_found" : "ambiguous",
+        resolved_folder: matches.length === 1 ? matches[0] : null,
+        matching_folders: matches,
+        direct_subfolders: publicFolders,
+        safety_note:
+          "Nur bei resolution_status=resolved und direktem Parent-Readback weiterarbeiten; bei not_found/ambiguous keine Monatsdateien verarbeiten."
       });
     }
   );
