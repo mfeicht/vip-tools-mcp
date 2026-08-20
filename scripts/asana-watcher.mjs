@@ -599,6 +599,8 @@ async function run() {
     mode: opts.write ? "write" : "dry-run",
     baseline: opts.baseline,
     agents_checked: 0,
+    agents_succeeded: 0,
+    agents_failed: 0,
     tasks_checked: 0,
     raw_signals_found: 0,
     signals_found: 0,
@@ -629,6 +631,7 @@ async function run() {
         errors: []
       };
       summary.agents[agentId] = agentSummary;
+      summary.agents_checked += 1;
 
       try {
         const whoami = await callTool(client, "asana_whoami", { agent_id: agentId });
@@ -681,13 +684,14 @@ async function run() {
         agentSummary.signals_found = freshSignals.length;
         agentSummary.signals_queued = queuedSignals.length;
         agentState.last_checked_at = detectedAt;
-        summary.agents_checked += 1;
+        summary.agents_succeeded += 1;
         summary.tasks_checked += agentSummary.tasks_checked;
         summary.raw_signals_found += agentSummary.raw_signals_found;
         summary.signals_found += agentSummary.signals_found;
         summary.signals_queued += agentSummary.signals_queued;
       } catch (error) {
         agentSummary.errors.push(error.message);
+        summary.agents_failed += 1;
       }
     }
 
@@ -705,9 +709,11 @@ async function run() {
         `${JSON.stringify(
           {
             generated_at: nowIso(),
-            status: "ok",
+            status: summary.agents_failed > 0 ? "partial" : "ok",
             detected_at: detectedAt,
             agents_checked: summary.agents_checked,
+            agents_succeeded: summary.agents_succeeded,
+            agents_failed: summary.agents_failed,
             tasks_checked: summary.tasks_checked,
             raw_signals_found: summary.raw_signals_found,
             signals_found: summary.signals_found,
@@ -731,6 +737,8 @@ function renderLog(summary, signals) {
     "",
     `- mode: ${summary.mode}${summary.baseline ? " / baseline" : ""}`,
     `- agents_checked: ${summary.agents_checked}`,
+    `- agents_succeeded: ${summary.agents_succeeded}`,
+    `- agents_failed: ${summary.agents_failed}`,
     `- tasks_checked: ${summary.tasks_checked}`,
     `- raw_signals_found: ${summary.raw_signals_found}`,
     `- signals_found: ${summary.signals_found}`,
