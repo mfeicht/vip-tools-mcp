@@ -9,6 +9,8 @@ const DEFAULT_ATTEMPTS = 3;
 const DEFAULT_DELAY_MS = 15000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 25000;
 const DEFAULT_TOOL_TIMEOUT_MS = 120000;
+const MAX_RETRY_DELAY_MS = 60000;
+const MAX_ERROR_OUTPUT_CHARS = 600;
 const MAX_ARGS_BYTES = 2 * 1024 * 1024;
 
 function usage() {
@@ -18,6 +20,7 @@ Usage:
   node scripts/vip-mcp-call.mjs --tool asana_list_agents --args-json '{}'
   node scripts/vip-mcp-call.mjs --tool asana_whoami --args-file /absolute/path/args.json
   node scripts/vip-mcp-call.mjs --list-tools
+  node scripts/vip-mcp-call.mjs --self-test
 
 This script always uses ${MCP_URL}. It does not accept endpoint overrides.`);
 }
@@ -36,6 +39,7 @@ function parseArgs(argv) {
     argsJson: null,
     argsFile: null,
     listTools: false,
+    selfTest: false,
     attempts: DEFAULT_ATTEMPTS,
     delayMs: DEFAULT_DELAY_MS,
     connectTimeoutMs: DEFAULT_CONNECT_TIMEOUT_MS,
@@ -63,6 +67,7 @@ function parseArgs(argv) {
     else if (arg.startsWith("--delay-ms=")) {
       opts.delayMs = parsePositiveInt(arg.slice("--delay-ms=".length), "delay-ms");
     } else if (arg === "--list-tools") opts.listTools = true;
+    else if (arg === "--self-test") opts.selfTest = true;
     else if (arg === "--help" || arg === "-h") {
       usage();
       process.exit(0);
@@ -71,7 +76,9 @@ function parseArgs(argv) {
     }
   }
 
-  if (!opts.listTools && !opts.tool) throw new Error("--tool oder --list-tools ist erforderlich.");
+  if (!opts.listTools && !opts.selfTest && !opts.tool) {
+    throw new Error("--tool, --list-tools oder --self-test ist erforderlich.");
+  }
   if (opts.argsJson !== null && opts.argsFile !== null) {
     throw new Error("Nur eines von --args-json und --args-file verwenden.");
   }
@@ -99,8 +106,20 @@ function errorText(error) {
   return String(error?.message || error || "unknown error");
 }
 
+function safeErrorText(error) {
+  const message = errorText(error);
+  if (/Just a moment|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
+    return "Cloudflare managed challenge on the canonical MCP endpoint";
+  }
+  return message.replace(/\s+/g, " ").slice(0, MAX_ERROR_OUTPUT_CHARS);
+}
+
 function classifyConnectionError(error) {
   const message = errorText(error);
+  if (/Just a moment|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
+    return "cloudflare_managed_challenge";
+  }
+  if (/\b429\b|too many requests|rate.?limit/i.test(message)) return "remote_rate_limited";
   if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(message)) return "dns_resolution_error";
   if (/\b(502|503|504)\b|Streamable HTTP error/i.test(message)) return "remote_mcp_transient_error";
   if (/ECONNRESET|ECONNREFUSED|ETIMEDOUT|fetch failed|timeout after/i.test(message)) {
@@ -115,6 +134,27 @@ function isTransientConnectionError(error) {
     "remote_mcp_transient_error",
     "network_transport_error"
   ].includes(classifyConnectionError(error));
+}
+
+function retryDelayMs(baseDelayMs, attempt) {
+  return Math.min(baseDelayMs * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
+}
+
+function runSelfTest() {
+  const cases = [
+    [new Error("HTTP 503"), "remote_mcp_transient_error"],
+    [new Error("HTTP 429 Too Many Requests"), "remote_rate_limited"],
+    [new Error("<title>Just a moment...</title> challenges.cloudflare.com"), "cloudflare_managed_challenge"],
+    [new Error("getaddrinfo ENOTFOUND vip-tools-mcp.onrender.com"), "dns_resolution_error"]
+  ];
+  for (const [error, expected] of cases) {
+    const actual = classifyConnectionError(error);
+    if (actual !== expected) throw new Error(`Self-test failed: expected ${expected}, got ${actual}`);
+  }
+  if (safeErrorText(cases[2][0]).includes("<title>")) {
+    throw new Error("Self-test failed: Cloudflare HTML was not sanitized");
+  }
+  console.log(JSON.stringify({ ok: true, checks: cases.length + 1 }));
 }
 
 async function parseToolArgs(opts) {
@@ -155,10 +195,10 @@ async function connectWithRetry(opts) {
       const retry = attempt < opts.attempts && isTransientConnectionError(error);
       console.error(
         `[vip-mcp] connect attempt ${attempt}/${opts.attempts} failed ` +
-          `(${classifyConnectionError(error)}): ${errorText(error)}${retry ? "; retrying" : ""}`
+          `(${classifyConnectionError(error)}): ${safeErrorText(error)}${retry ? "; retrying" : ""}`
       );
       if (!retry) break;
-      await sleep(opts.delayMs);
+      await sleep(retryDelayMs(opts.delayMs, attempt));
     }
   }
   throw lastError;
@@ -179,6 +219,10 @@ function normalizeContent(content) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.selfTest) {
+    runSelfTest();
+    return;
+  }
   const toolArgs = opts.listTools ? null : await parseToolArgs(opts);
   let client;
 
@@ -231,7 +275,7 @@ main().catch((error) => {
       transport: "canonical_remote_mcp_fallback",
       endpoint: MCP_URL,
       error_class: classifyConnectionError(error),
-      error: errorText(error),
+      error: safeErrorText(error),
       attempts_used: error?.attempt || null
     })
   );
