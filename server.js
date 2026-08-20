@@ -2994,6 +2994,7 @@ async function uploadBufferToDrive({
 const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
 const ACCOUNTING_OCR_APP_PROPERTY = "vip_transient_accounting_ocr";
 const ACCOUNTING_OCR_STALE_MS = 15 * 60 * 1000;
+const ACCOUNTING_OCR_LIVE_MAX_FILES = 2;
 
 async function createTransientAccountingOcrDocument({
   sourceFileId,
@@ -3095,7 +3096,7 @@ async function deleteGoogleDriveFileWithRetry(fileId, googleContext = {}) {
   throw cleanupError;
 }
 
-async function cleanupStaleAccountingOcrDocuments(folderId, googleContext = {}) {
+async function listAccountingOcrDocuments(folderId, googleContext = {}) {
   await assertAllowedAccountingFolder(folderId, googleContext);
   const query =
     `'${escapeGoogleDriveQueryString(folderId)}' in parents and trashed = false and ` +
@@ -3114,8 +3115,13 @@ async function cleanupStaleAccountingOcrDocuments(folderId, googleContext = {}) 
     },
     googleContext
   );
+  return res.data.files || [];
+}
+
+async function cleanupStaleAccountingOcrDocuments(folderId, googleContext = {}) {
+  const transientDocuments = await listAccountingOcrDocuments(folderId, googleContext);
   const cutoff = Date.now() - ACCOUNTING_OCR_STALE_MS;
-  const stale = (res.data.files || []).filter((file) => {
+  const stale = transientDocuments.filter((file) => {
     const createdAt = Date.parse(file.createdTime || "");
     return Number.isFinite(createdAt) && createdAt < cutoff;
   });
@@ -13174,6 +13180,7 @@ function createServer() {
           throw new Error(`Accounting OCR-Datei ${file.id} liegt nicht direkt im freigegebenen Ordner ${folder_id}.`);
         }
       }
+      const transientDocumentsBefore = await listAccountingOcrDocuments(folder_id, googleContext);
 
       const plannedFiles = files.map((file) => ({
         id: file.id,
@@ -13190,6 +13197,8 @@ function createServer() {
           expected_month_key: expected_month_key || null,
           ocr_language,
           pdf_count: files.length,
+          max_live_files_per_call: ACCOUNTING_OCR_LIVE_MAX_FILES,
+          active_transient_document_count: transientDocumentsBefore.length,
           files: plannedFiles,
           transient_storage_contract:
             "Pro PDF wird im selben freigegebenen Accounting-Ordner kurzzeitig ein markiertes Google-Dokument erzeugt, als Text exportiert und im finally-Pfad geloescht. Kein Volltext wird ausgegeben oder lokal gespeichert.",
@@ -13198,6 +13207,12 @@ function createServer() {
             "verifizierter Moritz-Auftrag in Asana oder authorization.source=direct_codex"
           ]
         });
+      }
+      if (files.length > ACCOUNTING_OCR_LIVE_MAX_FILES) {
+        throw new Error(
+          `Accounting OCR Live-Batch ist auf ${ACCOUNTING_OCR_LIVE_MAX_FILES} PDFs begrenzt. ` +
+            "file_ids explizit in kleine Batches aufteilen und jeden Batch separat readback-verifizieren."
+        );
       }
 
       const authorizationReceipt = await assertActionAuthorized({
@@ -13210,6 +13225,13 @@ function createServer() {
         requireMoritz: true
       });
       const staleCleanupCount = await cleanupStaleAccountingOcrDocuments(folder_id, googleContext);
+      const activeTransientDocuments = await listAccountingOcrDocuments(folder_id, googleContext);
+      if (activeTransientDocuments.length) {
+        throw new Error(
+          `Accounting OCR ist blockiert: ${activeTransientDocuments.length} markierte transiente Dokumente sind noch aktiv. ` +
+            "Keinen parallelen oder doppelten OCR-Lauf starten; nach dem laufenden finally-Cleanup erneut read-only pruefen."
+        );
+      }
       const details = [];
       const totals = { net_amount: 0, vat_amount: 0, gross_amount: 0 };
       let safeCount = 0;
@@ -13321,6 +13343,7 @@ function createServer() {
         safe_for_write_count: safeCount,
         requires_review_count: reviewCount,
         ready_for_accounting_write: files.length > 0 && safeCount === files.length,
+        max_live_files_per_call: ACCOUNTING_OCR_LIVE_MAX_FILES,
         stale_transient_documents_cleaned: staleCleanupCount,
         totals_from_safe_files_only: {
           net_amount: round(totals.net_amount),

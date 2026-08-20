@@ -27,6 +27,9 @@ assert.match(toolBlock, /file\.mimeType !== "application\/pdf"/);
 assert.match(toolBlock, /file\.parents \|\| \[\]\)\.includes\(folder_id\)/);
 assert.match(toolBlock, /deleteGoogleDriveFileWithRetry\(transientFile\.id/);
 assert.match(toolBlock, /transient_cleanup_verified/);
+assert.match(toolBlock, /ACCOUNTING_OCR_LIVE_MAX_FILES/);
+assert.match(toolBlock, /active_transient_document_count/);
+assert.match(toolBlock, /Keinen parallelen oder doppelten OCR-Lauf starten/);
 assert.match(toolBlock, /Kein Volltext wird ausgegeben oder lokal gespeichert/);
 assert.doesNotMatch(toolBlock, /ocrText\s*:/);
 
