@@ -34,6 +34,8 @@ assert.match(toolBlock, /Kein Volltext wird ausgegeben oder lokal gespeichert/);
 assert.doesNotMatch(toolBlock, /ocrText\s*:/);
 assert.match(source, /function accountingAmountsPlausible\(/);
 assert.match(source, /amounts_plausible:\s*amountsPlausible/);
+assert.match(source, /status:\s*"conflict",\s*safe_for_write:\s*false,\s*amounts_plausible:\s*false/);
 assert.match(source, /selection\.amounts_plausible/);
+assert.match(source, /\(\?!\[\\d\.,\]\)/);
 
 console.log("accounting OCR contract self-test passed");

@@ -3166,6 +3166,7 @@ function chooseAccountingOcrExtraction(directExtraction, ocrExtraction) {
     return {
       status: "conflict",
       safe_for_write: false,
+      amounts_plausible: false,
       source: null,
       conflicting_fields: conflicts,
       extraction: null
@@ -5824,16 +5825,16 @@ function extractInvoiceAmountsFromPdfText(rawText) {
 
   const invoiceDate = extractFirstGermanInvoiceDate(text);
   const rawNetInvoice = parseFirstEuroAmountFromText(text, [
-    /\bSumme\s*:?\s*(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i,
-    /\b(?:Nettobetrag|Netto(?:summe|betrag)?|Summe\s+netto|Zwischensumme|Subtotal(?:\s+before\s+tax)?|Net\s+amount)\b[^\n€$]{0,80}(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i
+    /\bSumme\s*:?\s*(-?\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{2})(?![\d.,])\s*(?:€|EUR|\$|USD)?/i,
+    /\b(?:Nettobetrag|Netto(?:summe|betrag)?|Summe\s+netto|Zwischensumme|Subtotal(?:\s+before\s+tax)?|Net\s+amount)\b[^\n€$]{0,80}(-?\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{2})(?![\d.,])\s*(?:€|EUR|\$|USD)?/i
   ]);
   const vatInvoice = parseFirstEuroAmountFromText(text, [
-    /\bMwSt\.?\s*(?:\([^)]*\))?\s*(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i,
-    /\b(?:USt\.?|Umsatzsteuer|Mehrwertsteuer|VAT|Sales\s+tax|Tax(?:\s+amount)?)\b[^\n€$]{0,80}(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i
+    /\bMwSt\.?\s*(?:\([^)]*\))?\s*(-?\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{2})(?![\d.,])\s*(?:€|EUR|\$|USD)?/i,
+    /\b(?:USt\.?|Umsatzsteuer|Mehrwertsteuer|VAT|Sales\s+tax|Tax(?:\s+amount)?)\b[^\n€$]{0,80}(-?\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{2})(?![\d.,])\s*(?:€|EUR|\$|USD)?/i
   ]);
   const grossInvoice = parseFirstEuroAmountFromText(text, [
-    /\bGesamtsumme\s*:?\s*(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i,
-    /\b(?:Gesamtbetrag|Rechnungsbetrag|Betrag\s+zu\s+zahlen|Zu\s+zahlen|Amount\s+due|Balance\s+due|Grand\s+total|Total(?!\s+(?:tax|vat)))\b[^\n€$]{0,80}(-?\s*[\d.,]+[.,]\d{2})\s*(?:€|EUR|\$|USD)?/i
+    /\bGesamtsumme\s*:?\s*(-?\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{2})(?![\d.,])\s*(?:€|EUR|\$|USD)?/i,
+    /\b(?:Gesamtbetrag|Rechnungsbetrag|Betrag\s+zu\s+zahlen|Zu\s+zahlen|Amount\s+due|Balance\s+due|Grand\s+total|Total(?!\s+(?:tax|vat)))\b[^\n€$]{0,80}(-?\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{2})(?![\d.,])\s*(?:€|EUR|\$|USD)?/i
   ]);
   let netInvoice = rawNetInvoice;
   if (
