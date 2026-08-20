@@ -15594,7 +15594,7 @@ function createServer() {
 
   server.tool(
     "google_seo_oauth_check_config",
-    "Prueft die zentrale Google-OAuth-Konfiguration fuer GA4/Search Console read-only. Erzeugt testweise ein Access Token, gibt aber keine Secrets aus.",
+    "Prueft die getrennte Google-OAuth-Konfiguration fuer GA4/Search Console read-only. Ein erfolgreicher Token-Refresh allein reicht nicht: ready_for_ga4_gsc wird nur bei vollstaendigen GA4-/GSC-Scopes true. Gibt keine Secrets aus.",
     {},
     TOOL_EXTERNAL_READ,
     async () => {
@@ -15603,30 +15603,61 @@ function createServer() {
         env_prefix_candidates: GOOGLE_SEO_OAUTH_PREFIXES,
         env_configured: oauthEnvSummary(GOOGLE_SEO_OAUTH_PREFIXES),
         selected_env_prefix: selectedConfig?.prefix || null,
-        required_scopes: GOOGLE_SEO_REQUIRED_SCOPES
+        recommended_env_prefix: "GOOGLE_SEO_OAUTH",
+        required_scopes: GOOGLE_SEO_REQUIRED_SCOPES,
+        separation_contract: {
+          drive_sheets: "GOOGLE_DRIVE_OAUTH",
+          ga4_search_console: "GOOGLE_SEO_OAUTH",
+          google_ads: "GOOGLE_ADS_OAUTH",
+          generic_google_oauth: "legacy GA4/GSC fallback only; never Drive/Sheets or Ads"
+        }
       };
       if (!selectedConfig) {
         return out({
           ...summary,
+          status: "missing_oauth_env",
           token_refresh_ok: false,
+          required_scopes_present: false,
+          ready_for_ga4_gsc: false,
           error: "Kein vollstaendiges OAuth-Env-Set gefunden."
         });
       }
 
-      const accessToken = await refreshGoogleOAuthAccessToken(selectedConfig, googleSeoTokenCache);
-      const tokenInfo = await getGoogleTokenInfo(accessToken);
-      const scopes = String(tokenInfo.data?.scope || "")
-        .split(/\s+/)
-        .filter(Boolean);
-      return out({
-        ...summary,
-        token_refresh_ok: true,
-        tokeninfo_status: tokenInfo.status,
-        expires_in: tokenInfo.data?.expires_in,
-        scopes,
-        required_scopes_present: GOOGLE_SEO_REQUIRED_SCOPES.every((scope) => scopes.includes(scope)),
-        audience: tokenInfo.data?.audience || tokenInfo.data?.aud || null
-      });
+      try {
+        const accessToken = await refreshGoogleOAuthAccessToken(selectedConfig, googleSeoTokenCache);
+        const tokenInfo = await getGoogleTokenInfo(accessToken);
+        const scopes = String(tokenInfo.data?.scope || "")
+          .split(/\s+/)
+          .filter(Boolean);
+        const requiredScopesPresent = GOOGLE_SEO_REQUIRED_SCOPES.every((scope) =>
+          scopes.includes(scope)
+        );
+        return out({
+          ...summary,
+          status: requiredScopesPresent ? "ready" : "invalid_scopes",
+          token_refresh_ok: true,
+          tokeninfo_status: tokenInfo.status,
+          expires_in: tokenInfo.data?.expires_in,
+          scopes,
+          required_scopes_present: requiredScopesPresent,
+          ready_for_ga4_gsc: requiredScopesPresent,
+          configuration_action: requiredScopesPresent
+            ? null
+            : "Neuen Refresh Token mit analytics.readonly und webmasters.readonly erzeugen und als GOOGLE_SEO_OAUTH_* hinterlegen; Drive- und Ads-Variablen nicht ersetzen.",
+          audience: tokenInfo.data?.audience || tokenInfo.data?.aud || null
+        });
+      } catch (error) {
+        return out({
+          ...summary,
+          status: "token_refresh_failed",
+          token_refresh_ok: false,
+          required_scopes_present: false,
+          ready_for_ga4_gsc: false,
+          error: String(error?.message || error || "OAuth token refresh failed").slice(0, 500),
+          configuration_action:
+            "GOOGLE_SEO_OAUTH_REFRESH_TOKEN mit Production-OAuth-App und den beiden erforderlichen GA4-/GSC-Scopes neu erzeugen."
+        });
+      }
     }
   );
 

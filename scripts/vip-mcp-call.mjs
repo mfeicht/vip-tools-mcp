@@ -10,6 +10,7 @@ const DEFAULT_DELAY_MS = 15000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 25000;
 const DEFAULT_TOOL_TIMEOUT_MS = 120000;
 const MAX_RETRY_DELAY_MS = 60000;
+const RATE_LIMIT_COOLDOWN_MS = 60000;
 const MAX_ERROR_OUTPUT_CHARS = 600;
 const MAX_ARGS_BYTES = 2 * 1024 * 1024;
 
@@ -136,6 +137,12 @@ function isTransientConnectionError(error) {
   ].includes(classifyConnectionError(error));
 }
 
+function isCooldownConnectionError(error) {
+  return ["remote_rate_limited", "cloudflare_managed_challenge"].includes(
+    classifyConnectionError(error)
+  );
+}
+
 function retryDelayMs(baseDelayMs, attempt) {
   return Math.min(baseDelayMs * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
 }
@@ -192,13 +199,20 @@ async function connectWithRetry(opts) {
       return { client: await connectOnce(opts, attempt), attemptsUsed: attempt };
     } catch (error) {
       lastError = error;
-      const retry = attempt < opts.attempts && isTransientConnectionError(error);
+      const cooldown = isCooldownConnectionError(error);
+      const retry = cooldown
+        ? attempt === 1 && opts.attempts > 1
+        : attempt < opts.attempts && isTransientConnectionError(error);
+      const delayMs = cooldown
+        ? RATE_LIMIT_COOLDOWN_MS
+        : retryDelayMs(opts.delayMs, attempt);
       console.error(
         `[vip-mcp] connect attempt ${attempt}/${opts.attempts} failed ` +
-          `(${classifyConnectionError(error)}): ${safeErrorText(error)}${retry ? "; retrying" : ""}`
+          `(${classifyConnectionError(error)}): ${safeErrorText(error)}` +
+          `${retry ? `; ${cooldown ? "cooldown" : "retrying"} in ${delayMs} ms` : ""}`
       );
       if (!retry) break;
-      await sleep(retryDelayMs(opts.delayMs, attempt));
+      await sleep(delayMs);
     }
   }
   throw lastError;

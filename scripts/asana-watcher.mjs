@@ -26,6 +26,10 @@ const WATCHER_TRANSIENT_RETRY_DELAY_MS = Number.parseInt(
   process.env.WATCHER_TRANSIENT_RETRY_DELAY_MS || "15000",
   10
 );
+const WATCHER_RATE_LIMIT_COOLDOWN_MS = Number.parseInt(
+  process.env.WATCHER_RATE_LIMIT_COOLDOWN_MS || "60000",
+  10
+);
 
 function parseArgs(argv) {
   const opts = {
@@ -155,6 +159,11 @@ function isTransientMcpError(error) {
   );
 }
 
+function isMcpCooldownError(error) {
+  const message = String(error?.message || error || "");
+  return /\b429\b|cf-mitigated|cloudflare|managed challenge/i.test(message);
+}
+
 async function retryTransient(label, operation) {
   let lastError;
   for (let attempt = 1; attempt <= WATCHER_TRANSIENT_MAX_ATTEMPTS; attempt += 1) {
@@ -162,14 +171,20 @@ async function retryTransient(label, operation) {
       return await operation();
     } catch (error) {
       lastError = error;
-      if (!isTransientMcpError(error) || attempt >= WATCHER_TRANSIENT_MAX_ATTEMPTS) throw error;
+      const cooldown = isMcpCooldownError(error);
+      const maxAttempts = cooldown ? Math.min(2, WATCHER_TRANSIENT_MAX_ATTEMPTS) : WATCHER_TRANSIENT_MAX_ATTEMPTS;
+      if (!isTransientMcpError(error) || attempt >= maxAttempts) throw error;
     }
-    const delayMs = WATCHER_TRANSIENT_RETRY_DELAY_MS * attempt;
+    const cooldown = isMcpCooldownError(lastError);
+    const maxAttempts = cooldown ? Math.min(2, WATCHER_TRANSIENT_MAX_ATTEMPTS) : WATCHER_TRANSIENT_MAX_ATTEMPTS;
+    const delayMs = cooldown
+      ? WATCHER_RATE_LIMIT_COOLDOWN_MS
+      : WATCHER_TRANSIENT_RETRY_DELAY_MS * attempt;
     console.error(
       `[watcher] ${label} transient failure: ${truncate(
         lastError?.message || String(lastError),
         220
-      )}; retry ${attempt + 1}/${WATCHER_TRANSIENT_MAX_ATTEMPTS} in ${delayMs} ms`
+      )}; ${cooldown ? "cooldown" : "retry"} ${attempt + 1}/${maxAttempts} in ${delayMs} ms`
     );
     await sleep(delayMs);
   }
@@ -693,34 +708,39 @@ async function run() {
         await fs.appendFile(queuePath, `${allQueuedSignals.map((signal) => JSON.stringify(signal)).join("\n")}\n`);
       }
       await fs.appendFile(logPath, renderLog(summary, allQueuedSignals));
-      await fs.writeFile(
-        healthPath,
-        `${JSON.stringify(
-          {
-            generated_at: nowIso(),
-            status: summary.agents_failed > 0 ? "partial" : "ok",
-            detected_at: detectedAt,
-            agents_checked: summary.agents_checked,
-            agents_succeeded: summary.agents_succeeded,
-            agents_failed: summary.agents_failed,
-            tasks_checked: summary.tasks_checked,
-            overdue_tasks: summary.overdue_tasks,
-            due_today_tasks: summary.due_today_tasks,
-            due_later_today_tasks: summary.due_later_today_tasks,
-            due_tomorrow_tasks: summary.due_tomorrow_tasks,
-            future_tasks: summary.future_tasks,
-            tasks_without_due: summary.tasks_without_due,
-            routine_tasks: summary.routine_tasks,
-            routine_missing_tag: summary.routine_missing_tag,
-            raw_signals_found: summary.raw_signals_found,
-            signals_found: summary.signals_found,
-            signals_queued: summary.signals_queued
-          },
-          null,
-          2
-        )}\n`
-      );
     }
+
+    // A successful read-only dry-run is valid transport health evidence. Keep
+    // business state/queue immutable, but refresh the local health snapshot.
+    await fs.mkdir(BetriebDir, { recursive: true });
+    await fs.writeFile(
+      healthPath,
+      `${JSON.stringify(
+        {
+          generated_at: nowIso(),
+          status: summary.agents_failed > 0 ? "partial" : "ok",
+          mode: summary.mode,
+          detected_at: detectedAt,
+          agents_checked: summary.agents_checked,
+          agents_succeeded: summary.agents_succeeded,
+          agents_failed: summary.agents_failed,
+          tasks_checked: summary.tasks_checked,
+          overdue_tasks: summary.overdue_tasks,
+          due_today_tasks: summary.due_today_tasks,
+          due_later_today_tasks: summary.due_later_today_tasks,
+          due_tomorrow_tasks: summary.due_tomorrow_tasks,
+          future_tasks: summary.future_tasks,
+          tasks_without_due: summary.tasks_without_due,
+          routine_tasks: summary.routine_tasks,
+          routine_missing_tag: summary.routine_missing_tag,
+          raw_signals_found: summary.raw_signals_found,
+          signals_found: summary.signals_found,
+          signals_queued: summary.signals_queued
+        },
+        null,
+        2
+      )}\n`
+    );
 
     console.log(JSON.stringify({ summary, queued_signals: allQueuedSignals }, null, 2));
   } finally {
@@ -774,22 +794,23 @@ function renderLog(summary, signals) {
 
 run().catch(async (error) => {
   console.error(error?.stack || error?.message || String(error));
+  await fs.mkdir(BetriebDir, { recursive: true }).catch(() => {});
+  await fs
+    .writeFile(
+      healthPath,
+      `${JSON.stringify(
+        {
+          generated_at: nowIso(),
+          status: "failed",
+          mode: process.argv.includes("--write") ? "write" : "dry-run",
+          error: error?.message || String(error)
+        },
+        null,
+        2
+      )}\n`
+    )
+    .catch(() => {});
   if (process.argv.includes("--write")) {
-    await fs.mkdir(BetriebDir, { recursive: true }).catch(() => {});
-    await fs
-      .writeFile(
-        healthPath,
-        `${JSON.stringify(
-          {
-            generated_at: nowIso(),
-            status: "failed",
-            error: error?.message || String(error)
-          },
-          null,
-          2
-        )}\n`
-      )
-      .catch(() => {});
     await fs
       .appendFile(
         logPath,
