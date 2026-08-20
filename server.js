@@ -20272,6 +20272,8 @@ app.get(["/", "/health"], (req, res) => {
   res.json({
     ok: true,
     service: "vip-tools-mcp",
+    deployment_commit:
+      process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown",
     uptime_seconds: Math.floor(process.uptime()),
     checked_at: new Date().toISOString()
   });
