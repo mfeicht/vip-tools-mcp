@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "watcher:asana": "node scripts/asana-watcher.mjs",
     "postinstall": "node scripts/install-browser-runtime.mjs",
     "test": "node scripts/asana-watcher.mjs --self-test",
     "test:evidence-gate": "node scripts/evidence-gate-selftest.mjs",

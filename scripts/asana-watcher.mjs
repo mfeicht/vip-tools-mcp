@@ -18,44 +18,14 @@ const AGENT_PREFIX = "vip-ai-";
 const LOCAL_TIME_ZONE = "Europe/Berlin";
 const WATCHER_CONNECT_TIMEOUT_MS = Number.parseInt(process.env.WATCHER_CONNECT_TIMEOUT_MS || "20000", 10);
 const WATCHER_TOOL_TIMEOUT_MS = Number.parseInt(process.env.WATCHER_TOOL_TIMEOUT_MS || "25000", 10);
-const WATCHER_TRANSIENT_RETRY_DELAY_MS = Number.parseInt(
-  process.env.WATCHER_TRANSIENT_RETRY_DELAY_MS || "10000",
+const WATCHER_TRANSIENT_MAX_ATTEMPTS = Number.parseInt(
+  process.env.WATCHER_TRANSIENT_MAX_ATTEMPTS || "3",
   10
 );
-const TASK_FIELDS = [
-  "gid",
-  "name",
-  "modified_at",
-  "due_on",
-  "due_at",
-  "completed",
-  "permalink_url",
-  "assignee.gid",
-  "assignee.name",
-  "tags.name",
-  "memberships.project.name",
-  "custom_fields.name",
-  "custom_fields.display_value",
-  "custom_fields.text_value",
-  "custom_fields.enum_value.name"
-].join(",");
-const STORY_FIELDS = [
-  "gid",
-  "created_at",
-  "text",
-  "type",
-  "resource_subtype",
-  "created_by.gid",
-  "created_by.name"
-].join(",");
-const ATTACHMENT_FIELDS = [
-  "gid",
-  "name",
-  "created_at",
-  "resource_subtype",
-  "download_url",
-  "view_url"
-].join(",");
+const WATCHER_TRANSIENT_RETRY_DELAY_MS = Number.parseInt(
+  process.env.WATCHER_TRANSIENT_RETRY_DELAY_MS || "15000",
+  10
+);
 
 function parseArgs(argv) {
   const opts = {
@@ -64,9 +34,8 @@ function parseArgs(argv) {
     baseline: false,
     mcpUrl: process.env.WATCHER_MCP_URL || DEFAULT_MCP_URL,
     agents: null,
-    limit: 20,
+    limit: 100,
     maxSignalsPerAgent: 3,
-    lookbackHours: 72,
     selfTest: false
   };
 
@@ -95,7 +64,7 @@ function parseArgs(argv) {
         "max-signals-per-agent"
       );
     } else if (arg.startsWith("--lookback-hours=")) {
-      opts.lookbackHours = parsePositiveInt(arg.slice("--lookback-hours=".length), "lookback-hours");
+      parsePositiveInt(arg.slice("--lookback-hours=".length), "lookback-hours");
     } else if (arg === "--help" || arg === "-h") {
       printHelpAndExit();
     } else if (arg === "--self-test") {
@@ -129,9 +98,9 @@ Optionen:
   --write                    State/Queue/Log lokal schreiben.
   --baseline                 Aktuellen Stand als gesehen markieren, ohne Queue-Signale.
   --agents=a,b               Nur bestimmte agent_id-Werte pruefen.
-  --limit=20                 Max. offene Tasks je Agent.
+  --limit=100                Max. offene Tasks je Agent.
   --max-signals-per-agent=3  Max. Queue-Signale je Agent und Lauf.
-  --lookback-hours=72        Nur neuere Modifikationen vertiefen.
+  --lookback-hours=72        Veralteter, kompatibel akzeptierter Parameter ohne Zusatzabrufe.
 `);
   process.exit(0);
 }
@@ -172,30 +141,39 @@ function sleep(ms) {
 function isTransientMcpError(error) {
   const message = String(error?.message || error || "");
   return (
-    /\b(502|503|504)\b/.test(message) ||
+    /\b(429|502|503|504)\b/.test(message) ||
+    /cf-mitigated|cloudflare|managed challenge/i.test(message) ||
     message.includes("Streamable HTTP error") ||
     message.includes("Error POSTing to endpoint") ||
     message.includes("fetch failed") ||
     message.includes("ECONNRESET") ||
+    message.includes("ECONNREFUSED") ||
+    message.includes("EAI_AGAIN") ||
+    message.includes("ENOTFOUND") ||
     message.includes("ETIMEDOUT") ||
     message.includes("timeout after")
   );
 }
 
 async function retryTransient(label, operation) {
-  try {
-    return await operation();
-  } catch (error) {
-    if (!isTransientMcpError(error)) throw error;
+  let lastError;
+  for (let attempt = 1; attempt <= WATCHER_TRANSIENT_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientMcpError(error) || attempt >= WATCHER_TRANSIENT_MAX_ATTEMPTS) throw error;
+    }
+    const delayMs = WATCHER_TRANSIENT_RETRY_DELAY_MS * attempt;
     console.error(
       `[watcher] ${label} transient failure: ${truncate(
-        error?.message || String(error),
+        lastError?.message || String(lastError),
         220
-      )}; retrying in ${WATCHER_TRANSIENT_RETRY_DELAY_MS} ms`
+      )}; retry ${attempt + 1}/${WATCHER_TRANSIENT_MAX_ATTEMPTS} in ${delayMs} ms`
     );
-    await sleep(WATCHER_TRANSIENT_RETRY_DELAY_MS);
-    return operation();
+    await sleep(delayMs);
   }
+  throw lastError;
 }
 
 function safeArray(value) {
@@ -241,16 +219,6 @@ async function callTool(client, name, args = {}) {
     if (!text) return {};
     return JSON.parse(text);
   });
-}
-
-async function asanaGet(client, agentId, pathName, params = {}) {
-  const result = await callTool(client, "asana_request", {
-    agent_id: agentId,
-    method: "GET",
-    path: pathName,
-    params
-  });
-  return result?.response?.data;
 }
 
 function createEmptyState() {
@@ -361,56 +329,50 @@ function makeSignal(input) {
   };
 }
 
-function shouldInspectDetails(task, previousTaskState, opts) {
-  if (!previousTaskState) return true;
-  if (previousTaskState.last_modified_at !== task.modified_at) return true;
-  if (getDueSignal(task)) return true;
+function getTaskDueBucket(task, now = new Date()) {
+  const today = berlinDateString(now);
+  const tomorrow = addDays(today, 1);
 
-  const modifiedAt = Date.parse(task.modified_at || "");
-  if (!Number.isFinite(modifiedAt)) return false;
-  return Date.now() - modifiedAt <= opts.lookbackHours * 60 * 60 * 1000;
+  if (task.due_at) {
+    const dueAt = new Date(task.due_at);
+    if (!Number.isFinite(dueAt.getTime())) return "invalid";
+    const dueDate = berlinDateString(dueAt);
+    if (dueAt.getTime() <= now.getTime()) return "overdue";
+    if (dueDate === today) return "due_later_today";
+    if (dueDate === tomorrow) return "due_tomorrow";
+    return "future";
+  }
+
+  if (!task.due_on) return "without_due";
+  if (task.due_on < today) return "overdue";
+  if (task.due_on === today) return "due_today";
+  if (task.due_on === tomorrow) return "due_tomorrow";
+  return "future";
 }
 
-async function inspectTaskDetails(client, agentId, task, previousTaskState) {
-  const [stories, attachments] = await Promise.all([
-    asanaGet(client, agentId, `/tasks/${task.gid}/stories`, {
-      limit: 20,
-      opt_fields: STORY_FIELDS
-    }).catch((error) => ({ error: error.message, data: [] })),
-    asanaGet(client, agentId, "/attachments", {
-      parent: task.gid,
-      limit: 20,
-      opt_fields: ATTACHMENT_FIELDS
-    }).catch((error) => ({ error: error.message, data: [] }))
-  ]);
+function looksLikeRoutineTask(task) {
+  return /^\s*R\s*:/i.test(String(task?.name || ""));
+}
 
-  const previousStories = previousTaskState?.seen_stories || {};
-  const previousAttachments = previousTaskState?.seen_attachments || {};
-  const storyData = safeArray(stories?.data ?? stories);
-  const attachmentData = safeArray(attachments?.data ?? attachments);
+function hasRoutineTag(task) {
+  return safeArray(task?.tags).some((tag) => String(tag?.name || "").trim().toLowerCase() === "routine");
+}
 
-  return {
-    stories: storyData,
-    attachments: attachmentData,
-    newStories: previousTaskState ? storyData.filter((story) => !previousStories[story.gid]) : [],
-    newAttachments: previousTaskState
-      ? attachmentData.filter((attachment) => !previousAttachments[attachment.gid])
-      : [],
-    errors: [stories?.error, attachments?.error].filter(Boolean)
+function incrementDueBucketSummary(summary, dueBucket) {
+  const fieldByBucket = {
+    overdue: "overdue_tasks",
+    due_today: "due_today_tasks",
+    due_later_today: "due_later_today_tasks",
+    due_tomorrow: "due_tomorrow_tasks",
+    future: "future_tasks",
+    without_due: "tasks_without_due"
   };
+  const field = fieldByBucket[dueBucket];
+  if (field) summary[field] += 1;
 }
 
-function updateTaskState(agentState, task, details) {
-  const seenStories = {};
-  for (const story of safeArray(details?.stories)) {
-    if (story?.gid) seenStories[story.gid] = story.created_at || null;
-  }
-
-  const seenAttachments = {};
-  for (const attachment of safeArray(details?.attachments)) {
-    if (attachment?.gid) seenAttachments[attachment.gid] = attachment.created_at || null;
-  }
-
+function updateTaskState(agentState, task) {
+  const previousTaskState = agentState.tasks[task.gid] || {};
   agentState.tasks[task.gid] = {
     last_seen_at: nowIso(),
     last_modified_at: task.modified_at || null,
@@ -419,8 +381,8 @@ function updateTaskState(agentState, task, details) {
     completed: Boolean(task.completed),
     name: task.name || "",
     permalink_url: task.permalink_url || null,
-    seen_stories: seenStories,
-    seen_attachments: seenAttachments
+    seen_stories: previousTaskState.seen_stories || {},
+    seen_attachments: previousTaskState.seen_attachments || {}
   };
 }
 
@@ -575,7 +537,12 @@ async function run() {
       result.length === 2 &&
       taskOne?.signal_type === "overdue" &&
       taskOne?.coalesced_signal_count === 3 &&
-      taskOne?.related_signal_types?.length === 3;
+      taskOne?.related_signal_types?.length === 3 &&
+      getTaskDueBucket({ due_on: "2099-01-01" }, new Date("2026-08-20T10:00:00.000Z")) === "future" &&
+      getTaskDueBucket({}, new Date("2026-08-20T10:00:00.000Z")) === "without_due" &&
+      looksLikeRoutineTask({ name: "R: Test" }) &&
+      hasRoutineTag({ tags: [{ name: "Routine" }] }) &&
+      !hasRoutineTag({ tags: [] });
     console.log(JSON.stringify({ passed, result }));
     if (!passed) process.exitCode = 1;
     return;
@@ -602,6 +569,14 @@ async function run() {
     agents_succeeded: 0,
     agents_failed: 0,
     tasks_checked: 0,
+    overdue_tasks: 0,
+    due_today_tasks: 0,
+    due_later_today_tasks: 0,
+    due_tomorrow_tasks: 0,
+    future_tasks: 0,
+    tasks_without_due: 0,
+    routine_tasks: 0,
+    routine_missing_tag: 0,
     raw_signals_found: 0,
     signals_found: 0,
     signals_queued: 0,
@@ -611,20 +586,31 @@ async function run() {
   try {
     client = await retryTransient("MCP connect", connectClient);
     console.error(`[watcher] connected ${opts.mcpUrl}`);
-    const list = await callTool(client, "asana_list_agents");
-    const agentIds = safeArray(list)
-      .filter((agent) => agent?.agent_id?.startsWith(AGENT_PREFIX))
-      .filter((agent) => agent.token_configured)
-      .map((agent) => agent.agent_id)
-      .filter((agentId) => !opts.agents || opts.agents.includes(agentId));
+    const taskSnapshot = await callTool(client, "asana_agents_open_task_snapshot", {
+      ...(opts.agents ? { agent_ids: opts.agents } : {}),
+      limit: opts.limit,
+      concurrency: 4
+    });
+    const agentSnapshots = safeArray(taskSnapshot?.agents).filter((agent) =>
+      String(agent?.agent_id || "").startsWith(AGENT_PREFIX)
+    );
 
     const allQueuedSignals = [];
 
-    for (const agentId of agentIds) {
+    for (const agentSnapshot of agentSnapshots) {
+      const agentId = agentSnapshot.agent_id;
       console.error(`[watcher] checking ${agentId}`);
       const agentState = getAgentState(state, agentId);
       const agentSummary = {
         tasks_checked: 0,
+        overdue_tasks: 0,
+        due_today_tasks: 0,
+        due_later_today_tasks: 0,
+        due_tomorrow_tasks: 0,
+        future_tasks: 0,
+        tasks_without_due: 0,
+        routine_tasks: 0,
+        routine_missing_tag: 0,
         raw_signals_found: 0,
         signals_found: 0,
         signals_queued: 0,
@@ -634,32 +620,27 @@ async function run() {
       summary.agents_checked += 1;
 
       try {
-        const whoami = await callTool(client, "asana_whoami", { agent_id: agentId });
-        const workspaceGid = whoami?.user?.workspaces?.[0]?.gid;
+        if (!agentSnapshot.ok) {
+          throw new Error(agentSnapshot.error || "Gebündelter Asana-Readback fehlgeschlagen.");
+        }
+        const workspaceGid = agentSnapshot.workspace_gid;
         if (!workspaceGid) throw new Error("Kein Asana-Workspace im whoami-Result gefunden.");
         agentState.workspace_gid = workspaceGid;
-
-        const taskResult = await asanaGet(client, agentId, "/tasks", {
-          assignee: "me",
-          workspace: workspaceGid,
-          completed_since: "now",
-          limit: opts.limit,
-          opt_fields: TASK_FIELDS
-        });
-
-        const tasks = safeArray(taskResult?.data ?? taskResult);
+        const tasks = safeArray(agentSnapshot.tasks);
         const candidateSignals = [];
 
         for (const task of tasks) {
           const previousTaskState = agentState.tasks[task.gid];
-          let details = { stories: [], attachments: [], newStories: [], newAttachments: [], errors: [] };
+          const details = { newStories: [], newAttachments: [] };
 
-          if (shouldInspectDetails(task, previousTaskState, opts)) {
-            details = await inspectTaskDetails(client, agentId, task, previousTaskState);
-            agentSummary.errors.push(...details.errors.map((message) => `${task.gid}: ${message}`));
+          const dueBucket = getTaskDueBucket(task);
+          incrementDueBucketSummary(agentSummary, dueBucket);
+          if (looksLikeRoutineTask(task)) {
+            agentSummary.routine_tasks += 1;
+            if (!hasRoutineTag(task)) agentSummary.routine_missing_tag += 1;
           }
 
-          updateTaskState(agentState, task, details);
+          updateTaskState(agentState, task);
           const taskSignals = buildSignalsForTask(agentId, task, previousTaskState, details, detectedAt);
           candidateSignals.push(...taskSignals);
           agentSummary.tasks_checked += 1;
@@ -686,6 +667,14 @@ async function run() {
         agentState.last_checked_at = detectedAt;
         summary.agents_succeeded += 1;
         summary.tasks_checked += agentSummary.tasks_checked;
+        summary.overdue_tasks += agentSummary.overdue_tasks;
+        summary.due_today_tasks += agentSummary.due_today_tasks;
+        summary.due_later_today_tasks += agentSummary.due_later_today_tasks;
+        summary.due_tomorrow_tasks += agentSummary.due_tomorrow_tasks;
+        summary.future_tasks += agentSummary.future_tasks;
+        summary.tasks_without_due += agentSummary.tasks_without_due;
+        summary.routine_tasks += agentSummary.routine_tasks;
+        summary.routine_missing_tag += agentSummary.routine_missing_tag;
         summary.raw_signals_found += agentSummary.raw_signals_found;
         summary.signals_found += agentSummary.signals_found;
         summary.signals_queued += agentSummary.signals_queued;
@@ -715,6 +704,14 @@ async function run() {
             agents_succeeded: summary.agents_succeeded,
             agents_failed: summary.agents_failed,
             tasks_checked: summary.tasks_checked,
+            overdue_tasks: summary.overdue_tasks,
+            due_today_tasks: summary.due_today_tasks,
+            due_later_today_tasks: summary.due_later_today_tasks,
+            due_tomorrow_tasks: summary.due_tomorrow_tasks,
+            future_tasks: summary.future_tasks,
+            tasks_without_due: summary.tasks_without_due,
+            routine_tasks: summary.routine_tasks,
+            routine_missing_tag: summary.routine_missing_tag,
             raw_signals_found: summary.raw_signals_found,
             signals_found: summary.signals_found,
             signals_queued: summary.signals_queued
@@ -740,6 +737,14 @@ function renderLog(summary, signals) {
     `- agents_succeeded: ${summary.agents_succeeded}`,
     `- agents_failed: ${summary.agents_failed}`,
     `- tasks_checked: ${summary.tasks_checked}`,
+    `- overdue_tasks: ${summary.overdue_tasks}`,
+    `- due_today_tasks: ${summary.due_today_tasks}`,
+    `- due_later_today_tasks: ${summary.due_later_today_tasks}`,
+    `- due_tomorrow_tasks: ${summary.due_tomorrow_tasks}`,
+    `- future_tasks: ${summary.future_tasks}`,
+    `- tasks_without_due: ${summary.tasks_without_due}`,
+    `- routine_tasks: ${summary.routine_tasks}`,
+    `- routine_missing_tag: ${summary.routine_missing_tag}`,
     `- raw_signals_found: ${summary.raw_signals_found}`,
     `- signals_found: ${summary.signals_found}`,
     `- signals_queued: ${summary.signals_queued}`
@@ -747,7 +752,7 @@ function renderLog(summary, signals) {
 
   for (const [agentId, data] of Object.entries(summary.agents)) {
     lines.push(
-      `- ${agentId}: tasks=${data.tasks_checked}, raw=${data.raw_signals_found}, found=${data.signals_found}, queued=${data.signals_queued}`
+      `- ${agentId}: tasks=${data.tasks_checked}, overdue=${data.overdue_tasks}, due_today=${data.due_today_tasks}, due_later_today=${data.due_later_today_tasks}, due_tomorrow=${data.due_tomorrow_tasks}, future=${data.future_tasks}, no_due=${data.tasks_without_due}, routines=${data.routine_tasks}, routine_missing_tag=${data.routine_missing_tag}, raw=${data.raw_signals_found}, found=${data.signals_found}, queued=${data.signals_queued}`
     );
     for (const error of data.errors.slice(0, 3)) {
       lines.push(`  - error: ${truncate(error, 220)}`);

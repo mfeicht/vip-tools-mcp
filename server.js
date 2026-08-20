@@ -2411,6 +2411,8 @@ async function refreshGoogleOAuthAccessToken(oauthConfig, tokenCache) {
   } catch (error) {
     const status = error?.response?.status;
     const data = error?.response?.data;
+    const networkCode = error?.code || error?.cause?.code || null;
+    const networkMessage = String(error?.message || error?.cause?.message || "").slice(0, 500);
     let dataSnippet = "";
     try {
       if (data !== undefined) dataSnippet = JSON.stringify(data).slice(0, 2000);
@@ -2419,6 +2421,8 @@ async function refreshGoogleOAuthAccessToken(oauthConfig, tokenCache) {
     }
     throw new Error(
       `Google OAuth token refresh failed for prefix=${oauthConfig.prefix} (${status || "unknown"})` +
+        (networkCode ? ` | network_code=${networkCode}` : "") +
+        (networkMessage ? ` | network_message=${networkMessage}` : "") +
         (dataSnippet ? ` | response=${dataSnippet}` : "")
     );
   }
@@ -10044,6 +10048,49 @@ function createServer() {
       });
 
       return out({ agent_id, tasks: res.data.data });
+    }
+  );
+
+  server.tool(
+    "asana_agents_open_task_snapshot",
+    "Liest die offenen Aufgaben mehrerer VIP-Agenten in einem einzigen read-only MCP-Aufruf. Der Pfad ist fuer Watcher und Health-Checks gedacht, reduziert Remote-Roundtrips und isoliert Fehler pro Agent.",
+    {
+      agent_ids: z.array(agentIdSchema).max(25).optional(),
+      limit: z.number().int().min(1).max(100).optional().default(100),
+      concurrency: z.number().int().min(1).max(4).optional().default(4)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_ids, limit, concurrency }) => {
+      const selectedAgentIds = [
+        ...new Set(
+          (agent_ids?.length
+            ? agent_ids
+            : Object.keys(ASANA_TOKEN_ENVS).filter(
+                (agentId) => agentId.startsWith("vip-ai-") && process.env[ASANA_TOKEN_ENVS[agentId]]
+              ))
+        )
+      ];
+      const generatedAt = new Date().toISOString();
+      const agents = await mapWithConcurrency(selectedAgentIds, concurrency, async (agentId) => {
+        try {
+          return await readAsanaAgentOpenTaskSnapshot(agentId, limit);
+        } catch (error) {
+          return {
+            agent_id: agentId,
+            ok: false,
+            error: String(error?.message || error || "Asana-Readback fehlgeschlagen.").slice(0, 500),
+            workspace_gid: null,
+            tasks: []
+          };
+        }
+      });
+      return out({
+        generated_at: generatedAt,
+        agents_checked: agents.length,
+        agents_succeeded: agents.filter((agent) => agent.ok).length,
+        agents_failed: agents.filter((agent) => !agent.ok).length,
+        agents
+      });
     }
   );
 
@@ -18571,6 +18618,39 @@ async function mapWithConcurrency(values, concurrency, mapper) {
   });
   await Promise.all(workers);
   return results;
+}
+
+async function readAsanaAgentOpenTaskSnapshot(agentId, limit = 100) {
+  const asana = getAsana(agentId);
+  const userResponse = await asanaRequestWithRetry(asana, {
+    method: "GET",
+    url: "/users/me"
+  });
+  const user = userResponse.data.data;
+  const workspaceGid = user.workspaces?.[0]?.gid;
+  if (!workspaceGid) throw new Error("Kein Asana-Workspace gefunden.");
+
+  const taskResponse = await asanaRequestWithRetry(asana, {
+    method: "GET",
+    url: "/tasks",
+    params: {
+      assignee: "me",
+      workspace: workspaceGid,
+      completed_since: "now",
+      limit,
+      opt_fields:
+        "gid,name,modified_at,due_on,due_at,completed,permalink_url,assignee.gid,assignee.name,tags.gid,tags.name,memberships.project.gid,memberships.project.name,custom_fields.name,custom_fields.display_value,custom_fields.text_value,custom_fields.enum_value.name"
+    }
+  });
+
+  return {
+    agent_id: agentId,
+    ok: true,
+    user_gid: user.gid,
+    workspace_gid: workspaceGid,
+    tasks: taskResponse.data.data || [],
+    truncated: Boolean(taskResponse.data.next_page)
+  };
 }
 
 async function readDashboardAgentHealth(agentId, now) {
