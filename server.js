@@ -11336,7 +11336,7 @@ function createServer() {
 
   server.tool(
     "asana_update_task_description",
-    "Ergaenzt eine Asana-Aufgabenbeschreibung kontrolliert und mit Readback. Standardpfad fuer dauerhafte Aenderungen an Routine-Aufgaben; Kommentare allein reichen dafuer nicht.",
+    "Ergaenzt eine Asana-Aufgabenbeschreibung kontrolliert und mit Readback. Standardpfad fuer dauerhafte Aenderungen an Routine-Aufgaben; Kommentare allein reichen dafuer nicht. replace_full_description=true ersetzt widerspruechliche oder veraltete Beschreibungen nur mit verifizierter Moritz-Freigabe.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -11345,6 +11345,7 @@ function createServer() {
       dedupe_key: z.string().min(3).max(160).optional(),
       update_basis: z.string().min(20),
       require_routine_context: z.boolean().optional().default(true),
+      replace_full_description: z.boolean().optional().default(false),
       confirmed_by_asana: z.boolean().optional().default(false),
       authorization: actionAuthorizationSchema.optional(),
       allow_completed_task: z.boolean().optional().default(false),
@@ -11360,6 +11361,7 @@ function createServer() {
       dedupe_key,
       update_basis,
       require_routine_context,
+      replace_full_description,
       confirmed_by_asana,
       authorization,
       allow_completed_task,
@@ -11377,7 +11379,8 @@ function createServer() {
             confirmedByAsana: confirmed_by_asana,
             asanaTaskGid:
               authorization?.source === "asana" || confirmed_by_asana ? task_gid : undefined,
-            actionName: "asana_update_task_description"
+            actionName: "asana_update_task_description",
+            requireMoritz: replace_full_description
           });
 
       const asana = getAsana(agent_id);
@@ -11398,7 +11401,7 @@ function createServer() {
       }
 
       const existingForDedupe = `${before_task.notes || ""}\n${before_task.html_notes || ""}`;
-      if (dedupe_key && existingForDedupe.includes(dedupe_key)) {
+      if (!replace_full_description && dedupe_key && existingForDedupe.includes(dedupe_key)) {
         return out({
           agent_id,
           task_gid,
@@ -11410,13 +11413,16 @@ function createServer() {
         });
       }
 
-      const sectionHtml = buildAsanaDescriptionAppendSection({
-        section_title,
-        section_text,
-        dedupe_key
-      });
-      const existingHtmlNotes = before_task.html_notes || escapeAsanaTextWithLinks(before_task.notes || "");
-      const html_notes = appendAsanaHtmlNotesSection(existingHtmlNotes, sectionHtml);
+      const html_notes = replace_full_description
+        ? `<body>${escapeAsanaTextWithLinks(section_text)}</body>`
+        : appendAsanaHtmlNotesSection(
+            before_task.html_notes || escapeAsanaTextWithLinks(before_task.notes || ""),
+            buildAsanaDescriptionAppendSection({
+              section_title,
+              section_text,
+              dedupe_key
+            })
+          );
       const html_sha256 = createHash("sha256").update(html_notes, "utf8").digest("hex");
       const update_basis_sha256 = createHash("sha256").update(update_basis, "utf8").digest("hex");
 
@@ -11426,6 +11432,7 @@ function createServer() {
           dry_run: true,
           task_gid,
           routine_like_task,
+          replace_full_description,
           before_task,
           html_notes,
           html_bytes: Buffer.byteLength(html_notes, "utf8"),
@@ -11476,6 +11483,7 @@ function createServer() {
         before_task,
         verified_task,
         routine_like_task,
+        replace_full_description,
         verification_status,
         html_bytes: Buffer.byteLength(html_notes, "utf8"),
         html_sha256,

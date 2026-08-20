@@ -25,7 +25,10 @@ const checks = {
     source.includes('/tasks/${task_gid}/removeFollowers'),
   observer_leave_is_nonduplicating:
     source.includes("leave_failed_do_not_retry_comment") &&
-    source.includes("failed_still_follower_do_not_retry_comment")
+    source.includes("failed_still_follower_do_not_retry_comment"),
+  full_description_replacement_requires_moritz:
+    source.includes("replace_full_description") &&
+    source.includes("requireMoritz: replace_full_description")
 };
 
 console.log(JSON.stringify(checks));
