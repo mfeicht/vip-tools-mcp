@@ -2991,6 +2991,203 @@ async function uploadBufferToDrive({
   return res.data;
 }
 
+const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
+const ACCOUNTING_OCR_APP_PROPERTY = "vip_transient_accounting_ocr";
+const ACCOUNTING_OCR_STALE_MS = 15 * 60 * 1000;
+
+async function createTransientAccountingOcrDocument({
+  sourceFileId,
+  targetFolderId,
+  bytes,
+  ocrLanguage,
+  googleContext = {}
+}) {
+  await assertAllowedAccountingFolder(targetFolderId, googleContext);
+  const boundary = `vip-accounting-ocr-${randomUUID()}`;
+  const metadata = JSON.stringify({
+    name: `.vip-accounting-ocr-${randomUUID()}`,
+    mimeType: GOOGLE_DOC_MIME_TYPE,
+    parents: [targetFolderId],
+    appProperties: {
+      [ACCOUNTING_OCR_APP_PROPERTY]: "true",
+      vip_source_id_sha256: createHash("sha256").update(sourceFileId, "utf8").digest("hex").slice(0, 64)
+    }
+  });
+  const body = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
+        `--${boundary}\r\nContent-Type: application/pdf\r\n\r\n`,
+      "utf8"
+    ),
+    bytes,
+    Buffer.from(`\r\n--${boundary}--`, "utf8")
+  ]);
+
+  const res = await googleRequest(
+    {
+      method: "POST",
+      url: "https://www.googleapis.com/upload/drive/v3/files",
+      params: {
+        uploadType: "multipart",
+        ocrLanguage,
+        fields: "id,name,mimeType,parents,createdTime,appProperties",
+        supportsAllDrives: true
+      },
+      headers: {
+        "Content-Type": `multipart/related; boundary=${boundary}`,
+        "Content-Length": String(body.length)
+      },
+      maxBodyLength: Infinity,
+      data: body
+    },
+    googleContext
+  );
+  if (res.data?.mimeType !== GOOGLE_DOC_MIME_TYPE) {
+    throw new Error(`Google OCR-Konvertierung lieferte unerwarteten MIME-Type: ${res.data?.mimeType || "unknown"}`);
+  }
+  return res.data;
+}
+
+async function exportGoogleDocAsPlainText(fileId, googleContext = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    try {
+      const res = await googleRequest(
+        {
+          method: "GET",
+          url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export`,
+          params: { mimeType: "text/plain" },
+          responseType: "text",
+          transformResponse: [(value) => value]
+        },
+        googleContext
+      );
+      return String(res.data || "");
+    } catch (error) {
+      lastError = error;
+      if (attempt < 4) await sleep(250 * 2 ** (attempt - 1));
+    }
+  }
+  throw lastError;
+}
+
+async function deleteGoogleDriveFileWithRetry(fileId, googleContext = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await googleRequest(
+        {
+          method: "DELETE",
+          url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+          params: { supportsAllDrives: true }
+        },
+        googleContext
+      );
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await sleep(300 * 2 ** (attempt - 1));
+    }
+  }
+  const cleanupError = new Error(`Transienter Accounting-OCR-Drive-Eintrag ${fileId} konnte nicht geloescht werden.`);
+  cleanupError.cause = lastError;
+  cleanupError.transient_file_id = fileId;
+  throw cleanupError;
+}
+
+async function cleanupStaleAccountingOcrDocuments(folderId, googleContext = {}) {
+  await assertAllowedAccountingFolder(folderId, googleContext);
+  const query =
+    `'${escapeGoogleDriveQueryString(folderId)}' in parents and trashed = false and ` +
+    `appProperties has { key='${ACCOUNTING_OCR_APP_PROPERTY}' and value='true' }`;
+  const res = await googleRequest(
+    {
+      method: "GET",
+      url: "https://www.googleapis.com/drive/v3/files",
+      params: {
+        q: query,
+        fields: "files(id,createdTime)",
+        pageSize: 100,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
+      }
+    },
+    googleContext
+  );
+  const cutoff = Date.now() - ACCOUNTING_OCR_STALE_MS;
+  const stale = (res.data.files || []).filter((file) => {
+    const createdAt = Date.parse(file.createdTime || "");
+    return Number.isFinite(createdAt) && createdAt < cutoff;
+  });
+  for (const file of stale) {
+    await deleteGoogleDriveFileWithRetry(file.id, googleContext);
+  }
+  return stale.length;
+}
+
+function accountingExtractionRank(extraction) {
+  if (!extraction || extraction.status === "not_extracted") return 0;
+  const amountFields = ["net_amount", "vat_amount", "gross_amount"];
+  const populatedAmounts = amountFields.filter((field) => extraction[field] !== null).length;
+  return (
+    (extraction.status === "extracted" ? 100 : 50) +
+    populatedAmounts * 5 +
+    (extraction.invoice_date ? 4 : 0) +
+    (extraction.recipient_confidence === "high" ? 4 : 0)
+  );
+}
+
+function chooseAccountingOcrExtraction(directExtraction, ocrExtraction) {
+  const amountFields = ["net_amount", "vat_amount", "gross_amount"];
+  const conflicts = amountFields.filter((field) => {
+    const directValue = directExtraction?.[field];
+    const ocrValue = ocrExtraction?.[field];
+    return directValue !== null && ocrValue !== null && Math.abs(Number(directValue) - Number(ocrValue)) > 0.01;
+  });
+  if (conflicts.length) {
+    return {
+      status: "conflict",
+      safe_for_write: false,
+      source: null,
+      conflicting_fields: conflicts,
+      extraction: null
+    };
+  }
+
+  const useOcr = accountingExtractionRank(ocrExtraction) > accountingExtractionRank(directExtraction);
+  const selected = useOcr ? ocrExtraction : directExtraction;
+  const source = useOcr ? "google_drive_ocr" : "embedded_pdf_text";
+  const safeForWrite = Boolean(
+    selected?.status === "extracted" &&
+      selected.invoice_date &&
+      selected.recipient_confidence === "high"
+  );
+  return {
+    status: selected?.status || "not_extracted",
+    safe_for_write: safeForWrite,
+    source,
+    conflicting_fields: [],
+    extraction: selected || null
+  };
+}
+
+function publicAccountingExtraction(extraction) {
+  if (!extraction) return null;
+  return {
+    kind: extraction.kind || null,
+    status: extraction.status || "not_extracted",
+    invoice_date: extraction.invoice_date || null,
+    month_key: extraction.month_key || null,
+    net_amount: extraction.net_amount ?? null,
+    vat_amount: extraction.vat_amount ?? null,
+    gross_amount: extraction.gross_amount ?? null,
+    confidence: extraction.confidence || "low",
+    recipient_name: extraction.recipient_name || null,
+    recipient_confidence: extraction.recipient_confidence || "low",
+    recipient_source: extraction.recipient_source || "not_found"
+  };
+}
+
 async function getSheetIdByName(spreadsheetId, sheetName, googleContext = {}) {
   const res = await googleRequest({
     method: "GET",
@@ -12805,6 +13002,227 @@ function createServer() {
           gross_amount: round(totals.gross_amount)
         },
         files: include_file_details ? details : undefined
+      });
+    }
+  );
+
+  server.tool(
+    "accounting_drive_pdf_invoice_ocr_totals",
+    "Accounting-OCR-Fallback: konvertiert ausschliesslich freigegebene Rechnungs-PDFs kurzzeitig serverseitig per Google Drive OCR, loescht jedes markierte Zwischen-Dokument sofort wieder und gibt nur enge Extraktions-/QS-Daten ohne Rechnungsvolltext aus.",
+    {
+      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      folder_id: z.string(),
+      file_ids: z.array(z.string()).max(20).optional().default([]),
+      expected_month_key: z.string().regex(/^\d{2}\/\d{2}$/).optional(),
+      max_files: z.number().int().positive().max(20).optional().default(20),
+      max_pdf_bytes: z
+        .number()
+        .int()
+        .min(1024)
+        .max(ACCOUNTING_ATTACHMENT_HARD_MAX_BYTES)
+        .optional()
+        .default(ACCOUNTING_ATTACHMENT_HARD_MAX_BYTES),
+      ocr_language: z.string().regex(/^[a-z]{2,3}(?:-[A-Z]{2})?$/).optional().default("de"),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      approved_by: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_SAFE_WRITE,
+    async ({
+      agent_id,
+      folder_id,
+      file_ids,
+      expected_month_key,
+      max_files,
+      max_pdf_bytes,
+      ocr_language,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      approved_by,
+      authorization
+    }) => {
+      const googleContext = { agent_id };
+      await assertAllowedAccountingFolder(folder_id, googleContext);
+      const requestedIds = [...new Set(file_ids.map((value) => String(value).trim()).filter(Boolean))];
+      const files = requestedIds.length
+        ? await Promise.all(
+            requestedIds.map((fileId) =>
+              getDriveFile(
+                fileId,
+                "id,name,mimeType,size,createdTime,modifiedTime,parents,webViewLink",
+                googleContext
+              )
+            )
+          )
+        : await listAccountingDriveFolderPdfFiles(folder_id, max_files, googleContext);
+
+      for (const file of files) {
+        if (file.mimeType !== "application/pdf") {
+          throw new Error(`Accounting OCR akzeptiert nur PDF-Dateien: ${file.id}`);
+        }
+        if (!(file.parents || []).includes(folder_id)) {
+          throw new Error(`Accounting OCR-Datei ${file.id} liegt nicht direkt im freigegebenen Ordner ${folder_id}.`);
+        }
+      }
+
+      const plannedFiles = files.map((file) => ({
+        id: file.id,
+        name: file.name,
+        size: file.size ? Number(file.size) : null,
+        modifiedTime: file.modifiedTime || null,
+        webViewLink: file.webViewLink || null
+      }));
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          folder_id,
+          expected_month_key: expected_month_key || null,
+          ocr_language,
+          pdf_count: files.length,
+          files: plannedFiles,
+          transient_storage_contract:
+            "Pro PDF wird im selben freigegebenen Accounting-Ordner kurzzeitig ein markiertes Google-Dokument erzeugt, als Text exportiert und im finally-Pfad geloescht. Kein Volltext wird ausgegeben oder lokal gespeichert.",
+          requires_for_live: [
+            "dry_run=false",
+            "verifizierter Moritz-Auftrag in Asana oder authorization.source=direct_codex"
+          ]
+        });
+      }
+
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        approvedBy: approved_by,
+        actionName: "accounting_drive_pdf_invoice_ocr_totals",
+        requireMoritz: true
+      });
+      const staleCleanupCount = await cleanupStaleAccountingOcrDocuments(folder_id, googleContext);
+      const details = [];
+      const totals = { net_amount: 0, vat_amount: 0, gross_amount: 0 };
+      let safeCount = 0;
+      let reviewCount = 0;
+
+      for (const file of files) {
+        const fileSummary = {
+          id: file.id,
+          name: file.name,
+          size: file.size ? Number(file.size) : null,
+          modifiedTime: file.modifiedTime || null,
+          webViewLink: file.webViewLink || null
+        };
+        let transientFile = null;
+        let cleanupVerified = false;
+        try {
+          if (file.size && Number(file.size) > max_pdf_bytes) {
+            throw new Error(`PDF ist groesser als max_pdf_bytes (${max_pdf_bytes}).`);
+          }
+          const buffer = await downloadDrivePdfBuffer(file.id, max_pdf_bytes, googleContext);
+          const parser = new PDFParse({ data: buffer });
+          let directText;
+          try {
+            directText = (await parser.getText()).text || "";
+          } finally {
+            await parser.destroy().catch(() => {});
+          }
+          const directExtraction = extractInvoiceAmountsFromPdfText(directText);
+
+          transientFile = await createTransientAccountingOcrDocument({
+            sourceFileId: file.id,
+            targetFolderId: folder_id,
+            bytes: buffer,
+            ocrLanguage: ocr_language,
+            googleContext
+          });
+          const ocrText = await exportGoogleDocAsPlainText(transientFile.id, googleContext);
+          const ocrExtraction = extractInvoiceAmountsFromPdfText(ocrText);
+          const selection = chooseAccountingOcrExtraction(directExtraction, ocrExtraction);
+          const selected = selection.extraction;
+          const monthMatches = Boolean(
+            !expected_month_key || (selected?.month_key && selected.month_key === expected_month_key)
+          );
+          const safeForWrite = selection.safe_for_write && monthMatches;
+          details.push({
+            ...fileSummary,
+            status: selection.status,
+            selected_source: selection.source,
+            safe_for_write: safeForWrite,
+            month_matches_expected: monthMatches,
+            conflicting_fields: selection.conflicting_fields,
+            selected_extraction: publicAccountingExtraction(selected),
+            embedded_pdf_extraction: publicAccountingExtraction(directExtraction),
+            ocr_extraction: publicAccountingExtraction(ocrExtraction),
+            transient_cleanup_verified: true
+          });
+        } catch (error) {
+          details.push({
+            ...fileSummary,
+            status: "error",
+            safe_for_write: false,
+            error: String(error?.message || error),
+            transient_file_id: error?.transient_file_id || transientFile?.id || null,
+            transient_cleanup_verified: cleanupVerified
+          });
+        } finally {
+          if (transientFile) {
+            try {
+              await deleteGoogleDriveFileWithRetry(transientFile.id, googleContext);
+              cleanupVerified = true;
+              const detail = details.at(-1);
+              if (detail?.id === file.id) {
+                detail.transient_cleanup_verified = true;
+                detail.transient_file_id = null;
+              }
+            } catch (cleanupError) {
+              const detail = details.at(-1);
+              if (detail?.id === file.id) {
+                detail.status = "cleanup_error";
+                detail.safe_for_write = false;
+                detail.error = String(cleanupError?.message || cleanupError);
+                detail.transient_file_id = cleanupError?.transient_file_id || transientFile.id;
+                detail.transient_cleanup_verified = false;
+              }
+            }
+          }
+        }
+
+        const finalDetail = details.at(-1);
+        if (finalDetail?.id === file.id && finalDetail.safe_for_write && finalDetail.transient_cleanup_verified) {
+          safeCount += 1;
+          totals.net_amount += finalDetail.selected_extraction?.net_amount || 0;
+          totals.vat_amount += finalDetail.selected_extraction?.vat_amount || 0;
+          totals.gross_amount += finalDetail.selected_extraction?.gross_amount || 0;
+        } else {
+          reviewCount += 1;
+        }
+      }
+
+      const round = (value) => Math.round(value * 100) / 100;
+      return out({
+        agent_id,
+        dry_run: false,
+        authorization: authorizationReceipt,
+        folder_id,
+        expected_month_key: expected_month_key || null,
+        ocr_language,
+        pdf_count: files.length,
+        safe_for_write_count: safeCount,
+        requires_review_count: reviewCount,
+        ready_for_accounting_write: files.length > 0 && safeCount === files.length,
+        stale_transient_documents_cleaned: staleCleanupCount,
+        totals_from_safe_files_only: {
+          net_amount: round(totals.net_amount),
+          vat_amount: round(totals.vat_amount),
+          gross_amount: round(totals.gross_amount)
+        },
+        files: details,
+        data_handling:
+          "OCR-Volltexte wurden nur im Speicher verarbeitet, nicht ausgegeben und nicht lokal gespeichert. Transiente Google-Dokumente wurden pro Datei im finally-Pfad geloescht."
       });
     }
   );
