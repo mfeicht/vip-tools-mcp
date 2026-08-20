@@ -37,10 +37,10 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 /* ---------------- CONFIG ---------------- */
 
 const DEFAULT_AGENT_ID = "vip-ai-sales";
-const ASANA_TIMEOUT_MS = Number(process.env.ASANA_TIMEOUT_MS || 12_000);
+const ASANA_TIMEOUT_MS = Number(process.env.ASANA_TIMEOUT_MS || 30_000);
 const ASANA_WRITE_TIMEOUT_MS = Number(process.env.ASANA_WRITE_TIMEOUT_MS || 30_000);
-const ASANA_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ASANA_RETRY_ATTEMPTS || 2));
-const ASANA_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ASANA_RETRY_BASE_DELAY_MS || 250));
+const ASANA_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ASANA_RETRY_ATTEMPTS || 3));
+const ASANA_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ASANA_RETRY_BASE_DELAY_MS || 750));
 const execFileAsync = promisify(execFile);
 const VIP_INTAKE_MAX_FILES = Math.max(0, Number(process.env.VIP_INTAKE_MAX_FILES || 12));
 const VIP_INTAKE_MAX_FILE_MB = Math.max(1, Number(process.env.VIP_INTAKE_MAX_FILE_MB || 25));
