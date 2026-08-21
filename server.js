@@ -188,6 +188,10 @@ const EMAIL_ACTION_SEND_ACCOUNT_CONFIG_URL = new URL(
   import.meta.url
 );
 const EMAIL_ACTION_CONTROL_AGENT_ID = "vip-ai-communication";
+const EMAIL_ACTION_READ_AGENT_IDS = Object.freeze([
+  EMAIL_ACTION_CONTROL_AGENT_ID,
+  "vip-ai-operations"
+]);
 const EMAIL_ACTION_MAX_EMAIL_BYTES = Number(process.env.EMAIL_ACTION_MAX_EMAIL_BYTES || 4 * 1024 * 1024);
 const EMAIL_ACTION_MAX_SCAN_MESSAGES = Number(process.env.EMAIL_ACTION_MAX_SCAN_MESSAGES || 100);
 const EMAIL_BCC_LEARNING_MAX_EMAIL_BYTES = Number(
@@ -6186,6 +6190,76 @@ function emailDomainFromAddress(address) {
 
 function resendApiKeyEnvNameForAddress(address) {
   return RESEND_API_KEY_ENV_BY_DOMAIN[emailDomainFromAddress(address)] || "";
+}
+
+async function readResendDomainStatus(domain) {
+  const normalizedDomain = String(domain || "").trim().toLowerCase();
+  const apiKeyEnvName = RESEND_API_KEY_ENV_BY_DOMAIN[normalizedDomain] || "";
+  const apiKey = apiKeyEnvName ? process.env[apiKeyEnvName] : "";
+  const base = {
+    provider: "resend",
+    domain: normalizedDomain,
+    api_key_env_name: apiKeyEnvName || null,
+    api_key_configured: Boolean(apiKey),
+    provider_readback_attempted: false,
+    provider_http_status: null,
+    domain_registered: false,
+    domain_status: null,
+    region: null,
+    capabilities: null,
+    ready_for_live_send: false,
+    error: null
+  };
+
+  if (!apiKey) {
+    return {
+      ...base,
+      error: "Der domain-spezifische Resend-API-Key ist im MCP-Environment nicht konfiguriert."
+    };
+  }
+
+  try {
+    const response = await axios.get("https://api.resend.com/domains", {
+      timeout: EMAIL_HTTP_TIMEOUT_MS,
+      params: { limit: 100 },
+      headers: { Authorization: `Bearer ${apiKey}` }
+    });
+    const domains = Array.isArray(response?.data?.data) ? response.data.data : [];
+    const match = domains.find(
+      (item) => String(item?.name || "").trim().toLowerCase() === normalizedDomain
+    );
+    const status = String(match?.status || "").trim().toLowerCase() || null;
+    const capabilities = match?.capabilities && typeof match.capabilities === "object"
+      ? {
+          sending: match.capabilities.sending || null,
+          receiving: match.capabilities.receiving || null
+        }
+      : null;
+    return {
+      ...base,
+      provider_readback_attempted: true,
+      provider_http_status: response.status,
+      domain_registered: Boolean(match),
+      domain_status: status,
+      region: match?.region || null,
+      capabilities,
+      ready_for_live_send:
+        Boolean(match) &&
+        status === "verified" &&
+        (!capabilities || capabilities.sending !== "disabled")
+    };
+  } catch (caught) {
+    const status = Number(caught?.response?.status || 0) || null;
+    const providerMessage = caught?.response?.data?.message || caught?.response?.data?.error;
+    return {
+      ...base,
+      provider_readback_attempted: true,
+      provider_http_status: status,
+      error: `Resend-Domain-Readback fehlgeschlagen${status ? ` (HTTP ${status})` : ""}: ${String(
+        providerMessage || caught?.message || "Unbekannter Fehler"
+      ).slice(0, 500)}`
+    };
+  }
 }
 
 function getResendApiKeyDetails({ fromAddress, suffix, genericApiKey }) {
@@ -17679,7 +17753,7 @@ function createServer() {
     "email_action_list_send_accounts",
     "Listet die versionierten Versandkonten fuer die Communication-E-Mail-Automatisierung und prueft deren zentrale Resend-HTTPS- sowie SMTP-Bereitschaft ohne Anmeldung oder Versand. Gibt nur Env-Variablennamen, niemals Secret-Werte aus.",
     {
-      agent_id: z.literal(EMAIL_ACTION_CONTROL_AGENT_ID).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID)
+      agent_id: z.enum(EMAIL_ACTION_READ_AGENT_IDS).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID)
     },
     TOOL_READ_ONLY,
     async ({ agent_id }) => {
@@ -17736,6 +17810,25 @@ function createServer() {
             error
           };
         })
+      });
+    }
+  );
+
+  server.tool(
+    "email_action_resend_domain_status",
+    "Prueft den aktuellen Resend-Providerstatus einer registrierten Versanddomain read-only ueber GET /domains. Gibt nur Domainstatus, Region, Capabilities und Env-Variablennamen aus, niemals API-Key-Werte.",
+    {
+      agent_id: z.enum(EMAIL_ACTION_READ_AGENT_IDS).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      domain: z
+        .enum(Object.keys(RESEND_API_KEY_ENV_BY_DOMAIN))
+        .optional()
+        .default("reise-stories.de")
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, domain }) => {
+      return out({
+        agent_id,
+        ...(await readResendDomainStatus(domain))
       });
     }
   );

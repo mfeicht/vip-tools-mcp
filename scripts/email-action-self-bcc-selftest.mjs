@@ -19,6 +19,12 @@ await client.connect(transport);
 try {
   const toolList = await client.listTools();
   const names = new Set((toolList.tools || []).map((tool) => tool.name));
+  const sendAccountTool = (toolList.tools || []).find(
+    (tool) => tool.name === "email_action_list_send_accounts"
+  );
+  const resendDomainStatusTool = (toolList.tools || []).find(
+    (tool) => tool.name === "email_action_resend_domain_status"
+  );
   const accounts = parse(await client.callTool({
     name: "email_action_list_send_accounts",
     arguments: { agent_id: "vip-ai-communication" }
@@ -38,6 +44,15 @@ try {
   const report = {
     discovery_tool_present: names.has("email_action_discover_folders"),
     send_account_tool_present: names.has("email_action_list_send_accounts"),
+    send_account_tool_allows_operations_readback:
+      sendAccountTool?.inputSchema?.properties?.agent_id?.enum?.includes(
+        "vip-ai-operations"
+      ) === true,
+    resend_domain_status_tool_present: Boolean(resendDomainStatusTool),
+    resend_domain_status_allows_operations_readback:
+      resendDomainStatusTool?.inputSchema?.properties?.agent_id?.enum?.includes(
+        "vip-ai-operations"
+      ) === true,
     template_style_tool_present: names.has("email_action_template_style_readback"),
     draft_template_test_send_tool_present: names.has("email_action_send_test_from_draft_template"),
     adaptive_context_tool_present: names.has("email_action_agent_context"),
@@ -104,6 +119,11 @@ try {
       source.includes("sendEmailActionViaResend") &&
       source.includes("getEmailActionHttpConfig") &&
       source.includes('type: "resend_http_mime_equivalent"'),
+    resend_domain_status_is_read_only_and_secret_safe:
+      source.includes("async function readResendDomainStatus") &&
+      source.includes('axios.get("https://api.resend.com/domains"') &&
+      source.includes("api_key_env_name: apiKeyEnvName || null") &&
+      source.includes("ready_for_live_send"),
     resend_preserves_self_bcc_and_thread_headers:
       source.includes("bcc: [plan.bcc]") &&
       source.includes('"In-Reply-To": plan.in_reply_to') &&
