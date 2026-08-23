@@ -20,6 +20,9 @@ await new Promise((resolve) => setTimeout(resolve, 300));
 await client.connect(transport);
 
 try {
+  const listedTools = await client.listTools();
+  const asanaCommentTool = listedTools.tools.find((tool) => tool.name === "asana_comment");
+  const asanaCompleteTaskTool = listedTools.tools.find((tool) => tool.name === "asana_complete_task");
   const missing = await call({
     agent_id: "vip-ai-content",
     task_gid: "1234567890",
@@ -82,6 +85,10 @@ try {
 
   const validText = text(valid);
   const report = {
+    completion_guard_schema_visible: Boolean(
+      asanaCommentTool?.inputSchema?.properties?.supersedes_story_gid &&
+        asanaCompleteTaskTool?.description?.includes("Status=Todo")
+    ),
     missing_evidence_blocked: Boolean(missing.isError),
     missing_status_evidence_blocked: Boolean(missingStatus.isError),
     pure_question_without_claims_passed: !pureQuestion.isError,

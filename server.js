@@ -30,6 +30,11 @@ import {
   decodeAndVerifyDashboardTelemetry,
   verifyDashboardRefreshPoll
 } from "./lib/dashboard-health.js";
+import {
+  detectRoutineFollowUpSignals,
+  inspectRoutineMaterialCommentIdempotency,
+  validateRoutineFollowUpTaskContract
+} from "./lib/asana-completion-guard.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -2300,38 +2305,31 @@ function assertAsanaStoryReadbackLooksSafe(story, expectedCodeSnippets = []) {
   }
 }
 
-function detectRoutineFollowUpSignals({ finalComment, completionBasis, followUpNotRequiredBasis }) {
-  const htmlText = String(finalComment?.html_text || "");
-  const combinedText = [
-    finalComment?.text || "",
-    htmlText,
-    completionBasis || "",
-    followUpNotRequiredBasis || ""
-  ]
-    .join("\n")
-    .toLowerCase()
-    .normalize("NFKC");
-  const hasMention = /<a\s+data-asana-gid="\d+"\s*\/?>/i.test(htmlText);
-  const noFollowUpClaim =
-    /\bkein(?:e|er|en)?\s+(?:aktive\s+)?(?:nacharbeit|folgeaufgabe|follow[\s-]?up|handoff|aktion)\s+(?:noetig|nötig|erforderlich|offen)\b/i.test(
-      combinedText
-    ) ||
-    /\b(?:keine|kein)\s+(?:weitere\s+)?(?:to-?dos?|aktion|aufgabe)\s+(?:noetig|nötig|erforderlich|offen)\b/i.test(
-      combinedText
+async function readAllAsanaTaskStories(asana, taskGid, { maxPages = 10 } = {}) {
+  const stories = [];
+  let offset;
+  let pageCount = 0;
+  do {
+    const response = await asanaRequestWithRetry(asana, {
+      method: "GET",
+      url: `/tasks/${taskGid}/stories`,
+      params: {
+        limit: 100,
+        opt_fields: "gid,text,html_text,created_at,created_by.gid,created_by.name,resource_subtype",
+        ...(offset ? { offset } : {})
+      }
+    });
+    stories.push(...(response.data.data || []));
+    offset = response.data.next_page?.offset || null;
+    pageCount += 1;
+  } while (offset && pageCount < maxPages);
+
+  if (offset) {
+    throw new Error(
+      `Routine-Kommentar-Idempotenz konnte nicht vollstaendig geprueft werden: mehr als ${maxPages * 100} Stories.`
     );
-  const actionSignal =
-    /\b(?:bitte|soll|muss|kann\s+jetzt|naechster\s+schritt|nächster\s+schritt|weitergabe|handoff|follow[\s-]?up|folgeaufgabe|nacharbeit)\b/i.test(
-      combinedText
-    ) &&
-    /\b(?:pruef|prüf|freigeb|importier|weiterbearbeit|bearbeit|erledig|umsetz|einpfleg|hochlad|veroeffentlich|veröffentlich|antwort|rueckmeld|rückmeld|nachzieh|uebernehm|übernehm|anleg|erstel)\w*/i.test(
-      combinedText
-    );
-  return {
-    has_mention: hasMention,
-    has_action_signal: actionSignal,
-    no_follow_up_claim: noFollowUpClaim,
-    blocked_without_follow_up_task: hasMention || (actionSignal && !noFollowUpClaim)
-  };
+  }
+  return stories;
 }
 
 function normalizePrivateKey(value) {
@@ -11089,7 +11087,7 @@ function createServer() {
 
   server.tool(
     "asana_comment",
-    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. In Routinen ist der erste geschlossene Ergebnis-/Handoff-/Abschlusskommentar kanonisch; weitere materiale Kommentare werden ohne explizite supersedes_story_gid als Duplikat blockiert. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -11123,6 +11121,7 @@ function createServer() {
         .optional(),
       keep_routine_observer_subscription: z.boolean().optional().default(false),
       keep_routine_observer_basis: z.string().min(20).optional(),
+      supersedes_story_gid: z.string().optional(),
       effort_note: z.string().optional(),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
@@ -11140,12 +11139,14 @@ function createServer() {
       routine_supervisor_mention_reason,
       keep_routine_observer_subscription,
       keep_routine_observer_basis,
+      supersedes_story_gid,
       effort_note,
       dry_run,
       verify_after
     }) => {
       validateAsanaGid(task_gid, "task_gid");
       validateAsanaGid(mention_user_gid, "mention_user_gid");
+      validateAsanaGid(supersedes_story_gid, "supersedes_story_gid");
       const materialResultSignals = asanaCommentHasMaterialResultSignals({ greeting, sections });
       const preparedEvidence = prepareAsanaEvidenceSections(comment_kind, evidence, { materialResultSignals });
       const finalSections = [...sections, ...preparedEvidence.evidence_sections];
@@ -11175,6 +11176,10 @@ function createServer() {
             applicable: null,
             status: "not_evaluated_dry_run",
             reason: "Kein Live-Task-Readback fuer reinen Kommentar-Dry-Run."
+          },
+          routine_material_comment_idempotency: {
+            applicable: null,
+            status: "not_evaluated_dry_run"
           },
           html_text,
           html_bytes: Buffer.byteLength(html_text, "utf8"),
@@ -11306,6 +11311,38 @@ function createServer() {
       });
       const expectedCodeSnippets = collectAsanaCodeBlocks(finalSections);
       const html_sha256 = createHash("sha256").update(html_text, "utf8").digest("hex");
+      const materialRoutineComment =
+        routineCommentTask && ["result", "handoff", "completion"].includes(comment_kind);
+      let routine_material_comment_idempotency = {
+        applicable: materialRoutineComment,
+        status: materialRoutineComment ? "checking" : "not_applicable",
+        allowed: true,
+        prior_material_story_gids: [],
+        supersedes_story_gid: supersedes_story_gid || null
+      };
+      if (supersedes_story_gid && !materialRoutineComment) {
+        throw new Error(
+          "supersedes_story_gid ist nur fuer result|handoff|completion in einer Routine-Aufgabe zulaessig."
+        );
+      }
+      if (materialRoutineComment) {
+        const existingStories = await readAllAsanaTaskStories(asana, task_gid);
+        routine_material_comment_idempotency = {
+          applicable: true,
+          ...inspectRoutineMaterialCommentIdempotency({
+            stories: existingStories,
+            agentUserGid: commentAgentUser.gid,
+            supersedesStoryGid: supersedes_story_gid
+          })
+        };
+        if (!routine_material_comment_idempotency.allowed) {
+          throw new Error(
+            `Routine-Kommentar-Idempotenz blockiert (${routine_material_comment_idempotency.status}). Nutze den bereits vorhandenen Evidenzkommentar ${routine_material_comment_idempotency.prior_material_story_gids.join(
+              ", "
+            ) || "-"} als final_comment_story_gid. Nur eine echte Korrektur darf mit supersedes_story_gid auf genau diesen Kommentar verweisen.`
+          );
+        }
+      }
 
       if (dry_run) {
         return out({
@@ -11318,6 +11355,7 @@ function createServer() {
           evidence_sha256: preparedEvidence.evidence_sha256,
           routine_supervisor_mention_gate,
           routine_observer_gate,
+          routine_material_comment_idempotency,
           html_text,
           html_bytes: Buffer.byteLength(html_text, "utf8"),
           html_sha256
@@ -11392,6 +11430,7 @@ function createServer() {
         evidence_sha256: preparedEvidence.evidence_sha256,
         routine_supervisor_mention_gate,
         routine_observer_gate,
+        routine_material_comment_idempotency,
         observer_leave_result,
         observer_leave_error,
         observer_leave_verification,
@@ -11569,7 +11608,7 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden vorab ausschliesslich per problemgebundener Asana-Mention adressiert.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Behauptete Abdeckung durch bestehende Routinen braucht eine konkrete offene Follow-up-Aufgabe; deren Link/GID, Assignee, Status=Todo und Faelligkeit muessen im finalen Kommentar readback-dokumentiert sein. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden vorab ausschliesslich per problemgebundener Asana-Mention adressiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -11627,7 +11666,7 @@ function createServer() {
       const taskRes = await asana.get(`/tasks/${task_gid}`, {
         params: {
           opt_fields:
-            "gid,name,completed,completed_at,assignee.gid,assignee.name,due_on,due_at,tags.name,followers.gid,followers.name,permalink_url"
+            "gid,name,completed,completed_at,assignee.gid,assignee.name,due_on,due_at,tags.name,followers.gid,followers.name,permalink_url,memberships.project.gid,memberships.project.name"
         }
       });
       const task = taskRes.data.data;
@@ -11709,19 +11748,36 @@ function createServer() {
       }
 
       let follow_up_task = null;
+      let follow_up_contract = null;
       if (follow_up_task_gid) {
         const followUpRes = await asana.get(`/tasks/${follow_up_task_gid}`, {
           params: {
             opt_fields:
-              "gid,name,completed,assignee.gid,assignee.name,due_on,permalink_url,memberships.project.gid,memberships.project.name,followers.gid,followers.name"
+              "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,memberships.project.gid,memberships.project.name,memberships.section.gid,memberships.section.name,followers.gid,followers.name,custom_fields.gid,custom_fields.name,custom_fields.display_value,custom_fields.text_value,custom_fields.enum_value.gid,custom_fields.enum_value.name"
           }
         });
         follow_up_task = followUpRes.data.data;
         if (follow_up_task.completed) {
-          throw new Error("Die angegebene Follow-up-Aufgabe ist bereits abgeschlossen; Routine-Abschluss braucht eine offene Folgeaufgabe oder eine konkrete No-Follow-up-Begruendung.");
+          throw new Error(
+            "Die angegebene Follow-up-Aufgabe ist bereits abgeschlossen; Abschluss braucht eine offene Folgeaufgabe oder eine konkrete No-Follow-up-Begruendung."
+          );
         }
         if (!follow_up_task.assignee?.gid) {
           throw new Error("Die angegebene Follow-up-Aufgabe hat keinen Assignee.");
+        }
+        if (routine_like_task) {
+          follow_up_contract = validateRoutineFollowUpTaskContract({
+            sourceTask: task,
+            followUpTask: follow_up_task,
+            finalComment: final_comment
+          });
+          if (!follow_up_contract.ok) {
+            throw new Error(
+              `Routine-Follow-up-Contract blockiert: ${follow_up_contract.issues.join(
+                ", "
+              )}. Der finale Evidenzkommentar muss Link/GID, Assignee, Status=Todo und Faelligkeit aus dem aktuellen Task-Readback enthalten.`
+            );
+          }
         }
       }
 
@@ -11752,6 +11808,7 @@ function createServer() {
           follow_up_required,
           follow_up_task_gid: follow_up_task_gid || null,
           follow_up_task,
+          follow_up_contract,
           follow_up_not_required_basis: hasFollowUpTask ? null : trimmedFollowUpNotRequiredBasis || null,
           routine_follow_up_signal_check,
           routine_like_task,
@@ -11826,6 +11883,7 @@ function createServer() {
         follow_up_required,
         follow_up_task_gid: follow_up_task_gid || null,
         follow_up_task,
+        follow_up_contract,
         follow_up_not_required_basis: hasFollowUpTask ? null : trimmedFollowUpNotRequiredBasis || null,
         routine_follow_up_signal_check,
         routine_like_task,
