@@ -33,9 +33,15 @@ assert.match(toolBlock, /Keinen parallelen oder doppelten OCR-Lauf starten/);
 assert.match(toolBlock, /Kein Volltext wird ausgegeben oder lokal gespeichert/);
 assert.doesNotMatch(toolBlock, /ocrText\s*:/);
 assert.match(source, /function accountingAmountsPlausible\(/);
+assert.match(source, /extractAccountingInvoice as extractAccountingInvoiceV2/);
+assert.match(toolBlock, /extractAccountingInvoiceV2\(directText\)/);
+assert.match(toolBlock, /extractAccountingInvoiceV2\(ocrText\)/);
 assert.match(source, /amounts_plausible:\s*amountsPlausible/);
 assert.match(source, /status:\s*"conflict",\s*safe_for_write:\s*false,\s*amounts_plausible:\s*false/);
 assert.match(source, /selection\.amounts_plausible/);
-assert.match(source, /\(\?!\[\\d\.,\]\)/);
+assert.match(source, /selected\.invoice_character === true/);
+assert.match(source, /selected\.supplier_confidence === "high"/);
+assert.match(source, /selected\.currency_code === "EUR"/);
+assert.match(source, /selected\.multiple_documents !== true/);
 
 console.log("accounting OCR contract self-test passed");
