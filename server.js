@@ -35,6 +35,10 @@ import {
   inspectRoutineMaterialCommentIdempotency,
   validateRoutineFollowUpTaskContract
 } from "./lib/asana-completion-guard.js";
+import {
+  extractAccountingInvoice as extractAccountingInvoiceV2,
+  getNormalizedAccountingInvoiceLines as getNormalizedAccountingInvoiceLinesV2
+} from "./lib/accounting-invoice-parser.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -3165,14 +3169,17 @@ async function cleanupStaleAccountingOcrDocuments(folderId, googleContext = {}) 
 }
 
 function accountingExtractionRank(extraction) {
-  if (!extraction || extraction.status === "not_extracted") return 0;
+  if (!extraction || ["not_extracted", "not_invoice"].includes(extraction.status)) return 0;
   const amountFields = ["net_amount", "vat_amount", "gross_amount"];
   const populatedAmounts = amountFields.filter((field) => extraction[field] !== null).length;
   return (
     (extraction.status === "extracted" ? 100 : 50) +
     populatedAmounts * 5 +
     (extraction.invoice_date ? 4 : 0) +
-    (extraction.recipient_confidence === "high" ? 4 : 0)
+    (extraction.recipient_confidence === "high" ? 4 : 0) +
+    (extraction.supplier_confidence === "high" ? 4 : 0) +
+    (extraction.invoice_number ? 3 : 0) +
+    (extraction.currency_code === "EUR" ? 3 : 0)
   );
 }
 
@@ -3212,8 +3219,14 @@ function chooseAccountingOcrExtraction(directExtraction, ocrExtraction) {
   const amountsPlausible = accountingAmountsPlausible(selected);
   const safeForWrite = Boolean(
     selected?.status === "extracted" &&
+      selected.invoice_character === true &&
+      selected.invoice_number &&
       selected.invoice_date &&
       selected.recipient_confidence === "high" &&
+      selected.supplier_confidence === "high" &&
+      selected.currency_code === "EUR" &&
+      selected.multiple_documents !== true &&
+      selected.amount_ambiguous !== true &&
       amountsPlausible
   );
   return {
@@ -3239,7 +3252,19 @@ function publicAccountingExtraction(extraction) {
     confidence: extraction.confidence || "low",
     recipient_name: extraction.recipient_name || null,
     recipient_confidence: extraction.recipient_confidence || "low",
-    recipient_source: extraction.recipient_source || "not_found"
+    recipient_source: extraction.recipient_source || "not_found",
+    supplier_name: extraction.supplier_name || null,
+    supplier_confidence: extraction.supplier_confidence || "low",
+    supplier_source: extraction.supplier_source || "not_found",
+    invoice_character: extraction.invoice_character === true,
+    invoice_number: extraction.invoice_number || null,
+    currency_code: extraction.currency_code || null,
+    amount_ambiguous: extraction.amount_ambiguous === true,
+    multiple_documents: extraction.multiple_documents === true,
+    reverse_charge: extraction.reverse_charge === true,
+    classification_reasons: Array.isArray(extraction.classification_reasons)
+      ? extraction.classification_reasons
+      : []
   };
 }
 
@@ -4774,7 +4799,7 @@ async function detectInlineAccountingInvoiceAttachment(message) {
   if (!isAppleInvoice) return null;
 
   const invoiceText = compactInlineInvoiceText(bodyText);
-  const invoiceExtraction = extractInvoiceAmountsFromPdfText(invoiceText || bodyText);
+  const invoiceExtraction = extractAccountingInvoiceV2(invoiceText || bodyText);
   const invoiceDate = invoiceExtraction.invoice_date || extractFirstGermanInvoiceDate(bodyText);
   const documentNumber = bodyText.match(/\bDokument\s*:\s*([A-Z0-9-]+)/i)?.[1] || null;
   const filename = buildInlineInvoiceFileName({
@@ -4812,7 +4837,7 @@ async function classifyAccountingAttachmentForUpload(attachment, message) {
   const subjectAndName = `${message?.subject || ""}\n${attachment.filename || ""}`;
   if (attachment.generated_from_inline_invoice) {
     const extraction =
-      attachment.inline_invoice_extraction || extractInvoiceAmountsFromPdfText(message?.inline_invoice_text || "");
+      attachment.inline_invoice_extraction || extractAccountingInvoiceV2(message?.inline_invoice_text || "");
     return {
       ...classifyAccountingTextAsInvoice(`${subjectAndName}\n${message?.subject || ""}`),
       status: "invoice",
@@ -4845,7 +4870,7 @@ async function classifyAccountingAttachmentForUpload(attachment, message) {
   }
   const classification = classifyAccountingTextAsInvoice(`${subjectAndName}\n${parsed.text || ""}`);
   const invoiceExtraction =
-    classification.decision === "allow" ? extractInvoiceAmountsFromPdfText(parsed.text || "") : null;
+    classification.decision === "allow" ? extractAccountingInvoiceV2(parsed.text || "") : null;
   return {
     ...classification,
     source: "pdf_text",
@@ -5922,7 +5947,7 @@ function extractInvoiceAmountsFromPdfText(rawText) {
 }
 
 function getLimitedPdfTextDebugLines(rawText, limit) {
-  return getNormalizedPdfTextLines(rawText).slice(0, limit);
+  return getNormalizedAccountingInvoiceLinesV2(rawText).slice(0, limit);
 }
 
 async function listAccountingDriveFolderPdfFiles(folderId, maxFiles, googleContext = {}) {
@@ -13617,7 +13642,7 @@ function createServer() {
             await parser.destroy().catch(() => {});
           }
           const pdfText = parsed.text || "";
-          const extracted = extractInvoiceAmountsFromPdfText(pdfText);
+          const extracted = extractAccountingInvoiceV2(pdfText);
           const monthMismatch = Boolean(
             expected_month_key && extracted.month_key && extracted.month_key !== expected_month_key
           );
@@ -13809,7 +13834,7 @@ function createServer() {
           } finally {
             await parser.destroy().catch(() => {});
           }
-          const directExtraction = extractInvoiceAmountsFromPdfText(directText);
+          const directExtraction = extractAccountingInvoiceV2(directText);
 
           transientFile = await createTransientAccountingOcrDocument({
             sourceFileId: file.id,
@@ -13819,7 +13844,7 @@ function createServer() {
             googleContext
           });
           const ocrText = await exportGoogleDocAsPlainText(transientFile.id, googleContext);
-          const ocrExtraction = extractInvoiceAmountsFromPdfText(ocrText);
+          const ocrExtraction = extractAccountingInvoiceV2(ocrText);
           const selection = chooseAccountingOcrExtraction(directExtraction, ocrExtraction);
           const selected = selection.extraction;
           const monthMatches = Boolean(
