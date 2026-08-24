@@ -147,6 +147,10 @@ const GOOGLE_ALLOWED_FOLDER_IDS = new Set(
     .map((value) => value.trim())
     .filter(Boolean)
 );
+const GOOGLE_AGENT_UPLOAD_MAX_BYTES = Math.min(
+  Math.max(Number(process.env.GOOGLE_DRIVE_AGENT_UPLOAD_MAX_BYTES || 5 * 1024 * 1024), 1024),
+  10 * 1024 * 1024
+);
 const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/spreadsheets"
@@ -3030,6 +3034,105 @@ async function uploadBufferToDrive({
     googleContext
   );
   return res.data;
+}
+
+function decodeAgentDriveCsvUpload({ fileName, contentText, contentBase64, expectedSha256 }) {
+  const normalizedName = String(fileName || "").trim();
+  if (
+    !normalizedName ||
+    path.basename(normalizedName) !== normalizedName ||
+    /[\\/\0\r\n]/.test(normalizedName)
+  ) {
+    throw new Error("file_name muss ein einfacher Dateiname ohne Pfadsegmente oder Steuerzeichen sein.");
+  }
+  if (!/\.csv$/i.test(normalizedName)) {
+    throw new Error("google_drive_upload_csv_to_agent_folder akzeptiert nur Dateinamen mit .csv-Endung.");
+  }
+
+  const hasText = contentText !== undefined;
+  const hasBase64 = contentBase64 !== undefined;
+  if (hasText === hasBase64) {
+    throw new Error("Genau eines von content_text oder content_base64 ist erforderlich.");
+  }
+
+  let bytes;
+  let contentMode;
+  if (hasText) {
+    bytes = Buffer.from(String(contentText), "utf8");
+    contentMode = "utf8_text";
+  } else {
+    const compactBase64 = String(contentBase64 || "").replace(/\s+/g, "");
+    const validBase64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      compactBase64
+    );
+    if (!validBase64) {
+      throw new Error("content_base64 ist kein gueltiger Base64-Payload.");
+    }
+    bytes = Buffer.from(compactBase64, "base64");
+    contentMode = "base64_bytes";
+  }
+
+  if (!bytes.length) {
+    throw new Error("Der CSV-Payload darf nicht leer sein.");
+  }
+  if (bytes.length > GOOGLE_AGENT_UPLOAD_MAX_BYTES) {
+    throw new Error(
+      `Der CSV-Payload ist zu gross (${bytes.length} Bytes; Limit ${GOOGLE_AGENT_UPLOAD_MAX_BYTES} Bytes).`
+    );
+  }
+
+  const normalizedExpectedSha256 = String(expectedSha256 || "").trim().toLowerCase();
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  if (sha256 !== normalizedExpectedSha256) {
+    throw new Error(`SHA-256 stimmt nicht: erwartet ${normalizedExpectedSha256}, berechnet ${sha256}.`);
+  }
+
+  return {
+    fileName: normalizedName,
+    bytes,
+    byteLength: bytes.length,
+    contentMode,
+    sha256,
+    md5: createHash("md5").update(bytes).digest("hex")
+  };
+}
+
+async function findAgentDriveCsvUploadDuplicate({ folderId, fileName, sha256 }, googleContext = {}) {
+  const query =
+    `'${escapeGoogleDriveQueryString(folderId)}' in parents and trashed = false and ` +
+    `name = '${escapeGoogleDriveQueryString(fileName)}' and ` +
+    `appProperties has { key='vip_sha256' and value='${escapeGoogleDriveQueryString(sha256)}' }`;
+  const res = await googleRequest(
+    {
+      method: "GET",
+      url: "https://www.googleapis.com/drive/v3/files",
+      params: {
+        q: query,
+        pageSize: 5,
+        fields:
+          "files(id,name,mimeType,size,md5Checksum,parents,webViewLink,webContentLink,appProperties,createdTime,modifiedTime)",
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
+      }
+    },
+    googleContext
+  );
+  return res.data.files || [];
+}
+
+function verifyAgentDriveCsvUpload(file, { targetFolderId, fileName, byteLength, sha256, md5 }) {
+  const checks = {
+    parent_matches: Boolean(file?.parents?.includes(targetFolderId)),
+    name_matches: file?.name === fileName,
+    mime_type_matches: file?.mimeType === "text/csv",
+    byte_length_matches: Number(file?.size) === byteLength,
+    sha256_property_matches: file?.appProperties?.vip_sha256 === sha256,
+    md5_matches: file?.md5Checksum === md5
+  };
+  return {
+    checks,
+    verification_status: Object.values(checks).every(Boolean) ? "verified" : "readback_mismatch"
+  };
 }
 
 const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
@@ -17091,6 +17194,152 @@ function createServer() {
         agent_id,
         ...summary,
         token_check
+      });
+    }
+  );
+
+  server.tool(
+    "google_drive_upload_csv_to_agent_folder",
+    "Laedt einen kleinen CSV-Payload aus Text oder Base64 in den erlaubten Google-Drive-Agentenordner. Base64 erhaelt Nicht-UTF-8-Bytes verlustfrei. Pflicht-SHA-256, Asana-/Direct-Codex-Freigabe, Hash-Dedupe und Drive-Readback verhindern falsche oder doppelte Uploads. Akzeptiert aus Sicherheitsgruenden keinen lokalen Serverpfad.",
+    {
+      agent_id: agentIdSchema,
+      file_name: z.string().min(1).max(240),
+      mime_type: z.literal("text/csv").optional().default("text/csv"),
+      content_text: z.string().max(GOOGLE_AGENT_UPLOAD_MAX_BYTES).optional(),
+      content_base64: z.string().max(Math.ceil((GOOGLE_AGENT_UPLOAD_MAX_BYTES * 4) / 3) + 16).optional(),
+      expected_sha256: z.string().regex(/^[a-f0-9]{64}$/i),
+      target_folder_id: z.string().optional().default(GOOGLE_AGENT_FOLDER_ID),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional(),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_IDEMPOTENT_SAFE_WRITE,
+    async ({
+      agent_id,
+      file_name,
+      mime_type,
+      content_text,
+      content_base64,
+      expected_sha256,
+      target_folder_id,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      authorization,
+      verify_after
+    }) => {
+      if (asana_task_gid) validateAsanaGid(asana_task_gid, "asana_task_gid");
+      const googleContext = { agent_id };
+      await assertAllowedGoogleFolder(target_folder_id, googleContext);
+      const payload = decodeAgentDriveCsvUpload({
+        fileName: file_name,
+        contentText: content_text,
+        contentBase64: content_base64,
+        expectedSha256: expected_sha256
+      });
+
+      const plan = {
+        file_name: payload.fileName,
+        mime_type,
+        target_folder_id,
+        byte_length: payload.byteLength,
+        content_mode: payload.contentMode,
+        sha256: payload.sha256,
+        duplicate_policy: "same target folder + file name + sha256 returns the verified existing Drive file"
+      };
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          ...plan,
+          requires_for_live: [
+            "dry_run=false",
+            "verifizierter Asana-Auftrag oder authorization.source=direct_codex aus aktuellem Moritz-Auftrag"
+          ]
+        });
+      }
+
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "google_drive_upload_csv_to_agent_folder"
+      });
+      const duplicates = await findAgentDriveCsvUploadDuplicate(
+        {
+          folderId: target_folder_id,
+          fileName: payload.fileName,
+          sha256: payload.sha256
+        },
+        googleContext
+      );
+      if (duplicates.length) {
+        const existingFile = duplicates[0];
+        const verification = verifyAgentDriveCsvUpload(existingFile, {
+          targetFolderId: target_folder_id,
+          fileName: payload.fileName,
+          byteLength: payload.byteLength,
+          sha256: payload.sha256,
+          md5: payload.md5
+        });
+        return out({
+          agent_id,
+          dry_run: false,
+          asana_task_gid,
+          authorization: authorizationReceipt,
+          ...plan,
+          upload_status: "deduplicated_existing",
+          duplicate_count: duplicates.length,
+          uploaded_file: existingFile,
+          verified_file: existingFile,
+          ...verification
+        });
+      }
+
+      const appProperties = {
+        vip_sha256: payload.sha256,
+        vip_source: "agent_csv_payload",
+        vip_agent_id: agent_id,
+        ...(asana_task_gid ? { vip_asana_task_gid: asana_task_gid } : {})
+      };
+      const uploadedFile = await uploadBufferToDrive({
+        name: payload.fileName,
+        mimeType: mime_type,
+        targetFolderId: target_folder_id,
+        bytes: payload.bytes,
+        appProperties,
+        googleContext
+      });
+      const verifiedFile = verify_after
+        ? await getDriveFile(
+            uploadedFile.id,
+            "id,name,mimeType,size,md5Checksum,parents,webViewLink,webContentLink,appProperties,createdTime,modifiedTime",
+            googleContext
+          )
+        : uploadedFile;
+      const verification = verify_after
+        ? verifyAgentDriveCsvUpload(verifiedFile, {
+            targetFolderId: target_folder_id,
+            fileName: payload.fileName,
+            byteLength: payload.byteLength,
+            sha256: payload.sha256,
+            md5: payload.md5
+          })
+        : { checks: null, verification_status: "not_requested" };
+
+      return out({
+        agent_id,
+        dry_run: false,
+        asana_task_gid,
+        authorization: authorizationReceipt,
+        ...plan,
+        upload_status: "uploaded",
+        uploaded_file: uploadedFile,
+        verified_file: verifiedFile,
+        ...verification
       });
     }
   );

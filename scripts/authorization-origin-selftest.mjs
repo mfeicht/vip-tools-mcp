@@ -50,6 +50,7 @@ try {
     "dataforseo_google_keyword_ideas",
     "dataforseo_google_search_volume",
     "dataforseo_google_keyword_research",
+    "google_drive_upload_csv_to_agent_folder",
     "google_drive_copy_file_to_agent_folder",
     "google_sheets_update_range",
     "rs_redaktionsplan_update_row",
