@@ -6,18 +6,27 @@ const resolverStart = source.indexOf('server.tool(\n    "accounting_drive_resolv
 const resolverEnd = source.indexOf('server.tool(\n    "accounting_drive_pdf_invoice_totals"', resolverStart);
 const start = source.indexOf('server.tool(\n    "accounting_drive_pdf_invoice_ocr_totals"');
 const end = source.indexOf('server.tool(\n    "accounting_drive_invoice_metadata_delta"', start);
+const metadataEnd = source.indexOf('server.tool(\n    "accounting_mail_scan_upload_attachment"', end);
 
 assert.notEqual(resolverStart, -1, "accounting month-folder resolver is missing");
 assert.notEqual(resolverEnd, -1, "accounting month-folder resolver boundary is missing");
 assert.notEqual(start, -1, "accounting OCR fallback tool is missing");
 assert.notEqual(end, -1, "accounting OCR fallback tool boundary is missing");
+assert.notEqual(metadataEnd, -1, "accounting metadata-delta boundary is missing");
+assert.match(
+  source,
+  /const accountingReadAgentIdSchema = z\s*\.enum\(\["vip-ai-accounting", "vip-ai-operations"\]\)/
+);
 
 const resolverBlock = source.slice(resolverStart, resolverEnd);
+const totalsBlock = source.slice(resolverEnd, start);
 assert.match(resolverBlock, /TOOL_READ_ONLY/);
 assert.match(resolverBlock, /assertAllowedAccountingFolder\(parent_folder_id/);
 assert.match(resolverBlock, /resolution_status/);
 assert.match(resolverBlock, /matches\.length === 1/);
 assert.match(resolverBlock, /keine Monatsdateien verarbeiten/);
+assert.match(resolverBlock, /agent_id: accountingReadAgentIdSchema/);
+assert.match(totalsBlock, /agent_id: accountingReadAgentIdSchema/);
 
 const toolBlock = source.slice(start, end);
 assert.match(toolBlock, /TOOL_SAFE_WRITE/);
@@ -43,5 +52,9 @@ assert.match(source, /selected\.invoice_character === true/);
 assert.match(source, /selected\.supplier_confidence === "high"/);
 assert.match(source, /selected\.currency_code === "EUR"/);
 assert.match(source, /selected\.multiple_documents !== true/);
+assert.match(toolBlock, /agent_id: accountingReadAgentIdSchema/);
+
+const metadataBlock = source.slice(end, metadataEnd);
+assert.match(metadataBlock, /agent_id: accountingReadAgentIdSchema/);
 
 console.log("accounting OCR contract self-test passed");

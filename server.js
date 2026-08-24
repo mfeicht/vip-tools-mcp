@@ -106,6 +106,10 @@ const ASANA_TOKEN_ENVS = {
 };
 
 const agentIdSchema = z.enum(Object.keys(ASANA_TOKEN_ENVS)).optional().default(DEFAULT_AGENT_ID);
+const accountingReadAgentIdSchema = z
+  .enum(["vip-ai-accounting", "vip-ai-operations"])
+  .optional()
+  .default("vip-ai-accounting");
 const VIP_DASHBOARD_AGENT_NAMES = {
   "vip-ai-operations": ["VIP AI-Operations", "Operations"],
   "vip-ai-content": ["VIP AI-Content", "Content"],
@@ -13522,7 +13526,7 @@ function createServer() {
     "accounting_drive_resolve_month_folder",
     "Accounting-Ordnerresolver: listet ausschliesslich direkte Unterordner eines freigegebenen Accounting-Drive-Ordners und markiert den eindeutigen Monatsordner read-only. Keine Dateien oder Beleginhalte werden gelesen.",
     {
-      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      agent_id: accountingReadAgentIdSchema,
       parent_folder_id: z.string(),
       expected_month_key: z.string().regex(/^\d{2}\/\d{2}$/),
       max_folders: z.number().int().positive().max(100).optional().default(100)
@@ -13574,7 +13578,7 @@ function createServer() {
     "accounting_drive_pdf_invoice_totals",
     "Accounting-Spezialpfad: liest PDF-Rechnungen in einem freigegebenen Accounting-Drive-Ordner read-only, extrahiert nur Netto/MwSt./Brutto und gibt keine vollstaendigen Rechnungstexte aus.",
     {
-      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      agent_id: accountingReadAgentIdSchema,
       folder_id: z.string(),
       expected_month_key: z.string().regex(/^\d{2}\/\d{2}$/).optional(),
       max_files: z.number().int().positive().max(300).optional().default(200),
@@ -13698,7 +13702,7 @@ function createServer() {
     "accounting_drive_pdf_invoice_ocr_totals",
     "Accounting-OCR-Fallback: konvertiert ausschliesslich freigegebene Rechnungs-PDFs kurzzeitig serverseitig per Google Drive OCR, loescht jedes markierte Zwischen-Dokument sofort wieder und gibt nur enge Extraktions-/QS-Daten ohne Rechnungsvolltext aus.",
     {
-      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      agent_id: accountingReadAgentIdSchema,
       folder_id: z.string(),
       file_ids: z.array(z.string()).max(20).optional().default([]),
       expected_month_key: z.string().regex(/^\d{2}\/\d{2}$/).optional(),
@@ -13937,7 +13941,7 @@ function createServer() {
     "accounting_drive_invoice_metadata_delta",
     "Accounting-Spezialpfad: prueft freigegebene Accounting-Drive-Ordner read-only und leichtgewichtig nur per Dateimetadaten auf neue, geaenderte oder fehlende Rechnungs-PDFs/Bilder. Laedt keine Dateien herunter.",
     {
-      agent_id: z.literal("vip-ai-accounting").optional().default("vip-ai-accounting"),
+      agent_id: accountingReadAgentIdSchema,
       folders: z
         .array(
           z.object({
