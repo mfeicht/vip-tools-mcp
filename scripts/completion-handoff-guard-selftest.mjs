@@ -11,6 +11,13 @@ const closedEvidenceStory = {
   created_by: { gid: "1214979008788676" },
   text: "Ergebnis\nEvidenz / Verifikation\nAlle Readbacks sind ok."
 };
+const openEvidenceStory = {
+  gid: "1217000000000002",
+  created_at: "2026-08-23T07:00:00.000Z",
+  created_by: { gid: "1214979008788676" },
+  text:
+    "Status\nEvidenz / Verifikation\nDer Zwischenstand ist belegt.\nOffene Evidenzluecken\nDeployment fehlt."
+};
 
 assert.deepEqual(
   inspectRoutineMaterialCommentIdempotency({
@@ -34,6 +41,27 @@ assert.equal(
     supersedesStoryGid: "1217000000000999"
   }).allowed,
   false
+);
+assert.deepEqual(
+  inspectRoutineMaterialCommentIdempotency({
+    stories: [openEvidenceStory],
+    agentUserGid: "1214979008788676",
+    supersedesStoryGid: openEvidenceStory.gid
+  }),
+  {
+    status: "allowed_explicit_correction",
+    allowed: true,
+    prior_material_story_gids: [],
+    supersedes_story_gid: openEvidenceStory.gid
+  }
+);
+assert.equal(
+  inspectRoutineMaterialCommentIdempotency({
+    stories: [openEvidenceStory, closedEvidenceStory],
+    agentUserGid: "1214979008788676",
+    supersedesStoryGid: openEvidenceStory.gid
+  }).allowed,
+  true
 );
 assert.equal(
   inspectRoutineMaterialCommentIdempotency({
