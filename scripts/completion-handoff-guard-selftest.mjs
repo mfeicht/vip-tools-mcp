@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import {
   detectRoutineFollowUpSignals,
   inspectRoutineMaterialCommentIdempotency,
-  validateRoutineFollowUpTaskContract
+  validateRoutineFollowUpTaskContract,
+  validateRoutineVisibleFollowUpStatus
 } from "../lib/asana-completion-guard.js";
 
 const closedEvidenceStory = {
@@ -101,6 +102,30 @@ const noFollowUpSignal = detectRoutineFollowUpSignals({
 assert.equal(noFollowUpSignal.no_follow_up_claim, true);
 assert.equal(noFollowUpSignal.blocked_without_follow_up_task, false);
 
+assert.deepEqual(
+  validateRoutineVisibleFollowUpStatus({
+    finalComment: { text: "Evidenz / Verifikation\nAlle Readbacks sind gruen." },
+    hasFollowUpTask: false
+  }).issues,
+  ["final_comment_missing_visible_no_follow_up_status"]
+);
+assert.equal(
+  validateRoutineVisibleFollowUpStatus({
+    finalComment: {
+      text: "Follow-up-Status\nKeine weitere Folgeaufgabe erforderlich; es bleibt keine Nacharbeit offen."
+    },
+    hasFollowUpTask: false
+  }).ok,
+  true
+);
+assert.equal(
+  validateRoutineVisibleFollowUpStatus({
+    finalComment: { text: "Follow-up https://app.asana.com/0/0/1217000000000300" },
+    hasFollowUpTask: true
+  }).mode,
+  "follow_up_task_readback"
+);
+
 const sourceTask = {
   gid: "1217000000000100",
   memberships: [{ project: { gid: "1217000000000200", name: "(VIP) AI-Buero" } }]
@@ -146,6 +171,7 @@ console.log(
   JSON.stringify({
     routine_material_comment_idempotency: "ok",
     routine_existing_task_coverage_detection: "ok",
+    routine_visible_follow_up_status: "ok",
     routine_follow_up_readback_contract: "ok"
   })
 );

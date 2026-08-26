@@ -33,7 +33,8 @@ import {
 import {
   detectRoutineFollowUpSignals,
   inspectRoutineMaterialCommentIdempotency,
-  validateRoutineFollowUpTaskContract
+  validateRoutineFollowUpTaskContract,
+  validateRoutineVisibleFollowUpStatus
 } from "./lib/asana-completion-guard.js";
 import {
   extractAccountingInvoice as extractAccountingInvoiceV2,
@@ -11740,7 +11741,7 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Behauptete Abdeckung durch bestehende Routinen braucht eine konkrete offene Follow-up-Aufgabe; deren Link/GID, Assignee, Status=Todo und Faelligkeit muessen im finalen Kommentar readback-dokumentiert sein. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden vorab ausschliesslich per problemgebundener Asana-Mention adressiert.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Behauptete Abdeckung durch bestehende Routinen braucht eine konkrete offene Follow-up-Aufgabe; deren Link/GID, Assignee, Status=Todo und Faelligkeit muessen im finalen Kommentar readback-dokumentiert sein. Wenn keine Folgeaufgabe noetig ist, muss dieser Status zusaetzlich zur Tool-Basis sichtbar im finalen Kommentar stehen. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden vorab ausschliesslich per problemgebundener Asana-Mention adressiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -11878,6 +11879,14 @@ function createServer() {
           "Routine-Abschluss blockiert: Der finale Kommentar oder die Abschlussbasis enthaelt eine echte Mention oder aktive Folgearbeits-Signale, aber follow_up_task_gid fehlt. Lege zuerst eine Follow-up-Aufgabe mit asana_create_task an und uebergib deren GID. Reine FYI-Kommentare ohne Nacharbeit duerfen keine unnoetige Mention enthalten und brauchen eine konkrete follow_up_not_required_basis."
         );
       }
+      const routine_visible_follow_up_status = routine_like_task
+        ? validateRoutineVisibleFollowUpStatus({ finalComment: final_comment, hasFollowUpTask })
+        : { ok: true, issues: [], mode: "not_applicable" };
+      if (!routine_visible_follow_up_status.ok) {
+        throw new Error(
+          "Routine-Abschluss blockiert: follow_up_not_required_basis ist nur interne Tool-Evidenz. Der finale Asana-Kommentar muss sichtbar festhalten, dass keine weitere Folgeaufgabe oder Nacharbeit noetig ist."
+        );
+      }
 
       let follow_up_task = null;
       let follow_up_contract = null;
@@ -11943,6 +11952,7 @@ function createServer() {
           follow_up_contract,
           follow_up_not_required_basis: hasFollowUpTask ? null : trimmedFollowUpNotRequiredBasis || null,
           routine_follow_up_signal_check,
+          routine_visible_follow_up_status,
           routine_like_task,
           due_gate,
           task,
@@ -12018,6 +12028,7 @@ function createServer() {
         follow_up_contract,
         follow_up_not_required_basis: hasFollowUpTask ? null : trimmedFollowUpNotRequiredBasis || null,
         routine_follow_up_signal_check,
+        routine_visible_follow_up_status,
         routine_like_task,
         due_gate,
         completion_basis,
