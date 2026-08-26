@@ -16,6 +16,10 @@ const checks = {
     source.includes("asana_create_task_observer_gate") &&
     source.includes("authorization_story_mentions_agent") &&
     source.includes("Beobachter-Gate: Der Agent ist in der Ausgangsaufgabe weder Assignee noch Creator"),
+  observer_comment_gate:
+    source.includes("asana_comment_observer_gate") &&
+    source.includes("observer_comment_reason") &&
+    source.includes("Reiner Follower-/Beteiligtenstatus ist read-only"),
   governance_scope_is_bounded:
     source.includes("ASANA_GOVERNANCE_AGENT_IDS") &&
     source.includes("isGovernanceTaskCreationIntent"),

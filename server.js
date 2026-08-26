@@ -37,6 +37,10 @@ import {
   validateRoutineVisibleFollowUpStatus
 } from "./lib/asana-completion-guard.js";
 import {
+  classifyAsanaCommentAuthority,
+  validateAsanaObserverCommentIntent
+} from "./lib/asana-observer-guard.js";
+import {
   extractAccountingInvoice as extractAccountingInvoiceV2,
   getNormalizedAccountingInvoiceLines as getNormalizedAccountingInvoiceLinesV2
 } from "./lib/accounting-invoice-parser.js";
@@ -11220,7 +11224,7 @@ function createServer() {
 
   server.tool(
     "asana_comment",
-    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. In Routinen ist der erste geschlossene Ergebnis-/Handoff-/Abschlusskommentar kanonisch; weitere materiale Kommentare werden ohne explizite supersedes_story_gid als Duplikat blockiert. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene Ergebnis-/Handoff-/Abschlusskommentar kanonisch; weitere materiale Kommentare werden ohne explizite supersedes_story_gid als Duplikat blockiert. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -11254,6 +11258,11 @@ function createServer() {
         .optional(),
       keep_routine_observer_subscription: z.boolean().optional().default(false),
       keep_routine_observer_basis: z.string().min(20).optional(),
+      observer_comment_reason: z
+        .enum(["explicit_instruction", "direct_codex", "critical_anomaly", "governance_scope"])
+        .optional(),
+      observer_comment_basis: z.string().min(20).optional(),
+      authorization: actionAuthorizationSchema.optional(),
       supersedes_story_gid: z.string().optional(),
       effort_note: z.string().optional(),
       dry_run: z.boolean().optional().default(false),
@@ -11272,6 +11281,9 @@ function createServer() {
       routine_supervisor_mention_reason,
       keep_routine_observer_subscription,
       keep_routine_observer_basis,
+      observer_comment_reason,
+      observer_comment_basis,
+      authorization,
       supersedes_story_gid,
       effort_note,
       dry_run,
@@ -11310,6 +11322,10 @@ function createServer() {
             status: "not_evaluated_dry_run",
             reason: "Kein Live-Task-Readback fuer reinen Kommentar-Dry-Run."
           },
+          observer_comment_gate: {
+            applicable: null,
+            status: "not_evaluated_dry_run"
+          },
           routine_material_comment_idempotency: {
             applicable: null,
             status: "not_evaluated_dry_run"
@@ -11333,11 +11349,47 @@ function createServer() {
       ]);
       const commentTask = commentTaskRes.data.data;
       const commentAgentUser = commentMeRes.data.data;
+      const commentAuthority = classifyAsanaCommentAuthority({
+        task: commentTask,
+        agentUserGid: commentAgentUser.gid
+      });
+      let observerAuthorizationReceipt = null;
+      if (
+        commentAuthority.observer_only &&
+        ["explicit_instruction", "direct_codex"].includes(observer_comment_reason)
+      ) {
+        if (!authorization) {
+          throw new Error(
+            "Beobachter-Kommentar-Gate: explicit_instruction/direct_codex braucht einen verifizierbaren authorization-Block."
+          );
+        }
+        observerAuthorizationReceipt = await assertActionAuthorized({
+          agentId: agent_id,
+          authorization,
+          confirmedByAsana: authorization.source === "asana",
+          asanaTaskGid: authorization.source === "asana" ? task_gid : undefined,
+          actionName: "asana_comment_observer_gate"
+        });
+      }
+      const observer_comment_gate = validateAsanaObserverCommentIntent({
+        authority: commentAuthority,
+        reason: observer_comment_reason,
+        basis: observer_comment_basis,
+        authorizationReceipt: observerAuthorizationReceipt,
+        evidence,
+        commentText: [greeting, JSON.stringify(sections || []), evidence?.summary]
+          .filter(Boolean)
+          .join(" "),
+        governanceAgent: ASANA_GOVERNANCE_AGENT_IDS.has(String(agent_id || ""))
+      });
+      if (!observer_comment_gate.allowed) {
+        throw new Error(
+          `Beobachter-Kommentar-Gate blockiert (${observer_comment_gate.status}): Reiner Follower-/Beteiligtenstatus ist read-only. Ohne aktuelle ausdrueckliche GID-Mention/Anweisung, direkte Moritz-Anweisung, belegte kritische Anomalie oder dokumentierten Governance-Scope keinen Kommentar, Reminder, Handoff oder Arbeitsauftrag posten.`
+        );
+      }
       const routineCommentTask = isRoutineLikeAsanaTask(commentTask);
       const temporaryRoutineObserver =
-        routineCommentTask &&
-        String(commentTask.assignee?.gid || "") !== String(commentAgentUser.gid) &&
-        String(commentTask.created_by?.gid || "") !== String(commentAgentUser.gid);
+        routineCommentTask && commentAuthority.observer_only;
       if (keep_routine_observer_subscription && !temporaryRoutineObserver) {
         throw new Error(
           "keep_routine_observer_subscription ist nur fuer eine temporaere Nebenrolle in einer fremden Routine zulaessig."
@@ -11488,6 +11540,8 @@ function createServer() {
           evidence_sha256: preparedEvidence.evidence_sha256,
           routine_supervisor_mention_gate,
           routine_observer_gate,
+          observer_comment_gate,
+          observer_authorization: observerAuthorizationReceipt,
           routine_material_comment_idempotency,
           html_text,
           html_bytes: Buffer.byteLength(html_text, "utf8"),
@@ -11563,6 +11617,8 @@ function createServer() {
         evidence_sha256: preparedEvidence.evidence_sha256,
         routine_supervisor_mention_gate,
         routine_observer_gate,
+        observer_comment_gate,
+        observer_authorization: observerAuthorizationReceipt,
         routine_material_comment_idempotency,
         observer_leave_result,
         observer_leave_error,

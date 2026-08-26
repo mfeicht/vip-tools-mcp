@@ -10,6 +10,7 @@
     "test:evidence-gate": "node scripts/evidence-gate-selftest.mjs",
     "test:authorization-origin": "node scripts/authorization-origin-selftest.mjs",
     "test:asana-governance-gates": "node scripts/asana-governance-gate-selftest.mjs",
+    "test:asana-observer-comment-guard": "node scripts/asana-observer-comment-guard-selftest.mjs",
     "test:completion-handoff-guard": "node scripts/completion-handoff-guard-selftest.mjs",
     "test:imap-window": "node scripts/imap-window-selftest.mjs",
     "test:email-action-self-bcc": "node scripts/email-action-self-bcc-selftest.mjs",
