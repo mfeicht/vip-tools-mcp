@@ -102,6 +102,29 @@ const noFollowUpSignal = detectRoutineFollowUpSignals({
 assert.equal(noFollowUpSignal.no_follow_up_claim, true);
 assert.equal(noFollowUpSignal.blocked_without_follow_up_task, false);
 
+const financeNoFollowUpSignal = detectRoutineFollowUpSignals({
+  finalComment: {
+    text:
+      "Follow-up: keines erforderlich, weil kein neuer eigenstaendiger Arbeitsgegenstand entstanden ist.\n" +
+      "Verifiziert: Finance ist Assignee und Creator; Routine-Tag und Projekt sind vorhanden.\n" +
+      "Quelle/Readback: Asana-Task-Readback 1217842217630584."
+  },
+  completionBasis: "Der definierte Instanzscope ist vollstaendig abgeschlossen.",
+  followUpNotRequiredBasis:
+    "Kein Follow-up erforderlich, weil evidence.unresolved=[] und kein eigenstaendiger Arbeitsgegenstand entstanden ist."
+});
+assert.equal(financeNoFollowUpSignal.no_follow_up_claim, true);
+assert.equal(financeNoFollowUpSignal.has_existing_task_coverage_claim, false);
+assert.equal(financeNoFollowUpSignal.blocked_without_follow_up_task, false);
+
+const explicitCoverageSignal = detectRoutineFollowUpSignals({
+  finalComment: { text: "Die naechste Routine uebernimmt die weitere Bearbeitung.", html_text: "" },
+  completionBasis: "Der Scope dieser Instanz ist abgeschlossen.",
+  followUpNotRequiredBasis: "Keine weitere Folgeaufgabe erforderlich."
+});
+assert.equal(explicitCoverageSignal.has_existing_task_coverage_claim, true);
+assert.equal(explicitCoverageSignal.blocked_without_follow_up_task, true);
+
 assert.deepEqual(
   validateRoutineVisibleFollowUpStatus({
     finalComment: { text: "Evidenz / Verifikation\nAlle Readbacks sind gruen." },
@@ -171,6 +194,7 @@ console.log(
   JSON.stringify({
     routine_material_comment_idempotency: "ok",
     routine_existing_task_coverage_detection: "ok",
+    finance_no_follow_up_phrase_detection: "ok",
     routine_visible_follow_up_status: "ok",
     routine_follow_up_readback_contract: "ok"
   })

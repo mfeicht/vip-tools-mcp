@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -9,6 +10,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..");
 const BetriebDir = path.join(repoRoot, "VIP-AI-Memory", "03-Betrieb");
 const statePath = path.join(BetriebDir, "Watcher-State.json");
+const stateLastGoodPath = path.join(BetriebDir, "Watcher-State.last-good.json");
+const watcherLockPath = path.join(BetriebDir, "Watcher-State.lock");
 const queuePath = path.join(BetriebDir, "Watcher-Queue.jsonl");
 const logPath = path.join(BetriebDir, "Watcher-Log.md");
 const healthPath = path.join(BetriebDir, "Watcher-Health.json");
@@ -30,6 +33,12 @@ const WATCHER_RATE_LIMIT_COOLDOWN_MS = Number.parseInt(
   process.env.WATCHER_RATE_LIMIT_COOLDOWN_MS || "60000",
   10
 );
+const WATCHER_LOCK_STALE_MS = Number.parseInt(
+  process.env.WATCHER_LOCK_STALE_MS || String(45 * 60 * 1000),
+  10
+);
+
+let activeWatcherLock = null;
 
 function parseArgs(argv) {
   const opts = {
@@ -216,6 +225,125 @@ async function readJsonOrDefault(filePath, fallback) {
   } catch (error) {
     if (error?.code === "ENOENT") return fallback;
     throw error;
+  }
+}
+
+function isValidWatcherState(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    value.agents &&
+    typeof value.agents === "object" &&
+    value.emitted_signals &&
+    typeof value.emitted_signals === "object"
+  );
+}
+
+async function atomicWriteFile(filePath, contents) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  let handle;
+  try {
+    handle = await fs.open(tempPath, "wx", 0o600);
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.rename(tempPath, filePath);
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await fs.unlink(tempPath).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+  }
+}
+
+async function atomicWriteJson(filePath, value) {
+  await atomicWriteFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function readWatcherState({ primaryPath = statePath, lastGoodPath = stateLastGoodPath } = {}) {
+  let primaryError = null;
+  try {
+    const primary = await readJsonOrDefault(primaryPath, null);
+    if (primary === null) throw Object.assign(new Error("watcher_state_missing"), { code: "ENOENT" });
+    if (!isValidWatcherState(primary)) throw new Error("watcher_state_schema_invalid");
+    return { state: primary, source: "primary", recovered: false, baseline_required: false };
+  } catch (error) {
+    primaryError = error;
+  }
+
+  try {
+    const lastGood = await readJsonOrDefault(lastGoodPath, null);
+    if (lastGood === null) throw Object.assign(new Error("watcher_last_good_missing"), { code: "ENOENT" });
+    if (!isValidWatcherState(lastGood)) throw new Error("watcher_last_good_schema_invalid");
+    return {
+      state: lastGood,
+      source: "last_good",
+      recovered: true,
+      baseline_required: false,
+      primary_error: primaryError?.message || String(primaryError)
+    };
+  } catch (lastGoodError) {
+    return {
+      state: createEmptyState(),
+      source: "reconstructed_baseline",
+      recovered: true,
+      baseline_required: true,
+      primary_error: primaryError?.message || String(primaryError),
+      last_good_error: lastGoodError?.message || String(lastGoodError)
+    };
+  }
+}
+
+async function acquireWatcherRunLock(lockPath = watcherLockPath) {
+  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  const token = crypto.randomUUID();
+  const payload = {
+    token,
+    pid: process.pid,
+    acquired_at: nowIso()
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let handle;
+    try {
+      handle = await fs.open(lockPath, "wx", 0o600);
+      await handle.writeFile(`${JSON.stringify(payload)}\n`, "utf8");
+      await handle.sync();
+      return { handle, lockPath, token };
+    } catch (error) {
+      if (handle) {
+        await handle.close().catch(() => {});
+        await fs.unlink(lockPath).catch((unlinkError) => {
+          if (unlinkError?.code !== "ENOENT") throw unlinkError;
+        });
+      }
+      if (error?.code !== "EEXIST") throw error;
+      const stat = await fs.stat(lockPath).catch(() => null);
+      const stale = stat && Date.now() - stat.mtimeMs > WATCHER_LOCK_STALE_MS;
+      if (!stale || attempt === 2) {
+        const lockError = new Error("watcher_run_locked");
+        lockError.code = "WATCHER_LOCKED";
+        throw lockError;
+      }
+      await fs.unlink(lockPath).catch((unlinkError) => {
+        if (unlinkError?.code !== "ENOENT") throw unlinkError;
+      });
+    }
+  }
+  throw new Error("watcher_lock_acquire_failed");
+}
+
+async function releaseWatcherRunLock(lock) {
+  if (!lock) return;
+  await lock.handle.close().catch(() => {});
+  const current = await fs.readFile(lock.lockPath, "utf8").catch(() => "");
+  if (current.includes(lock.token)) {
+    await fs.unlink(lock.lockPath).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
   }
 }
 
@@ -548,7 +676,7 @@ async function run() {
     ];
     const result = coalesceSignalsByTask(sample);
     const taskOne = result.find((signal) => signal.task_gid === "1");
-    const passed =
+    const signalChecksPassed =
       result.length === 2 &&
       taskOne?.signal_type === "overdue" &&
       taskOne?.coalesced_signal_count === 3 &&
@@ -558,12 +686,63 @@ async function run() {
       looksLikeRoutineTask({ name: "R: Test" }) &&
       hasRoutineTag({ tags: [{ name: "Routine" }] }) &&
       !hasRoutineTag({ tags: [] });
-    console.log(JSON.stringify({ passed, result }));
+    const selfTestDir = await fs.mkdtemp(path.join(os.tmpdir(), "vip-asana-watcher-selftest-"));
+    let persistenceChecksPassed = false;
+    try {
+      const primary = path.join(selfTestDir, "state.json");
+      const lastGood = path.join(selfTestDir, "state.last-good.json");
+      const lockPath = path.join(selfTestDir, "state.lock");
+      const validState = createEmptyState();
+      validState.updated_at = "2026-08-27T10:00:00.000Z";
+
+      await atomicWriteJson(primary, validState);
+      const primaryReadback = await readWatcherState({ primaryPath: primary, lastGoodPath: lastGood });
+
+      await atomicWriteJson(lastGood, validState);
+      await fs.writeFile(primary, "{\n", "utf8");
+      const recoveredReadback = await readWatcherState({ primaryPath: primary, lastGoodPath: lastGood });
+
+      const firstLock = await acquireWatcherRunLock(lockPath);
+      let concurrentLockBlocked = false;
+      try {
+        await acquireWatcherRunLock(lockPath);
+      } catch (error) {
+        concurrentLockBlocked = error?.code === "WATCHER_LOCKED";
+      } finally {
+        await releaseWatcherRunLock(firstLock);
+      }
+
+      const tempFiles = (await fs.readdir(selfTestDir)).filter((name) => name.endsWith(".tmp"));
+      persistenceChecksPassed =
+        primaryReadback.source === "primary" &&
+        primaryReadback.state.updated_at === validState.updated_at &&
+        recoveredReadback.source === "last_good" &&
+        recoveredReadback.recovered === true &&
+        concurrentLockBlocked &&
+        tempFiles.length === 0;
+    } finally {
+      await fs.rm(selfTestDir, { recursive: true, force: true });
+    }
+
+    const passed = signalChecksPassed && persistenceChecksPassed;
+    console.log(JSON.stringify({ passed, signal_checks: signalChecksPassed, persistence_checks: persistenceChecksPassed, result }));
     if (!passed) process.exitCode = 1;
     return;
   }
+  try {
+    activeWatcherLock = await acquireWatcherRunLock();
+  } catch (error) {
+    if (error?.code === "WATCHER_LOCKED") {
+      console.error("[watcher] run skipped: another watcher instance holds the state lock");
+      console.log(JSON.stringify({ status: "skipped_locked", mode: opts.write ? "write" : "dry-run" }));
+      return;
+    }
+    throw error;
+  }
   const detectedAt = nowIso();
-  const state = await readJsonOrDefault(statePath, createEmptyState());
+  const stateReadback = await readWatcherState();
+  const state = stateReadback.state;
+  const effectiveBaseline = opts.baseline || stateReadback.baseline_required;
   let client;
   const connectClient = async () => {
     const nextClient = new Client({ name: "vip-asana-watcher", version: "0.1.0" });
@@ -579,7 +758,9 @@ async function run() {
   const summary = {
     detected_at: detectedAt,
     mode: opts.write ? "write" : "dry-run",
-    baseline: opts.baseline,
+    baseline: effectiveBaseline,
+    state_source: stateReadback.source,
+    state_recovered: stateReadback.recovered,
     agents_checked: 0,
     agents_succeeded: 0,
     agents_failed: 0,
@@ -663,8 +844,8 @@ async function run() {
 
         const freshRawSignals = sortSignals(candidateSignals).filter((signal) => !state.emitted_signals[signal.id]);
         const freshSignals = coalesceSignalsByTask(freshRawSignals);
-        const queuedSignals = opts.baseline ? [] : freshSignals.slice(0, opts.maxSignalsPerAgent);
-        const signalIdsToMarkSeen = opts.baseline
+        const queuedSignals = effectiveBaseline ? [] : freshSignals.slice(0, opts.maxSignalsPerAgent);
+        const signalIdsToMarkSeen = effectiveBaseline
           ? freshRawSignals.map((signal) => signal.id)
           : queuedSignals.flatMap((signal) => signal.related_signal_ids || [signal.id]);
 
@@ -703,7 +884,8 @@ async function run() {
 
     if (opts.write) {
       await fs.mkdir(BetriebDir, { recursive: true });
-      await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+      await atomicWriteJson(stateLastGoodPath, state);
+      await atomicWriteJson(statePath, state);
       if (allQueuedSignals.length > 0) {
         await fs.appendFile(queuePath, `${allQueuedSignals.map((signal) => JSON.stringify(signal)).join("\n")}\n`);
       }
@@ -713,34 +895,29 @@ async function run() {
     // A successful read-only dry-run is valid transport health evidence. Keep
     // business state/queue immutable, but refresh the local health snapshot.
     await fs.mkdir(BetriebDir, { recursive: true });
-    await fs.writeFile(
-      healthPath,
-      `${JSON.stringify(
-        {
-          generated_at: nowIso(),
-          status: summary.agents_failed > 0 ? "partial" : "ok",
-          mode: summary.mode,
-          detected_at: detectedAt,
-          agents_checked: summary.agents_checked,
-          agents_succeeded: summary.agents_succeeded,
-          agents_failed: summary.agents_failed,
-          tasks_checked: summary.tasks_checked,
-          overdue_tasks: summary.overdue_tasks,
-          due_today_tasks: summary.due_today_tasks,
-          due_later_today_tasks: summary.due_later_today_tasks,
-          due_tomorrow_tasks: summary.due_tomorrow_tasks,
-          future_tasks: summary.future_tasks,
-          tasks_without_due: summary.tasks_without_due,
-          routine_tasks: summary.routine_tasks,
-          routine_missing_tag: summary.routine_missing_tag,
-          raw_signals_found: summary.raw_signals_found,
-          signals_found: summary.signals_found,
-          signals_queued: summary.signals_queued
-        },
-        null,
-        2
-      )}\n`
-    );
+    await atomicWriteJson(healthPath, {
+      generated_at: nowIso(),
+      status: summary.agents_failed > 0 ? "partial" : "ok",
+      mode: summary.mode,
+      detected_at: detectedAt,
+      agents_checked: summary.agents_checked,
+      agents_succeeded: summary.agents_succeeded,
+      agents_failed: summary.agents_failed,
+      tasks_checked: summary.tasks_checked,
+      overdue_tasks: summary.overdue_tasks,
+      due_today_tasks: summary.due_today_tasks,
+      due_later_today_tasks: summary.due_later_today_tasks,
+      due_tomorrow_tasks: summary.due_tomorrow_tasks,
+      future_tasks: summary.future_tasks,
+      tasks_without_due: summary.tasks_without_due,
+      routine_tasks: summary.routine_tasks,
+      routine_missing_tag: summary.routine_missing_tag,
+      raw_signals_found: summary.raw_signals_found,
+      signals_found: summary.signals_found,
+      signals_queued: summary.signals_queued,
+      state_source: summary.state_source,
+      state_recovered: summary.state_recovered
+    });
 
     console.log(JSON.stringify({ summary, queued_signals: allQueuedSignals }, null, 2));
   } finally {
@@ -753,6 +930,8 @@ function renderLog(summary, signals) {
     `\n## ${summary.detected_at} - Asana Watcher`,
     "",
     `- mode: ${summary.mode}${summary.baseline ? " / baseline" : ""}`,
+    `- state_source: ${summary.state_source}`,
+    `- state_recovered: ${summary.state_recovered}`,
     `- agents_checked: ${summary.agents_checked}`,
     `- agents_succeeded: ${summary.agents_succeeded}`,
     `- agents_failed: ${summary.agents_failed}`,
@@ -792,34 +971,32 @@ function renderLog(summary, signals) {
   return `${lines.join("\n")}\n`;
 }
 
-run().catch(async (error) => {
-  console.error(error?.stack || error?.message || String(error));
-  await fs.mkdir(BetriebDir, { recursive: true }).catch(() => {});
-  await fs
-    .writeFile(
-      healthPath,
-      `${JSON.stringify(
-        {
-          generated_at: nowIso(),
-          status: "failed",
-          mode: process.argv.includes("--write") ? "write" : "dry-run",
-          error: error?.message || String(error)
-        },
-        null,
-        2
-      )}\n`
-    )
-    .catch(() => {});
-  if (process.argv.includes("--write")) {
-    await fs
-      .appendFile(
-        logPath,
-        `\n## ${nowIso()} - Asana Watcher Technical Failure\n\n- status: failed\n- error: ${truncate(
-          error?.message || String(error),
-          500
-        )}\n\n`
-      )
-      .catch(() => {});
-  }
-  process.exit(1);
-});
+run()
+  .catch(async (error) => {
+    console.error(error?.stack || error?.message || String(error));
+    await fs.mkdir(BetriebDir, { recursive: true }).catch(() => {});
+    await atomicWriteJson(healthPath, {
+      generated_at: nowIso(),
+      status: "failed",
+      mode: process.argv.includes("--write") ? "write" : "dry-run",
+      error: error?.message || String(error)
+    }).catch(() => {});
+    if (process.argv.includes("--write")) {
+      await fs
+        .appendFile(
+          logPath,
+          `\n## ${nowIso()} - Asana Watcher Technical Failure\n\n- status: failed\n- error: ${truncate(
+            error?.message || String(error),
+            500
+          )}\n\n`
+        )
+        .catch(() => {});
+    }
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await releaseWatcherRunLock(activeWatcherLock).catch((error) => {
+      console.error(`[watcher] failed to release state lock: ${error?.message || String(error)}`);
+      process.exitCode = 1;
+    });
+  });
