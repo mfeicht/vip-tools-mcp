@@ -102,6 +102,20 @@ const noFollowUpSignal = detectRoutineFollowUpSignals({
 assert.equal(noFollowUpSignal.no_follow_up_claim, true);
 assert.equal(noFollowUpSignal.blocked_without_follow_up_task, false);
 
+const coordinatedNoFollowUpSignal = detectRoutineFollowUpSignals({
+  finalComment: {
+    text:
+      "Der abgegrenzte 10:30-Lead-Routine-Scope ist vollständig erledigt. " +
+      "Keine weitere Folgeaufgabe oder Nacharbeit ist nötig, weil Sheet-Deduplizierung, Survivor-Readback und lokaler WordPress-Import bestätigt sind."
+  },
+  completionBasis: "Der abgegrenzte Routine-Scope ist vollständig abgeschlossen.",
+  followUpNotRequiredBasis:
+    "Keine weitere Folgeaufgabe oder Nacharbeit ist nötig, weil alle Readbacks geschlossen sind."
+});
+assert.equal(coordinatedNoFollowUpSignal.no_follow_up_claim, true);
+assert.equal(coordinatedNoFollowUpSignal.has_action_signal, true);
+assert.equal(coordinatedNoFollowUpSignal.blocked_without_follow_up_task, false);
+
 const financeNoFollowUpSignal = detectRoutineFollowUpSignals({
   finalComment: {
     text:
@@ -136,6 +150,15 @@ assert.equal(
   validateRoutineVisibleFollowUpStatus({
     finalComment: {
       text: "Follow-up-Status\nKeine weitere Folgeaufgabe erforderlich; es bleibt keine Nacharbeit offen."
+    },
+    hasFollowUpTask: false
+  }).ok,
+  true
+);
+assert.equal(
+  validateRoutineVisibleFollowUpStatus({
+    finalComment: {
+      text: "Keine weitere Folgeaufgabe oder Nacharbeit ist nötig, weil der Routine-Scope vollständig abgeschlossen ist."
     },
     hasFollowUpTask: false
   }).ok,
