@@ -6846,6 +6846,8 @@ async function sendEmailActionViaResend(config, plan) {
     type: "resend_http_mime_equivalent",
     provider: "resend",
     accepted: true,
+    submission_verified: true,
+    submission_status: response.status,
     provider_message_id: providerMessageId,
     outbound_payload_sha256: outbound.payload_sha256,
     html_sha256: outbound.html_sha256,
@@ -6883,6 +6885,8 @@ async function sendDraftTemplateViaResend(config, plan, outbound) {
     type: "resend_http_template",
     provider: "resend",
     accepted: true,
+    submission_verified: true,
+    submission_status: response.status,
     provider_message_id: providerMessageId,
     outbound_payload_sha256: outbound.payload_sha256,
     html_sha256: outbound.html_sha256,
@@ -6917,6 +6921,8 @@ async function sendEmailActionReviewProposalViaResend(config, plan) {
     type: "resend_http_internal_review_proposal",
     provider: "resend",
     accepted: true,
+    submission_verified: true,
+    submission_status: response.status,
     provider_message_id: providerMessageId,
     outbound_payload_sha256: outbound.payload_sha256,
     html_sha256: outbound.html_sha256,
@@ -8172,24 +8178,46 @@ function emailActionProcessingFlag(idempotencyId) {
 }
 
 function emailActionResendProviderFlag(providerMessageId) {
-  const encoded = Buffer.from(String(providerMessageId || ""), "utf8").toString("base64url");
-  if (!encoded || encoded.length > 120) {
-    throw new Error("Resend-Provider-ID kann nicht sicher als IMAP-Keyword persistiert werden.");
+  const normalized = String(providerMessageId || "").trim().toLowerCase();
+  const uuidHex = normalized.replace(/-/g, "");
+  if (!/^[a-f0-9]{32}$/.test(uuidHex)) {
+    throw new Error("Resend-Provider-ID hat nicht das erwartete UUID-Format.");
   }
-  return `$VIPAI-RID-${encoded}`;
+  return `$VR-${Buffer.from(uuidHex, "hex").toString("base64url")}`;
 }
 
 function emailActionResendProviderIdFromFlags(flags) {
-  const prefix = "$VIPAI-RID-";
-  const flag = (flags || []).find((item) =>
-    String(item || "").toUpperCase().startsWith(prefix)
+  const compactPrefix = "$VR-";
+  const compactFlag = (flags || []).find((item) =>
+    String(item || "").toUpperCase().startsWith(compactPrefix)
   );
-  if (!flag) return "";
+  if (compactFlag) {
+    try {
+      const bytes = Buffer.from(String(compactFlag).slice(compactPrefix.length), "base64url");
+      if (bytes.length !== 16) return "";
+      const hex = bytes.toString("hex");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    } catch {
+      return "";
+    }
+  }
+
+  const legacyPrefix = "$VIPAI-RID-";
+  const legacyFlag = (flags || []).find((item) =>
+    String(item || "").toUpperCase().startsWith(legacyPrefix)
+  );
+  if (!legacyFlag) return "";
   try {
-    return Buffer.from(String(flag).slice(prefix.length), "base64url").toString("utf8");
+    return Buffer.from(String(legacyFlag).slice(legacyPrefix.length), "base64url").toString("utf8");
   } catch {
     return "";
   }
+}
+
+function isEmailActionTransportSendConfirmed(transport) {
+  if (!transport?.accepted || !String(transport.provider_message_id || "").trim()) return false;
+  if (transport.readback_verified) return true;
+  return transport.provider === "resend" && transport.submission_verified === true;
 }
 
 function cleanupEmailActionIdempotencyCache(nowMs = Date.now()) {
@@ -19316,6 +19344,8 @@ function createServer() {
             type: "resend_http_internal_review_proposal",
             provider: "resend",
             accepted: true,
+            submission_verified: true,
+            submission_confirmation_source: "persistent_provider_marker",
             provider_message_id: providerIdFromFlag
           });
         } else if (
@@ -19399,7 +19429,7 @@ function createServer() {
             markerErrors.push(`sent_marker: ${String(error?.message || error)}`);
           }
         }
-        if (markerErrors.length || !transport.readback_verified) {
+        if (markerErrors.length || !isEmailActionTransportSendConfirmed(transport)) {
           return out({
             ...common,
             status: markerErrors.length
@@ -19697,6 +19727,10 @@ function createServer() {
       create_missing_result_folders: z.boolean().optional().default(false),
       move_failed_to_error: z.boolean().optional().default(false),
       move_thread_ancestors_to_done: z.boolean().optional().default(true),
+      confirmed_resend_provider_ids_by_uid: z.record(
+        z.string(),
+        z.string().regex(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i)
+      ).optional().default({}),
       placeholder_values_by_uid: z.record(z.string(), z.record(z.string(), z.string())).optional().default({}),
       agent_decisions_by_uid: z.record(
         z.string(),
@@ -19722,6 +19756,7 @@ function createServer() {
       create_missing_result_folders,
       move_failed_to_error,
       move_thread_ancestors_to_done,
+      confirmed_resend_provider_ids_by_uid,
       placeholder_values_by_uid,
       agent_decisions_by_uid,
       max_scan_messages,
@@ -19944,6 +19979,9 @@ function createServer() {
           const cachedSend = getEmailActionCachedSend(plan.idempotency_id);
           const alreadySentByFlag = hasImapFlag(message.flags, plan.sent_flag);
           const providerIdFromFlag = emailActionResendProviderIdFromFlags(message.flags);
+          const confirmedRecoveryProviderId = String(
+            confirmed_resend_provider_ids_by_uid[String(message.uid)] || ""
+          ).trim();
           let transport = cachedSend?.transport || null;
           let sentNow = false;
           let processingMarker = null;
@@ -19962,6 +20000,8 @@ function createServer() {
               type: "resend_http_mime_equivalent",
               provider: "resend",
               accepted: true,
+              submission_verified: true,
+              submission_confirmation_source: "persistent_provider_marker",
               provider_message_id: providerIdFromFlag
             });
             rememberEmailActionSend(plan.idempotency_id, {
@@ -19980,6 +20020,29 @@ function createServer() {
               provider_message_id: transport.provider_message_id,
               action_id: action.id,
               source_uid: message.uid
+            });
+          }
+
+          if (!transport && alreadySentByFlag && confirmedRecoveryProviderId) {
+            transport = {
+              type: "resend_http_mime_equivalent",
+              provider: "resend",
+              accepted: true,
+              submission_verified: true,
+              submission_confirmation_source: "explicit_recovery_after_accepted_response",
+              provider_message_id: confirmedRecoveryProviderId,
+              readback_verified: false,
+              readback_checks: null,
+              provider_last_event: null,
+              internet_message_id: null,
+              readback_error: "Provider-GET ist fuer den Send-only-Key nicht erlaubt; die akzeptierte Provider-ID wurde explizit fuer den idempotenten Abschluss bestaetigt."
+            };
+            rememberEmailActionSend(plan.idempotency_id, {
+              transport,
+              provider_message_id: confirmedRecoveryProviderId,
+              action_id: action.id,
+              source_uid: message.uid,
+              recovered_after_accepted_send: true
             });
           }
 
@@ -20075,7 +20138,7 @@ function createServer() {
             continue;
           }
 
-          if (!transport.readback_verified) {
+          if (!isEmailActionTransportSendConfirmed(transport)) {
             results.push({
               uid: message.uid,
               status: "sent_but_provider_readback_failed",

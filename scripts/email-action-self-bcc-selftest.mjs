@@ -151,6 +151,12 @@ try {
       source.includes("readEmailActionResendResult") &&
       source.includes("emailActionResendProviderFlag") &&
       source.includes('status: "sent_but_provider_readback_failed"'),
+    send_only_resend_recovery_is_compact_and_idempotent:
+      source.includes('return `$VR-${Buffer.from(uuidHex, "hex").toString("base64url")}`') &&
+      source.includes("isEmailActionTransportSendConfirmed") &&
+      source.includes("submission_verified: true") &&
+      source.includes("confirmed_resend_provider_ids_by_uid") &&
+      source.includes("explicit_recovery_after_accepted_response"),
     draft_template_send_is_hash_bound_and_non_mutating:
       source.includes("expected_template_sha256") &&
       source.includes('hasImapFlag(template.flags, "\\\\Draft")') &&
