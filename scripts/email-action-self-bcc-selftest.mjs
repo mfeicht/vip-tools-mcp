@@ -56,6 +56,7 @@ try {
     template_style_tool_present: names.has("email_action_template_style_readback"),
     draft_template_test_send_tool_present: names.has("email_action_send_test_from_draft_template"),
     adaptive_context_tool_present: names.has("email_action_agent_context"),
+    internal_review_proposal_tool_present: names.has("email_action_send_review_proposal"),
     five_accounts_registered: accounts.account_count === 5,
     every_account_has_self_bcc: (accounts.accounts || []).every(
       (account) => account.mandatory_self_bcc === account.address
@@ -81,11 +82,10 @@ try {
     contact_actions_share_idempotency_scope:
       contactActions.length === 2 &&
       contactActions.every((action) => action.idempotency_scope === "rs-contact"),
-    only_authorized_contact_action_live:
+    approved_contact_language_actions_live:
       contactActions.length === 2 &&
       contactActions.every((action) => action.response_mode === "agent_assisted") &&
-      contactActions.find((action) => action.id === "rs-contact-de")?.live_enabled === true &&
-      contactActions.find((action) => action.id === "rs-contact-en")?.live_enabled === false,
+      contactActions.every((action) => action.live_enabled === true),
     contact_use_case_routing_present:
       contactActions.length === 2 &&
       contactActions.every(
@@ -103,6 +103,22 @@ try {
           action.enabled === false &&
           action.live_enabled === false
       ),
+    thread_ancestor_cleanup_is_reference_bound_and_no_send:
+      source.includes("function findEmailActionThreadAncestors") &&
+      source.includes("move_thread_ancestors_to_done") &&
+      source.includes("thread_ancestor_moves: threadAncestorMoves") &&
+      source.includes("$VIPAI-THREAD-HANDLED") &&
+      source.includes("move_failed_but_marked_handled") &&
+      source.includes("sent: false"),
+    successful_actions_move_to_imap_trash:
+      contactActions.every((action) => action.done_mailbox === "INBOX.Trash"),
+    internal_review_proposal_is_self_only_and_threaded:
+      source.includes("function buildEmailActionReviewProposalPlan") &&
+      source.includes('`ENTWURF: ${buildReplySubject(inbound.subject)}`') &&
+      source.includes("external_recipient_contacted: false") &&
+      source.includes("plan.envelope_recipients.includes(plan.external_recipient)") &&
+      source.includes("sendEmailActionReviewProposalViaResend") &&
+      source.includes("proposal_sent_and_source_trashed"),
     every_template_marker_is_excluded_from_inbound:
       source.includes("function isTemplateActionSubjectMarked") &&
       source.includes("function isEmailActionInboundMessage") &&

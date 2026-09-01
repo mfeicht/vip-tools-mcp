@@ -6731,6 +6731,27 @@ function buildDraftTemplateResendPayload({
   };
 }
 
+function buildEmailActionReviewProposalResendPayload(plan) {
+  const payload = {
+    from: plan.from,
+    to: [plan.to],
+    subject: plan.subject,
+    html: plan.proposal_html,
+    text: plan.proposal_body,
+    headers: {
+      "In-Reply-To": plan.in_reply_to,
+      ...(plan.references ? { References: plan.references } : {})
+    }
+  };
+  return {
+    payload,
+    payload_sha256: createHash("sha256").update(JSON.stringify(payload), "utf8").digest("hex"),
+    html_sha256: createHash("sha256").update(plan.proposal_html, "utf8").digest("hex"),
+    text_sha256: plan.proposal_body_sha256,
+    attachment_manifest: []
+  };
+}
+
 function resendReadbackChecks(data, plan, outbound) {
   const responseHeaders =
     data?.headers && typeof data.headers === "object" && !Array.isArray(data.headers)
@@ -6870,6 +6891,56 @@ async function sendDraftTemplateViaResend(config, plan, outbound) {
     self_bcc_submitted: plan.bcc,
     ...readback
   };
+}
+
+async function sendEmailActionReviewProposalViaResend(config, plan) {
+  if (config.provider !== "resend" || !config.apiKey) {
+    throw new Error("Resend-HTTPS-Transport ist fuer den internen Antwortentwurf nicht bereit.");
+  }
+  const outbound = buildEmailActionReviewProposalResendPayload(plan);
+  const response = await axios.post("https://api.resend.com/emails", outbound.payload, {
+    timeout: EMAIL_HTTP_TIMEOUT_MS,
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": plan.idempotency_id
+    }
+  }).catch((error) => {
+    throw new Error(formatEmailHttpError("resend", error));
+  });
+  const providerMessageId = String(response?.data?.id || "").trim();
+  if (!providerMessageId) {
+    throw new Error("Resend hat den internen Entwurf ohne Provider-ID bestaetigt.");
+  }
+  const readback = await readEmailActionResendResult(config, plan, providerMessageId, outbound);
+  return {
+    type: "resend_http_internal_review_proposal",
+    provider: "resend",
+    accepted: true,
+    provider_message_id: providerMessageId,
+    outbound_payload_sha256: outbound.payload_sha256,
+    html_sha256: outbound.html_sha256,
+    text_sha256: outbound.text_sha256,
+    attachment_manifest: [],
+    direct_internal_recipient: plan.to,
+    self_bcc_submitted: null,
+    thread_headers_submitted: {
+      in_reply_to: plan.in_reply_to,
+      references: plan.references || null
+    },
+    ...readback
+  };
+}
+
+async function refreshEmailActionReviewProposalResendReadback(config, plan, transport) {
+  const outbound = buildEmailActionReviewProposalResendPayload(plan);
+  const readback = await readEmailActionResendResult(
+    config,
+    plan,
+    transport.provider_message_id,
+    outbound
+  );
+  return { ...transport, ...readback };
 }
 
 async function refreshEmailActionResendReadback(config, plan, transport) {
@@ -7789,7 +7860,10 @@ function resolveEmailActionTemplate(action, scan) {
 }
 
 function isEmailActionInboundMessage(message) {
-  return message?.template_marker !== true;
+  return (
+    message?.template_marker !== true &&
+    !hasImapFlag(message?.flags || [], "$VIPAI-THREAD-HANDLED")
+  );
 }
 
 function publicActionFolderMessage(message) {
@@ -7912,6 +7986,81 @@ function buildReplyReferences(inbound) {
     ...splitReferences(inbound.in_reply_to),
     ...(inbound.message_id ? [inbound.message_id] : [])
   ]).join(" ");
+}
+
+function findEmailActionThreadAncestors(messages, sourceMessage) {
+  const sourceInbound = getInboundHeadersForAction(sourceMessage.raw);
+  const referencedMessageIds = new Set([
+    ...splitReferences(sourceInbound.references),
+    ...splitReferences(sourceInbound.in_reply_to)
+  ]);
+  const sourceFrom = extractEmailAddress(sourceMessage.parsed?.from_email || sourceInbound.from);
+  if (!referencedMessageIds.size || !sourceFrom) return [];
+
+  return messages.filter((message) => {
+    if (!isEmailActionInboundMessage(message) || String(message.uid) === String(sourceMessage.uid)) {
+      return false;
+    }
+    const inbound = getInboundHeadersForAction(message.raw);
+    return (
+      Boolean(inbound.message_id) &&
+      referencedMessageIds.has(inbound.message_id) &&
+      extractEmailAddress(message.parsed?.from_email || inbound.from) === sourceFrom
+    );
+  });
+}
+
+async function moveEmailActionThreadAncestorsToSuccess(configs, {
+  action,
+  scan,
+  sourceMessage,
+  createTargetMailbox
+}) {
+  const moves = [];
+  for (const ancestor of findEmailActionThreadAncestors(scan.messages, sourceMessage)) {
+    let handledMarker = null;
+    let handledMarkerError = null;
+    try {
+      try {
+        handledMarker = await addEmailActionKeywordWithFallback(configs, {
+          mailbox: action.mailbox,
+          uid: ancestor.uid,
+          flag: "$VIPAI-THREAD-HANDLED",
+          expectedRawSha256: ancestor.raw_sha256
+        });
+      } catch (error) {
+        handledMarkerError = String(error?.message || error);
+      }
+      const move = await moveEmailActionMessageWithFallback(configs, {
+        sourceMailbox: action.mailbox,
+        targetMailbox: action.done_mailbox,
+        uid: ancestor.uid,
+        expectedRawSha256: ancestor.raw_sha256,
+        expectedMessageId: ancestor.parsed?.message_id || "",
+        createTargetMailbox,
+        dryRun: false,
+        verifyAfter: true
+      });
+      moves.push({
+        uid: ancestor.uid,
+        status: move.status,
+        sent: false,
+        handled_marker: handledMarker,
+        handled_marker_error: handledMarkerError,
+        move
+      });
+    } catch (error) {
+      moves.push({
+        uid: ancestor.uid,
+        status: handledMarker ? "move_failed_but_marked_handled" : "move_and_marker_failed",
+        sent: false,
+        handled_marker: handledMarker,
+        handled_marker_error: handledMarkerError,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  return moves;
 }
 
 function displayNameFromAddressHeader(value) {
@@ -8140,6 +8289,101 @@ function buildRawTemplateReply({ action, templateMessage, sourceMessage, sendAcc
     source_message_id_hash: sourceMessage.parsed?.message_id_hash || null,
     placeholders: rendered.placeholders,
     placeholder_values_used: rendered.placeholder_values_used
+  };
+}
+
+function encodeMimeBase64Body(value) {
+  return Buffer.from(String(value || ""), "utf8")
+    .toString("base64")
+    .replace(/.{1,76}/g, "$&\r\n")
+    .trimEnd();
+}
+
+function buildEmailActionReviewProposalPlan({ action, sourceMessage, sendAccount, proposalBody }) {
+  const inbound = getInboundHeadersForAction(sourceMessage.raw);
+  if (!inbound.message_id) {
+    throw new Error(`UID ${sourceMessage.uid}: Message-ID fehlt; interner Thread-Entwurf blockiert.`);
+  }
+  const externalRecipient = extractSingleVerifiedReplyRecipient(inbound.headers);
+  const internalRecipient = extractEmailAddress(sendAccount.from);
+  if (!internalRecipient) {
+    throw new Error(`Action ${action.id}: verifizierte FROM-Adresse fuer internen Entwurf fehlt.`);
+  }
+  const normalizedBody = String(proposalBody || "").replace(/\r\n/g, "\n").trim();
+  if (!normalizedBody) throw new Error("Interner Entwurf braucht einen ausformulierten Antworttext.");
+  if (Buffer.byteLength(normalizedBody, "utf8") > 50_000) {
+    throw new Error("Interner Entwurf ist groesser als 50 KB.");
+  }
+  const idempotencyId = createHash("sha256")
+    .update(
+      [
+        EMAIL_ACTION_CONTROL_AGENT_ID,
+        "internal-review-proposal-v1",
+        action.idempotency_scope || action.id,
+        action.mailbox,
+        sourceMessage.uid,
+        sourceMessage.parsed?.message_id || "",
+        sourceMessage.raw_sha256 || ""
+      ].join("|"),
+      "utf8"
+    )
+    .digest("hex");
+  const subject = `ENTWURF: ${buildReplySubject(inbound.subject)}`;
+  const references = buildReplyReferences(inbound);
+  const html = `<div>${escapeAccountingHtml(normalizedBody).replace(/\n/g, "<br>\n")}</div>`;
+  const boundary = `VIP-Proposal-${idempotencyId.slice(0, 24)}`;
+  const messageId = `<vip-proposal-${idempotencyId.slice(0, 40)}@vip-tools-mcp.vip-studios.de>`;
+  const rawMessage = [
+    `From: <${internalRecipient}>`,
+    `To: <${internalRecipient}>`,
+    `Subject: ${encodeHeader(sanitizeHeaderLineValue(subject, "Subject"))}`,
+    `Date: ${new Date().toUTCString()}`,
+    `Message-ID: ${messageId}`,
+    `In-Reply-To: ${sanitizeHeaderLineValue(inbound.message_id, "In-Reply-To")}`,
+    ...(references ? [`References: ${sanitizeHeaderLineValue(references, "References")}`] : []),
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/alternative; boundary=\"${boundary}\"`,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    encodeMimeBase64Body(normalizedBody),
+    `--${boundary}`,
+    "Content-Type: text/html; charset=utf-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    encodeMimeBase64Body(html),
+    `--${boundary}--`,
+    ""
+  ].join("\r\n");
+
+  return {
+    idempotency_id: idempotencyId,
+    sent_flag: emailActionSentFlag(idempotencyId),
+    processing_flag: emailActionProcessingFlag(idempotencyId),
+    raw_message: rawMessage,
+    raw_message_bytes: Buffer.byteLength(rawMessage, "utf8"),
+    raw_message_sha256: createHash("sha256").update(rawMessage, "utf8").digest("hex"),
+    message_id: messageId,
+    from: internalRecipient,
+    to: internalRecipient,
+    bcc: "",
+    bcc_source: "not_required_internal_direct_delivery",
+    bcc_visible_in_mime_headers: false,
+    envelope_recipients: [internalRecipient],
+    recipient_source: "configured_sender_mailbox",
+    external_recipient: externalRecipient.email,
+    external_recipient_source: externalRecipient.source,
+    subject,
+    in_reply_to: inbound.message_id,
+    references,
+    content_type: `multipart/alternative; boundary=\"${boundary}\"`,
+    proposal_body: normalizedBody,
+    proposal_body_sha256: createHash("sha256").update(normalizedBody, "utf8").digest("hex"),
+    proposal_html: html,
+    source_uid: sourceMessage.uid,
+    source_message_id_hash: sourceMessage.parsed?.message_id_hash || null
   };
 }
 
@@ -18884,6 +19128,356 @@ function createServer() {
   );
 
   server.tool(
+    "email_action_send_review_proposal",
+    "Erzeugt fuer eine fachlich unsichere Eingangsmail einen ausformulierten internen Antwortentwurf. Der Entwurf wird mit ECHTEN Thread-Headern und Betreffspraefix ENTWURF: ausschliesslich an die konfigurierte FROM-Adresse gesendet; der externe Absender wird niemals kontaktiert. Nach bestaetigtem Provider-Readback wird der freigegebene Eingangsthread in den konfigurierten Erfolgsordner verschoben.",
+    {
+      agent_id: z.literal(EMAIL_ACTION_CONTROL_AGENT_ID).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      action_id: z.string(),
+      message_uid: z.string(),
+      proposal_body: z.string().min(1).max(50_000),
+      uncertainty_reason: z.string().min(12).max(1000),
+      mode: z.enum(["shadow_run", "live"]).optional().default("shadow_run"),
+      confirm_internal_proposal_send: z.boolean().optional().default(false),
+      create_missing_result_folders: z.boolean().optional().default(false),
+      move_thread_ancestors_to_done: z.boolean().optional().default(true),
+      max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
+      max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      action_id,
+      message_uid,
+      proposal_body,
+      uncertainty_reason,
+      mode,
+      confirm_internal_proposal_send,
+      create_missing_result_folders,
+      move_thread_ancestors_to_done,
+      max_scan_messages,
+      max_email_bytes
+    }) => {
+      const { action } = getEmailActionDefinition(action_id);
+      if (!action.enabled) throw new Error(`Action ${action.id} ist deaktiviert.`);
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const scan = await scanEmailActionFolderWithFallback(configs, {
+        mailbox: action.mailbox,
+        maxEmailBytes: max_email_bytes,
+        maxScanMessages: max_scan_messages
+      });
+      const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
+      const registryOk = registered.complete && registered.uid_ok && registered.message_id_ok && registered.sha256_ok;
+      if (!registryOk) {
+        return out({
+          agent_id,
+          action: publicEmailAction(action),
+          mode,
+          status: "template_registration_required",
+          sent: false,
+          external_recipient_contacted: false
+        });
+      }
+      const sourceMessage = scan.messages.find(
+        (message) => isEmailActionInboundMessage(message) && String(message.uid) === String(message_uid)
+      );
+      if (!sourceMessage) {
+        throw new Error(`Action ${action.id}: Eingangsnachricht UID ${message_uid} nicht gefunden.`);
+      }
+      if (sourceMessage.parse_error) {
+        throw new Error(`Action ${action.id}: UID ${message_uid} ist nicht sicher lesbar (${sourceMessage.parse_error}).`);
+      }
+      const plan = buildEmailActionReviewProposalPlan({
+        action,
+        sourceMessage,
+        sendAccount,
+        proposalBody: proposal_body
+      });
+      const common = {
+        agent_id,
+        action: publicEmailAction(action),
+        mode,
+        registry_ok: true,
+        source_message: publicActionFolderMessage(sourceMessage),
+        template: {
+          uid: template.uid,
+          sha256: template.raw_sha256,
+          message_id_hash: template.parsed.message_id_hash || null
+        },
+        proposal: {
+          idempotency_id: plan.idempotency_id,
+          from: plan.from,
+          to: plan.to,
+          bcc: null,
+          subject: plan.subject,
+          in_reply_to: plan.in_reply_to,
+          references: plan.references,
+          external_recipient: plan.external_recipient,
+          external_recipient_source: plan.external_recipient_source,
+          external_recipient_contacted: false,
+          proposal_body_sha256: plan.proposal_body_sha256,
+          uncertainty_reason_sha256: createHash("sha256")
+            .update(String(uncertainty_reason).trim(), "utf8")
+            .digest("hex")
+        },
+        safety: {
+          direct_recipient_matches_configured_from: plan.to === plan.from,
+          external_recipient_in_envelope: plan.envelope_recipients.includes(plan.external_recipient),
+          bcc_visible_in_mime_headers: false,
+          uses_real_thread_headers: Boolean(plan.in_reply_to && plan.references)
+        },
+        imap: {
+          ...summary,
+          connection: {
+            host: scan.host,
+            port: scan.port,
+            secure: scan.secure,
+            label: scan.label
+          }
+        }
+      };
+      if (
+        plan.to !== plan.from ||
+        plan.envelope_recipients.length !== 1 ||
+        plan.envelope_recipients[0] !== plan.from ||
+        plan.envelope_recipients.includes(plan.external_recipient)
+      ) {
+        throw new Error("Interner Antwortentwurf hat keinen sicher isolierten Self-only-Envelope.");
+      }
+      if (mode !== "live") {
+        const resendShadow =
+          sendAccount.email_http_provider === "resend" && sendAccount.email_http_ready_for_send
+            ? buildEmailActionReviewProposalResendPayload(plan)
+            : null;
+        return out({
+          ...common,
+          status: "proposal_shadow_ready",
+          sent: false,
+          moves_source_message: false,
+          resend_shadow: resendShadow
+            ? {
+                payload_sha256: resendShadow.payload_sha256,
+                html_sha256: resendShadow.html_sha256,
+                text_sha256: resendShadow.text_sha256,
+                to: [plan.to],
+                bcc: [],
+                external_recipient_contacted: false
+              }
+            : null
+        });
+      }
+      if (!confirm_internal_proposal_send) {
+        throw new Error("Live-Versand eines internen Entwurfs braucht confirm_internal_proposal_send=true.");
+      }
+      if (!sendAccount.raw_mime_transport_ready) {
+        throw new Error(`Action ${action.id}: Kein freigegebener Versandtransport ist bereit.`);
+      }
+
+      cleanupAgentOperationLocks();
+      const lockKey = buildAgentOperationLockKey({
+        scope: "resource",
+        agent_id,
+        resource_key: `email-action-proposal:${plan.idempotency_id}`
+      });
+      const nowMs = Date.now();
+      const existingLock = AGENT_OPERATION_LOCKS.get(lockKey);
+      if (existingLock && existingLock.expires_at_ms > nowMs) {
+        return out({ ...common, status: "locked", sent: false });
+      }
+      const lock = {
+        key: lockKey,
+        scope: "resource",
+        agent_id,
+        resource_key: `email-action-proposal:${plan.idempotency_id}`,
+        run_id: `email-action-proposal-${randomUUID()}`,
+        lock_token: randomUUID(),
+        holder: "email_action_send_review_proposal",
+        purpose: `Send internal proposal for ${action.id} UID ${sourceMessage.uid}`,
+        acquired_at_ms: nowMs,
+        renewed_at_ms: nowMs,
+        expires_at_ms: nowMs + 10 * 60 * 1000
+      };
+      AGENT_OPERATION_LOCKS.set(lockKey, lock);
+
+      try {
+        const cachedSend = getEmailActionCachedSend(plan.idempotency_id);
+        const alreadySentByFlag = hasImapFlag(sourceMessage.flags, plan.sent_flag);
+        const providerIdFromFlag = emailActionResendProviderIdFromFlags(sourceMessage.flags);
+        let transport = cachedSend?.transport || null;
+        let sentNow = false;
+        let processingMarker = null;
+        let providerMarker = null;
+        let sentMarker = null;
+
+        if (!transport && providerIdFromFlag) {
+          const { config: httpConfig } = getEmailActionHttpConfig(sendAccount, {
+            requireCredentials: true
+          });
+          transport = await refreshEmailActionReviewProposalResendReadback(httpConfig, plan, {
+            type: "resend_http_internal_review_proposal",
+            provider: "resend",
+            accepted: true,
+            provider_message_id: providerIdFromFlag
+          });
+        } else if (
+          transport?.type === "resend_http_internal_review_proposal" &&
+          !transport.readback_verified
+        ) {
+          const { config: httpConfig } = getEmailActionHttpConfig(sendAccount, {
+            requireCredentials: true
+          });
+          transport = await refreshEmailActionReviewProposalResendReadback(httpConfig, plan, transport);
+        }
+
+        if (!transport && alreadySentByFlag) {
+          return out({
+            ...common,
+            status: "proposal_sent_marker_without_provider_readback",
+            sent: true,
+            sent_now: false,
+            retry_instruction: "Provider-ID zuordnen; den internen Entwurf niemals erneut senden."
+          });
+        }
+        if (!transport) {
+          processingMarker = await addEmailActionKeywordWithFallback(configs, {
+            mailbox: action.mailbox,
+            uid: sourceMessage.uid,
+            flag: plan.processing_flag,
+            expectedRawSha256: sourceMessage.raw_sha256
+          });
+          if (sendAccount.email_http_provider === "resend" && sendAccount.email_http_ready_for_send) {
+            const { config: httpConfig } = getEmailActionHttpConfig(sendAccount, {
+              requireCredentials: true
+            });
+            transport = await sendEmailActionReviewProposalViaResend(httpConfig, plan);
+          } else {
+            const { configs: smtpConfigs } = getEmailActionSmtpConfigCandidates(sendAccount);
+            transport = {
+              type: "smtp_raw_mime_internal_review_proposal",
+              provider: "smtp",
+              accepted: true,
+              readback_verified: true,
+              provider_message_id: plan.message_id,
+              ...(await sendSmtpRawEmail(smtpConfigs, {
+                envelopeFrom: plan.from,
+                to: plan.envelope_recipients,
+                rawMessage: plan.raw_message
+              }))
+            };
+          }
+          sentNow = true;
+          rememberEmailActionSend(plan.idempotency_id, {
+            transport,
+            provider_message_id: transport.provider_message_id || plan.message_id,
+            action_id: action.id,
+            source_uid: sourceMessage.uid,
+            internal_review_proposal: true
+          });
+        }
+
+        const markerErrors = [];
+        if (transport.type === "resend_http_internal_review_proposal" && !providerIdFromFlag) {
+          try {
+            providerMarker = await addEmailActionKeywordWithFallback(configs, {
+              mailbox: action.mailbox,
+              uid: sourceMessage.uid,
+              flag: emailActionResendProviderFlag(transport.provider_message_id),
+              expectedRawSha256: sourceMessage.raw_sha256
+            });
+          } catch (error) {
+            markerErrors.push(`provider_marker: ${String(error?.message || error)}`);
+          }
+        }
+        if (!alreadySentByFlag) {
+          try {
+            sentMarker = await addEmailActionKeywordWithFallback(configs, {
+              mailbox: action.mailbox,
+              uid: sourceMessage.uid,
+              flag: plan.sent_flag,
+              expectedRawSha256: sourceMessage.raw_sha256
+            });
+          } catch (error) {
+            markerErrors.push(`sent_marker: ${String(error?.message || error)}`);
+          }
+        }
+        if (markerErrors.length || !transport.readback_verified) {
+          return out({
+            ...common,
+            status: markerErrors.length
+              ? "proposal_sent_but_marker_failed"
+              : "proposal_sent_but_provider_readback_failed",
+            sent: true,
+            sent_now: sentNow,
+            provider_message_id: transport.provider_message_id || plan.message_id,
+            transport,
+            processing_marker: processingMarker,
+            provider_marker: providerMarker,
+            sent_marker: sentMarker,
+            marker_errors: markerErrors,
+            retry_instruction: "Nicht erneut senden; nur Marker/Provider-Readback und Trash-Move vervollstaendigen."
+          });
+        }
+
+        const threadAncestorMoves = move_thread_ancestors_to_done
+          ? await moveEmailActionThreadAncestorsToSuccess(configs, {
+              action,
+              scan,
+              sourceMessage,
+              createTargetMailbox: create_missing_result_folders
+            })
+          : [];
+        let move;
+        try {
+          move = await moveEmailActionMessageWithFallback(configs, {
+            sourceMailbox: action.mailbox,
+            targetMailbox: action.done_mailbox,
+            uid: sourceMessage.uid,
+            expectedRawSha256: sourceMessage.raw_sha256,
+            expectedMessageId: sourceMessage.parsed?.message_id || "",
+            createTargetMailbox: create_missing_result_folders,
+            dryRun: false,
+            verifyAfter: true
+          });
+        } catch (error) {
+          return out({
+            ...common,
+            status: "proposal_sent_but_move_failed",
+            sent: true,
+            sent_now: sentNow,
+            provider_message_id: transport.provider_message_id || plan.message_id,
+            transport,
+            thread_ancestor_moves: threadAncestorMoves,
+            move_error: String(error?.message || error),
+            retry_instruction: "Interner Entwurf wurde bereits gesendet; niemals erneut senden, nur Trash-Move reparieren."
+          });
+        }
+        return out({
+          ...common,
+          status: move.status === "moved"
+            ? "proposal_sent_and_source_trashed"
+            : "proposal_sent_move_verification_failed",
+          sent: true,
+          sent_now: sentNow,
+          provider_message_id: transport.provider_message_id || plan.message_id,
+          transport,
+          processing_marker: processingMarker,
+          provider_marker: providerMarker,
+          sent_marker: sentMarker,
+          thread_ancestor_moves: threadAncestorMoves,
+          thread_ancestor_cleanup_complete: threadAncestorMoves.every(
+            (ancestorMove) => ancestorMove.status === "moved"
+          ),
+          move
+        });
+      } finally {
+        const current = AGENT_OPERATION_LOCKS.get(lockKey);
+        if (current?.lock_token === lock.lock_token) {
+          AGENT_OPERATION_LOCKS.delete(lockKey);
+        }
+      }
+    }
+  );
+
+  server.tool(
     "email_action_shadow_run",
     "Erzeugt deterministisch Raw-MIME-Antwortplaene fuer Eingangsnachrichten in einem Aktionsordner. Shadow-Run: kein Live-Versand, keine IMAP-Verschiebung, kein Gelesen-Markieren.",
     {
@@ -19102,6 +19696,7 @@ function createServer() {
       moritz_authorization_note: z.string().max(1000).optional(),
       create_missing_result_folders: z.boolean().optional().default(false),
       move_failed_to_error: z.boolean().optional().default(false),
+      move_thread_ancestors_to_done: z.boolean().optional().default(true),
       placeholder_values_by_uid: z.record(z.string(), z.record(z.string(), z.string())).optional().default({}),
       agent_decisions_by_uid: z.record(
         z.string(),
@@ -19126,6 +19721,7 @@ function createServer() {
       moritz_authorization_note,
       create_missing_result_folders,
       move_failed_to_error,
+      move_thread_ancestors_to_done,
       placeholder_values_by_uid,
       agent_decisions_by_uid,
       max_scan_messages,
@@ -19497,7 +20093,18 @@ function createServer() {
           }
 
           let moveResult;
+          const threadAncestorMoves = [];
           try {
+            if (move_thread_ancestors_to_done) {
+              threadAncestorMoves.push(
+                ...(await moveEmailActionThreadAncestorsToSuccess(configs, {
+                  action,
+                  scan,
+                  sourceMessage: message,
+                  createTargetMailbox: create_missing_result_folders
+                }))
+              );
+            }
             moveResult = await moveEmailActionMessageWithFallback(configs, {
               sourceMailbox: action.mailbox,
               targetMailbox: action.done_mailbox,
@@ -19522,6 +20129,7 @@ function createServer() {
               processing_marker: processingMarker,
               provider_marker: providerMarker,
               sent_marker: sentMarker,
+              thread_ancestor_moves: threadAncestorMoves,
               move_error: String(moveError?.message || moveError),
               retry_instruction:
                 "Retry darf wegen Idempotency-Cache/IMAP-Sent-Flag keine zweite E-Mail senden; zuerst Done-Move erneut versuchen."
@@ -19556,6 +20164,10 @@ function createServer() {
             processing_marker: processingMarker,
             provider_marker: providerMarker,
             sent_marker: sentMarker,
+            thread_ancestor_moves: threadAncestorMoves,
+            thread_ancestor_cleanup_complete: threadAncestorMoves.every(
+              (ancestorMove) => ancestorMove.status === "moved"
+            ),
             move: moveResult
           });
         } catch (error) {
