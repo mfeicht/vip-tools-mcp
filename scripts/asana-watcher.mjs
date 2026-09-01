@@ -147,6 +147,14 @@ function truncate(value, max = 180) {
   return `${text.slice(0, max - 3)}...`;
 }
 
+function safeMcpErrorText(error, max = 500) {
+  const message = String(error?.message || error || "unknown error");
+  if (/Just a moment|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
+    return "Cloudflare managed challenge on the canonical MCP endpoint";
+  }
+  return truncate(message, max);
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -685,7 +693,10 @@ async function run() {
       getTaskDueBucket({}, new Date("2026-08-20T10:00:00.000Z")) === "without_due" &&
       looksLikeRoutineTask({ name: "R: Test" }) &&
       hasRoutineTag({ tags: [{ name: "Routine" }] }) &&
-      !hasRoutineTag({ tags: [] });
+      !hasRoutineTag({ tags: [] }) &&
+      safeMcpErrorText(new Error("Just a moment... challenges.cloudflare.com")) ===
+        "Cloudflare managed challenge on the canonical MCP endpoint" &&
+      safeMcpErrorText(new Error("ordinary watcher failure")) === "ordinary watcher failure";
     const selfTestDir = await fs.mkdtemp(path.join(os.tmpdir(), "vip-asana-watcher-selftest-"));
     let persistenceChecksPassed = false;
     try {
@@ -979,15 +990,14 @@ run()
       generated_at: nowIso(),
       status: "failed",
       mode: process.argv.includes("--write") ? "write" : "dry-run",
-      error: error?.message || String(error)
+      error: safeMcpErrorText(error)
     }).catch(() => {});
     if (process.argv.includes("--write")) {
       await fs
         .appendFile(
           logPath,
-          `\n## ${nowIso()} - Asana Watcher Technical Failure\n\n- status: failed\n- error: ${truncate(
-            error?.message || String(error),
-            500
+          `\n## ${nowIso()} - Asana Watcher Technical Failure\n\n- status: failed\n- error: ${safeMcpErrorText(
+            error
           )}\n\n`
         )
         .catch(() => {});
