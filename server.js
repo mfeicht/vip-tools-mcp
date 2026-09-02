@@ -87,6 +87,26 @@ const VIP_DASHBOARD_ACTION_LEASE_MS = Math.max(
   2 * 60 * 1000,
   Number(process.env.VIP_DASHBOARD_ACTION_LEASE_MS || 10 * 60 * 1000)
 );
+const VIP_DASHBOARD_CHAT_MIGRATION_TTL_MS = Math.max(
+  VIP_DASHBOARD_ACTION_REQUEST_TTL_MS,
+  Number(process.env.VIP_DASHBOARD_CHAT_MIGRATION_TTL_MS || 48 * 60 * 60 * 1000)
+);
+const VIP_DASHBOARD_CHAT_MIGRATION_LEASE_MS = Math.max(
+  VIP_DASHBOARD_ACTION_LEASE_MS,
+  Number(process.env.VIP_DASHBOARD_CHAT_MIGRATION_LEASE_MS || 3 * 60 * 60 * 1000)
+);
+
+function dashboardActionTtlMs(type) {
+  return type === "chat_migration"
+    ? VIP_DASHBOARD_CHAT_MIGRATION_TTL_MS
+    : VIP_DASHBOARD_ACTION_REQUEST_TTL_MS;
+}
+
+function dashboardActionLeaseMs(type) {
+  return type === "chat_migration"
+    ? VIP_DASHBOARD_CHAT_MIGRATION_LEASE_MS
+    : VIP_DASHBOARD_ACTION_LEASE_MS;
+}
 const VIP_DASHBOARD_OVERDUE_GRACE_MS = Math.max(
   0,
   Number(process.env.VIP_DASHBOARD_OVERDUE_GRACE_MS || 60 * 60 * 1000)
@@ -20806,10 +20826,15 @@ function dashboardRecoveryMessage(requestId) {
 
 function normalizeDashboardAction(body = {}) {
   const type = String(body.type || "").trim();
-  if (!["agent_recovery", "agent_dispatch"].includes(type)) {
+  if (!["agent_recovery", "agent_dispatch", "chat_cleanup", "chat_migration"].includes(type)) {
     throw Object.assign(new Error("Unbekannter Dashboard-Auftrag."), { statusCode: 400 });
   }
   const agentIds = normalizeDashboardAgentIds(body.agent_ids, { allowAll: true });
+  if (type === "chat_cleanup" && (agentIds.length !== 1 || agentIds[0] !== "vip-ai-operations")) {
+    throw Object.assign(new Error("Chat-Aufraeumen ist ausschliesslich als Operations-Aktion erlaubt."), {
+      statusCode: 400
+    });
+  }
   const defaultStagger = type === "agent_recovery" && agentIds.length > 1 ? 90 : 15;
   const staggerSeconds = Math.min(
     300,
@@ -20850,6 +20875,46 @@ function dashboardActionFingerprint(action) {
   return createHash("sha256")
     .update(JSON.stringify([action.type, action.agentIds, action.staggerSeconds, action.message]))
     .digest("hex");
+}
+
+function dashboardPasswordResetRecipients() {
+  const configured = String(
+    process.env.VIP_DASHBOARD_PASSWORD_RESET_RECIPIENTS || "mf@vip-studios.de"
+  )
+    .split(",")
+    .map((value) => extractEmailAddress(value).toLowerCase())
+    .filter(Boolean);
+  return new Set(configured);
+}
+
+function normalizeDashboardPasswordResetEmail(body = {}) {
+  const email = extractEmailAddress(body.email).toLowerCase();
+  if (!email || !dashboardPasswordResetRecipients().has(email)) {
+    throw Object.assign(new Error("Dashboard-Empfaenger ist nicht freigeschaltet."), {
+      statusCode: 403
+    });
+  }
+
+  const allowedOrigin = String(
+    process.env.VIP_DASHBOARD_PUBLIC_ORIGIN || "https://ai-operations.vip-studios.de"
+  ).replace(/\/$/, "");
+  let resetUrl;
+  try {
+    resetUrl = new URL(String(body.reset_url || ""));
+  } catch {
+    throw Object.assign(new Error("Ungueltiger Dashboard-Reset-Link."), { statusCode: 400 });
+  }
+  if (
+    resetUrl.origin !== allowedOrigin ||
+    resetUrl.pathname !== "/reset-password" ||
+    !resetUrl.searchParams.get("token")
+  ) {
+    throw Object.assign(new Error("Dashboard-Reset-Link liegt ausserhalb des erlaubten Ziels."), {
+      statusCode: 400
+    });
+  }
+  const expiresMinutes = Math.min(60, Math.max(5, Number(body.expires_minutes || 30)));
+  return { email, resetUrl: resetUrl.toString(), expiresMinutes };
 }
 
 function berlinDateKey(value = new Date()) {
@@ -21464,6 +21529,52 @@ app.get("/dashboard/refresh/:requestId", (req, res) => {
 });
 
 app.post(
+  "/dashboard/auth/password-reset-email",
+  express.json({ limit: "4kb" }),
+  async (req, res) => {
+    res.set("cache-control", "no-store");
+    if (!hasValidDashboardFeedToken(req)) {
+      return res.status(401).json({ ok: false, error: "Unauthorized." });
+    }
+
+    try {
+      const reset = normalizeDashboardPasswordResetEmail(req.body);
+      const { config } = getEmailHttpConfigDetails("vip-ai-operations", {
+        requireCredentials: true,
+        fromAddressOverride: "ai-agent@vip-studios.de"
+      });
+      config.fromName = "VIP AI Operations";
+      const body = [
+        "Hallo Moritz,",
+        "",
+        "ueber diesen Link kannst du dein Passwort fuer VIP AI Operations Control einrichten oder zuruecksetzen:",
+        reset.resetUrl,
+        "",
+        `Der Link ist einmalig und ${reset.expiresMinutes} Minuten gueltig.`,
+        "Wenn du diese Anfrage nicht ausgeloest hast, kannst du die E-Mail ignorieren.",
+        "",
+        "VIP AI Operations"
+      ].join("\n");
+      const providerResult = await sendEmailViaHttpProvider(config, {
+        to: [reset.email],
+        subject: "Passwort fuer VIP AI Operations einrichten",
+        body,
+        idempotencyKey: `vip-dashboard-reset-${createHash("sha256")
+          .update(reset.resetUrl)
+          .digest("hex")
+          .slice(0, 32)}`
+      });
+      return res.json({ ok: true, provider: providerResult.provider || null });
+    } catch (error) {
+      return res.status(Number(error?.statusCode || 502)).json({
+        ok: false,
+        error: String(error?.message || "Dashboard-Passwort-E-Mail konnte nicht versendet werden.")
+      });
+    }
+  }
+);
+
+app.post(
   "/dashboard/actions",
   express.json({ limit: "12kb" }),
   (req, res) => {
@@ -21488,6 +21599,7 @@ app.post(
       }
 
       const requestId = randomUUID();
+      const actionTtlMs = dashboardActionTtlMs(action.type);
       const request = {
         id: requestId,
         type: action.type,
@@ -21496,13 +21608,15 @@ app.post(
         message:
           action.type === "agent_recovery"
             ? dashboardRecoveryMessage(requestId)
-            : action.message,
+            : action.type === "agent_dispatch"
+              ? action.message
+              : "",
         fingerprint,
         status: "pending",
         requestedAt: new Date(now).toISOString(),
         startedAt: null,
-        expiresAt: new Date(now + VIP_DASHBOARD_ACTION_REQUEST_TTL_MS).toISOString(),
-        expiresAtMs: now + VIP_DASHBOARD_ACTION_REQUEST_TTL_MS,
+        expiresAt: new Date(now + actionTtlMs).toISOString(),
+        expiresAtMs: now + actionTtlMs,
         leaseUntilMs: null,
         completedAt: null,
         results: [],
@@ -21561,7 +21675,7 @@ app.get("/dashboard/control/request", (req, res) => {
 
     pending.status = "running";
     pending.startedAt ||= new Date(now).toISOString();
-    pending.leaseUntilMs = now + VIP_DASHBOARD_ACTION_LEASE_MS;
+    pending.leaseUntilMs = now + dashboardActionLeaseMs(pending.type);
     return res.json(dashboardActionResponse(pending, { includePayload: true }));
   } catch (error) {
     return res.status(401).json({
@@ -21627,7 +21741,7 @@ app.post(
       });
 
       request.results = normalizedResults;
-      request.leaseUntilMs = now + VIP_DASHBOARD_ACTION_LEASE_MS;
+      request.leaseUntilMs = now + dashboardActionLeaseMs(request.type);
       if (payload.status === "running") {
         return res.json(dashboardActionResponse(request));
       }
