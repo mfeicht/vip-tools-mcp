@@ -72,9 +72,10 @@ const VIP_INTAKE_RATE_LIMIT_MAX = Math.max(1, Number(process.env.VIP_INTAKE_RATE
 const VIP_INTAKE_ROUTE_CONFIG = parseJsonEnv(process.env.VIP_INTAKE_CONFIG_JSON || "{}", {});
 const VIP_INTAKE_ALLOWED_ORIGINS = parseCsvEnv(process.env.VIP_INTAKE_ALLOWED_ORIGINS || "");
 const VIP_INTAKE_ROUTING_SECRET = String(process.env.VIP_INTAKE_ROUTING_SECRET || "");
-const VIP_DASHBOARD_FEED_TOKEN = String(
-  process.env.VIP_DASHBOARD_FEED_TOKEN || process.env.VIP_INTAKE_ROUTING_SECRET || ""
-);
+const VIP_DASHBOARD_FEED_TOKENS = [...new Set([
+  process.env.VIP_DASHBOARD_FEED_TOKEN,
+  process.env.VIP_INTAKE_ROUTING_SECRET
+].map((value) => String(value || "").trim()).filter(Boolean))];
 const VIP_DASHBOARD_REFRESH_REQUEST_TTL_MS = Math.max(
   60_000,
   Number(process.env.VIP_DASHBOARD_REFRESH_REQUEST_TTL_MS || 10 * 60 * 1000)
@@ -20742,13 +20743,15 @@ function dashboardBearerToken(req) {
 
 function hasValidDashboardFeedToken(req) {
   const supplied = dashboardBearerToken(req);
-  if (!VIP_DASHBOARD_FEED_TOKEN || !supplied) return false;
-  const expectedBuffer = Buffer.from(VIP_DASHBOARD_FEED_TOKEN);
+  if (!VIP_DASHBOARD_FEED_TOKENS.length || !supplied) return false;
   const suppliedBuffer = Buffer.from(supplied);
-  return (
-    expectedBuffer.length === suppliedBuffer.length &&
-    timingSafeEqual(expectedBuffer, suppliedBuffer)
-  );
+  return VIP_DASHBOARD_FEED_TOKENS.some((token) => {
+    const expectedBuffer = Buffer.from(token);
+    return (
+      expectedBuffer.length === suppliedBuffer.length &&
+      timingSafeEqual(expectedBuffer, suppliedBuffer)
+    );
+  });
 }
 
 function cleanupDashboardRefreshState(now = Date.now()) {
