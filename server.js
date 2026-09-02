@@ -6741,6 +6741,7 @@ function buildEmailActionReviewProposalResendPayload(plan) {
   const payload = {
     from: plan.from,
     to: [plan.to],
+    reply_to: plan.reply_to,
     subject: plan.subject,
     html: plan.proposal_html,
     text: plan.proposal_body,
@@ -6777,6 +6778,12 @@ function resendReadbackChecks(data, plan, outbound) {
       !Object.hasOwn(outbound.payload, "text") ||
       String(data?.text || "") === outbound.payload.text
   };
+  if (Object.hasOwn(outbound.payload, "reply_to")) {
+    checks.reply_to = sameProviderRecipientList(
+      data?.reply_to || data?.replyTo,
+      [outbound.payload.reply_to]
+    );
+  }
   if (outbound.payload.headers && plan.in_reply_to) {
     checks.in_reply_to_submitted =
       outbound.payload.headers["In-Reply-To"] === plan.in_reply_to;
@@ -6935,6 +6942,7 @@ async function sendEmailActionReviewProposalViaResend(config, plan) {
     text_sha256: outbound.text_sha256,
     attachment_manifest: [],
     direct_internal_recipient: plan.to,
+    reply_to_submitted: plan.reply_to,
     self_bcc_submitted: null,
     thread_headers_submitted: {
       in_reply_to: plan.in_reply_to,
@@ -8362,14 +8370,34 @@ function buildEmailActionReviewProposalPlan({ action, sourceMessage, sendAccount
       "utf8"
     )
     .digest("hex");
-  const subject = `ENTWURF: ${buildReplySubject(inbound.subject)}`;
+  const originalSubject = String(inbound.subject || "").trim();
+  const subject = `ENTWURF: AN ${externalRecipient.email} | ${buildReplySubject(originalSubject)}`;
   const references = buildReplyReferences(inbound);
-  const html = `<div>${escapeAccountingHtml(normalizedBody).replace(/\n/g, "<br>\n")}</div>`;
+  const operatorNotice = [
+    "INTERNER ENTWURF - NICHT AUTOMATISCH EXTERN VERSENDET",
+    `Ziel-Empfaenger: ${externalRecipient.email}`,
+    `Originalbetreff: ${originalSubject || "(ohne Betreff)"}`,
+    "Hinweis: Antworten adressiert den verifizierten Ziel-Empfaenger ueber Reply-To. Vor Versand bitte pruefen.",
+    "",
+    "--- Antwortvorschlag ---",
+    ""
+  ].join("\n");
+  const visibleProposalBody = `${operatorNotice}${normalizedBody}`;
+  const html = [
+    '<div style="border:1px solid #c7c7c7;padding:12px 14px;margin:0 0 18px 0;background:#f7f7f7;color:#222;font-family:Arial,sans-serif;font-size:14px;line-height:1.45">',
+    "<strong>INTERNER ENTWURF - NICHT AUTOMATISCH EXTERN VERSENDET</strong><br>",
+    `<strong>Ziel-Empfaenger:</strong> ${escapeAccountingHtml(externalRecipient.email)}<br>`,
+    `<strong>Originalbetreff:</strong> ${escapeAccountingHtml(originalSubject || "(ohne Betreff)")}<br>`,
+    "<span>Hinweis: Antworten adressiert den verifizierten Ziel-Empfaenger ueber Reply-To. Vor Versand bitte pruefen.</span>",
+    "</div>",
+    `<div>${escapeAccountingHtml(normalizedBody).replace(/\n/g, "<br>\n")}</div>`
+  ].join("");
   const boundary = `VIP-Proposal-${idempotencyId.slice(0, 24)}`;
   const messageId = `<vip-proposal-${idempotencyId.slice(0, 40)}@vip-tools-mcp.vip-studios.de>`;
   const rawMessage = [
     `From: <${internalRecipient}>`,
     `To: <${internalRecipient}>`,
+    `Reply-To: <${externalRecipient.email}>`,
     `Subject: ${encodeHeader(sanitizeHeaderLineValue(subject, "Subject"))}`,
     `Date: ${new Date().toUTCString()}`,
     `Message-ID: ${messageId}`,
@@ -8382,7 +8410,7 @@ function buildEmailActionReviewProposalPlan({ action, sourceMessage, sendAccount
     "Content-Type: text/plain; charset=utf-8",
     "Content-Transfer-Encoding: base64",
     "",
-    encodeMimeBase64Body(normalizedBody),
+    encodeMimeBase64Body(visibleProposalBody),
     `--${boundary}`,
     "Content-Type: text/html; charset=utf-8",
     "Content-Transfer-Encoding: base64",
@@ -8402,6 +8430,7 @@ function buildEmailActionReviewProposalPlan({ action, sourceMessage, sendAccount
     message_id: messageId,
     from: internalRecipient,
     to: internalRecipient,
+    reply_to: externalRecipient.email,
     bcc: "",
     bcc_source: "not_required_internal_direct_delivery",
     bcc_visible_in_mime_headers: false,
@@ -8413,8 +8442,9 @@ function buildEmailActionReviewProposalPlan({ action, sourceMessage, sendAccount
     in_reply_to: inbound.message_id,
     references,
     content_type: `multipart/alternative; boundary=\"${boundary}\"`,
-    proposal_body: normalizedBody,
-    proposal_body_sha256: createHash("sha256").update(normalizedBody, "utf8").digest("hex"),
+    proposal_body: visibleProposalBody,
+    proposal_body_sha256: createHash("sha256").update(visibleProposalBody, "utf8").digest("hex"),
+    reply_body_sha256: createHash("sha256").update(normalizedBody, "utf8").digest("hex"),
     proposal_html: html,
     source_uid: sourceMessage.uid,
     source_message_id_hash: sourceMessage.parsed?.message_id_hash || null
@@ -19241,6 +19271,7 @@ function createServer() {
           idempotency_id: plan.idempotency_id,
           from: plan.from,
           to: plan.to,
+          reply_to: plan.reply_to,
           bcc: null,
           subject: plan.subject,
           in_reply_to: plan.in_reply_to,
@@ -19248,7 +19279,10 @@ function createServer() {
           external_recipient: plan.external_recipient,
           external_recipient_source: plan.external_recipient_source,
           external_recipient_contacted: false,
+          external_recipient_visible_in_subject: plan.subject.includes(plan.external_recipient),
+          external_recipient_visible_in_body: plan.proposal_body.includes(plan.external_recipient),
           proposal_body_sha256: plan.proposal_body_sha256,
+          reply_body_sha256: plan.reply_body_sha256,
           uncertainty_reason_sha256: createHash("sha256")
             .update(String(uncertainty_reason).trim(), "utf8")
             .digest("hex")
@@ -19256,6 +19290,7 @@ function createServer() {
         safety: {
           direct_recipient_matches_configured_from: plan.to === plan.from,
           external_recipient_in_envelope: plan.envelope_recipients.includes(plan.external_recipient),
+          reply_to_matches_external_recipient: plan.reply_to === plan.external_recipient,
           bcc_visible_in_mime_headers: false,
           uses_real_thread_headers: Boolean(plan.in_reply_to && plan.references)
         },
@@ -19273,9 +19308,14 @@ function createServer() {
         plan.to !== plan.from ||
         plan.envelope_recipients.length !== 1 ||
         plan.envelope_recipients[0] !== plan.from ||
-        plan.envelope_recipients.includes(plan.external_recipient)
+        plan.envelope_recipients.includes(plan.external_recipient) ||
+        plan.reply_to !== plan.external_recipient ||
+        !plan.subject.includes(plan.external_recipient) ||
+        !plan.proposal_body.includes(plan.external_recipient)
       ) {
-        throw new Error("Interner Antwortentwurf hat keinen sicher isolierten Self-only-Envelope.");
+        throw new Error(
+          "Interner Antwortentwurf hat keinen sicher isolierten Self-only-Envelope oder keine eindeutige Zieladressierung."
+        );
       }
       if (mode !== "live") {
         const resendShadow =
@@ -19293,6 +19333,7 @@ function createServer() {
                 html_sha256: resendShadow.html_sha256,
                 text_sha256: resendShadow.text_sha256,
                 to: [plan.to],
+                reply_to: plan.reply_to,
                 bcc: [],
                 external_recipient_contacted: false
               }

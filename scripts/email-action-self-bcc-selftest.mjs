@@ -114,7 +114,16 @@ try {
       contactActions.every((action) => action.done_mailbox === "INBOX.Trash"),
     internal_review_proposal_is_self_only_and_threaded:
       source.includes("function buildEmailActionReviewProposalPlan") &&
-      source.includes('`ENTWURF: ${buildReplySubject(inbound.subject)}`') &&
+      source.includes('`ENTWURF: AN ${externalRecipient.email} | ${buildReplySubject(originalSubject)}`') &&
+      source.includes('`Reply-To: <${externalRecipient.email}>`') &&
+      source.includes("reply_to: plan.reply_to") &&
+      source.includes("Ziel-Empfaenger:") &&
+      source.includes("external_recipient_visible_in_subject") &&
+      source.includes("external_recipient_visible_in_body") &&
+      source.includes("reply_to_matches_external_recipient") &&
+      source.includes("plan.reply_to !== plan.external_recipient") &&
+      source.includes("!plan.subject.includes(plan.external_recipient)") &&
+      source.includes("!plan.proposal_body.includes(plan.external_recipient)") &&
       source.includes("external_recipient_contacted: false") &&
       source.includes("plan.envelope_recipients.includes(plan.external_recipient)") &&
       source.includes("sendEmailActionReviewProposalViaResend") &&
