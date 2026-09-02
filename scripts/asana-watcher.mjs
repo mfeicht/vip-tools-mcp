@@ -37,6 +37,7 @@ const WATCHER_LOCK_STALE_MS = Number.parseInt(
   process.env.WATCHER_LOCK_STALE_MS || String(45 * 60 * 1000),
   10
 );
+const MAX_OPEN_TASK_SNAPSHOT_LIMIT = 100;
 
 let activeWatcherLock = null;
 
@@ -47,7 +48,8 @@ function parseArgs(argv) {
     baseline: false,
     mcpUrl: process.env.WATCHER_MCP_URL || DEFAULT_MCP_URL,
     agents: null,
-    limit: 100,
+    limit: MAX_OPEN_TASK_SNAPSHOT_LIMIT,
+    limitWasClamped: false,
     maxSignalsPerAgent: 3,
     selfTest: false
   };
@@ -70,7 +72,9 @@ function parseArgs(argv) {
         .map((item) => item.trim())
         .filter(Boolean);
     } else if (arg.startsWith("--limit=")) {
-      opts.limit = parsePositiveInt(arg.slice("--limit=".length), "limit");
+      const requestedLimit = parsePositiveInt(arg.slice("--limit=".length), "limit");
+      opts.limit = Math.min(requestedLimit, MAX_OPEN_TASK_SNAPSHOT_LIMIT);
+      opts.limitWasClamped = requestedLimit !== opts.limit;
     } else if (arg.startsWith("--max-signals-per-agent=")) {
       opts.maxSignalsPerAgent = parsePositiveInt(
         arg.slice("--max-signals-per-agent=".length),
@@ -111,7 +115,7 @@ Optionen:
   --write                    State/Queue/Log lokal schreiben.
   --baseline                 Aktuellen Stand als gesehen markieren, ohne Queue-Signale.
   --agents=a,b               Nur bestimmte agent_id-Werte pruefen.
-  --limit=100                Max. offene Tasks je Agent.
+  --limit=100                Max. offene Tasks je Agent; Werte >100 werden gedeckelt.
   --max-signals-per-agent=3  Max. Queue-Signale je Agent und Lauf.
   --lookback-hours=72        Veralteter, kompatibel akzeptierter Parameter ohne Zusatzabrufe.
 `);
@@ -675,6 +679,11 @@ function coalesceSignalsByTask(signals) {
 
 async function run() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.limitWasClamped) {
+    console.error(
+      `[watcher] --limit capped at ${MAX_OPEN_TASK_SNAPSHOT_LIMIT} to match asana_agents_open_task_snapshot schema`
+    );
+  }
   if (opts.selfTest) {
     const sample = [
       { id: "new", agent_id: "vip-ai-test", task_gid: "1", signal_type: "new_task", priority: "medium" },
