@@ -18,6 +18,7 @@
     "test:accounting-ocr-contract": "node scripts/accounting-ocr-contract-selftest.mjs",
     "test:accounting-invoice-parser": "node scripts/accounting-invoice-parser-selftest.mjs",
     "test:recurrence-settle": "node scripts/recurrence-settle-selftest.mjs",
+    "test:asana-schedule-guard": "node scripts/asana-schedule-guard-selftest.mjs",
     "test:dashboard-health": "node scripts/dashboard-health-selftest.mjs",
     "test:google-drive-upload-contract": "node scripts/google-drive-upload-contract-selftest.mjs",
     "test:web-research": "node scripts/web-research-selftest.mjs",

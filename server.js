@@ -42,6 +42,10 @@ import {
   validateAsanaObserverCommentIntent
 } from "./lib/asana-observer-guard.js";
 import {
+  isRoutineInstanceMissingAlarmIntent,
+  sameAsanaDateTimeInstant
+} from "./lib/asana-schedule-guards.js";
+import {
   extractAccountingInvoice as extractAccountingInvoiceV2,
   getNormalizedAccountingInvoiceLines as getNormalizedAccountingInvoiceLinesV2
 } from "./lib/accounting-invoice-parser.js";
@@ -1654,17 +1658,6 @@ function asanaTaskCompletionAgeSeconds(task, nowMs = Date.now()) {
   const completedAtMs = Date.parse(String(task?.completed_at || ""));
   if (!Number.isFinite(completedAtMs)) return null;
   return Math.max(0, Math.floor((nowMs - completedAtMs) / 1000));
-}
-
-function isRoutineInstanceMissingAlarmIntent({ name, description, creation_basis }) {
-  const text = normalizeAsanaLabel([name, description, creation_basis].filter(Boolean).join(" "));
-  const routineSignal = ["routine", "folgeinstanz", "wiederholung", "recurrence"].some((term) =>
-    text.includes(term)
-  );
-  const missingSignal = ["fehlt", "fehlend", "nicht erstellt", "nicht erzeugt", "missing"].some((term) =>
-    text.includes(term)
-  );
-  return routineSignal && missingSignal;
 }
 
 async function findAsanaNextRoutineCandidates({
@@ -12438,7 +12431,7 @@ function createServer() {
             throw new Error("Asana-Readback zeigt weiterhin due_on/due_at nach clear_due=true.");
           }
         } else if (due_at) {
-          if (verified_task.due_at !== due_at) {
+          if (!sameAsanaDateTimeInstant(verified_task.due_at, due_at)) {
             throw new Error(`Asana-Readback due_at=${verified_task.due_at || "null"} statt erwartet ${due_at}.`);
           }
         } else if (due_on && verified_task.due_on !== due_on) {
@@ -12887,7 +12880,7 @@ function createServer() {
         verified_task = verify.data.data;
 
         if (scheduleInput.expected_due_at) {
-          if (verified_task.due_at !== scheduleInput.expected_due_at) {
+          if (!sameAsanaDateTimeInstant(verified_task.due_at, scheduleInput.expected_due_at)) {
             throw new Error(
               `Asana-Readback due_at=${verified_task.due_at || "null"} statt erwartet ${scheduleInput.expected_due_at}.`
             );
