@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
 import {
   buildGoogleAdsComparison,
+  dashboardControlPollMessage,
   dashboardRefreshPollMessage,
   decodeAndVerifyDashboardTelemetry,
+  verifyDashboardControlPoll,
   verifyDashboardRefreshPoll
 } from "../lib/dashboard-health.js";
 
@@ -51,6 +53,30 @@ assert.throws(() =>
     timestamp: pollTimestamp,
     nonce: `${pollNonce}x`,
     signatureBase64: pollSignature.toString("base64"),
+    publicKeyPem: publicKey.export({ type: "spki", format: "pem" }),
+    now
+  })
+);
+
+const controlNonce = "dashboard-control-selftest-123";
+const controlSignature = sign(
+  null,
+  dashboardControlPollMessage({ timestamp: pollTimestamp, nonce: controlNonce }),
+  privateKey
+);
+const verifiedControlPoll = verifyDashboardControlPoll({
+  timestamp: pollTimestamp,
+  nonce: controlNonce,
+  signatureBase64: controlSignature.toString("base64"),
+  publicKeyPem: publicKey.export({ type: "spki", format: "pem" }),
+  now
+});
+assert.equal(verifiedControlPoll.nonce, controlNonce);
+assert.throws(() =>
+  verifyDashboardControlPoll({
+    timestamp: pollTimestamp,
+    nonce: `${controlNonce}x`,
+    signatureBase64: controlSignature.toString("base64"),
     publicKeyPem: publicKey.export({ type: "spki", format: "pem" }),
     now
   })

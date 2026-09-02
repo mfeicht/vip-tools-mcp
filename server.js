@@ -28,6 +28,7 @@ import {
   dashboardTelemetryFresh,
   dateKeyShift,
   decodeAndVerifyDashboardTelemetry,
+  verifyDashboardControlPoll,
   verifyDashboardRefreshPoll
 } from "./lib/dashboard-health.js";
 import {
@@ -73,6 +74,18 @@ const VIP_DASHBOARD_FEED_TOKEN = String(
 const VIP_DASHBOARD_REFRESH_REQUEST_TTL_MS = Math.max(
   60_000,
   Number(process.env.VIP_DASHBOARD_REFRESH_REQUEST_TTL_MS || 10 * 60 * 1000)
+);
+const VIP_DASHBOARD_ACTION_REQUEST_TTL_MS = Math.max(
+  10 * 60 * 1000,
+  Number(process.env.VIP_DASHBOARD_ACTION_REQUEST_TTL_MS || 4 * 60 * 60 * 1000)
+);
+const VIP_DASHBOARD_ACTION_LEASE_MS = Math.max(
+  2 * 60 * 1000,
+  Number(process.env.VIP_DASHBOARD_ACTION_LEASE_MS || 10 * 60 * 1000)
+);
+const VIP_DASHBOARD_OVERDUE_GRACE_MS = Math.max(
+  0,
+  Number(process.env.VIP_DASHBOARD_OVERDUE_GRACE_MS || 60 * 60 * 1000)
 );
 const VIP_DASHBOARD_TELEMETRY_PUBLIC_KEY = Buffer.from(
   "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQUdhYXZZT2VzYVJBTUQzSlFKeU5TblVCVWxOU0xyTkJXN21PaSt5SEREV0k9Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=",
@@ -20661,6 +20674,9 @@ let vipDashboardTelemetry = null;
 const vipDashboardTelemetryNonces = new Map();
 const vipDashboardRefreshPollNonces = new Map();
 const vipDashboardRefreshRequests = new Map();
+const vipDashboardControlPollNonces = new Map();
+const vipDashboardControlResultNonces = new Map();
+const vipDashboardActionRequests = new Map();
 
 function dashboardBearerToken(req) {
   const authorization = String(req.headers.authorization || "");
@@ -20694,6 +20710,22 @@ function cleanupDashboardRefreshState(now = Date.now()) {
       vipDashboardRefreshRequests.delete(requestId);
     }
   }
+  for (const [nonce, seenAt] of vipDashboardControlPollNonces.entries()) {
+    if (now - seenAt > 10 * 60 * 1000) vipDashboardControlPollNonces.delete(nonce);
+  }
+  for (const [nonce, seenAt] of vipDashboardControlResultNonces.entries()) {
+    if (now - seenAt > 20 * 60 * 1000) vipDashboardControlResultNonces.delete(nonce);
+  }
+  for (const [requestId, request] of vipDashboardActionRequests.entries()) {
+    if (["pending", "running"].includes(request.status) && request.expiresAtMs <= now) {
+      request.status = "expired";
+      request.completedAt = new Date(now).toISOString();
+      request.error = "Die lokale Steuerung hat den Auftrag nicht innerhalb des Zeitfensters abgeholt.";
+    }
+    if (request.expiresAtMs + VIP_DASHBOARD_ACTION_REQUEST_TTL_MS <= now) {
+      vipDashboardActionRequests.delete(requestId);
+    }
+  }
 }
 
 function dashboardRefreshResponse(request) {
@@ -20707,6 +20739,83 @@ function dashboardRefreshResponse(request) {
     snapshotGeneratedAt: request.snapshotGeneratedAt || null,
     error: request.error || null
   };
+}
+
+function normalizeDashboardAgentIds(value, { allowAll = false } = {}) {
+  const requested = value === "all" && allowAll ? Object.keys(VIP_DASHBOARD_AGENT_NAMES) : value;
+  if (!Array.isArray(requested) || requested.length === 0) {
+    throw Object.assign(new Error("Mindestens ein Agent muss ausgewaehlt sein."), { statusCode: 400 });
+  }
+  const unique = [...new Set(requested.map((item) => String(item || "").trim()).filter(Boolean))];
+  if (unique.length > Object.keys(VIP_DASHBOARD_AGENT_NAMES).length) {
+    throw Object.assign(new Error("Zu viele Agenten in einem Dashboard-Auftrag."), { statusCode: 400 });
+  }
+  for (const agentId of unique) {
+    if (!VIP_DASHBOARD_AGENT_NAMES[agentId]) {
+      throw Object.assign(new Error(`Unbekannter Dashboard-Agent: ${agentId}`), { statusCode: 400 });
+    }
+  }
+  return unique;
+}
+
+function dashboardRecoveryMessage(requestId) {
+  return [
+    `Operations-Recovery ${requestId}`,
+    "Pruefe jetzt deinen eigenen Agentenbereich nach einer Betriebs- oder Internetunterbrechung.",
+    "Lies zuerst die aktive kanonische Wahrheit und pruefe danach deine eigenen offenen Asana-Aufgaben, Faelligkeiten, Locks, Handoffs, Run-States und benoetigten Verbindungen.",
+    "Ziehe faellige oder ueberfaellige eigene Arbeit gemaess den bestehenden Due-, Routine-, QA-, Handoff- und Known-Failure-Gates nach. Zukunftsroutinen duerfen vorbereitet, aber nicht vor due_at abgeschlossen werden.",
+    "Mische keine fremden Agenten-, Projekt- oder Systempunkte in deinen Status. Globale Stoerungen gehen als belegte enge Meldung an VIP AI-Operations.",
+    "Beende mit aktuellem Readback und nur echten verbleibenden Blockern. Bei leerer Queue kein Asana-Rauschen erzeugen.",
+    "Dieser Recovery-Auftrag ist keine pauschale Freigabe fuer destruktive, finanzielle, externe oder sonstige besonders geschuetzte Live-Aktionen."
+  ].join("\n\n");
+}
+
+function normalizeDashboardAction(body = {}) {
+  const type = String(body.type || "").trim();
+  if (!["agent_recovery", "agent_dispatch"].includes(type)) {
+    throw Object.assign(new Error("Unbekannter Dashboard-Auftrag."), { statusCode: 400 });
+  }
+  const agentIds = normalizeDashboardAgentIds(body.agent_ids, { allowAll: true });
+  const defaultStagger = type === "agent_recovery" && agentIds.length > 1 ? 90 : 15;
+  const staggerSeconds = Math.min(
+    300,
+    Math.max(0, Number.isFinite(Number(body.stagger_seconds)) ? Math.round(Number(body.stagger_seconds)) : defaultStagger)
+  );
+  let message = "";
+  if (type === "agent_dispatch") {
+    message = String(body.message || "").trim();
+    if (message.length < 12 || message.length > 4_000) {
+      throw Object.assign(new Error("Die Nachricht muss zwischen 12 und 4.000 Zeichen lang sein."), {
+        statusCode: 400
+      });
+    }
+  }
+  return { type, agentIds, staggerSeconds, message };
+}
+
+function dashboardActionResponse(request, { includePayload = false } = {}) {
+  const response = {
+    ok: true,
+    requestId: request.id,
+    type: request.type,
+    status: request.status,
+    agentIds: request.agentIds,
+    staggerSeconds: request.staggerSeconds,
+    requestedAt: request.requestedAt,
+    startedAt: request.startedAt || null,
+    expiresAt: request.expiresAt,
+    completedAt: request.completedAt || null,
+    results: request.results || [],
+    error: request.error || null
+  };
+  if (includePayload) response.message = request.message;
+  return response;
+}
+
+function dashboardActionFingerprint(action) {
+  return createHash("sha256")
+    .update(JSON.stringify([action.type, action.agentIds, action.staggerSeconds, action.message]))
+    .digest("hex");
 }
 
 function berlinDateKey(value = new Date()) {
@@ -20734,10 +20843,12 @@ function summarizeDashboardTasks(tasks, now = new Date()) {
     );
     const hasRoutineTitle = /^R:\s*/i.test(String(task?.name || ""));
     const isRoutine = hasRoutineTag || hasRoutineTitle;
-    const overdue =
+    const dueDeadlineMs =
       dueAt && !Number.isNaN(dueAt.getTime())
-        ? dueAt.getTime() < now.getTime()
-        : dueDate < today;
+        ? dueAt.getTime()
+        : Date.parse(berlinLocalDateTimeToUtcIso(dueDate, "23:59:59"));
+    const overdueMinutes = Math.max(0, Math.floor((now.getTime() - dueDeadlineMs) / 60_000));
+    const overdue = now.getTime() - dueDeadlineMs > VIP_DASHBOARD_OVERDUE_GRACE_MS;
 
     if (dueAt && !Number.isNaN(dueAt.getTime())) {
       if (overdue) overdueTasks += 1;
@@ -20753,6 +20864,7 @@ function summarizeDashboardTasks(tasks, now = new Date()) {
         name: task.name,
         dueAt: task.due_at || null,
         dueOn: task.due_on || null,
+        overdueMinutes,
         permalinkUrl: task.permalink_url || `https://app.asana.com/0/0/${task.gid}`,
         routineEvidence: hasRoutineTag ? "tag" : "title"
       });
@@ -20770,6 +20882,7 @@ function summarizeDashboardTasks(tasks, now = new Date()) {
     open_tasks: tasks.length,
     overdue_tasks: overdueTasks,
     due_today_tasks: dueTodayTasks,
+    overdue_grace_minutes: Math.round(VIP_DASHBOARD_OVERDUE_GRACE_MS / 60_000),
     routine_backlog: routineBacklog,
     routine_tag_missing: routineTagMissing
   };
@@ -21315,6 +21428,189 @@ app.get("/dashboard/refresh/:requestId", (req, res) => {
   }
   return res.json(dashboardRefreshResponse(request));
 });
+
+app.post(
+  "/dashboard/actions",
+  express.json({ limit: "12kb" }),
+  (req, res) => {
+    res.set("cache-control", "no-store");
+    if (!hasValidDashboardFeedToken(req)) {
+      return res.status(401).json({ ok: false, error: "Unauthorized." });
+    }
+
+    try {
+      const now = Date.now();
+      cleanupDashboardRefreshState(now);
+      const action = normalizeDashboardAction(req.body);
+      const fingerprint = dashboardActionFingerprint(action);
+      const existing = [...vipDashboardActionRequests.values()].find(
+        (request) =>
+          ["pending", "running"].includes(request.status) &&
+          request.expiresAtMs > now &&
+          request.fingerprint === fingerprint
+      );
+      if (existing) {
+        return res.status(202).json(dashboardActionResponse(existing));
+      }
+
+      const requestId = randomUUID();
+      const request = {
+        id: requestId,
+        type: action.type,
+        agentIds: action.agentIds,
+        staggerSeconds: action.staggerSeconds,
+        message:
+          action.type === "agent_recovery"
+            ? dashboardRecoveryMessage(requestId)
+            : action.message,
+        fingerprint,
+        status: "pending",
+        requestedAt: new Date(now).toISOString(),
+        startedAt: null,
+        expiresAt: new Date(now + VIP_DASHBOARD_ACTION_REQUEST_TTL_MS).toISOString(),
+        expiresAtMs: now + VIP_DASHBOARD_ACTION_REQUEST_TTL_MS,
+        leaseUntilMs: null,
+        completedAt: null,
+        results: [],
+        error: null
+      };
+      vipDashboardActionRequests.set(requestId, request);
+      return res.status(202).json(dashboardActionResponse(request));
+    } catch (error) {
+      return res.status(Number(error?.statusCode || 400)).json({
+        ok: false,
+        error: String(error?.message || "Dashboard-Auftrag ist ungueltig.")
+      });
+    }
+  }
+);
+
+app.get("/dashboard/actions/:requestId", (req, res) => {
+  res.set("cache-control", "no-store");
+  if (!hasValidDashboardFeedToken(req)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized." });
+  }
+  cleanupDashboardRefreshState();
+  const request = vipDashboardActionRequests.get(String(req.params.requestId || ""));
+  if (!request) {
+    return res.status(404).json({ ok: false, error: "Dashboard-Auftrag nicht gefunden." });
+  }
+  return res.json(dashboardActionResponse(request));
+});
+
+app.get("/dashboard/control/request", (req, res) => {
+  res.set("cache-control", "no-store");
+  try {
+    const now = Date.now();
+    const poll = verifyDashboardControlPoll({
+      timestamp: String(req.headers["x-vip-dashboard-timestamp"] || ""),
+      nonce: String(req.headers["x-vip-dashboard-nonce"] || ""),
+      signatureBase64: String(req.headers["x-vip-dashboard-signature"] || ""),
+      publicKeyPem: VIP_DASHBOARD_TELEMETRY_PUBLIC_KEY,
+      now
+    });
+    cleanupDashboardRefreshState(now);
+    if (vipDashboardControlPollNonces.has(poll.nonce)) {
+      return res.status(409).json({ ok: false, error: "Control poll replay rejected." });
+    }
+    vipDashboardControlPollNonces.set(poll.nonce, now);
+
+    const pending = [...vipDashboardActionRequests.values()]
+      .filter(
+        (request) =>
+          request.expiresAtMs > now &&
+          (request.status === "pending" ||
+            (request.status === "running" && Number(request.leaseUntilMs || 0) <= now))
+      )
+      .sort((left, right) => left.requestedAt.localeCompare(right.requestedAt))[0];
+    if (!pending) return res.status(204).end();
+
+    pending.status = "running";
+    pending.startedAt ||= new Date(now).toISOString();
+    pending.leaseUntilMs = now + VIP_DASHBOARD_ACTION_LEASE_MS;
+    return res.json(dashboardActionResponse(pending, { includePayload: true }));
+  } catch (error) {
+    return res.status(401).json({
+      ok: false,
+      error: String(error?.message || "Control poll authentication failed.")
+    });
+  }
+});
+
+app.post(
+  "/dashboard/control/result",
+  express.json({ limit: "64kb" }),
+  (req, res) => {
+    res.set("cache-control", "no-store");
+    try {
+      const now = Date.now();
+      cleanupDashboardRefreshState(now);
+      const payload = decodeAndVerifyDashboardTelemetry({
+        payloadBase64: req.body?.payload,
+        signatureBase64: req.body?.signature,
+        publicKeyPem: VIP_DASHBOARD_TELEMETRY_PUBLIC_KEY,
+        now
+      });
+      if (vipDashboardControlResultNonces.has(payload.nonce)) {
+        return res.status(409).json({ ok: false, error: "Control result replay rejected." });
+      }
+      vipDashboardControlResultNonces.set(payload.nonce, now);
+
+      const request = vipDashboardActionRequests.get(String(payload.actionRequestId || ""));
+      if (!request) {
+        return res.status(404).json({ ok: false, error: "Dashboard-Auftrag nicht gefunden." });
+      }
+      if (!["running", "pending"].includes(request.status)) {
+        return res.status(409).json({ ok: false, error: "Dashboard-Auftrag ist bereits beendet." });
+      }
+      if (!["running", "completed", "partial", "failed"].includes(String(payload.status))) {
+        return res.status(400).json({ ok: false, error: "Ungueltiger Dashboard-Ergebnisstatus." });
+      }
+
+      const results = Array.isArray(payload.results) ? payload.results : [];
+      if (results.length > request.agentIds.length) {
+        return res.status(400).json({ ok: false, error: "Zu viele Agentenergebnisse." });
+      }
+      const normalizedResults = results.map((result) => {
+        const agentId = String(result?.agentId || "");
+        if (!request.agentIds.includes(agentId)) {
+          throw Object.assign(new Error(`Unerwartetes Agentenergebnis: ${agentId}`), {
+            statusCode: 400
+          });
+        }
+        const status = String(result?.status || "");
+        if (!["completed", "failed"].includes(status)) {
+          throw Object.assign(new Error(`Ungueltiger Agentenergebnisstatus: ${status}`), {
+            statusCode: 400
+          });
+        }
+        return {
+          agentId,
+          status,
+          detail: String(result?.detail || "").slice(0, 500),
+          queuedAt: result?.queuedAt || null
+        };
+      });
+
+      request.results = normalizedResults;
+      request.leaseUntilMs = now + VIP_DASHBOARD_ACTION_LEASE_MS;
+      if (payload.status === "running") {
+        return res.json(dashboardActionResponse(request));
+      }
+
+      request.status = payload.status;
+      request.completedAt = new Date(now).toISOString();
+      request.error = payload.error ? String(payload.error).slice(0, 500) : null;
+      request.leaseUntilMs = null;
+      return res.json(dashboardActionResponse(request));
+    } catch (error) {
+      return res.status(Number(error?.statusCode || 400)).json({
+        ok: false,
+        error: String(error?.message || "Dashboard-Ergebnis ist ungueltig.")
+      });
+    }
+  }
+);
 
 app.get("/dashboard/telemetry/request", (req, res) => {
   res.set("cache-control", "no-store");
