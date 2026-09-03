@@ -12,7 +12,11 @@ import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 
-import { selectImapUidWindow, sortImapMessagesByUidWindow } from "./lib/imap-window.js";
+import {
+  selectImapUidPage,
+  selectImapUidWindow,
+  sortImapMessagesByUidWindow
+} from "./lib/imap-window.js";
 import {
   WEB_RESEARCH_INCLUDE_VALUES,
   WEB_RESEARCH_PURPOSE_VALUES,
@@ -294,6 +298,10 @@ const EMAIL_ACTION_READ_AGENT_IDS = Object.freeze([
 ]);
 const EMAIL_ACTION_MAX_EMAIL_BYTES = Number(process.env.EMAIL_ACTION_MAX_EMAIL_BYTES || 4 * 1024 * 1024);
 const EMAIL_ACTION_MAX_SCAN_MESSAGES = Number(process.env.EMAIL_ACTION_MAX_SCAN_MESSAGES || 100);
+const EMAIL_ACTION_QUEUE_PAGE_SIZE = Math.min(
+  100,
+  Math.max(1, Number(process.env.EMAIL_ACTION_QUEUE_PAGE_SIZE || 25))
+);
 const EMAIL_ACTION_QUOTED_HISTORY_MAX_CHARS = Number(
   process.env.EMAIL_ACTION_QUOTED_HISTORY_MAX_CHARS || 100_000
 );
@@ -5111,6 +5119,18 @@ function extractImapLiteral(response) {
   return response.slice(start, start + length);
 }
 
+function extractFirstImapLiteral(response) {
+  const match = /\{(\d+)\}\r?\n/.exec(String(response || ""));
+  if (!match) return "";
+  const start = match.index + match[0].length;
+  return String(response).slice(start, start + Number(match[1]));
+}
+
+function parseImapRfc822Size(response) {
+  const match = /\bRFC822\.SIZE\s+(\d+)/i.exec(String(response || ""));
+  return match ? Number(match[1]) : null;
+}
+
 async function runImapFetchUnseenRaw(config, {
   limit,
   maxEmailBytes,
@@ -6388,6 +6408,11 @@ const RESEND_API_KEY_ENV_BY_DOMAIN = Object.freeze({
   "vip-studios.de": "RESEND_API_KEY_VIP_STUDIOS_DE",
   "goklever.de": "RESEND_API_KEY_GOKLEVER_DE"
 });
+const RESEND_DOMAIN_READ_API_KEY_ENV_BY_DOMAIN = Object.freeze({
+  "reise-stories.de": "RESEND_DOMAIN_READ_API_KEY_REISE_STORIES_DE",
+  "vip-studios.de": "RESEND_DOMAIN_READ_API_KEY_VIP_STUDIOS_DE",
+  "goklever.de": "RESEND_DOMAIN_READ_API_KEY_GOKLEVER_DE"
+});
 
 function emailDomainFromAddress(address) {
   return extractEmailAddress(address).split("@")[1] || "";
@@ -6397,15 +6422,35 @@ function resendApiKeyEnvNameForAddress(address) {
   return RESEND_API_KEY_ENV_BY_DOMAIN[emailDomainFromAddress(address)] || "";
 }
 
+function resendDomainReadApiKeyEnvName(domain) {
+  return RESEND_DOMAIN_READ_API_KEY_ENV_BY_DOMAIN[String(domain || "").trim().toLowerCase()] || "";
+}
+
 async function readResendDomainStatus(domain) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
-  const apiKeyEnvName = RESEND_API_KEY_ENV_BY_DOMAIN[normalizedDomain] || "";
-  const apiKey = apiKeyEnvName ? process.env[apiKeyEnvName] : "";
+  const sendApiKeyEnvName = RESEND_API_KEY_ENV_BY_DOMAIN[normalizedDomain] || "";
+  const domainReadApiKeyEnvName = resendDomainReadApiKeyEnvName(normalizedDomain);
+  const domainReadApiKey = domainReadApiKeyEnvName
+    ? process.env[domainReadApiKeyEnvName]
+    : "";
+  const sendApiKey = sendApiKeyEnvName ? process.env[sendApiKeyEnvName] : "";
+  const apiKeyEnvName = domainReadApiKey ? domainReadApiKeyEnvName : sendApiKeyEnvName;
+  const apiKey = domainReadApiKey || sendApiKey;
+  const credentialScope = domainReadApiKey
+    ? "domain_read"
+    : sendApiKey
+      ? "send_key_fallback"
+      : null;
   const base = {
     provider: "resend",
     domain: normalizedDomain,
     api_key_env_name: apiKeyEnvName || null,
     api_key_configured: Boolean(apiKey),
+    credential_scope: credentialScope,
+    send_api_key_env_name: sendApiKeyEnvName || null,
+    send_api_key_configured: Boolean(sendApiKey),
+    domain_read_api_key_env_name: domainReadApiKeyEnvName || null,
+    domain_read_api_key_configured: Boolean(domainReadApiKey),
     provider_readback_attempted: false,
     provider_http_status: null,
     domain_registered: false,
@@ -6419,7 +6464,8 @@ async function readResendDomainStatus(domain) {
   if (!apiKey) {
     return {
       ...base,
-      error: "Der domain-spezifische Resend-API-Key ist im MCP-Environment nicht konfiguriert."
+      error:
+        "Weder der getrennte Resend-Domain-Read-Key noch der domain-spezifische Send-Key ist im MCP-Environment konfiguriert."
     };
   }
 
@@ -6460,6 +6506,10 @@ async function readResendDomainStatus(domain) {
       ...base,
       provider_readback_attempted: true,
       provider_http_status: status,
+      remediation:
+        status === 401 && credentialScope === "send_key_fallback"
+          ? `Der Send-Key darf GET /domains nicht lesen. ${domainReadApiKeyEnvName} mit einer getrennten read-only Domain-Credential konfigurieren; den Send-Key unveraendert lassen.`
+          : null,
       error: `Resend-Domain-Readback fehlgeschlagen${status ? ` (HTTP ${status})` : ""}: ${String(
         providerMessage || caught?.message || "Unbekannter Fehler"
       ).slice(0, 500)}`
@@ -7643,6 +7693,19 @@ function getEmailActionDefinition(actionId) {
   return { config, action };
 }
 
+function registeredEmailActionTemplateUidsForMailbox(mailbox) {
+  const normalizedMailbox = String(mailbox || "").trim().toLowerCase();
+  if (!normalizedMailbox) return [];
+  const actionUids = loadEmailActionDefinitions().actions
+    .filter((action) => action.mailbox.toLowerCase() === normalizedMailbox)
+    .map((action) => action.template?.uid || "");
+  const signatureUids = loadEmailActionSendAccounts().accounts
+    .map((account) => account.signature_template)
+    .filter((template) => template?.mailbox?.toLowerCase() === normalizedMailbox)
+    .map((template) => template.uid || "");
+  return uniqueValues([...actionUids, ...signatureUids].filter((uid) => /^\d+$/.test(String(uid))));
+}
+
 function findAgentIdForEmailAddress(address) {
   const normalized = extractEmailAddress(address);
   if (!normalized) return "";
@@ -7836,7 +7899,25 @@ function hasImapFlag(flags, flag) {
   return (flags || []).some((item) => item.toLowerCase() === String(flag || "").toLowerCase());
 }
 
-async function runImapActionFolderScan(config, { mailbox, maxEmailBytes, maxScanMessages }) {
+function parseImapSearchUids(response) {
+  const searchLine = String(response || "")
+    .split(/\r?\n/)
+    .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
+  const uidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
+  return uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
+}
+
+async function runImapActionFolderScan(config, {
+  mailbox,
+  maxEmailBytes,
+  maxScanMessages,
+  scanOrder = "newest_first",
+  scanCursorUid = null,
+  includeQueuePage = true,
+  specificUids = [],
+  requiredUids = [],
+  threadSourceUids = []
+}) {
   const socket = await openImapSocket(config);
   socket.setEncoding("binary");
   const state = { buffer: "" };
@@ -7892,49 +7973,130 @@ async function runImapActionFolderScan(config, { mailbox, maxEmailBytes, maxScan
     }
     await command(`EXAMINE ${quoteImapString(resolvedMailbox)}`);
     const searchResponse = await command("UID SEARCH ALL");
-    const searchLine = searchResponse
-      .split(/\r?\n/)
-      .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
-    const uidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
-    const allUids = uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
-    const selectedUids = allUids.slice(-Math.max(1, maxScanMessages || EMAIL_ACTION_MAX_SCAN_MESSAGES));
+    const allUids = parseImapSearchUids(searchResponse);
+    const availableUidSet = new Set(allUids);
+    const normalizedRequiredUids = uniqueValues(
+      requiredUids.filter((uid) => /^\d+$/.test(String(uid))).map(String)
+    );
+    const normalizedSpecificUids = uniqueValues(
+      specificUids.filter((uid) => /^\d+$/.test(String(uid))).map(String)
+    );
+    const queuePage = includeQueuePage
+      ? selectImapUidPage(allUids, {
+          limit: Math.max(1, maxScanMessages || EMAIL_ACTION_MAX_SCAN_MESSAGES),
+          cursorUid: scanCursorUid,
+          order: scanOrder,
+          excludeUids: normalizedRequiredUids
+        })
+      : {
+          uids: [],
+          order: scanOrder,
+          cursor_uid: scanCursorUid ? String(scanCursorUid) : null,
+          last_uid: null,
+          next_cursor_uid: null,
+          has_more: false,
+          remaining_count: 0
+        };
+    const selectedUids = uniqueValues([
+      ...queuePage.uids,
+      ...normalizedSpecificUids.filter((uid) => availableUidSet.has(uid)),
+      ...normalizedRequiredUids.filter((uid) => availableUidSet.has(uid))
+    ]);
     const messages = [];
+    const fetchedUids = new Set();
 
-    for (const uid of selectedUids) {
-      const fetchResponse = await command(`UID FETCH ${uid} (UID FLAGS BODY.PEEK[])`);
+    const fetchUid = async (uid) => {
+      const normalizedUid = String(uid);
+      if (fetchedUids.has(normalizedUid)) return;
+      fetchedUids.add(normalizedUid);
+
+      const metadataResponse = await command(
+        `UID FETCH ${normalizedUid} (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC BCC REPLY-TO MESSAGE-ID IN-REPLY-TO REFERENCES DATE)])`
+      );
+      const metadataFlags = parseImapFlagsFromFetchResponse(metadataResponse);
+      const declaredBytes = parseImapRfc822Size(metadataResponse);
+      const headerRaw = extractFirstImapLiteral(metadataResponse);
+      const headerParsed = headerRaw ? await parseRawEmail(headerRaw, normalizedUid) : {};
+      const decorate = ({ raw = "", rawBytes = null, parsed = headerParsed, parseError = null }) => {
+        const templateMarker = isTemplateActionSubjectMarked(parsed.subject);
+        let templateSubject = null;
+        let templateSubjectError = null;
+        if (templateMarker) {
+          try {
+            templateSubject = parseTemplateActionSubject(parsed.subject);
+          } catch (error) {
+            templateSubjectError = String(error?.message || error);
+          }
+        }
+        messages.push({
+          uid: normalizedUid,
+          flags: metadataFlags,
+          raw,
+          raw_bytes: rawBytes,
+          raw_sha256: raw
+            ? createHash("sha256").update(raw, "binary").digest("hex")
+            : null,
+          parsed,
+          template_marker: templateMarker,
+          template_subject: templateSubject,
+          template_subject_error: templateSubjectError,
+          parse_error: parseError
+        });
+      };
+
+      if (declaredBytes !== null && declaredBytes > maxEmailBytes) {
+        decorate({
+          rawBytes: declaredBytes,
+          parseError: "message_too_large"
+        });
+        return;
+      }
+
+      const fetchResponse = await command(`UID FETCH ${normalizedUid} (UID FLAGS BODY.PEEK[])`);
       const raw = extractImapLiteral(fetchResponse);
-      const flags = parseImapFlagsFromFetchResponse(fetchResponse);
       if (!raw) {
-        messages.push({ uid, flags, parse_error: "no_body_literal" });
-        continue;
+        decorate({ parseError: "no_body_literal" });
+        return;
       }
       const rawBytes = Buffer.byteLength(raw, "binary");
       if (rawBytes > maxEmailBytes) {
-        messages.push({ uid, flags, parse_error: "message_too_large", raw_bytes: rawBytes });
-        continue;
+        decorate({ rawBytes, parseError: "message_too_large" });
+        return;
       }
-      const parsed = await parseRawEmail(raw, uid);
-      const templateMarker = isTemplateActionSubjectMarked(parsed.subject);
-      let templateSubject = null;
-      let templateSubjectError = null;
-      if (templateMarker) {
-        try {
-          templateSubject = parseTemplateActionSubject(parsed.subject);
-        } catch (error) {
-          templateSubjectError = String(error?.message || error);
+      const parsed = await parseRawEmail(raw, normalizedUid);
+      const fullFlags = parseImapFlagsFromFetchResponse(fetchResponse);
+      if (fullFlags.length) metadataFlags.splice(0, metadataFlags.length, ...fullFlags);
+      decorate({ raw, rawBytes, parsed });
+    };
+
+    for (const uid of selectedUids) {
+      await fetchUid(uid);
+    }
+
+    const threadAncestorUids = [];
+    for (const sourceUid of uniqueValues(threadSourceUids.map(String)).slice(0, 10)) {
+      const sourceMessage = messages.find(
+        (message) => String(message.uid) === sourceUid && message.raw && !message.parse_error
+      );
+      if (!sourceMessage) continue;
+      const inbound = getInboundHeadersForAction(sourceMessage.raw);
+      const referencedMessageIds = uniqueValues([
+        ...splitReferences(inbound.references),
+        ...splitReferences(inbound.in_reply_to)
+      ]).slice(0, 50);
+      for (const messageId of referencedMessageIds) {
+        const ancestorSearch = await command(
+          `UID SEARCH HEADER Message-ID ${quoteImapString(messageId)}`
+        );
+        for (const ancestorUid of parseImapSearchUids(ancestorSearch)) {
+          if (ancestorUid !== sourceUid && !threadAncestorUids.includes(ancestorUid)) {
+            threadAncestorUids.push(ancestorUid);
+          }
         }
       }
-      messages.push({
-        uid,
-        flags,
-        raw,
-        raw_bytes: rawBytes,
-        raw_sha256: createHash("sha256").update(raw, "binary").digest("hex"),
-        parsed,
-        template_marker: templateMarker,
-        template_subject: templateSubject,
-        template_subject_error: templateSubjectError
-      });
+    }
+    for (const uid of threadAncestorUids) {
+      await fetchUid(uid);
     }
 
     await command("LOGOUT").catch(() => {});
@@ -7943,7 +8105,20 @@ async function runImapActionFolderScan(config, { mailbox, maxEmailBytes, maxScan
       mailbox: resolvedMailbox,
       available_mailboxes: mailboxes,
       total_uid_count: allUids.length,
-      scanned_uid_count: selectedUids.length,
+      scanned_uid_count: messages.length,
+      queue_page: {
+        ...queuePage,
+        requested_uid_count: normalizedSpecificUids.length,
+        required_uid_count: normalizedRequiredUids.length,
+        fetched_uid_count: messages.length,
+        full_body_fetched_count: messages.filter((message) => Boolean(message.raw)).length,
+        oversized_skipped_count: messages.filter(
+          (message) => message.parse_error === "message_too_large"
+        ).length
+      },
+      missing_specific_uids: normalizedSpecificUids.filter((uid) => !availableUidSet.has(uid)),
+      missing_required_uids: normalizedRequiredUids.filter((uid) => !availableUidSet.has(uid)),
+      thread_ancestor_uid_count: threadAncestorUids.length,
       messages
     };
   } catch (error) {
@@ -19306,6 +19481,8 @@ function createServer() {
               secure_optional: `SMTP_SECURE_${account.env_suffix}`,
               user_optional: `SMTP_USER_${account.env_suffix}`,
               resend_api_key: resendApiKeyEnvNameForAddress(account.address) || null,
+              resend_domain_read_api_key:
+                resendDomainReadApiKeyEnvName(emailDomainFromAddress(account.address)) || null,
               password_one_of: [
                 `SMTP_PASSWORD_${account.env_suffix}`,
                 `EMAIL_PASSWORD_${account.env_suffix}`
@@ -19394,6 +19571,7 @@ function createServer() {
             relative_path: mailbox.toLowerCase() === rootLower ? "" : mailbox.slice(root.length + 1),
             total_uid_count: scan.total_uid_count,
             scanned_uid_count: scan.scanned_uid_count,
+            queue_page: scan.queue_page,
             template_count: templates.length,
             inbound_count: inboundMessages.length,
             invalid_template_count: invalidTemplates.length,
@@ -19483,7 +19661,7 @@ function createServer() {
 
   server.tool(
     "email_action_template_readback",
-    "Liest einen konfigurierten IMAP-Aktionsordner read-only, identifiziert exakt eine Vorlage anhand des VORLAGE-Betreffs und gibt UID, Message-ID-Hash und SHA256 fuer die Registrierung zurueck. Sendet und verschiebt nichts.",
+    "Liest eine registrierte Action-Vorlage gezielt per IMAP-UID read-only; nur fuer noch unregistrierte Actions wird ein begrenztes Ordnerfenster durchsucht. Gibt Message-ID-Hash und SHA256 fuer die Registrierung zurueck, sendet und verschiebt nichts.",
     {
       agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
       action_id: z.string(),
@@ -19494,11 +19672,26 @@ function createServer() {
     async ({ agent_id, action_id, max_scan_messages, max_email_bytes }) => {
       const { action } = getEmailActionDefinition(action_id);
       const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
-      const scan = await scanEmailActionFolderWithFallback(configs, {
+      let scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: action.mailbox,
         maxEmailBytes: max_email_bytes,
-        maxScanMessages: max_scan_messages
+        maxScanMessages: max_scan_messages,
+        scanOrder: "oldest_first",
+        includeQueuePage: !action.template.uid,
+        requiredUids: registeredEmailActionTemplateUidsForMailbox(action.mailbox)
       });
+      if (action.template.uid && scan.missing_required_uids.includes(action.template.uid)) {
+        scan = await scanEmailActionFolderWithFallback(configs, {
+          mailbox: action.mailbox,
+          maxEmailBytes: max_email_bytes,
+          maxScanMessages: max_scan_messages,
+          scanOrder: "newest_first",
+          includeQueuePage: true,
+          requiredUids: registeredEmailActionTemplateUidsForMailbox(action.mailbox).filter(
+            (uid) => uid !== action.template.uid
+          )
+        });
+      }
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
       const inbound = scan.messages.filter(isEmailActionInboundMessage);
       const doneExists = scan.available_mailboxes.some((mailbox) => mailbox.toLowerCase() === action.done_mailbox.toLowerCase());
@@ -19521,6 +19714,8 @@ function createServer() {
           mailbox: scan.mailbox,
           total_uid_count: scan.total_uid_count,
           scanned_uid_count: scan.scanned_uid_count,
+          uid_fetch: scan.queue_page,
+          missing_required_uids: scan.missing_required_uids,
           template_count: 1,
           inbound_count: inbound.length,
           done_mailbox_exists: doneExists,
@@ -19586,7 +19781,10 @@ function createServer() {
       const scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: action.mailbox,
         maxEmailBytes: max_email_bytes,
-        maxScanMessages: max_scan_messages
+        maxScanMessages: max_scan_messages,
+        scanOrder: "oldest_first",
+        includeQueuePage: !action.template.uid,
+        requiredUids: registeredEmailActionTemplateUidsForMailbox(action.mailbox)
       });
       const { template, registered } = resolveEmailActionTemplate(action, scan);
       const registryOk = registered.complete && registered.uid_ok && registered.message_id_ok && registered.sha256_ok;
@@ -19688,7 +19886,9 @@ function createServer() {
       const scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: normalizedMailbox,
         maxEmailBytes: max_email_bytes,
-        maxScanMessages: max_scan_messages
+        maxScanMessages: max_scan_messages,
+        includeQueuePage: false,
+        specificUids: [template_uid]
       });
       const template = scan.messages.find((message) => String(message.uid) === String(template_uid));
       if (!template || template.parse_error) {
@@ -19827,7 +20027,9 @@ function createServer() {
       const verifyScan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: normalizedMailbox,
         maxEmailBytes: max_email_bytes,
-        maxScanMessages: max_scan_messages
+        maxScanMessages: max_scan_messages,
+        includeQueuePage: false,
+        specificUids: [template_uid]
       });
       const verifyTemplate = verifyScan.messages.find(
         (message) => String(message.uid) === String(template_uid)
@@ -19889,7 +20091,10 @@ function createServer() {
       const scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: action.mailbox,
         maxEmailBytes: max_email_bytes,
-        maxScanMessages: max_scan_messages
+        maxScanMessages: max_scan_messages,
+        includeQueuePage: false,
+        specificUids: [message_uid],
+        requiredUids: registeredEmailActionTemplateUidsForMailbox(action.mailbox)
       });
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
       const signatureTemplate = resolveEmailActionSignatureTemplate(sendAccount, scan);
@@ -20034,7 +20239,11 @@ function createServer() {
       const scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: action.mailbox,
         maxEmailBytes: max_email_bytes,
-        maxScanMessages: max_scan_messages
+        maxScanMessages: max_scan_messages,
+        includeQueuePage: false,
+        specificUids: [message_uid],
+        requiredUids: registeredEmailActionTemplateUidsForMailbox(action.mailbox),
+        threadSourceUids: [message_uid]
       });
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
       const signatureTemplate = resolveEmailActionSignatureTemplate(sendAccount, scan);
@@ -20384,7 +20593,9 @@ function createServer() {
         })
       ).optional().default({}),
       adaptive_replies_by_uid: z.record(z.string(), emailActionAdaptiveReplySchema).optional().default({}),
-      max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
+      scan_order: z.enum(["oldest_first", "newest_first"]).optional().default("oldest_first"),
+      scan_cursor_uid: z.string().regex(/^\d+$/).optional(),
+      max_scan_messages: z.number().int().min(1).max(100).optional().default(EMAIL_ACTION_QUEUE_PAGE_SIZE),
       max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
     },
     TOOL_EXTERNAL_READ,
@@ -20397,6 +20608,8 @@ function createServer() {
       placeholder_values_by_uid,
       agent_decisions_by_uid,
       adaptive_replies_by_uid,
+      scan_order,
+      scan_cursor_uid,
       max_scan_messages,
       max_email_bytes
     }) => {
@@ -20406,7 +20619,12 @@ function createServer() {
       const scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: action.mailbox,
         maxEmailBytes: max_email_bytes,
-        maxScanMessages: max_scan_messages
+        maxScanMessages: max_scan_messages,
+        scanOrder: scan_order,
+        scanCursorUid: scan_cursor_uid,
+        includeQueuePage: !message_uid,
+        specificUids: message_uid ? [message_uid] : [],
+        requiredUids: registeredEmailActionTemplateUidsForMailbox(action.mailbox)
       });
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
       const signatureTemplate = resolveEmailActionSignatureTemplate(sendAccount, scan);
@@ -20588,6 +20806,7 @@ function createServer() {
           skipped_count: skippedByLanguage.length,
           skipped: skippedByLanguage
         },
+        queue_page: scan.queue_page,
         returned_count: results.length,
         results
       });
@@ -20596,7 +20815,7 @@ function createServer() {
 
   server.tool(
     "email_action_process_folder",
-    "Verarbeitet E-Mail-Aktionsordner fuer VIP AI-Communication. Default ist Shadow-Run. Unterstuetzt registrierte Vorlagenantworten sowie explizit freigegebene adaptive Antworten mit Pflichtquellen- und Fokusnachweis. Live sendet nur bei unveraenderter Registry, live_enabled-Action, Moritz-Freigabeparameter, Message-Lock, Send-Readback und anschliessendem IMAP-Move-Readback.",
+    "Verarbeitet E-Mail-Aktionsordner fuer VIP AI-Communication in stabilen UID-Seiten, standardmaessig aelteste zuerst. Registrierte Vorlagen und Signaturen werden zielgenau per UID gelesen; grosse Nachrichten werden vor dem Vollabruf ueber RFC822.SIZE begrenzt. Default ist Shadow-Run. Live sendet nur bei unveraenderter Registry, live_enabled-Action, Moritz-Freigabeparameter, Message-Lock, Send-Readback und anschliessendem IMAP-Move-Readback.",
     {
       agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
       action_id: z.string(),
@@ -20623,7 +20842,9 @@ function createServer() {
         })
       ).optional().default({}),
       adaptive_replies_by_uid: z.record(z.string(), emailActionAdaptiveReplySchema).optional().default({}),
-      max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
+      scan_order: z.enum(["oldest_first", "newest_first"]).optional().default("oldest_first"),
+      scan_cursor_uid: z.string().regex(/^\d+$/).optional(),
+      max_scan_messages: z.number().int().min(1).max(100).optional().default(EMAIL_ACTION_QUEUE_PAGE_SIZE),
       max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
     },
     TOOL_EXTERNAL_WRITE,
@@ -20642,6 +20863,8 @@ function createServer() {
       placeholder_values_by_uid,
       agent_decisions_by_uid,
       adaptive_replies_by_uid,
+      scan_order,
+      scan_cursor_uid,
       max_scan_messages,
       max_email_bytes
     }) => {
@@ -20651,7 +20874,13 @@ function createServer() {
       const scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: action.mailbox,
         maxEmailBytes: max_email_bytes,
-        maxScanMessages: max_scan_messages
+        maxScanMessages: max_scan_messages,
+        scanOrder: scan_order,
+        scanCursorUid: scan_cursor_uid,
+        includeQueuePage: !message_uid,
+        specificUids: message_uid ? [message_uid] : [],
+        requiredUids: registeredEmailActionTemplateUidsForMailbox(action.mailbox),
+        threadSourceUids: mode === "live" && message_uid ? [message_uid] : []
       });
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
       const signatureTemplate = resolveEmailActionSignatureTemplate(sendAccount, scan);
@@ -21062,10 +21291,20 @@ function createServer() {
           const threadAncestorMoves = [];
           try {
             if (move_thread_ancestors_to_done) {
+              const threadScan = message_uid
+                ? scan
+                : await scanEmailActionFolderWithFallback(configs, {
+                    mailbox: action.mailbox,
+                    maxEmailBytes: max_email_bytes,
+                    maxScanMessages: 1,
+                    includeQueuePage: false,
+                    specificUids: [message.uid],
+                    threadSourceUids: [message.uid]
+                  });
               threadAncestorMoves.push(
                 ...(await moveEmailActionThreadAncestorsToSuccess(configs, {
                   action,
-                  scan,
+                  scan: threadScan,
                   sourceMessage: message,
                   createTargetMailbox: create_missing_result_folders
                 }))
@@ -21172,6 +21411,7 @@ function createServer() {
           skipped_count: skippedByLanguage.length,
           skipped: skippedByLanguage
         },
+        queue_page: scan.queue_page,
         returned_count: results.length,
         results
       });

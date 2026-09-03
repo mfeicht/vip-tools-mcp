@@ -28,6 +28,12 @@ try {
   const processFolderTool = (toolList.tools || []).find(
     (tool) => tool.name === "email_action_process_folder"
   );
+  const shadowRunTool = (toolList.tools || []).find(
+    (tool) => tool.name === "email_action_shadow_run"
+  );
+  const templateReadbackTool = (toolList.tools || []).find(
+    (tool) => tool.name === "email_action_template_readback"
+  );
   const accounts = parse(await client.callTool({
     name: "email_action_list_send_accounts",
     arguments: { agent_id: "vip-ai-communication" }
@@ -165,6 +171,33 @@ try {
       source.includes('axios.get("https://api.resend.com/domains"') &&
       source.includes("api_key_env_name: apiKeyEnvName || null") &&
       source.includes("ready_for_live_send"),
+    resend_domain_read_credential_is_separate_from_send_key:
+      accountById.get("rs-contact")?.required_env_names?.resend_domain_read_api_key ===
+        "RESEND_DOMAIN_READ_API_KEY_REISE_STORIES_DE" &&
+      accountById.get("vip-moritz")?.required_env_names?.resend_domain_read_api_key ===
+        "RESEND_DOMAIN_READ_API_KEY_VIP_STUDIOS_DE" &&
+      source.includes("RESEND_DOMAIN_READ_API_KEY_ENV_BY_DOMAIN") &&
+      source.includes("domain_read_api_key_env_name: domainReadApiKeyEnvName || null") &&
+      source.includes('credential_scope: credentialScope') &&
+      source.includes('credentialScope === "send_key_fallback"'),
+    registered_templates_are_fetched_by_uid:
+      Boolean(templateReadbackTool) &&
+      source.includes("registeredEmailActionTemplateUidsForMailbox") &&
+      source.includes("requiredUids: registeredEmailActionTemplateUidsForMailbox(action.mailbox)") &&
+      source.includes("includeQueuePage: !action.template.uid"),
+    action_queue_is_cursor_paginated_oldest_first:
+      processFolderTool?.inputSchema?.properties?.scan_order?.default === "oldest_first" &&
+      Boolean(processFolderTool?.inputSchema?.properties?.scan_cursor_uid) &&
+      shadowRunTool?.inputSchema?.properties?.scan_order?.default === "oldest_first" &&
+      Boolean(shadowRunTool?.inputSchema?.properties?.scan_cursor_uid) &&
+      source.includes("selectImapUidPage") &&
+      source.includes("queue_page: scan.queue_page"),
+    oversized_messages_are_preflighted_before_full_body_fetch:
+      source.includes("RFC822.SIZE BODY.PEEK[HEADER.FIELDS") &&
+      source.includes('parseError: "message_too_large"') &&
+      source.indexOf("declaredBytes > maxEmailBytes") <
+        source.indexOf("UID FETCH ${normalizedUid} (UID FLAGS BODY.PEEK[])") &&
+      source.includes("oversized_skipped_count"),
     resend_preserves_self_bcc_and_thread_headers:
       source.includes("bcc: [plan.bcc]") &&
       source.includes('"In-Reply-To": plan.in_reply_to') &&
