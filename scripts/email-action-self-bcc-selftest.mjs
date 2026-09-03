@@ -25,6 +25,9 @@ try {
   const resendDomainStatusTool = (toolList.tools || []).find(
     (tool) => tool.name === "email_action_resend_domain_status"
   );
+  const processFolderTool = (toolList.tools || []).find(
+    (tool) => tool.name === "email_action_process_folder"
+  );
   const accounts = parse(await client.callTool({
     name: "email_action_list_send_accounts",
     arguments: { agent_id: "vip-ai-communication" }
@@ -92,6 +95,11 @@ try {
       contactActions.length === 2 &&
       contactActions.every((action) => action.response_mode === "agent_assisted") &&
       contactActions.every((action) => action.live_enabled === true),
+    adaptive_contact_replies_are_explicitly_enabled:
+      contactActions.length === 2 &&
+      contactActions.every((action) => action.adaptive_external_enabled === true) &&
+      contactActions.every((action) => action.adaptive_request_types.includes("press_release")) &&
+      Boolean(processFolderTool?.inputSchema?.properties?.adaptive_replies_by_uid),
     contact_use_case_routing_present:
       contactActions.length === 2 &&
       contactActions.every(
@@ -181,7 +189,16 @@ try {
       source.includes("resolveEmailActionSignatureTemplate") &&
       source.includes("composeEmailActionContentWithSignature") &&
       source.includes("signatureTemplate.binding.trailing_identity_lines") &&
-      source.includes("signature_template: plan.signature_template")
+      source.includes("signature_template: plan.signature_template"),
+    adaptive_reply_is_focused_sourced_and_idempotent:
+      source.includes("validateEmailActionAdaptiveReply") &&
+      source.includes("buildEmailActionAdaptiveReplyPlan") &&
+      source.includes("requested_product_only") &&
+      source.includes("single_best_fit_offer") &&
+      source.includes("dynamic_sources_checked") &&
+      source.includes("dynamic_sources_checked_at") &&
+      source.includes("buildEmailActionIdempotencyId") &&
+      source.includes("adaptive_reply: plan.adaptive_reply")
   };
   console.log(JSON.stringify(report));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);

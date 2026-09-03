@@ -1,5 +1,5 @@
 {
-  "version": 7,
+  "version": 8,
   "owner_agent_id": "vip-ai-communication",
   "action_mailbox_root": "INBOX.E-Mail-Automatisierung",
   "done_mailbox_root": "INBOX.VIP AI.Erledigt",
@@ -14,6 +14,16 @@
       "from": "contact@reise-stories.de",
       "send_account_id": "rs-contact",
       "response_mode": "agent_assisted",
+      "adaptive_external_enabled": true,
+      "adaptive_request_types": [
+        "guest_article",
+        "link_insertion",
+        "link_purchase",
+        "newsletter",
+        "press_release",
+        "general_cooperation",
+        "other"
+      ],
       "inbound_language": "de",
       "template_language": "de",
       "idempotency_scope": "rs-contact",
@@ -24,7 +34,9 @@
         "language_selection",
         "template_fit_check",
         "personal_salutation",
-        "safe_name_placeholders"
+        "safe_name_placeholders",
+        "adaptive_body_from_verified_sources",
+        "focused_offer_selection"
       ],
       "enabled": true,
       "live_enabled": true,
@@ -35,7 +47,7 @@
       },
       "required_placeholders": [],
       "name_placeholder_mode": "from_header",
-      "notes": "Agent waehlt diese Variante nur fuer deutsche Eingangsmails, bestaetigt die fachliche Passung und darf ausschliesslich sichere Namens-/Anrede-Platzhalter anpassen."
+      "notes": "Agent waehlt diese Variante nur fuer deutsche Eingangsmails. Eine feste Antwort nutzt sichere Platzhalter; eine adaptive Antwort braucht Pflichtquellen-, Fokus- und Sicherheitsnachweis im versionierten Versandpfad."
     },
     {
       "id": "rs-contact-en",
@@ -46,6 +58,16 @@
       "from": "contact@reise-stories.de",
       "send_account_id": "rs-contact",
       "response_mode": "agent_assisted",
+      "adaptive_external_enabled": true,
+      "adaptive_request_types": [
+        "guest_article",
+        "link_insertion",
+        "link_purchase",
+        "newsletter",
+        "press_release",
+        "general_cooperation",
+        "other"
+      ],
       "inbound_language": "en",
       "template_language": "en",
       "idempotency_scope": "rs-contact",
@@ -56,7 +78,9 @@
         "language_selection",
         "template_fit_check",
         "personal_salutation",
-        "safe_name_placeholders"
+        "safe_name_placeholders",
+        "adaptive_body_from_verified_sources",
+        "focused_offer_selection"
       ],
       "enabled": true,
       "live_enabled": true,
@@ -67,7 +91,7 @@
       },
       "required_placeholders": [],
       "name_placeholder_mode": "from_header",
-      "notes": "Agent waehlt diese Variante nur fuer englische Eingangsmails, bestaetigt die fachliche Passung und darf ausschliesslich sichere Namens-/Anrede-Platzhalter anpassen."
+      "notes": "Agent waehlt diese Variante nur fuer englische Eingangsmails. Eine feste Antwort nutzt sichere Platzhalter; eine adaptive Antwort braucht Pflichtquellen-, Fokus- und Sicherheitsnachweis im versionierten Versandpfad."
     },
     {
       "id": "rs-contact-rabatt-de",

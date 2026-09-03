@@ -186,6 +186,31 @@ const actionAuthorizationSchema = z
     asana_authorization_story_gid: z.string().optional()
   })
   .strict();
+const emailActionAdaptiveReplySchema = z
+  .object({
+    language: z.enum(["de", "en"]),
+    request_type: z.enum([
+      "guest_article",
+      "link_insertion",
+      "link_purchase",
+      "newsletter",
+      "press_release",
+      "general_cooperation",
+      "other"
+    ]),
+    offer_strategy: z.enum([
+      "requested_product_only",
+      "single_best_fit_offer",
+      "clarification_only"
+    ]),
+    reply_body: z.string().min(1).max(50_000),
+    template_style_followed: z.literal(true),
+    knowledge_confidence: z.literal("high"),
+    dynamic_sources_checked: z.array(z.string().url()).min(1).max(8),
+    dynamic_sources_checked_at: z.string().datetime({ offset: true }),
+    evidence_note: z.string().min(20).max(2000)
+  })
+  .strict();
 const sheetCellValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const GOOGLE_AGENT_FOLDER_ID =
   process.env.GOOGLE_DRIVE_AGENT_FOLDER_ID || "16BPopNsMWrI-FkvQtLkpYwb_cMFDpMRr";
@@ -7545,6 +7570,12 @@ function loadEmailActionDefinitions() {
       send_agent_id: action.send_agent_id || "",
       send_account_id: sendAccountId,
       response_mode: responseMode,
+      adaptive_external_enabled: action.adaptive_external_enabled === true,
+      adaptive_request_types: uniqueValues(
+        (Array.isArray(action.adaptive_request_types) ? action.adaptive_request_types : [])
+          .map((item) => String(item || "").trim().toLowerCase())
+          .filter(Boolean)
+      ),
       inbound_language: inboundLanguage || "",
       template_language: templateLanguage || "",
       idempotency_scope: idempotencyScope,
@@ -7743,6 +7774,8 @@ function publicEmailAction(action) {
     enabled: action.enabled,
     live_enabled: action.live_enabled,
     response_mode: action.response_mode,
+    adaptive_external_enabled: action.adaptive_external_enabled,
+    adaptive_request_types: action.adaptive_request_types,
     inbound_language: action.inbound_language || null,
     template_language: action.template_language || null,
     idempotency_scope: action.idempotency_scope,
@@ -8614,6 +8647,225 @@ function buildRawTemplateReply({
           trailing_identity_removed: signatureComposition.trailing_identity_removed
         }
       : null
+  };
+}
+
+function validateEmailActionAdaptiveReply(action, decision) {
+  if (!decision || typeof decision !== "object" || Array.isArray(decision)) {
+    throw new Error(`Action ${action.id}: adaptive Antwortentscheidung fehlt.`);
+  }
+  if (!action.adaptive_external_enabled) {
+    throw new Error(`Action ${action.id}: adaptiver externer Versand ist nicht freigegeben.`);
+  }
+  const language = String(decision.language || "").trim().toLowerCase();
+  if (!language || language !== action.inbound_language) {
+    throw new Error(`Action ${action.id}: adaptive Sprache passt nicht zur Action-Sprache.`);
+  }
+  const requestType = String(decision.request_type || "").trim().toLowerCase();
+  const allowedRequestTypes = new Set([
+    "guest_article",
+    "link_insertion",
+    "link_purchase",
+    "newsletter",
+    "press_release",
+    "general_cooperation",
+    "other"
+  ]);
+  if (!allowedRequestTypes.has(requestType)) {
+    throw new Error(`Action ${action.id}: ungueltiger adaptiver Anfrage-Typ.`);
+  }
+  if (!action.adaptive_request_types.includes(requestType)) {
+    throw new Error(`Action ${action.id}: adaptiver Anfrage-Typ ist fuer diese Action nicht freigegeben.`);
+  }
+  const offerStrategy = String(decision.offer_strategy || "").trim().toLowerCase();
+  const allowedOfferStrategies = new Set([
+    "requested_product_only",
+    "single_best_fit_offer",
+    "clarification_only"
+  ]);
+  if (!allowedOfferStrategies.has(offerStrategy)) {
+    throw new Error(`Action ${action.id}: ungueltige adaptive Angebotsstrategie.`);
+  }
+  if (
+    ["guest_article", "link_insertion", "link_purchase"].includes(requestType) &&
+    offerStrategy !== "requested_product_only"
+  ) {
+    throw new Error(`Action ${action.id}: konkrete Anfrage muss auf das angefragte Produkt fokussiert bleiben.`);
+  }
+  if (requestType === "press_release" && offerStrategy !== "single_best_fit_offer") {
+    throw new Error(`Action ${action.id}: Pressemitteilung braucht genau ein bestpassendes Angebot.`);
+  }
+  if (requestType === "other" && offerStrategy !== "clarification_only") {
+    throw new Error(`Action ${action.id}: unklarer Anfrage-Typ darf nur eine Rueckfrage erhalten.`);
+  }
+  if (decision.template_style_followed !== true) {
+    throw new Error(`Action ${action.id}: Vorlagenstil wurde nicht bestaetigt.`);
+  }
+  if (String(decision.knowledge_confidence || "").trim().toLowerCase() !== "high") {
+    throw new Error(`Action ${action.id}: externe adaptive Antwort braucht hohe Wissenssicherheit.`);
+  }
+  const evidenceNote = String(decision.evidence_note || "").trim();
+  if (evidenceNote.length < 20 || evidenceNote.length > 2000) {
+    throw new Error(`Action ${action.id}: Evidenznotiz fehlt oder ist unplausibel lang.`);
+  }
+  const sourceUrls = uniqueValues(
+    (Array.isArray(decision.dynamic_sources_checked) ? decision.dynamic_sources_checked : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  );
+  const requiredSource = language === "de"
+    ? "https://reise-stories.de/unsere-kooperationen/"
+    : "https://reise-stories.de/cooperations/";
+  if (!sourceUrls.includes(requiredSource)) {
+    throw new Error(`Action ${action.id}: sprachlich passende dynamische Pflichtquelle wurde nicht bestaetigt.`);
+  }
+  for (const value of sourceUrls) {
+    let url;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error(`Action ${action.id}: ungueltige dynamische Quellen-URL.`);
+    }
+    if (url.protocol !== "https:" || url.hostname !== "reise-stories.de") {
+      throw new Error(`Action ${action.id}: adaptive Quellen muessen freigegebene Reise-Stories-HTTPS-Seiten sein.`);
+    }
+  }
+  const sourcesCheckedAtMs = Date.parse(String(decision.dynamic_sources_checked_at || ""));
+  const sourceAgeMs = Date.now() - sourcesCheckedAtMs;
+  if (
+    !Number.isFinite(sourcesCheckedAtMs) ||
+    sourceAgeMs < -5 * 60 * 1000 ||
+    sourceAgeMs > 6 * 60 * 60 * 1000
+  ) {
+    throw new Error(`Action ${action.id}: dynamischer Quellen-Readback ist nicht aktuell genug.`);
+  }
+  const replyBody = String(decision.reply_body || "").replace(/\r\n/g, "\n").trim();
+  if (!replyBody || Buffer.byteLength(replyBody, "utf8") > 50_000) {
+    throw new Error(`Action ${action.id}: adaptiver Antworttext fehlt oder ist groesser als 50 KB.`);
+  }
+  if (/^\s*ENTWURF\s*:/iu.test(replyBody)) {
+    throw new Error(`Action ${action.id}: externer Antworttext darf nicht als interner Entwurf markiert sein.`);
+  }
+  return {
+    language,
+    request_type: requestType,
+    offer_strategy: offerStrategy,
+    template_style_followed: true,
+    knowledge_confidence: "high",
+    dynamic_sources_checked: sourceUrls,
+    dynamic_sources_checked_at: new Date(sourcesCheckedAtMs).toISOString(),
+    evidence_note: evidenceNote,
+    reply_body: replyBody
+  };
+}
+
+function buildEmailActionAdaptiveReplyPlan({
+  action,
+  templateMessage,
+  sourceMessage,
+  sendAccount,
+  signatureTemplate,
+  adaptiveDecision
+}) {
+  const decision = validateEmailActionAdaptiveReply(action, adaptiveDecision);
+  if (!signatureTemplate) {
+    throw new Error(`Action ${action.id}: adaptiver externer Versand braucht eine registrierte Signaturvorlage.`);
+  }
+  const inbound = getInboundHeadersForAction(sourceMessage.raw);
+  if (!inbound.message_id) {
+    throw new Error(`UID ${sourceMessage.uid}: Message-ID fehlt; echte Thread-Antwort blockiert.`);
+  }
+  const recipient = extractSingleVerifiedReplyRecipient(inbound.headers);
+  const idempotencyId = buildEmailActionIdempotencyId({
+    action,
+    sourceMailbox: action.mailbox,
+    sourceMessage
+  });
+  const cleanReplyBody = stripTrailingIdentityFromText(
+    decision.reply_body,
+    signatureTemplate.binding.trailing_identity_lines
+  );
+  const contentHtml = `<div>${escapeAccountingHtml(cleanReplyBody).replace(/\n/g, "<br>\n")}</div>`;
+  const contentRaw = buildEmailActionMultipartRawMessage({
+    headerLines: ["From: <adaptive-reply@vip-tools-mcp.vip-studios.de>", "To: <adaptive-reply@vip-tools-mcp.vip-studios.de>"],
+    html: contentHtml,
+    text: cleanReplyBody,
+    attachments: [],
+    boundarySeed: idempotencyId
+  });
+  const signatureComposition = composeEmailActionContentWithSignature({
+    contentRaw,
+    signatureTemplate,
+    trailingIdentityLines: signatureTemplate.binding.trailing_identity_lines
+  });
+  const subject = buildReplySubject(inbound.subject);
+  const references = buildReplyReferences(inbound);
+  const messageId = emailActionMessageId(idempotencyId);
+  const headerLines = [
+    `From: <${sendAccount.from}>`,
+    `To: <${recipient.email}>`,
+    `Subject: ${encodeHeader(sanitizeHeaderLineValue(subject, "Subject"))}`,
+    `Date: ${new Date().toUTCString()}`,
+    `Message-ID: ${messageId}`,
+    `In-Reply-To: ${sanitizeHeaderLineValue(inbound.message_id, "In-Reply-To")}`,
+    ...(references ? [`References: ${sanitizeHeaderLineValue(references, "References")}`] : [])
+  ];
+  const rawMessage = buildEmailActionMultipartRawMessage({
+    headerLines,
+    html: signatureComposition.html,
+    text: signatureComposition.text,
+    attachments: signatureComposition.attachments,
+    boundarySeed: idempotencyId
+  });
+  const selfBcc = extractEmailAddress(sendAccount.from);
+  if (!selfBcc) throw new Error(`Action ${action.id}: verifizierte FROM-Adresse fuer Self-BCC fehlt.`);
+  return {
+    idempotency_id: idempotencyId,
+    sent_flag: emailActionSentFlag(idempotencyId),
+    processing_flag: emailActionProcessingFlag(idempotencyId),
+    raw_message: rawMessage,
+    raw_message_bytes: Buffer.byteLength(rawMessage, "utf8"),
+    raw_message_sha256: createHash("sha256").update(rawMessage, "utf8").digest("hex"),
+    message_id: messageId,
+    from: sendAccount.from,
+    to: recipient.email,
+    bcc: selfBcc,
+    bcc_source: "verified_from_address",
+    bcc_visible_in_mime_headers: false,
+    envelope_recipients: uniqueValues([recipient.email, selfBcc]),
+    recipient_source: recipient.source,
+    subject,
+    in_reply_to: inbound.message_id,
+    references,
+    content_type: "multipart/related",
+    template_sha256: templateMessage.raw_sha256,
+    template_uid: templateMessage.uid,
+    source_uid: sourceMessage.uid,
+    source_message_id_hash: sourceMessage.parsed?.message_id_hash || null,
+    placeholders: [],
+    placeholder_values_used: {},
+    signature_template: {
+      uid: signatureComposition.signature_template_uid,
+      sha256: signatureComposition.signature_template_sha256,
+      message_id_hash: signatureComposition.signature_template_message_id_hash,
+      html_marker_count: signatureComposition.html_marker_count,
+      text_marker_count: signatureComposition.text_marker_count,
+      inline_resource_count: signatureComposition.attachments.filter((item) => item.content_id).length,
+      trailing_identity_removed: signatureComposition.trailing_identity_removed
+    },
+    adaptive_reply: {
+      language: decision.language,
+      request_type: decision.request_type,
+      offer_strategy: decision.offer_strategy,
+      template_style_followed: decision.template_style_followed,
+      knowledge_confidence: decision.knowledge_confidence,
+      dynamic_sources_checked: decision.dynamic_sources_checked,
+      dynamic_sources_checked_at: decision.dynamic_sources_checked_at,
+      evidence_note_sha256: createHash("sha256").update(decision.evidence_note, "utf8").digest("hex"),
+      evidence_note_bytes: Buffer.byteLength(decision.evidence_note, "utf8"),
+      reply_body_sha256: createHash("sha256").update(cleanReplyBody, "utf8").digest("hex"),
+      reply_body_bytes: Buffer.byteLength(cleanReplyBody, "utf8")
+    }
   };
 }
 
@@ -19887,7 +20139,7 @@ function createServer() {
 
   server.tool(
     "email_action_shadow_run",
-    "Erzeugt deterministisch Raw-MIME-Antwortplaene fuer Eingangsnachrichten in einem Aktionsordner. Shadow-Run: kein Live-Versand, keine IMAP-Verschiebung, kein Gelesen-Markieren.",
+    "Erzeugt deterministisch Raw-MIME-Antwortplaene fuer registrierte Vorlagenantworten oder einen explizit belegten adaptiven Antworttext. Shadow-Run: kein Live-Versand, keine IMAP-Verschiebung, kein Gelesen-Markieren.",
     {
       agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
       action_id: z.string(),
@@ -19904,6 +20156,7 @@ function createServer() {
           placeholder_values: z.record(z.string(), z.string()).optional().default({})
         })
       ).optional().default({}),
+      adaptive_replies_by_uid: z.record(z.string(), emailActionAdaptiveReplySchema).optional().default({}),
       max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
       max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
     },
@@ -19916,6 +20169,7 @@ function createServer() {
       allow_unregistered_template,
       placeholder_values_by_uid,
       agent_decisions_by_uid,
+      adaptive_replies_by_uid,
       max_scan_messages,
       max_email_bytes
     }) => {
@@ -19959,7 +20213,9 @@ function createServer() {
           language_decision: evaluateEmailActionLanguage(
             action,
             message,
-            agent_decisions_by_uid[String(message.uid)]?.language || ""
+            adaptive_replies_by_uid[String(message.uid)]?.language ||
+              agent_decisions_by_uid[String(message.uid)]?.language ||
+              ""
           )
         }));
       const skippedByLanguage = evaluatedCandidates
@@ -19974,12 +20230,16 @@ function createServer() {
         .slice(0, limit);
       const results = [];
       for (const { message, agent_decision: agentDecision, language_decision: languageDecision } of candidates) {
+        const adaptiveDecision = adaptive_replies_by_uid[String(message.uid)] || null;
         if (message.parse_error) {
           results.push({ uid: message.uid, status: "blocked", reason: message.parse_error });
           continue;
         }
         if (action.response_mode === "agent_assisted") {
-          if (!agentDecision?.template_fit_confirmed || String(agentDecision.review_note || "").trim().length < 12) {
+          if (
+            !adaptiveDecision &&
+            (!agentDecision?.template_fit_confirmed || String(agentDecision.review_note || "").trim().length < 12)
+          ) {
             results.push({
               uid: message.uid,
               status: "blocked",
@@ -19989,7 +20249,7 @@ function createServer() {
             });
             continue;
           }
-          if (Object.keys(placeholder_values_by_uid[String(message.uid)] || {}).length) {
+          if (!adaptiveDecision && Object.keys(placeholder_values_by_uid[String(message.uid)] || {}).length) {
             results.push({
               uid: message.uid,
               status: "blocked",
@@ -20000,17 +20260,26 @@ function createServer() {
           }
         }
         try {
-          const plan = buildRawTemplateReply({
-            action,
-            templateMessage: template,
-            sourceMessage: message,
-            sendAccount,
-            signatureTemplate,
-            placeholderValues:
-              action.response_mode === "agent_assisted"
-                ? validateEmailActionAgentPlaceholderValues(agentDecision?.placeholder_values || {})
-                : placeholder_values_by_uid[String(message.uid)] || {}
-          });
+          const plan = adaptiveDecision
+            ? buildEmailActionAdaptiveReplyPlan({
+                action,
+                templateMessage: template,
+                sourceMessage: message,
+                sendAccount,
+                signatureTemplate,
+                adaptiveDecision
+              })
+            : buildRawTemplateReply({
+                action,
+                templateMessage: template,
+                sourceMessage: message,
+                sendAccount,
+                signatureTemplate,
+                placeholderValues:
+                  action.response_mode === "agent_assisted"
+                    ? validateEmailActionAgentPlaceholderValues(agentDecision?.placeholder_values || {})
+                    : placeholder_values_by_uid[String(message.uid)] || {}
+              });
           results.push({
             uid: message.uid,
             status: "ready",
@@ -20032,8 +20301,9 @@ function createServer() {
             template_uid: plan.template_uid,
             template_sha256: plan.template_sha256,
             signature_template: plan.signature_template,
+            adaptive_reply: plan.adaptive_reply || null,
             language_decision: languageDecision,
-            agent_review: action.response_mode === "agent_assisted" ? {
+            agent_review: action.response_mode === "agent_assisted" && !adaptiveDecision ? {
               template_fit_confirmed: true,
               review_note_sha256: createHash("sha256").update(agentDecision.review_note, "utf8").digest("hex"),
               review_note_bytes: Buffer.byteLength(agentDecision.review_note, "utf8")
@@ -20047,7 +20317,7 @@ function createServer() {
               marks_seen: false,
               cc_bcc_copied: false,
               mandatory_self_bcc_matches_from: plan.bcc === plan.from,
-              raw_mime_preserved_from_template_entity: true,
+              raw_mime_preserved_from_template_entity: !adaptiveDecision,
               thread_headers_present: Boolean(plan.in_reply_to && plan.references)
             }
           });
@@ -20096,7 +20366,7 @@ function createServer() {
 
   server.tool(
     "email_action_process_folder",
-    "Verarbeitet E-Mail-Aktionsordner fuer VIP AI-Communication. Default ist Shadow-Run. Live sendet nur bei registrierter unveraenderter Vorlage, live_enabled-Action, Moritz-Freigabeparameter, Message-Lock, Send-Readback und anschliessendem IMAP-Move-Readback.",
+    "Verarbeitet E-Mail-Aktionsordner fuer VIP AI-Communication. Default ist Shadow-Run. Unterstuetzt registrierte Vorlagenantworten sowie explizit freigegebene adaptive Antworten mit Pflichtquellen- und Fokusnachweis. Live sendet nur bei unveraenderter Registry, live_enabled-Action, Moritz-Freigabeparameter, Message-Lock, Send-Readback und anschliessendem IMAP-Move-Readback.",
     {
       agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
       action_id: z.string(),
@@ -20122,6 +20392,7 @@ function createServer() {
           placeholder_values: z.record(z.string(), z.string()).optional().default({})
         })
       ).optional().default({}),
+      adaptive_replies_by_uid: z.record(z.string(), emailActionAdaptiveReplySchema).optional().default({}),
       max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
       max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
     },
@@ -20140,6 +20411,7 @@ function createServer() {
       confirmed_resend_provider_ids_by_uid,
       placeholder_values_by_uid,
       agent_decisions_by_uid,
+      adaptive_replies_by_uid,
       max_scan_messages,
       max_email_bytes
     }) => {
@@ -20184,7 +20456,9 @@ function createServer() {
           language_decision: evaluateEmailActionLanguage(
             action,
             message,
-            agent_decisions_by_uid[String(message.uid)]?.language || ""
+            adaptive_replies_by_uid[String(message.uid)]?.language ||
+              agent_decisions_by_uid[String(message.uid)]?.language ||
+              ""
           )
         }));
       const skippedByLanguage = evaluatedCandidates
@@ -20200,12 +20474,16 @@ function createServer() {
       const results = [];
 
       for (const { message, agent_decision: agentDecision, language_decision: languageDecision } of candidates) {
+        const adaptiveDecision = adaptive_replies_by_uid[String(message.uid)] || null;
         if (message.parse_error) {
           results.push({ uid: message.uid, status: "blocked", reason: message.parse_error });
           continue;
         }
         if (action.response_mode === "agent_assisted") {
-          if (!agentDecision?.template_fit_confirmed || String(agentDecision.review_note || "").trim().length < 12) {
+          if (
+            !adaptiveDecision &&
+            (!agentDecision?.template_fit_confirmed || String(agentDecision.review_note || "").trim().length < 12)
+          ) {
             results.push({
               uid: message.uid,
               status: "blocked_before_send",
@@ -20215,7 +20493,7 @@ function createServer() {
             });
             continue;
           }
-          if (Object.keys(placeholder_values_by_uid[String(message.uid)] || {}).length) {
+          if (!adaptiveDecision && Object.keys(placeholder_values_by_uid[String(message.uid)] || {}).length) {
             results.push({
               uid: message.uid,
               status: "blocked_before_send",
@@ -20228,17 +20506,26 @@ function createServer() {
 
         let plan;
         try {
-          plan = buildRawTemplateReply({
-            action,
-            templateMessage: template,
-            sourceMessage: message,
-            sendAccount,
-            signatureTemplate,
-            placeholderValues:
-              action.response_mode === "agent_assisted"
-                ? validateEmailActionAgentPlaceholderValues(agentDecision?.placeholder_values || {})
-                : placeholder_values_by_uid[String(message.uid)] || {}
-          });
+          plan = adaptiveDecision
+            ? buildEmailActionAdaptiveReplyPlan({
+                action,
+                templateMessage: template,
+                sourceMessage: message,
+                sendAccount,
+                signatureTemplate,
+                adaptiveDecision
+              })
+            : buildRawTemplateReply({
+                action,
+                templateMessage: template,
+                sourceMessage: message,
+                sendAccount,
+                signatureTemplate,
+                placeholderValues:
+                  action.response_mode === "agent_assisted"
+                    ? validateEmailActionAgentPlaceholderValues(agentDecision?.placeholder_values || {})
+                    : placeholder_values_by_uid[String(message.uid)] || {}
+              });
         } catch (error) {
           const blocked = {
             uid: message.uid,
@@ -20314,8 +20601,9 @@ function createServer() {
             raw_message_sha256: plan.raw_message_sha256,
             template_sha256: plan.template_sha256,
             signature_template: plan.signature_template,
+            adaptive_reply: plan.adaptive_reply || null,
             language_decision: languageDecision,
-            agent_review: action.response_mode === "agent_assisted" ? {
+            agent_review: action.response_mode === "agent_assisted" && !adaptiveDecision ? {
               template_fit_confirmed: true,
               review_note_sha256: createHash("sha256").update(agentDecision.review_note, "utf8").digest("hex"),
               review_note_bytes: Buffer.byteLength(agentDecision.review_note, "utf8")
@@ -20600,8 +20888,10 @@ function createServer() {
             bcc_visible_in_mime_headers: plan.bcc_visible_in_mime_headers,
             subject: plan.subject,
             template_sha256: plan.template_sha256,
+            signature_template: plan.signature_template,
+            adaptive_reply: plan.adaptive_reply || null,
             language_decision: languageDecision,
-            agent_review: action.response_mode === "agent_assisted" ? {
+            agent_review: action.response_mode === "agent_assisted" && !adaptiveDecision ? {
               template_fit_confirmed: true,
               review_note_sha256: createHash("sha256").update(agentDecision.review_note, "utf8").digest("hex"),
               review_note_bytes: Buffer.byteLength(agentDecision.review_note, "utf8")
