@@ -220,7 +220,18 @@ try {
       contactActions.every((action) => action.agent_allowed_adjustments.includes("industry_safety_classification")) &&
       source.includes('industryRisk === "prohibited"') &&
       source.includes("Casino-, Gluecksspiel-, Crypto-, Spam- oder sonstige unserioese Linkziele sind gesperrt") &&
-      source.includes('industryRisk !== "safe"')
+      source.includes('industryRisk !== "safe"'),
+    visible_original_history_is_appended_after_signature:
+      contactActions.every((action) => action.include_quoted_original === true) &&
+      source.includes("function appendEmailActionQuotedOriginal") &&
+      source.includes('class="vip-original-message"') &&
+      source.includes("quoted_original: quotedComposition.quoted_original") &&
+      source.includes("html: quotedComposition.html") &&
+      source.includes("text: quotedComposition.text"),
+    german_umlaut_substitutions_are_blocked:
+      source.includes("function assertGermanEmailOrthography") &&
+      source.includes("deutsche Antwort enthaelt ae/oe/ue-Ersatzschreibweisen") &&
+      source.includes('if (language === "de") assertGermanEmailOrthography(replyBody, action.id)')
   };
   console.log(JSON.stringify(report));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);

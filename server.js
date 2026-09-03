@@ -294,6 +294,9 @@ const EMAIL_ACTION_READ_AGENT_IDS = Object.freeze([
 ]);
 const EMAIL_ACTION_MAX_EMAIL_BYTES = Number(process.env.EMAIL_ACTION_MAX_EMAIL_BYTES || 4 * 1024 * 1024);
 const EMAIL_ACTION_MAX_SCAN_MESSAGES = Number(process.env.EMAIL_ACTION_MAX_SCAN_MESSAGES || 100);
+const EMAIL_ACTION_QUOTED_HISTORY_MAX_CHARS = Number(
+  process.env.EMAIL_ACTION_QUOTED_HISTORY_MAX_CHARS || 100_000
+);
 const EMAIL_BCC_LEARNING_MAX_EMAIL_BYTES = Number(
   process.env.EMAIL_BCC_LEARNING_MAX_EMAIL_BYTES || 4 * 1024 * 1024
 );
@@ -7593,6 +7596,7 @@ function loadEmailActionDefinitions() {
       selection_group: selectionGroup,
       use_case: String(action.use_case || actionId).trim(),
       routing_description: String(action.routing_description || "").trim(),
+      include_quoted_original: action.include_quoted_original === true,
       agent_allowed_adjustments: uniqueValues(
         (Array.isArray(action.agent_allowed_adjustments) ? action.agent_allowed_adjustments : [])
           .map((item) => String(item || "").trim().toLowerCase())
@@ -7793,6 +7797,7 @@ function publicEmailAction(action) {
     selection_group: action.selection_group,
     use_case: action.use_case,
     routing_description: action.routing_description || null,
+    include_quoted_original: action.include_quoted_original,
     agent_allowed_adjustments: action.agent_allowed_adjustments || [],
     from: action.from || null,
     send_agent_id: action.send_agent_id || sendAccount?.send_agent_id || null,
@@ -8238,6 +8243,73 @@ function buildReplyReferences(inbound) {
   ]).join(" ");
 }
 
+function appendHtmlBeforeBodyEnd(html, addition) {
+  const source = String(html || "");
+  if (/<\/body\s*>/i.test(source)) {
+    return source.replace(/<\/body\s*>/i, `${addition}</body>`);
+  }
+  return `${source}${addition}`;
+}
+
+function buildEmailActionQuotedOriginal(sourceMessage, language) {
+  const inbound = getInboundHeadersForAction(sourceMessage.raw);
+  const body = emailLearningBodyText(
+    parseMimeMessageTextParts(sourceMessage.raw),
+    EMAIL_ACTION_QUOTED_HISTORY_MAX_CHARS
+  );
+  if (!body.text) {
+    throw new Error(`UID ${sourceMessage.uid}: Originalnachricht kann nicht sicher zitiert werden.`);
+  }
+  const sender = inbound.from || sourceMessage.parsed?.from_email || "Unbekannter Absender";
+  const date = decodeMimeHeaderValue(inbound.headers.date || "").trim();
+  const lead = language === "en"
+    ? `On ${date || "an unknown date"}, ${sender} wrote:`
+    : `Am ${date || "unbekannten Datum"} schrieb ${sender}:`;
+  const normalizedBody = String(body.text)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\u0000/g, "")
+    .trim();
+  const quotedText = normalizedBody
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+  const html = [
+    '<div class="vip-original-message" style="margin-top:24px;color:#555;font-size:12px;line-height:1.45;">',
+    `<div style="margin-bottom:8px;">${escapeAccountingHtml(lead)}</div>`,
+    '<blockquote style="margin:0 0 0 8px;padding:0 0 0 12px;border-left:2px solid #c7c7c7;">',
+    escapeAccountingHtml(normalizedBody).replace(/\n/g, "<br>\n"),
+    "</blockquote>",
+    "</div>"
+  ].join("");
+  return {
+    html,
+    text: `${lead}\n${quotedText}`,
+    source: body.source,
+    truncated: body.truncated,
+    body_chars: normalizedBody.length,
+    from: extractEmailAddress(sender) || null,
+    subject: inbound.subject || null,
+    date: date || null
+  };
+}
+
+function appendEmailActionQuotedOriginal({ html, text, sourceMessage, language }) {
+  const quoted = buildEmailActionQuotedOriginal(sourceMessage, language);
+  return {
+    html: appendHtmlBeforeBodyEnd(html, quoted.html),
+    text: `${String(text || "").trimEnd()}\n\n${quoted.text}`,
+    quoted_original: {
+      source: quoted.source,
+      truncated: quoted.truncated,
+      body_chars: quoted.body_chars,
+      from: quoted.from,
+      subject: quoted.subject,
+      date: quoted.date
+    }
+  };
+}
+
 function findEmailActionThreadAncestors(messages, sourceMessage) {
   const sourceInbound = getInboundHeadersForAction(sourceMessage.raw);
   const referencedMessageIds = new Set([
@@ -8600,11 +8672,22 @@ function buildRawTemplateReply({
         trailingIdentityLines: signatureTemplate.binding.trailing_identity_lines
       })
     : null;
+  if (action.include_quoted_original && !signatureComposition) {
+    throw new Error(`Action ${action.id}: sichtbarer Originalverlauf braucht eine registrierte Signaturkomposition.`);
+  }
+  const quotedComposition = action.include_quoted_original
+    ? appendEmailActionQuotedOriginal({
+        html: signatureComposition.html,
+        text: signatureComposition.text,
+        sourceMessage,
+        language: action.inbound_language
+      })
+    : null;
   const rawMessage = signatureComposition
     ? buildEmailActionMultipartRawMessage({
         headerLines: headers,
-        html: signatureComposition.html,
-        text: signatureComposition.text,
+        html: quotedComposition?.html || signatureComposition.html,
+        text: quotedComposition?.text || signatureComposition.text,
         attachments: signatureComposition.attachments,
         boundarySeed: idempotencyId
       })
@@ -8657,8 +8740,21 @@ function buildRawTemplateReply({
           inline_resource_count: signatureComposition.attachments.filter((item) => item.content_id).length,
           trailing_identity_removed: signatureComposition.trailing_identity_removed
         }
-      : null
+      : null,
+    quoted_original: quotedComposition?.quoted_original || null
   };
+}
+
+function assertGermanEmailOrthography(replyBody, actionId) {
+  const transliterations = /\b(?:fuer|ueber|zurueck|moech\w*|koenn\w*|mues\w*|grues\w*|glueck\w*|veroeff\w*|vollstaendig\w*|bestaetig\w*|zusaetz\w*|ausdrueck\w*|unserioe\w*|waehr\w*|haeufig\w*|naech\w*|spaet\w*|frueh\w*|erhaelt\w*|aender\w*|moeg\w*|pruef\w*|uebermittel\w*)\b/giu;
+  const matches = uniqueValues(
+    Array.from(String(replyBody || "").matchAll(transliterations)).map((match) => match[0])
+  );
+  if (matches.length) {
+    throw new Error(
+      `Action ${actionId}: deutsche Antwort enthaelt ae/oe/ue-Ersatzschreibweisen statt Umlauten (${matches.slice(0, 8).join(", ")}).`
+    );
+  }
 }
 
 function validateEmailActionAdaptiveReply(action, decision) {
@@ -8849,6 +8945,7 @@ function validateEmailActionAdaptiveReply(action, decision) {
   if (/^\s*ENTWURF\s*:/iu.test(replyBody)) {
     throw new Error(`Action ${action.id}: externer Antworttext darf nicht als interner Entwurf markiert sein.`);
   }
+  if (language === "de") assertGermanEmailOrthography(replyBody, action.id);
   return {
     language,
     request_type: requestType,
@@ -8909,6 +9006,15 @@ function buildEmailActionAdaptiveReplyPlan({
     signatureTemplate,
     trailingIdentityLines: signatureTemplate.binding.trailing_identity_lines
   });
+  if (!action.include_quoted_original) {
+    throw new Error(`Action ${action.id}: adaptive externe Antwort braucht sichtbaren Originalverlauf.`);
+  }
+  const quotedComposition = appendEmailActionQuotedOriginal({
+    html: signatureComposition.html,
+    text: signatureComposition.text,
+    sourceMessage,
+    language: decision.language
+  });
   const subject = buildReplySubject(inbound.subject);
   const references = buildReplyReferences(inbound);
   const messageId = emailActionMessageId(idempotencyId);
@@ -8923,8 +9029,8 @@ function buildEmailActionAdaptiveReplyPlan({
   ];
   const rawMessage = buildEmailActionMultipartRawMessage({
     headerLines,
-    html: signatureComposition.html,
-    text: signatureComposition.text,
+    html: quotedComposition.html,
+    text: quotedComposition.text,
     attachments: signatureComposition.attachments,
     boundarySeed: idempotencyId
   });
@@ -8964,6 +9070,7 @@ function buildEmailActionAdaptiveReplyPlan({
       inline_resource_count: signatureComposition.attachments.filter((item) => item.content_id).length,
       trailing_identity_removed: signatureComposition.trailing_identity_removed
     },
+    quoted_original: quotedComposition.quoted_original,
     adaptive_reply: {
       language: decision.language,
       request_type: decision.request_type,
@@ -20421,6 +20528,7 @@ function createServer() {
             template_uid: plan.template_uid,
             template_sha256: plan.template_sha256,
             signature_template: plan.signature_template,
+            quoted_original: plan.quoted_original,
             adaptive_reply: plan.adaptive_reply || null,
             language_decision: languageDecision,
             agent_review: action.response_mode === "agent_assisted" && !adaptiveDecision ? {
@@ -20438,7 +20546,9 @@ function createServer() {
               cc_bcc_copied: false,
               mandatory_self_bcc_matches_from: plan.bcc === plan.from,
               raw_mime_preserved_from_template_entity: !adaptiveDecision,
-              thread_headers_present: Boolean(plan.in_reply_to && plan.references)
+              thread_headers_present: Boolean(plan.in_reply_to && plan.references),
+              subject_is_reply: /^Re\s*:/i.test(plan.subject),
+              visible_original_history_present: Boolean(plan.quoted_original)
             }
           });
         } catch (error) {
@@ -20721,6 +20831,7 @@ function createServer() {
             raw_message_sha256: plan.raw_message_sha256,
             template_sha256: plan.template_sha256,
             signature_template: plan.signature_template,
+            quoted_original: plan.quoted_original,
             adaptive_reply: plan.adaptive_reply || null,
             language_decision: languageDecision,
             agent_review: action.response_mode === "agent_assisted" && !adaptiveDecision ? {
@@ -21009,6 +21120,7 @@ function createServer() {
             subject: plan.subject,
             template_sha256: plan.template_sha256,
             signature_template: plan.signature_template,
+            quoted_original: plan.quoted_original,
             adaptive_reply: plan.adaptive_reply || null,
             language_decision: languageDecision,
             agent_review: action.response_mode === "agent_assisted" && !adaptiveDecision ? {

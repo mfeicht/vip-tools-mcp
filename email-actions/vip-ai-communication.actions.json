@@ -1,5 +1,5 @@
 {
-  "version": 12,
+  "version": 13,
   "owner_agent_id": "vip-ai-communication",
   "action_mailbox_root": "INBOX.E-Mail-Automatisierung",
   "done_mailbox_root": "INBOX.VIP AI.Erledigt",
@@ -32,6 +32,7 @@
       "selection_group": "rs-contact",
       "use_case": "link-or-article-cooperation-including-discount-follow-up",
       "routing_description": "Neue Anfrage oder nachgelagerte Rabattverhandlung zu Linkkooperation, Beitragskooperation, Gastbeitrag oder vergleichbarer Zusammenarbeit; Rabattantworten nur ueber den adaptiven Quellen- und Preis-Floor-Pfad.",
+      "include_quoted_original": true,
       "agent_allowed_adjustments": [
         "language_selection",
         "template_fit_check",
@@ -79,6 +80,7 @@
       "selection_group": "rs-contact",
       "use_case": "link-or-article-cooperation-including-discount-follow-up",
       "routing_description": "New inquiry or later discount negotiation for a link cooperation, article cooperation, guest post or comparable collaboration; discount replies require the adaptive source and price-floor path.",
+      "include_quoted_original": true,
       "agent_allowed_adjustments": [
         "language_selection",
         "template_fit_check",
