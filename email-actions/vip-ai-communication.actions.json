@@ -1,5 +1,5 @@
 {
-  "version": 9,
+  "version": 10,
   "owner_agent_id": "vip-ai-communication",
   "action_mailbox_root": "INBOX.E-Mail-Automatisierung",
   "done_mailbox_root": "INBOX.VIP AI.Erledigt",
@@ -23,6 +23,7 @@
         "newsletter",
         "press_release",
         "general_cooperation",
+        "account_or_platform_setup",
         "other"
       ],
       "inbound_language": "de",
@@ -68,6 +69,7 @@
         "newsletter",
         "press_release",
         "general_cooperation",
+        "account_or_platform_setup",
         "other"
       ],
       "inbound_language": "en",

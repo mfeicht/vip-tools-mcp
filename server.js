@@ -197,11 +197,13 @@ const emailActionAdaptiveReplySchema = z
       "newsletter",
       "press_release",
       "general_cooperation",
+      "account_or_platform_setup",
       "other"
     ]),
     offer_strategy: z.enum([
       "requested_product_only",
       "single_best_fit_offer",
+      "counterparty_setup_required",
       "clarification_only"
     ]),
     reply_body: z.string().min(1).max(50_000),
@@ -8675,6 +8677,7 @@ function validateEmailActionAdaptiveReply(action, decision) {
     "newsletter",
     "press_release",
     "general_cooperation",
+    "account_or_platform_setup",
     "other"
   ]);
   if (!allowedRequestTypes.has(requestType)) {
@@ -8687,6 +8690,7 @@ function validateEmailActionAdaptiveReply(action, decision) {
   const allowedOfferStrategies = new Set([
     "requested_product_only",
     "single_best_fit_offer",
+    "counterparty_setup_required",
     "clarification_only"
   ]);
   if (!allowedOfferStrategies.has(offerStrategy)) {
@@ -8700,6 +8704,9 @@ function validateEmailActionAdaptiveReply(action, decision) {
   }
   if (requestType === "press_release" && offerStrategy !== "single_best_fit_offer") {
     throw new Error(`Action ${action.id}: Pressemitteilung braucht genau ein bestpassendes Angebot.`);
+  }
+  if (requestType === "account_or_platform_setup" && offerStrategy !== "counterparty_setup_required") {
+    throw new Error(`Action ${action.id}: fremder Account muss vom anfragenden Partner eingerichtet werden.`);
   }
   if (requestType === "other" && offerStrategy !== "clarification_only") {
     throw new Error(`Action ${action.id}: unklarer Anfrage-Typ darf nur eine Rueckfrage erhalten.`);

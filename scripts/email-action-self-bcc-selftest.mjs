@@ -100,6 +100,7 @@ try {
       contactActions.every((action) => action.adaptive_external_enabled === true) &&
       contactActions.every((action) => action.adaptive_request_types.includes("press_release")) &&
       contactActions.every((action) => action.adaptive_request_types.includes("discount_negotiation")) &&
+      contactActions.every((action) => action.adaptive_request_types.includes("account_or_platform_setup")) &&
       Boolean(processFolderTool?.inputSchema?.properties?.adaptive_replies_by_uid),
     contact_use_case_routing_present:
       contactActions.length === 2 &&
@@ -205,7 +206,11 @@ try {
       source.includes("Rabatt-Endpreis unter 100 EUR ist gesperrt") &&
       source.includes("previousOfferAmountsEur.length < 2") &&
       source.includes("Rabattcode-Tabelle") &&
-      source.includes("final_floor")
+      source.includes("final_floor"),
+    counterparty_account_setup_is_required:
+      source.includes('requestType === "account_or_platform_setup"') &&
+      source.includes("counterparty_setup_required") &&
+      source.includes("fremder Account muss vom anfragenden Partner eingerichtet werden")
   };
   console.log(JSON.stringify(report));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);
