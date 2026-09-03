@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "owner_agent_id": "vip-ai-communication",
   "accounts": [
     {
@@ -16,7 +16,18 @@
       "env_suffix": "EMAIL_AUTOMATION_RS_CONTACT",
       "smtp_host": "vip-studios.vip-studios.de",
       "smtp_port": 465,
-      "smtp_secure": true
+      "smtp_secure": true,
+      "signature_template": {
+        "action_id": "rs-signatur-de-en",
+        "mailbox": "INBOX.E-Mail-Automatisierung.RS | Contact",
+        "uid": "23",
+        "message_id": "<E152F2AF-6266-40E4-A879-CF060FDE4542@reise-stories.de>",
+        "sha256": "ab4410e3545a27507607ceb47d0049a8e53c684f7a4475a7390ccd17c9003500",
+        "body_marker": "TEXT",
+        "trailing_identity_lines": [
+          "Reise-Stories"
+        ]
+      }
     },
     {
       "id": "rs-media",

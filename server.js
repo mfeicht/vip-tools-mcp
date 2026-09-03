@@ -49,6 +49,10 @@ import {
   extractAccountingInvoice as extractAccountingInvoiceV2,
   getNormalizedAccountingInvoiceLines as getNormalizedAccountingInvoiceLinesV2
 } from "./lib/accounting-invoice-parser.js";
+import {
+  composeHtmlWithSignature,
+  stripTrailingIdentityFromText
+} from "./lib/email-signature-template.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -6759,6 +6763,7 @@ function buildDraftTemplateResendPayload({
 }
 
 function buildEmailActionReviewProposalResendPayload(plan) {
+  const attachments = Array.isArray(plan.proposal_attachments) ? plan.proposal_attachments : [];
   const payload = {
     from: plan.from,
     to: [plan.to],
@@ -6769,14 +6774,29 @@ function buildEmailActionReviewProposalResendPayload(plan) {
     headers: {
       "In-Reply-To": plan.in_reply_to,
       ...(plan.references ? { References: plan.references } : {})
-    }
+    },
+    ...(attachments.length
+      ? {
+          attachments: attachments.map((attachment) => ({
+            filename: attachment.filename,
+            content: attachment.content_base64,
+            ...(attachment.content_id ? { content_id: attachment.content_id } : {})
+          }))
+        }
+      : {})
   };
   return {
     payload,
     payload_sha256: createHash("sha256").update(JSON.stringify(payload), "utf8").digest("hex"),
     html_sha256: createHash("sha256").update(plan.proposal_html, "utf8").digest("hex"),
     text_sha256: plan.proposal_body_sha256,
-    attachment_manifest: []
+    attachment_manifest: attachments.map((attachment) => ({
+      filename: attachment.filename,
+      content_type: attachment.content_type,
+      content_id: attachment.content_id,
+      byte_length: attachment.byte_length,
+      sha256: attachment.sha256
+    }))
   };
 }
 
@@ -6792,7 +6812,7 @@ function resendReadbackChecks(data, plan, outbound) {
     provider_id: Boolean(data?.id),
     from: extractEmailAddress(data?.from) === extractEmailAddress(plan.from),
     to: sameProviderRecipientList(data?.to, [plan.to]),
-    bcc: sameProviderRecipientList(data?.bcc, [plan.bcc]),
+    bcc: sameProviderRecipientList(data?.bcc, outbound.payload.bcc || []),
     subject: String(data?.subject || "") === plan.subject,
     html: String(data?.html || "") === outbound.payload.html,
     text:
@@ -6961,7 +6981,7 @@ async function sendEmailActionReviewProposalViaResend(config, plan) {
     outbound_payload_sha256: outbound.payload_sha256,
     html_sha256: outbound.html_sha256,
     text_sha256: outbound.text_sha256,
-    attachment_manifest: [],
+    attachment_manifest: outbound.attachment_manifest,
     direct_internal_recipient: plan.to,
     reply_to_submitted: plan.reply_to,
     self_bcc_submitted: null,
@@ -7409,13 +7429,49 @@ function loadEmailActionSendAccounts() {
     if (!Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535) {
       throw new Error(`E-Mail-Sendekonto ${id}: smtp_port ist ungueltig.`);
     }
+    let signatureTemplate = null;
+    if (account.signature_template) {
+      const signatureActionId = normalizeActionSlug(account.signature_template.action_id);
+      const signatureMailbox = String(account.signature_template.mailbox || "").trim();
+      const signatureUid = String(account.signature_template.uid || "").trim();
+      const signatureMessageId = String(account.signature_template.message_id || "").trim();
+      const signatureSha256 = String(account.signature_template.sha256 || "").trim().toLowerCase();
+      const bodyMarker = String(account.signature_template.body_marker || "TEXT");
+      if (!signatureMailbox) throw new Error(`E-Mail-Sendekonto ${id}: Signatur-Mailbox fehlt.`);
+      if (!/^\d+$/.test(signatureUid)) throw new Error(`E-Mail-Sendekonto ${id}: Signatur-UID ist ungueltig.`);
+      if (!/^<[^>]+>$/.test(signatureMessageId)) {
+        throw new Error(`E-Mail-Sendekonto ${id}: Signatur-Message-ID ist ungueltig.`);
+      }
+      if (!/^[a-f0-9]{64}$/.test(signatureSha256)) {
+        throw new Error(`E-Mail-Sendekonto ${id}: Signatur-SHA256 ist ungueltig.`);
+      }
+      if (!bodyMarker || /[\r\n]/.test(bodyMarker)) {
+        throw new Error(`E-Mail-Sendekonto ${id}: Signatur-Einsetzpunkt ist ungueltig.`);
+      }
+      signatureTemplate = {
+        action_id: signatureActionId,
+        mailbox: signatureMailbox,
+        uid: signatureUid,
+        message_id: signatureMessageId,
+        sha256: signatureSha256,
+        body_marker: bodyMarker,
+        trailing_identity_lines: uniqueValues(
+          (Array.isArray(account.signature_template.trailing_identity_lines)
+            ? account.signature_template.trailing_identity_lines
+            : [])
+            .map((value) => String(value || "").trim())
+            .filter(Boolean)
+        )
+      };
+    }
     return {
       id,
       address,
       env_suffix: envSuffix,
       smtp_host: smtpHost,
       smtp_port: smtpPort,
-      smtp_secure: smtpSecure
+      smtp_secure: smtpSecure,
+      signature_template: signatureTemplate
     };
   });
   return {
@@ -7616,6 +7672,7 @@ function resolveEmailActionSendAccount(action, templateFrom) {
       raw_mime_transport: httpReady ? "resend_http_mime_equivalent" : "smtp_raw_mime",
       raw_mime_transport_ready: httpReady || smtpDetails.summary.ready_for_send,
       mandatory_self_bcc: true,
+      signature_template: standaloneAccount.signature_template,
       raw_mime_note:
         "Der zentrale Communication-Workflow bevorzugt Resend HTTPS und erhaelt HTML, Plain-Text-Alternative, CID-Anhaenge, Thread-Header und unsichtbaren Self-BCC; SMTP-Raw-MIME bleibt als Transport-Fallback verfuegbar."
     };
@@ -7703,6 +7760,18 @@ function publicEmailAction(action) {
       ? createHash("sha256").update(action.template.message_id).digest("hex")
       : null,
     template_sha256: action.template.sha256 || null,
+    signature_template: sendAccount?.signature_template
+      ? {
+          action_id: sendAccount.signature_template.action_id,
+          mailbox: sendAccount.signature_template.mailbox,
+          uid: sendAccount.signature_template.uid,
+          message_id_hash: createHash("sha256")
+            .update(sendAccount.signature_template.message_id)
+            .digest("hex"),
+          sha256: sendAccount.signature_template.sha256,
+          body_marker: sendAccount.signature_template.body_marker
+        }
+      : null,
     raw_mime_transport_ready: sendAccount?.raw_mime_transport_ready ?? null,
     send_account_error: sendAccountError
   };
@@ -7898,6 +7967,102 @@ function resolveEmailActionTemplate(action, scan) {
     complete: Boolean(action.template.uid && action.template.message_id && action.template.sha256)
   };
   return { template, sendAccount, registered };
+}
+
+function resolveEmailActionSignatureTemplate(sendAccount, scan) {
+  const binding = sendAccount?.signature_template;
+  if (!binding) return null;
+  if (String(scan.mailbox || "").toLowerCase() !== binding.mailbox.toLowerCase()) {
+    throw new Error(
+      `Signaturvorlage ${binding.action_id}: v1 unterstuetzt nur dieselbe IMAP-Mailbox wie die Action.`
+    );
+  }
+  const matches = scan.messages.filter(
+    (message) => message.template_subject?.action_id === binding.action_id
+  );
+  if (matches.length !== 1) {
+    throw new Error(
+      `Signaturvorlage ${binding.action_id}: genau eine passende Vorlage erwartet, gefunden: ${matches.length}.`
+    );
+  }
+  const template = matches[0];
+  const checks = {
+    uid: String(template.uid) === binding.uid,
+    message_id: String(template.parsed?.message_id || "") === binding.message_id,
+    sha256: template.raw_sha256 === binding.sha256,
+    from: template.template_subject?.from === sendAccount.from,
+    draft: hasImapFlag(template.flags, "\\Draft")
+  };
+  if (!Object.values(checks).every(Boolean)) {
+    throw new Error(
+      `Signaturvorlage ${binding.action_id}: registrierter UID-/Message-ID-/SHA256-/FROM-/Draft-Readback stimmt nicht.`
+    );
+  }
+  const probe = buildDraftTemplateResendPayload({
+    templateRaw: template.raw,
+    from: sendAccount.from,
+    to: sendAccount.from,
+    bcc: sendAccount.from,
+    subject: "Signatur-Shadow-Readback",
+    body: "SIGNATURE_TEMPLATE_READBACK",
+    bodyMarker: binding.body_marker
+  });
+  return {
+    template,
+    binding,
+    checks,
+    html_marker_count: probe.html_marker_count,
+    plain_marker_count: probe.plain_marker_count,
+    attachment_manifest: probe.attachment_manifest
+  };
+}
+
+function composeEmailActionContentWithSignature({
+  contentRaw,
+  signatureTemplate,
+  trailingIdentityLines = []
+}) {
+  const contentParts = parseMimeMessageTextParts(contentRaw);
+  const contentHtml = selectSingleEmailActionTextPart(contentParts, "text/html", { required: true });
+  const contentPlain =
+    selectSingleEmailActionTextPart(contentParts, "text/plain") ||
+    emailLearningBodyText(contentParts, 50_000).text;
+  const signatureParts = parseMimeMessageTextParts(signatureTemplate.template.raw);
+  const signatureHtml = selectSingleEmailActionTextPart(signatureParts, "text/html", { required: true });
+  const signaturePlain = selectSingleEmailActionTextPart(signatureParts, "text/plain");
+  const marker = signatureTemplate.binding.body_marker;
+  const composedHtml = composeHtmlWithSignature({
+    contentHtml,
+    signatureHtml,
+    marker,
+    trailingIdentities: trailingIdentityLines
+  });
+  const cleanContentPlain = stripTrailingIdentityFromText(contentPlain, trailingIdentityLines);
+  const signatureTextSource =
+    signaturePlain || emailLearningBodyText(signatureParts, 50_000).text;
+  const signatureTextMarkerCount = countLiteralOccurrences(signatureTextSource, marker);
+  if (signatureTextMarkerCount !== 1) {
+    throw new Error(
+      `Signatur-Textdarstellung muss den Einsetzpunkt ${marker} exakt einmal enthalten, gefunden: ${signatureTextMarkerCount}.`
+    );
+  }
+  const text = signatureTextSource.replace(marker, cleanContentPlain);
+  const attachments = [
+    ...parseMimeMessageResendAttachments(contentRaw),
+    ...parseMimeMessageResendAttachments(signatureTemplate.template.raw)
+  ];
+  validateEmailTemplateCidReferences(composedHtml.html, attachments);
+  return {
+    html: composedHtml.html,
+    text,
+    attachments,
+    html_marker_count: composedHtml.marker_count,
+    text_marker_count: signatureTextMarkerCount,
+    trailing_identity_removed: composedHtml.trailing_identity_removed,
+    signature_template_uid: signatureTemplate.template.uid,
+    signature_template_sha256: signatureTemplate.template.raw_sha256,
+    signature_template_message_id_hash: signatureTemplate.template.parsed?.message_id_hash || null
+  };
 }
 
 function isEmailActionInboundMessage(message) {
@@ -8277,7 +8442,73 @@ function rememberEmailActionSend(idempotencyId, data) {
   });
 }
 
-function buildRawTemplateReply({ action, templateMessage, sourceMessage, sendAccount, placeholderValues = {} }) {
+function buildEmailActionMultipartRawMessage({ headerLines, html, text, attachments, boundarySeed }) {
+  const seed = String(boundarySeed || randomUUID()).replace(/[^a-z0-9]/gi, "").slice(0, 40);
+  const alternativeBoundary = `VIP-Alt-${seed}`;
+  const relatedBoundary = `VIP-Related-${seed}`;
+  const alternative = [
+    `--${alternativeBoundary}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    encodeMimeBase64Body(text),
+    `--${alternativeBoundary}`,
+    "Content-Type: text/html; charset=utf-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    encodeMimeBase64Body(html),
+    `--${alternativeBoundary}--`,
+    ""
+  ].join("\r\n");
+  if (!attachments.length) {
+    return [
+      ...headerLines,
+      "MIME-Version: 1.0",
+      `Content-Type: multipart/alternative; boundary=\"${alternativeBoundary}\"`,
+      "",
+      alternative
+    ].join("\r\n");
+  }
+
+  const parts = [
+    ...headerLines,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/related; boundary=\"${relatedBoundary}\"`,
+    "",
+    `--${relatedBoundary}`,
+    `Content-Type: multipart/alternative; boundary=\"${alternativeBoundary}\"`,
+    "",
+    alternative
+  ];
+  for (const attachment of attachments) {
+    const contentType = sanitizeHeaderLineValue(attachment.content_type || "application/octet-stream", "Attachment Content-Type");
+    const filename = sanitizeHeaderLineValue(attachment.filename || "attachment", "Attachment filename").replace(/["\\]/g, "_");
+    const contentId = stripMimeContentId(attachment.content_id || "");
+    parts.push(
+      `--${relatedBoundary}`,
+      `Content-Type: ${contentType}; name=\"${filename}\"`,
+      "Content-Transfer-Encoding: base64",
+      `Content-Disposition: ${contentId ? "inline" : "attachment"}; filename=\"${filename}\"`,
+      ...(contentId ? [`Content-ID: <${sanitizeHeaderLineValue(contentId, "Content-ID")}>`] : []),
+      "",
+      String(attachment.content_base64 || "")
+        .replace(/\s+/g, "")
+        .replace(/.{1,76}/g, "$&\r\n")
+        .trimEnd()
+    );
+  }
+  parts.push(`--${relatedBoundary}--`, "");
+  return parts.join("\r\n");
+}
+
+function buildRawTemplateReply({
+  action,
+  templateMessage,
+  sourceMessage,
+  sendAccount,
+  signatureTemplate = null,
+  placeholderValues = {}
+}) {
   const inbound = getInboundHeadersForAction(sourceMessage.raw);
   if (!inbound.message_id) {
     throw new Error(`UID ${sourceMessage.uid}: Message-ID fehlt; echte Thread-Antwort blockiert.`);
@@ -8315,12 +8546,32 @@ function buildRawTemplateReply({ action, templateMessage, sourceMessage, sendAcc
     `Date: ${new Date().toUTCString()}`,
     `Message-ID: ${messageId}`,
     `In-Reply-To: ${sanitizeHeaderLineValue(inbound.message_id, "In-Reply-To")}`,
-    ...(references ? [`References: ${sanitizeHeaderLineValue(references, "References")}`] : []),
-    "MIME-Version: 1.0",
-    `Content-Type: ${contentType}`,
-    ...(!isMultipart && cte ? [`Content-Transfer-Encoding: ${cte}`] : [])
+    ...(references ? [`References: ${sanitizeHeaderLineValue(references, "References")}`] : [])
   ];
-  const rawMessage = `${headers.join("\r\n")}\r\n\r\n${rendered.body}`;
+  const renderedTemplateRaw = `${headersText}\r\n\r\n${rendered.body}`;
+  const signatureComposition = signatureTemplate
+    ? composeEmailActionContentWithSignature({
+        contentRaw: renderedTemplateRaw,
+        signatureTemplate,
+        trailingIdentityLines: signatureTemplate.binding.trailing_identity_lines
+      })
+    : null;
+  const rawMessage = signatureComposition
+    ? buildEmailActionMultipartRawMessage({
+        headerLines: headers,
+        html: signatureComposition.html,
+        text: signatureComposition.text,
+        attachments: signatureComposition.attachments,
+        boundarySeed: idempotencyId
+      })
+    : [
+        ...headers,
+        "MIME-Version: 1.0",
+        `Content-Type: ${contentType}`,
+        ...(!isMultipart && cte ? [`Content-Transfer-Encoding: ${cte}`] : []),
+        "",
+        rendered.body
+      ].join("\r\n");
   const selfBcc = extractEmailAddress(sendAccount.from);
   if (!selfBcc) {
     throw new Error(`Action ${action.id}: verifizierte FROM-Adresse fuer Self-BCC fehlt.`);
@@ -8345,13 +8596,24 @@ function buildRawTemplateReply({ action, templateMessage, sourceMessage, sendAcc
     subject,
     in_reply_to: inbound.message_id,
     references,
-    content_type: contentType,
+    content_type: signatureComposition ? "multipart/related" : contentType,
     template_sha256: templateMessage.raw_sha256,
     template_uid: templateMessage.uid,
     source_uid: sourceMessage.uid,
     source_message_id_hash: sourceMessage.parsed?.message_id_hash || null,
     placeholders: rendered.placeholders,
-    placeholder_values_used: rendered.placeholder_values_used
+    placeholder_values_used: rendered.placeholder_values_used,
+    signature_template: signatureComposition
+      ? {
+          uid: signatureComposition.signature_template_uid,
+          sha256: signatureComposition.signature_template_sha256,
+          message_id_hash: signatureComposition.signature_template_message_id_hash,
+          html_marker_count: signatureComposition.html_marker_count,
+          text_marker_count: signatureComposition.text_marker_count,
+          inline_resource_count: signatureComposition.attachments.filter((item) => item.content_id).length,
+          trailing_identity_removed: signatureComposition.trailing_identity_removed
+        }
+      : null
   };
 }
 
@@ -8362,7 +8624,13 @@ function encodeMimeBase64Body(value) {
     .trimEnd();
 }
 
-function buildEmailActionReviewProposalPlan({ action, sourceMessage, sendAccount, proposalBody }) {
+function buildEmailActionReviewProposalPlan({
+  action,
+  sourceMessage,
+  sendAccount,
+  signatureTemplate = null,
+  proposalBody
+}) {
   const inbound = getInboundHeadersForAction(sourceMessage.raw);
   if (!inbound.message_id) {
     throw new Error(`UID ${sourceMessage.uid}: Message-ID fehlt; interner Thread-Entwurf blockiert.`);
@@ -8413,9 +8681,25 @@ function buildEmailActionReviewProposalPlan({ action, sourceMessage, sendAccount
     "</div>",
     `<div>${escapeAccountingHtml(normalizedBody).replace(/\n/g, "<br>\n")}</div>`
   ].join("");
-  const boundary = `VIP-Proposal-${idempotencyId.slice(0, 24)}`;
   const messageId = `<vip-proposal-${idempotencyId.slice(0, 40)}@vip-tools-mcp.vip-studios.de>`;
-  const rawMessage = [
+  const baseContentRaw = buildEmailActionMultipartRawMessage({
+    headerLines: ["From: <internal-proposal@vip-tools-mcp.vip-studios.de>", "To: <internal-proposal@vip-tools-mcp.vip-studios.de>"],
+    html,
+    text: visibleProposalBody,
+    attachments: [],
+    boundarySeed: idempotencyId
+  });
+  const signatureComposition = signatureTemplate
+    ? composeEmailActionContentWithSignature({
+        contentRaw: baseContentRaw,
+        signatureTemplate,
+        trailingIdentityLines: signatureTemplate.binding.trailing_identity_lines
+      })
+    : null;
+  const finalHtml = signatureComposition?.html || html;
+  const finalText = signatureComposition?.text || visibleProposalBody;
+  const finalAttachments = signatureComposition?.attachments || [];
+  const rawHeaders = [
     `From: <${internalRecipient}>`,
     `To: <${internalRecipient}>`,
     `Reply-To: <${externalRecipient.email}>`,
@@ -8423,23 +8707,21 @@ function buildEmailActionReviewProposalPlan({ action, sourceMessage, sendAccount
     `Date: ${new Date().toUTCString()}`,
     `Message-ID: ${messageId}`,
     `In-Reply-To: ${sanitizeHeaderLineValue(inbound.message_id, "In-Reply-To")}`,
-    ...(references ? [`References: ${sanitizeHeaderLineValue(references, "References")}`] : []),
-    "MIME-Version: 1.0",
-    `Content-Type: multipart/alternative; boundary=\"${boundary}\"`,
-    "",
-    `--${boundary}`,
-    "Content-Type: text/plain; charset=utf-8",
-    "Content-Transfer-Encoding: base64",
-    "",
-    encodeMimeBase64Body(visibleProposalBody),
-    `--${boundary}`,
-    "Content-Type: text/html; charset=utf-8",
-    "Content-Transfer-Encoding: base64",
-    "",
-    encodeMimeBase64Body(html),
-    `--${boundary}--`,
-    ""
-  ].join("\r\n");
+    ...(references ? [`References: ${sanitizeHeaderLineValue(references, "References")}`] : [])
+  ];
+  const rawMessage = buildEmailActionMultipartRawMessage({
+    headerLines: rawHeaders,
+    html: finalHtml,
+    text: finalText,
+    attachments: finalAttachments,
+    boundarySeed: idempotencyId
+  });
+  const cleanReplyBody = signatureTemplate
+    ? stripTrailingIdentityFromText(
+        normalizedBody,
+        signatureTemplate.binding.trailing_identity_lines
+      )
+    : normalizedBody;
 
   return {
     idempotency_id: idempotencyId,
@@ -8462,11 +8744,23 @@ function buildEmailActionReviewProposalPlan({ action, sourceMessage, sendAccount
     subject,
     in_reply_to: inbound.message_id,
     references,
-    content_type: `multipart/alternative; boundary=\"${boundary}\"`,
-    proposal_body: visibleProposalBody,
-    proposal_body_sha256: createHash("sha256").update(visibleProposalBody, "utf8").digest("hex"),
-    reply_body_sha256: createHash("sha256").update(normalizedBody, "utf8").digest("hex"),
-    proposal_html: html,
+    content_type: finalAttachments.length ? "multipart/related" : "multipart/alternative",
+    proposal_body: finalText,
+    proposal_body_sha256: createHash("sha256").update(finalText, "utf8").digest("hex"),
+    reply_body_sha256: createHash("sha256").update(cleanReplyBody, "utf8").digest("hex"),
+    proposal_html: finalHtml,
+    proposal_attachments: finalAttachments,
+    signature_template: signatureComposition
+      ? {
+          uid: signatureComposition.signature_template_uid,
+          sha256: signatureComposition.signature_template_sha256,
+          message_id_hash: signatureComposition.signature_template_message_id_hash,
+          html_marker_count: signatureComposition.html_marker_count,
+          text_marker_count: signatureComposition.text_marker_count,
+          inline_resource_count: finalAttachments.filter((item) => item.content_id).length,
+          trailing_identity_removed: signatureComposition.trailing_identity_removed
+        }
+      : null,
     source_uid: sourceMessage.uid,
     source_message_id_hash: sourceMessage.parsed?.message_id_hash || null
   };
@@ -18539,6 +18833,18 @@ function createServer() {
               ]
             },
             mandatory_self_bcc: account.address,
+            signature_template: account.signature_template
+              ? {
+                  action_id: account.signature_template.action_id,
+                  mailbox: account.signature_template.mailbox,
+                  uid: account.signature_template.uid,
+                  message_id_hash: createHash("sha256")
+                    .update(account.signature_template.message_id)
+                    .digest("hex"),
+                  sha256: account.signature_template.sha256,
+                  body_marker: account.signature_template.body_marker
+                }
+              : null,
             error
           };
         })
@@ -19107,6 +19413,7 @@ function createServer() {
         maxScanMessages: max_scan_messages
       });
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
+      const signatureTemplate = resolveEmailActionSignatureTemplate(sendAccount, scan);
       const registryOk = registered.complete && registered.uid_ok && registered.message_id_ok && registered.sha256_ok;
       if (!registryOk) {
         return out({
@@ -19251,6 +19558,7 @@ function createServer() {
         maxScanMessages: max_scan_messages
       });
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
+      const signatureTemplate = resolveEmailActionSignatureTemplate(sendAccount, scan);
       const registryOk = registered.complete && registered.uid_ok && registered.message_id_ok && registered.sha256_ok;
       if (!registryOk) {
         return out({
@@ -19275,6 +19583,7 @@ function createServer() {
         action,
         sourceMessage,
         sendAccount,
+        signatureTemplate,
         proposalBody: proposal_body
       });
       const common = {
@@ -19288,6 +19597,7 @@ function createServer() {
           sha256: template.raw_sha256,
           message_id_hash: template.parsed.message_id_hash || null
         },
+        signature_template: plan.signature_template,
         proposal: {
           idempotency_id: plan.idempotency_id,
           from: plan.from,
@@ -19618,6 +19928,7 @@ function createServer() {
         maxScanMessages: max_scan_messages
       });
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
+      const signatureTemplate = resolveEmailActionSignatureTemplate(sendAccount, scan);
       const registryOk = registered.complete && registered.uid_ok && registered.message_id_ok && registered.sha256_ok;
       if (!registryOk && !allow_unregistered_template) {
         return out({
@@ -19694,6 +20005,7 @@ function createServer() {
             templateMessage: template,
             sourceMessage: message,
             sendAccount,
+            signatureTemplate,
             placeholderValues:
               action.response_mode === "agent_assisted"
                 ? validateEmailActionAgentPlaceholderValues(agentDecision?.placeholder_values || {})
@@ -19719,6 +20031,7 @@ function createServer() {
             raw_message_sha256: plan.raw_message_sha256,
             template_uid: plan.template_uid,
             template_sha256: plan.template_sha256,
+            signature_template: plan.signature_template,
             language_decision: languageDecision,
             agent_review: action.response_mode === "agent_assisted" ? {
               template_fit_confirmed: true,
@@ -19839,6 +20152,7 @@ function createServer() {
         maxScanMessages: max_scan_messages
       });
       const { template, sendAccount, registered } = resolveEmailActionTemplate(action, scan);
+      const signatureTemplate = resolveEmailActionSignatureTemplate(sendAccount, scan);
       const registryOk = registered.complete && registered.uid_ok && registered.message_id_ok && registered.sha256_ok;
 
       if (mode === "live") {
@@ -19919,6 +20233,7 @@ function createServer() {
             templateMessage: template,
             sourceMessage: message,
             sendAccount,
+            signatureTemplate,
             placeholderValues:
               action.response_mode === "agent_assisted"
                 ? validateEmailActionAgentPlaceholderValues(agentDecision?.placeholder_values || {})
@@ -19998,6 +20313,7 @@ function createServer() {
             message_id: plan.message_id,
             raw_message_sha256: plan.raw_message_sha256,
             template_sha256: plan.template_sha256,
+            signature_template: plan.signature_template,
             language_decision: languageDecision,
             agent_review: action.response_mode === "agent_assisted" ? {
               template_fit_confirmed: true,

@@ -61,6 +61,12 @@ try {
     every_account_has_self_bcc: (accounts.accounts || []).every(
       (account) => account.mandatory_self_bcc === account.address
     ),
+    rs_contact_signature_is_hash_bound:
+      accountById.get("rs-contact")?.signature_template?.action_id === "rs-signatur-de-en" &&
+      accountById.get("rs-contact")?.signature_template?.uid === "23" &&
+      accountById.get("rs-contact")?.signature_template?.sha256 ===
+        "ab4410e3545a27507607ceb47d0049a8e53c684f7a4475a7390ccd17c9003500" &&
+      accountById.get("rs-contact")?.signature_template?.body_marker === "TEXT",
     domain_scoped_resend_env_names_present:
       accountById.get("rs-contact")?.required_env_names?.resend_api_key ===
         "RESEND_API_KEY_REISE_STORIES_DE" &&
@@ -170,7 +176,12 @@ try {
       source.includes("expected_template_sha256") &&
       source.includes('hasImapFlag(template.flags, "\\\\Draft")') &&
       source.includes('moves_template: false') &&
-      source.includes("buildDraftTemplateResendPayload")
+      source.includes("buildDraftTemplateResendPayload"),
+    routine_signature_composition_is_readback_gated:
+      source.includes("resolveEmailActionSignatureTemplate") &&
+      source.includes("composeEmailActionContentWithSignature") &&
+      source.includes("signatureTemplate.binding.trailing_identity_lines") &&
+      source.includes("signature_template: plan.signature_template")
   };
   console.log(JSON.stringify(report));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);

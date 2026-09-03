@@ -14,6 +14,7 @@
     "test:completion-handoff-guard": "node scripts/completion-handoff-guard-selftest.mjs",
     "test:imap-window": "node scripts/imap-window-selftest.mjs",
     "test:email-action-self-bcc": "node scripts/email-action-self-bcc-selftest.mjs",
+    "test:email-signature-template": "node scripts/email-signature-template-selftest.mjs",
     "test:attachment-visual-contract": "node scripts/attachment-visual-contract-selftest.mjs",
     "test:accounting-ocr-contract": "node scripts/accounting-ocr-contract-selftest.mjs",
     "test:accounting-invoice-parser": "node scripts/accounting-invoice-parser-selftest.mjs",
