@@ -99,13 +99,14 @@ try {
       contactActions.length === 2 &&
       contactActions.every((action) => action.adaptive_external_enabled === true) &&
       contactActions.every((action) => action.adaptive_request_types.includes("press_release")) &&
+      contactActions.every((action) => action.adaptive_request_types.includes("discount_negotiation")) &&
       Boolean(processFolderTool?.inputSchema?.properties?.adaptive_replies_by_uid),
     contact_use_case_routing_present:
       contactActions.length === 2 &&
       contactActions.every(
         (action) =>
           action.selection_group === "rs-contact" &&
-          action.use_case === "initial-link-or-article-cooperation" &&
+          action.use_case === "link-or-article-cooperation-including-discount-follow-up" &&
           Boolean(action.routing_description)
       ),
     discount_actions_safely_prepared:
@@ -198,7 +199,13 @@ try {
       source.includes("dynamic_sources_checked") &&
       source.includes("dynamic_sources_checked_at") &&
       source.includes("buildEmailActionIdempotencyId") &&
-      source.includes("adaptive_reply: plan.adaptive_reply")
+      source.includes("adaptive_reply: plan.adaptive_reply"),
+    discount_floor_is_staged_and_source_gated:
+      source.includes('requestType === "discount_negotiation"') &&
+      source.includes("Rabatt-Endpreis unter 100 EUR ist gesperrt") &&
+      source.includes("previousOfferAmountsEur.length < 2") &&
+      source.includes("Rabattcode-Tabelle") &&
+      source.includes("final_floor")
   };
   console.log(JSON.stringify(report));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);

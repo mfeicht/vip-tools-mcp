@@ -193,6 +193,7 @@ const emailActionAdaptiveReplySchema = z
       "guest_article",
       "link_insertion",
       "link_purchase",
+      "discount_negotiation",
       "newsletter",
       "press_release",
       "general_cooperation",
@@ -208,6 +209,10 @@ const emailActionAdaptiveReplySchema = z
     knowledge_confidence: z.literal("high"),
     dynamic_sources_checked: z.array(z.string().url()).min(1).max(8),
     dynamic_sources_checked_at: z.string().datetime({ offset: true }),
+    discount_stage: z.enum(["initial", "intermediate", "final_floor"]).optional(),
+    proposed_price_eur: z.number().finite().min(0).max(1_000_000).optional(),
+    negotiation_rounds_failed: z.number().int().min(0).max(20).optional(),
+    previous_offer_amounts_eur: z.array(z.number().finite().min(0).max(1_000_000)).max(20).optional(),
     evidence_note: z.string().min(20).max(2000)
   })
   .strict();
@@ -8666,6 +8671,7 @@ function validateEmailActionAdaptiveReply(action, decision) {
     "guest_article",
     "link_insertion",
     "link_purchase",
+    "discount_negotiation",
     "newsletter",
     "press_release",
     "general_cooperation",
@@ -8687,7 +8693,7 @@ function validateEmailActionAdaptiveReply(action, decision) {
     throw new Error(`Action ${action.id}: ungueltige adaptive Angebotsstrategie.`);
   }
   if (
-    ["guest_article", "link_insertion", "link_purchase"].includes(requestType) &&
+    ["guest_article", "link_insertion", "link_purchase", "discount_negotiation"].includes(requestType) &&
     offerStrategy !== "requested_product_only"
   ) {
     throw new Error(`Action ${action.id}: konkrete Anfrage muss auf das angefragte Produkt fokussiert bleiben.`);
@@ -8719,6 +8725,22 @@ function validateEmailActionAdaptiveReply(action, decision) {
   if (!sourceUrls.includes(requiredSource)) {
     throw new Error(`Action ${action.id}: sprachlich passende dynamische Pflichtquelle wurde nicht bestaetigt.`);
   }
+  const discountSheetId = "1rQXoI9-YSTEhpDNIaP1GnVS3DUdDwwwsZaAq8SbyA84";
+  const isApprovedDiscountSheetUrl = (value) => {
+    try {
+      const url = new URL(value);
+      return (
+        url.protocol === "https:" &&
+        url.hostname === "docs.google.com" &&
+        url.pathname.startsWith(`/spreadsheets/d/${discountSheetId}/`)
+      );
+    } catch {
+      return false;
+    }
+  };
+  if (requestType === "discount_negotiation" && !sourceUrls.some(isApprovedDiscountSheetUrl)) {
+    throw new Error(`Action ${action.id}: Rabattantwort braucht einen frischen Readback der freigegebenen Rabattcode-Tabelle.`);
+  }
   for (const value of sourceUrls) {
     let url;
     try {
@@ -8726,8 +8748,49 @@ function validateEmailActionAdaptiveReply(action, decision) {
     } catch {
       throw new Error(`Action ${action.id}: ungueltige dynamische Quellen-URL.`);
     }
-    if (url.protocol !== "https:" || url.hostname !== "reise-stories.de") {
-      throw new Error(`Action ${action.id}: adaptive Quellen muessen freigegebene Reise-Stories-HTTPS-Seiten sein.`);
+    const isCooperationPage = url.protocol === "https:" && url.hostname === "reise-stories.de";
+    if (!isCooperationPage && !isApprovedDiscountSheetUrl(value)) {
+      throw new Error(`Action ${action.id}: adaptive Quellen muessen freigegebene Reise-Stories-Quellen sein.`);
+    }
+  }
+  let discountStage = null;
+  let proposedPriceEur = null;
+  let negotiationRoundsFailed = 0;
+  let previousOfferAmountsEur = [];
+  if (requestType === "discount_negotiation") {
+    discountStage = String(decision.discount_stage || "").trim().toLowerCase();
+    proposedPriceEur = Number(decision.proposed_price_eur);
+    negotiationRoundsFailed = Number(decision.negotiation_rounds_failed ?? 0);
+    previousOfferAmountsEur = Array.isArray(decision.previous_offer_amounts_eur)
+      ? decision.previous_offer_amounts_eur.map(Number)
+      : [];
+    if (!Number.isFinite(proposedPriceEur) || proposedPriceEur < 100) {
+      throw new Error(`Action ${action.id}: Rabatt-Endpreis unter 100 EUR ist gesperrt.`);
+    }
+    if (!Number.isInteger(negotiationRoundsFailed) || negotiationRoundsFailed < 0) {
+      throw new Error(`Action ${action.id}: dokumentierte erfolglose Verhandlungsrunden fehlen.`);
+    }
+    if (discountStage === "final_floor") {
+      if (Math.abs(proposedPriceEur - 100) > 0.005) {
+        throw new Error(`Action ${action.id}: finale Preisuntergrenze muss exakt 100 EUR betragen.`);
+      }
+      if (
+        negotiationRoundsFailed < 2 ||
+        previousOfferAmountsEur.length < 2 ||
+        previousOfferAmountsEur.some((amount) => !Number.isFinite(amount) || amount <= 100)
+      ) {
+        throw new Error(`Action ${action.id}: 100 EUR sind erst nach mindestens zwei belegten abgelehnten hoeheren Angeboten erlaubt.`);
+      }
+    } else {
+      if (!["initial", "intermediate"].includes(discountStage)) {
+        throw new Error(`Action ${action.id}: ungueltige Rabattstufe.`);
+      }
+      if (proposedPriceEur <= 100) {
+        throw new Error(`Action ${action.id}: 100 EUR sind ausschliesslich als finale Preisuntergrenze erlaubt.`);
+      }
+      if (discountStage === "intermediate" && negotiationRoundsFailed < 1) {
+        throw new Error(`Action ${action.id}: Zwischenrabatt braucht mindestens eine belegte abgelehnte Preisstufe.`);
+      }
     }
   }
   const sourcesCheckedAtMs = Date.parse(String(decision.dynamic_sources_checked_at || ""));
@@ -8754,6 +8817,10 @@ function validateEmailActionAdaptiveReply(action, decision) {
     knowledge_confidence: "high",
     dynamic_sources_checked: sourceUrls,
     dynamic_sources_checked_at: new Date(sourcesCheckedAtMs).toISOString(),
+    discount_stage: discountStage,
+    proposed_price_eur: proposedPriceEur,
+    negotiation_rounds_failed: negotiationRoundsFailed,
+    previous_offer_amounts_eur: previousOfferAmountsEur,
     evidence_note: evidenceNote,
     reply_body: replyBody
   };
@@ -8861,6 +8928,10 @@ function buildEmailActionAdaptiveReplyPlan({
       knowledge_confidence: decision.knowledge_confidence,
       dynamic_sources_checked: decision.dynamic_sources_checked,
       dynamic_sources_checked_at: decision.dynamic_sources_checked_at,
+      discount_stage: decision.discount_stage,
+      proposed_price_eur: decision.proposed_price_eur,
+      negotiation_rounds_failed: decision.negotiation_rounds_failed,
+      previous_offer_amounts_eur: decision.previous_offer_amounts_eur,
       evidence_note_sha256: createHash("sha256").update(decision.evidence_note, "utf8").digest("hex"),
       evidence_note_bytes: Buffer.byteLength(decision.evidence_note, "utf8"),
       reply_body_sha256: createHash("sha256").update(cleanReplyBody, "utf8").digest("hex"),
