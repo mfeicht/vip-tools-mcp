@@ -215,7 +215,12 @@ try {
       source.includes("includedLinkCount === 2") &&
       source.includes('requestType !== "guest_article"') &&
       source.includes("Zwei Links brauchen einen finalen Kooperationspreis ueber 100 EUR") &&
-      source.includes("negotiationRoundsCompleted < 1")
+      source.includes("negotiationRoundsCompleted < 1"),
+    prohibited_link_industries_are_blocked:
+      contactActions.every((action) => action.agent_allowed_adjustments.includes("industry_safety_classification")) &&
+      source.includes('industryRisk === "prohibited"') &&
+      source.includes("Casino-, Gluecksspiel-, Crypto-, Spam- oder sonstige unserioese Linkziele sind gesperrt") &&
+      source.includes('industryRisk !== "safe"')
   };
   console.log(JSON.stringify(report));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);

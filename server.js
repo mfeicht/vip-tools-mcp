@@ -209,6 +209,8 @@ const emailActionAdaptiveReplySchema = z
     reply_body: z.string().min(1).max(50_000),
     template_style_followed: z.literal(true),
     knowledge_confidence: z.literal("high"),
+    industry_risk: z.enum(["safe", "prohibited", "uncertain"]),
+    industry_evidence_note: z.string().min(12).max(1000),
     dynamic_sources_checked: z.array(z.string().url()).min(1).max(8),
     dynamic_sources_checked_at: z.string().datetime({ offset: true }),
     discount_stage: z.enum(["initial", "intermediate", "final_floor"]).optional(),
@@ -8719,6 +8721,17 @@ function validateEmailActionAdaptiveReply(action, decision) {
   if (String(decision.knowledge_confidence || "").trim().toLowerCase() !== "high") {
     throw new Error(`Action ${action.id}: externe adaptive Antwort braucht hohe Wissenssicherheit.`);
   }
+  const industryRisk = String(decision.industry_risk || "").trim().toLowerCase();
+  const industryEvidenceNote = String(decision.industry_evidence_note || "").trim();
+  if (industryRisk === "prohibited") {
+    throw new Error(`Action ${action.id}: Casino-, Gluecksspiel-, Crypto-, Spam- oder sonstige unserioese Linkziele sind gesperrt.`);
+  }
+  if (industryRisk !== "safe") {
+    throw new Error(`Action ${action.id}: unklare Branche oder Linkziel braucht den sicheren Pruefweg.`);
+  }
+  if (industryEvidenceNote.length < 12 || industryEvidenceNote.length > 1000) {
+    throw new Error(`Action ${action.id}: Branchenpruefung ist nicht ausreichend belegt.`);
+  }
   const evidenceNote = String(decision.evidence_note || "").trim();
   if (evidenceNote.length < 20 || evidenceNote.length > 2000) {
     throw new Error(`Action ${action.id}: Evidenznotiz fehlt oder ist unplausibel lang.`);
@@ -8842,6 +8855,8 @@ function validateEmailActionAdaptiveReply(action, decision) {
     offer_strategy: offerStrategy,
     template_style_followed: true,
     knowledge_confidence: "high",
+    industry_risk: industryRisk,
+    industry_evidence_note: industryEvidenceNote,
     dynamic_sources_checked: sourceUrls,
     dynamic_sources_checked_at: new Date(sourcesCheckedAtMs).toISOString(),
     discount_stage: discountStage,
@@ -8955,6 +8970,9 @@ function buildEmailActionAdaptiveReplyPlan({
       offer_strategy: decision.offer_strategy,
       template_style_followed: decision.template_style_followed,
       knowledge_confidence: decision.knowledge_confidence,
+      industry_risk: decision.industry_risk,
+      industry_evidence_note_sha256: createHash("sha256").update(decision.industry_evidence_note, "utf8").digest("hex"),
+      industry_evidence_note_bytes: Buffer.byteLength(decision.industry_evidence_note, "utf8"),
       dynamic_sources_checked: decision.dynamic_sources_checked,
       dynamic_sources_checked_at: decision.dynamic_sources_checked_at,
       discount_stage: decision.discount_stage,

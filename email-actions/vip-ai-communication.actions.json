@@ -1,5 +1,5 @@
 {
-  "version": 11,
+  "version": 12,
   "owner_agent_id": "vip-ai-communication",
   "action_mailbox_root": "INBOX.E-Mail-Automatisierung",
   "done_mailbox_root": "INBOX.VIP AI.Erledigt",
@@ -38,7 +38,8 @@
         "personal_salutation",
         "safe_name_placeholders",
         "adaptive_body_from_verified_sources",
-        "focused_offer_selection"
+        "focused_offer_selection",
+        "industry_safety_classification"
       ],
       "enabled": true,
       "live_enabled": true,
@@ -84,7 +85,8 @@
         "personal_salutation",
         "safe_name_placeholders",
         "adaptive_body_from_verified_sources",
-        "focused_offer_selection"
+        "focused_offer_selection",
+        "industry_safety_classification"
       ],
       "enabled": true,
       "live_enabled": true,
