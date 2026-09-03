@@ -214,6 +214,8 @@ const emailActionAdaptiveReplySchema = z
     discount_stage: z.enum(["initial", "intermediate", "final_floor"]).optional(),
     proposed_price_eur: z.number().finite().min(0).max(1_000_000).optional(),
     negotiation_rounds_failed: z.number().int().min(0).max(20).optional(),
+    negotiation_rounds_completed: z.number().int().min(0).max(20).optional(),
+    included_link_count: z.number().int().min(1).max(2).optional(),
     previous_offer_amounts_eur: z.array(z.number().finite().min(0).max(1_000_000)).max(20).optional(),
     evidence_note: z.string().min(20).max(2000)
   })
@@ -8761,12 +8763,30 @@ function validateEmailActionAdaptiveReply(action, decision) {
     }
   }
   let discountStage = null;
-  let proposedPriceEur = null;
+  let proposedPriceEur = decision.proposed_price_eur == null ? null : Number(decision.proposed_price_eur);
   let negotiationRoundsFailed = 0;
+  const negotiationRoundsCompleted = Number(decision.negotiation_rounds_completed ?? 0);
+  const includedLinkCount = Number(decision.included_link_count ?? 1);
   let previousOfferAmountsEur = [];
+  if (!Number.isInteger(negotiationRoundsCompleted) || negotiationRoundsCompleted < 0) {
+    throw new Error(`Action ${action.id}: ungueltige Anzahl abgeschlossener Verhandlungsrunden.`);
+  }
+  if (!Number.isInteger(includedLinkCount) || includedLinkCount < 1 || includedLinkCount > 2) {
+    throw new Error(`Action ${action.id}: ungueltige Anzahl enthaltener Links.`);
+  }
+  if (includedLinkCount === 2) {
+    if (requestType !== "guest_article") {
+      throw new Error(`Action ${action.id}: Zwei-Link-Ausnahme ist nur fuer Gastbeitraege erlaubt.`);
+    }
+    if (!Number.isFinite(proposedPriceEur) || proposedPriceEur <= 100) {
+      throw new Error(`Action ${action.id}: Zwei Links brauchen einen finalen Kooperationspreis ueber 100 EUR.`);
+    }
+    if (negotiationRoundsCompleted < 1) {
+      throw new Error(`Action ${action.id}: Zwei Links sind erst nach mindestens einer belegten Verhandlungsrunde erlaubt.`);
+    }
+  }
   if (requestType === "discount_negotiation") {
     discountStage = String(decision.discount_stage || "").trim().toLowerCase();
-    proposedPriceEur = Number(decision.proposed_price_eur);
     negotiationRoundsFailed = Number(decision.negotiation_rounds_failed ?? 0);
     previousOfferAmountsEur = Array.isArray(decision.previous_offer_amounts_eur)
       ? decision.previous_offer_amounts_eur.map(Number)
@@ -8827,6 +8847,8 @@ function validateEmailActionAdaptiveReply(action, decision) {
     discount_stage: discountStage,
     proposed_price_eur: proposedPriceEur,
     negotiation_rounds_failed: negotiationRoundsFailed,
+    negotiation_rounds_completed: negotiationRoundsCompleted,
+    included_link_count: includedLinkCount,
     previous_offer_amounts_eur: previousOfferAmountsEur,
     evidence_note: evidenceNote,
     reply_body: replyBody
@@ -8938,6 +8960,8 @@ function buildEmailActionAdaptiveReplyPlan({
       discount_stage: decision.discount_stage,
       proposed_price_eur: decision.proposed_price_eur,
       negotiation_rounds_failed: decision.negotiation_rounds_failed,
+      negotiation_rounds_completed: decision.negotiation_rounds_completed,
+      included_link_count: decision.included_link_count,
       previous_offer_amounts_eur: decision.previous_offer_amounts_eur,
       evidence_note_sha256: createHash("sha256").update(decision.evidence_note, "utf8").digest("hex"),
       evidence_note_bytes: Buffer.byteLength(decision.evidence_note, "utf8"),

@@ -1,5 +1,5 @@
 {
-  "version": 10,
+  "version": 11,
   "owner_agent_id": "vip-ai-communication",
   "action_mailbox_root": "INBOX.E-Mail-Automatisierung",
   "done_mailbox_root": "INBOX.VIP AI.Erledigt",

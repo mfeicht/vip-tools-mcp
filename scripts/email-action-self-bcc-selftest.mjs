@@ -210,7 +210,12 @@ try {
     counterparty_account_setup_is_required:
       source.includes('requestType === "account_or_platform_setup"') &&
       source.includes("counterparty_setup_required") &&
-      source.includes("fremder Account muss vom anfragenden Partner eingerichtet werden")
+      source.includes("fremder Account muss vom anfragenden Partner eingerichtet werden"),
+    guest_article_second_link_is_negotiated_above_floor:
+      source.includes("includedLinkCount === 2") &&
+      source.includes('requestType !== "guest_article"') &&
+      source.includes("Zwei Links brauchen einen finalen Kooperationspreis ueber 100 EUR") &&
+      source.includes("negotiationRoundsCompleted < 1")
   };
   console.log(JSON.stringify(report));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);
