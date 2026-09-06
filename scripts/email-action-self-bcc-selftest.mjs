@@ -261,6 +261,8 @@ try {
       source.includes("quoted_original: quotedComposition.quoted_original") &&
       source.includes("html: quotedComposition.html") &&
       source.includes("text: quotedComposition.text"),
+    quoted_original_cid_markers_are_not_treated_as_attachments:
+      source.includes('replace(/\\bcid:/giu, "cid&#58;")'),
     german_umlaut_substitutions_are_blocked:
       source.includes("function assertGermanEmailOrthography") &&
       source.includes("deutsche Antwort enthaelt ae/oe/ue-Ersatzschreibweisen") &&

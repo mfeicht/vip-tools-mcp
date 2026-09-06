@@ -8451,11 +8451,14 @@ function buildEmailActionQuotedOriginal(sourceMessage, language) {
     .split("\n")
     .map((line) => `> ${line}`)
     .join("\n");
+  const quotedHtmlBody = escapeAccountingHtml(normalizedBody)
+    .replace(/\bcid:/giu, "cid&#58;")
+    .replace(/\n/g, "<br>\n");
   const html = [
     '<div class="vip-original-message" style="margin-top:24px;color:#555;font-size:12px;line-height:1.45;">',
     `<div style="margin-bottom:8px;">${escapeAccountingHtml(lead)}</div>`,
     '<blockquote style="margin:0 0 0 8px;padding:0 0 0 12px;border-left:2px solid #c7c7c7;">',
-    escapeAccountingHtml(normalizedBody).replace(/\n/g, "<br>\n"),
+    quotedHtmlBody,
     "</blockquote>",
     "</div>"
   ].join("");
