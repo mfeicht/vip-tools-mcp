@@ -108,13 +108,13 @@ const VIP_DASHBOARD_CHAT_MIGRATION_LEASE_MS = Math.max(
 );
 
 function dashboardActionTtlMs(type) {
-  return type === "chat_migration"
+  return type === "chat_migration" || type === "chat_cleanup"
     ? VIP_DASHBOARD_CHAT_MIGRATION_TTL_MS
     : VIP_DASHBOARD_ACTION_REQUEST_TTL_MS;
 }
 
 function dashboardActionLeaseMs(type) {
-  return type === "chat_migration"
+  return type === "chat_migration" || type === "chat_cleanup"
     ? VIP_DASHBOARD_CHAT_MIGRATION_LEASE_MS
     : VIP_DASHBOARD_ACTION_LEASE_MS;
 }
@@ -21956,6 +21956,57 @@ function normalizeDashboardAction(body = {}) {
   return { type, agentIds, staggerSeconds, message };
 }
 
+function recoverSignedDashboardAction(payload, now = Date.now()) {
+  const requestId = String(payload?.actionRequestId || "");
+  const source = payload?.request;
+  if (!/^[a-f0-9-]{20,80}$/i.test(requestId) || !source || typeof source !== "object") {
+    throw Object.assign(new Error("Unbekannter Dashboard-Auftrag ohne gueltigen Wiederanlaufbeleg."), {
+      statusCode: 404
+    });
+  }
+  const type = String(source.type || "");
+  if (!["agent_recovery", "agent_dispatch", "chat_cleanup", "chat_migration"].includes(type)) {
+    throw Object.assign(new Error("Ungueltiger Auftragstyp im Wiederanlaufbeleg."), {
+      statusCode: 400
+    });
+  }
+  const agentIds = normalizeDashboardAgentIds(source.agentIds, { allowAll: false });
+  if (type === "chat_cleanup" && (agentIds.length !== 1 || agentIds[0] !== "vip-ai-operations")) {
+    throw Object.assign(new Error("Ungueltiger Chat-Cleanup-Wiederanlaufbeleg."), {
+      statusCode: 400
+    });
+  }
+  const staggerSeconds = Math.min(300, Math.max(0, Math.round(Number(source.staggerSeconds || 0))));
+  const requestedAt = Number.isFinite(Date.parse(String(source.requestedAt || "")))
+    ? String(source.requestedAt)
+    : String(payload.generatedAt || new Date(now).toISOString());
+  const startedAt = Number.isFinite(Date.parse(String(source.startedAt || "")))
+    ? String(source.startedAt)
+    : requestedAt;
+  const ttlMs = dashboardActionTtlMs(type);
+  const expiresAtMs = now + ttlMs;
+  const request = {
+    id: requestId,
+    fingerprint: `signed-listener-recovery:${requestId}`,
+    type,
+    agentIds,
+    staggerSeconds,
+    message: "",
+    status: "running",
+    requestedAt,
+    startedAt,
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    expiresAtMs,
+    leaseUntilMs: now + dashboardActionLeaseMs(type),
+    completedAt: null,
+    results: [],
+    error: null,
+    recoveredAfterServiceRestart: true
+  };
+  vipDashboardActionRequests.set(requestId, request);
+  return request;
+}
+
 function dashboardActionResponse(request, { includePayload = false } = {}) {
   const response = {
     ok: true,
@@ -22138,6 +22189,36 @@ async function readAsanaAgentOpenTaskSnapshot(agentId, limit = 100) {
   };
 }
 
+async function readAllDashboardOpenTasks(asana, workspace, maxPages = 10) {
+  const tasks = [];
+  let offset;
+  let pageCount = 0;
+  do {
+    const taskResponse = await asanaRequestWithRetry(asana, {
+      method: "GET",
+      url: "/tasks",
+      params: {
+        assignee: "me",
+        workspace,
+        completed_since: "now",
+        limit: 100,
+        opt_fields: "gid,name,due_on,due_at,modified_at,permalink_url,tags.gid,tags.name",
+        ...(offset ? { offset } : {})
+      }
+    });
+    tasks.push(...(taskResponse.data.data || []));
+    offset = taskResponse.data.next_page?.offset || null;
+    pageCount += 1;
+  } while (offset && pageCount < maxPages);
+
+  if (offset) {
+    throw new Error(
+      `Dashboard kann den offenen Asana-Bestand nicht vollstaendig lesen: mehr als ${maxPages * 100} Aufgaben.`
+    );
+  }
+  return tasks;
+}
+
 async function readDashboardAgentHealth(agentId, now) {
   const [name, area] = VIP_DASHBOARD_AGENT_NAMES[agentId] || [agentId, "Agent"];
   const envName = ASANA_TOKEN_ENVS[agentId];
@@ -22173,18 +22254,7 @@ async function readDashboardAgentHealth(agentId, now) {
     const workspace = userResponse.data.data.workspaces?.[0]?.gid;
     if (!workspace) throw new Error("Kein Asana-Workspace gefunden.");
 
-    const taskResponse = await asanaRequestWithRetry(asana, {
-      method: "GET",
-      url: "/tasks",
-      params: {
-        assignee: "me",
-        workspace,
-        completed_since: "now",
-        limit: 100,
-        opt_fields: "gid,name,due_on,due_at,modified_at,permalink_url,tags.gid,tags.name"
-      }
-    });
-    const tasks = taskResponse.data.data || [];
+    const tasks = await readAllDashboardOpenTasks(asana, workspace);
     const taskSummary = summarizeDashboardTasks(tasks, now);
 
     return {
@@ -22203,7 +22273,8 @@ async function readDashboardAgentHealth(agentId, now) {
       routineBacklog: taskSummary.routine_backlog,
       routineTagMissing: taskSummary.routine_tag_missing,
       activeLocks,
-      lastSeen: now.toISOString()
+      lastSeen: now.toISOString(),
+      _tasks: tasks
     };
   } catch (error) {
     return {
@@ -22225,7 +22296,11 @@ async function readDashboardAgentHealth(agentId, now) {
   }
 }
 
-function dashboardIntegrationServices(now, agents) {
+function dashboardService({ id, name, detail, status, checkedAt, group, required = true }) {
+  return { id, name, detail, status, checkedAt, group, required };
+}
+
+async function dashboardIntegrationServices(now, agents, marketing, telemetry) {
   const checkedAt = now.toISOString();
   const asanaHealthy = agents.every((agent) => agent.asanaStatus !== "critical");
   const driveConfigured = Boolean(
@@ -22246,37 +22321,158 @@ function dashboardIntegrationServices(now, agents) {
       return false;
     }
   }).length;
+  const imapConfigured = Object.keys(VIP_DASHBOARD_AGENT_NAMES).filter((agentId) => {
+    try {
+      return Boolean(getImapConfigDetails(agentId)?.summary?.imap_ready_for_read);
+    } catch {
+      return false;
+    }
+  }).length;
 
-  return [
-    {
+  const [driveReadback, ga4Readback, gscReadback] = await Promise.allSettled([
+    getDriveFile(
+      GOOGLE_AGENT_FOLDER_ID,
+      "id,name,mimeType",
+      { agent_id: "vip-ai-operations" }
+    ),
+    googleSeoRequest({
+      method: "GET",
+      url: "https://analyticsadmin.googleapis.com/v1beta/accountSummaries",
+      params: { pageSize: 1 },
+      timeout: 15_000
+    }),
+    googleSeoRequest({
+      method: "GET",
+      url: "https://www.googleapis.com/webmasters/v3/sites",
+      timeout: 15_000
+    })
+  ]);
+
+  const pexels = getPexelsConfigDetails("vip-ai-content", { requireCredentials: false });
+  const unsplash = getUnsplashConfigDetails("vip-ai-content", { requireCredentials: false });
+  const freepik = getFreepikConfigDetails("vip-ai-design", { requireCredentials: false });
+  const templated = getTemplatedConfigDetails("vip-ai-design", { requireCredentials: false });
+  const cloudinary = getCloudinaryConfigDetails({ requireCredentials: false });
+  const webResearch = getWebResearchConfig();
+  const bufferConfigured = Object.keys(process.env).some(
+    (key) => /^(BUFFER_API_KEY|BUFFER_TOKEN|BUFFER_ACCESS_TOKEN)_/.test(key) && Boolean(process.env[key])
+  );
+  const wordpressImportConfigured = Boolean(process.env.WORDPRESS_GK_API_KEY);
+  const pageSpeedConfigured = Boolean(googleApiKeyFor("pagespeed"));
+  const cruxConfigured = Boolean(googleApiKeyFor("crux"));
+  const financeSourceHealth = telemetry?.finance?.sourceHealth || null;
+  const financeCheckedAt = financeSourceHealth?.generatedAt || telemetry?.generatedAt || null;
+
+  const services = [
+    dashboardService({
       id: "remote-mcp",
       name: "Remote MCP",
       detail: `Service aktiv · Uptime ${Math.floor(process.uptime() / 60)} Minuten`,
       status: "healthy",
-      checkedAt
-    },
-    {
+      checkedAt,
+      group: "Kernsysteme"
+    }),
+    dashboardService({
       id: "asana",
       name: "Asana",
-      detail: `${agents.filter((agent) => agent.configured).length}/${agents.length} VIP-Agenten konfiguriert`,
-      status: asanaHealthy ? "healthy" : "attention",
-      checkedAt
-    },
-    {
+      detail: `${agents.filter((agent) => agent.configured).length}/${agents.length} VIP-Agenten live gelesen`,
+      status: asanaHealthy ? "healthy" : "critical",
+      checkedAt,
+      group: "Kernsysteme"
+    }),
+    dashboardService({
       id: "google-drive",
       name: "Google Drive / Sheets",
-      detail: driveConfigured ? "Remote-Zugang konfiguriert" : "Kein Remote-Zugang erkannt",
-      status: driveConfigured ? "healthy" : "attention",
-      checkedAt
-    },
-    {
-      id: "email",
-      name: "E-Mail HTTP",
-      detail: `${emailConfigured}/${agents.length} VIP-Agentenkonten mit Provider-Konfiguration`,
+      detail:
+        driveReadback.status === "fulfilled"
+          ? `Live-Readback erfolgreich · ${driveReadback.value.name || "Agenten-Workspace"}`
+          : driveConfigured
+            ? `Zugang konfiguriert, Live-Readback fehlgeschlagen: ${String(driveReadback.reason?.message || driveReadback.reason).slice(0, 150)}`
+            : "Kein Remote-Zugang erkannt",
+      status: driveReadback.status === "fulfilled" ? "healthy" : "critical",
+      checkedAt,
+      group: "Google"
+    }),
+    dashboardService({
+      id: "ga4",
+      name: "Google Analytics 4",
+      detail:
+        ga4Readback.status === "fulfilled"
+          ? `${ga4Readback.value.data.accountSummaries?.length || 0} Accounts im Live-Readback`
+          : `Live-Readback fehlgeschlagen: ${String(ga4Readback.reason?.message || ga4Readback.reason).slice(0, 160)}`,
+      status:
+        ga4Readback.status === "fulfilled" &&
+        Number(ga4Readback.value.data.accountSummaries?.length || 0) > 0
+          ? "healthy"
+          : ga4Readback.status === "fulfilled"
+            ? "attention"
+            : "critical",
+      checkedAt,
+      group: "Google"
+    }),
+    dashboardService({
+      id: "gsc",
+      name: "Google Search Console",
+      detail:
+        gscReadback.status === "fulfilled"
+          ? `${gscReadback.value.data.siteEntry?.length || 0} Properties im Live-Readback`
+          : `Live-Readback fehlgeschlagen: ${String(gscReadback.reason?.message || gscReadback.reason).slice(0, 160)}`,
+      status:
+        gscReadback.status === "fulfilled" &&
+        Number(gscReadback.value.data.siteEntry?.length || 0) > 0
+          ? "healthy"
+          : gscReadback.status === "fulfilled"
+            ? "attention"
+            : "critical",
+      checkedAt,
+      group: "Google"
+    }),
+    dashboardService({
+      id: "google-ads",
+      name: "Google Ads",
+      detail:
+        marketing?.status === "healthy"
+          ? `Live-Kampagne gelesen · ${marketing.campaign?.name || "Kampagne"}`
+          : `Live-Readback fehlgeschlagen: ${String(marketing?.error?.message || "unbekannt").slice(0, 160)}`,
+      status: marketing?.status === "healthy" ? "healthy" : "critical",
+      checkedAt: marketing?.checkedAt || checkedAt,
+      group: "Google"
+    }),
+    dashboardService({
+      id: "pagespeed",
+      name: "PageSpeed Insights API",
+      detail: pageSpeedConfigured ? "API-Key konfiguriert" : "Kein API-Key erkannt",
+      status: pageSpeedConfigured ? "healthy" : "attention",
+      checkedAt,
+      group: "Google",
+      required: false
+    }),
+    dashboardService({
+      id: "crux",
+      name: "Chrome UX Report API",
+      detail: cruxConfigured ? "API-Key konfiguriert" : "Kein API-Key erkannt",
+      status: cruxConfigured ? "healthy" : "attention",
+      checkedAt,
+      group: "Google",
+      required: false
+    }),
+    dashboardService({
+      id: "email-send",
+      name: "Resend / E-Mail-Versand",
+      detail: `${emailConfigured}/${agents.length} Agentenkonten sendebereit`,
       status: emailConfigured === agents.length ? "healthy" : "attention",
-      checkedAt
-    },
-    {
+      checkedAt,
+      group: "Kommunikation"
+    }),
+    dashboardService({
+      id: "email-read",
+      name: "E-Mail-Eingang / IMAP",
+      detail: `${imapConfigured}/${agents.length} Agentenkonten lesebereit`,
+      status: imapConfigured === agents.length ? "healthy" : "attention",
+      checkedAt,
+      group: "Kommunikation"
+    }),
+    dashboardService({
       id: "dataforseo",
       name: "DataForSEO",
       detail: `Primary ${dataForSeo.summary?.primary_ready_for_live_calls ? "bereit" : "fehlt"} · Fallback ${
@@ -22287,19 +22483,135 @@ function dashboardIntegrationServices(now, agents) {
         dataForSeo.summary?.fallback_ready_for_live_calls
           ? "healthy"
           : "attention",
-      checkedAt
-    },
-    {
+      checkedAt,
+      group: "Research und SEO"
+    }),
+    dashboardService({
+      id: "web-research",
+      name: "Web Research / Seitenanalyse",
+      detail: `HTTP ${webResearch.render_modes.includes("http") ? "bereit" : "fehlt"} · Browser ${webResearch.browser_enabled ? "bereit" : "deaktiviert"}`,
+      status: webResearch.render_modes.includes("http") ? "healthy" : "critical",
+      checkedAt,
+      group: "Research und SEO"
+    }),
+    dashboardService({
+      id: "pexels",
+      name: "Pexels",
+      detail: pexels.summary.ready_for_read_calls ? "API konfiguriert" : "Nicht konfiguriert",
+      status: pexels.summary.ready_for_read_calls ? "healthy" : "attention",
+      checkedAt,
+      group: "Content und Medien",
+      required: false
+    }),
+    dashboardService({
+      id: "unsplash",
+      name: "Unsplash",
+      detail: unsplash.summary.ready_for_read_calls ? "API konfiguriert" : "Nicht konfiguriert",
+      status: unsplash.summary.ready_for_read_calls ? "healthy" : "attention",
+      checkedAt,
+      group: "Content und Medien",
+      required: false
+    }),
+    dashboardService({
+      id: "freepik",
+      name: "Freepik / Magnific",
+      detail: freepik.summary.ready_for_read_calls ? "API konfiguriert" : "Nicht konfiguriert",
+      status: freepik.summary.ready_for_read_calls ? "healthy" : "attention",
+      checkedAt,
+      group: "Content und Medien",
+      required: false
+    }),
+    dashboardService({
+      id: "templated",
+      name: "Templated.io",
+      detail: templated.summary.ready_for_render_calls ? "Render-API konfiguriert" : "Nicht konfiguriert",
+      status: templated.summary.ready_for_render_calls ? "healthy" : "attention",
+      checkedAt,
+      group: "Content und Medien",
+      required: false
+    }),
+    dashboardService({
+      id: "cloudinary",
+      name: "Cloudinary",
+      detail: cloudinary.summary.ready_for_uploads ? "Upload-API konfiguriert" : "Nicht konfiguriert",
+      status: cloudinary.summary.ready_for_uploads ? "healthy" : "attention",
+      checkedAt,
+      group: "Content und Medien",
+      required: false
+    }),
+    dashboardService({
+      id: "buffer",
+      name: "Buffer",
+      detail: bufferConfigured ? "Mindestens ein Projektzugang konfiguriert" : "Nicht konfiguriert",
+      status: bufferConfigured ? "healthy" : "attention",
+      checkedAt,
+      group: "Content und Medien",
+      required: false
+    }),
+    dashboardService({
+      id: "wordpress-import",
+      name: "WordPress Import",
+      detail: wordpressImportConfigured ? "Goklever-Importzugang konfiguriert" : "Kein Import-Key erkannt",
+      status: wordpressImportConfigured ? "healthy" : "attention",
+      checkedAt,
+      group: "Web und Publishing",
+      required: false
+    }),
+    dashboardService({
       id: "intake",
       name: "Asana Intake",
       detail: `${Object.keys(VIP_INTAKE_ROUTE_CONFIG).length} Formularrouten konfiguriert`,
       status:
         Object.keys(VIP_INTAKE_ROUTE_CONFIG).length && VIP_INTAKE_ROUTING_SECRET
           ? "healthy"
-          : "attention",
-      checkedAt
-    }
+          : "critical",
+      checkedAt,
+      group: "Web und Publishing"
+    })
   ];
+
+  if (financeSourceHealth) {
+    services.push(
+      dashboardService({
+        id: "finance-sources",
+        name: "Finance Datenquellen gesamt",
+        detail: financeSourceHealth.detail || "Finance-Quellenstatus vorhanden",
+        status: financeSourceHealth.status || "unknown",
+        checkedAt: financeCheckedAt,
+        group: "Finance"
+      })
+    );
+    for (const source of financeSourceHealth.sources || []) {
+      const sourceStatus = ["ok", "stale_ok"].includes(source.status)
+        ? "healthy"
+        : source.status === "unknown"
+          ? "unknown"
+          : "attention";
+      services.push(
+        dashboardService({
+          id: `finance-${source.id}`,
+          name: source.name || source.id,
+          detail: `${source.status}${source.httpStatus ? ` · HTTP ${source.httpStatus}` : ""}`,
+          status: sourceStatus,
+          checkedAt: financeCheckedAt,
+          group: "Finance"
+        })
+      );
+    }
+  } else {
+    services.push(
+      dashboardService({
+        id: "finance-sources",
+        name: "Finance Datenquellen",
+        detail: "Kein frischer lokaler Quellenstatus im manuellen Snapshot",
+        status: "unknown",
+        checkedAt: financeCheckedAt,
+        group: "Finance"
+      })
+    );
+  }
+
+  return services;
 }
 
 async function readDashboardMarketing(now) {
@@ -22373,7 +22685,9 @@ function dashboardLocalServices(now, telemetry) {
           }`
         : "Keine frische lokale Telemetrie",
       status: codex?.status || "attention",
-      checkedAt
+      checkedAt,
+      group: "Kernsysteme",
+      required: true
     },
     {
       id: "automation-gates",
@@ -22385,7 +22699,9 @@ function dashboardLocalServices(now, telemetry) {
         codex && codex.directGateCount === codex.fachautomationen
           ? "healthy"
           : "attention",
-      checkedAt
+      checkedAt,
+      group: "Kernsysteme",
+      required: true
     },
     {
       id: "ib-gateway",
@@ -22396,7 +22712,9 @@ function dashboardLocalServices(now, telemetry) {
           : "Keine Verbindung auf dem Finance-Gateway-Port"
         : "Keine frische lokale Telemetrie",
       status: finance?.gatewayConnected ? "healthy" : "critical",
-      checkedAt
+      checkedAt,
+      group: "Finance",
+      required: true
     },
     {
       id: "codex-capacity",
@@ -22406,10 +22724,100 @@ function dashboardLocalServices(now, telemetry) {
             resources.forecast?.projectedUsedPercent ?? "–"
           } % bis Reset`
         : "Keine frische Kapazitätstelemetrie",
-      status: resources?.forecast?.status || "attention",
-      checkedAt
+      status:
+        resources && Number(resources.plan?.remainingPercent) > 20
+          ? "healthy"
+          : resources
+            ? "critical"
+            : "unknown",
+      checkedAt,
+      group: "Kernsysteme",
+      required: true
     }
   ];
+}
+
+const VIP_DASHBOARD_MAINTENANCE_ROUTINES = [
+  {
+    id: "chat-migration",
+    key: "migration",
+    name: "Monatlicher Agenten-Chatwechsel",
+    taskTitle: "R: Kontrollierter Agenten-Chatwechsel",
+    automationId: "automation-vip-ai-operations-kontrollierter-agenten-chatwechsel",
+    schedule: "Monatlich am 15. · 02:00 Uhr; Automation 02:12 Uhr"
+  },
+  {
+    id: "chat-cleanup",
+    key: "cleanup",
+    name: "Wöchentliche Auto-Archivierung",
+    taskTitle: "R: Sichere Daten-Retention und Bereinigung",
+    automationId: "automation-vip-ai-operations-sichere-daten-retention",
+    schedule: "Sonntags · 16:00 Uhr; Automation 16:12 Uhr"
+  }
+];
+
+function dashboardTaskDueAt(task) {
+  if (task?.due_at) return task.due_at;
+  if (task?.due_on) return berlinLocalDateTimeToUtcIso(task.due_on, "23:59:59");
+  return null;
+}
+
+function dashboardMaintenanceRoutines(now, telemetry, operationsAgent) {
+  const automationStates = telemetry?.codex?.maintenanceAutomations || [];
+  const maintenanceState = telemetry?.codex?.maintenance || {};
+  const tasks = operationsAgent?._tasks || [];
+
+  return VIP_DASHBOARD_MAINTENANCE_ROUTINES.map((definition) => {
+    const automation = automationStates.find((item) => item.id === definition.automationId);
+    const task = tasks.find((item) => String(item?.name || "").trim() === definition.taskTitle);
+    const dueAt = dashboardTaskDueAt(task);
+    const dueMs = Date.parse(dueAt || "");
+    const overdue = Number.isFinite(dueMs) && now.getTime() - dueMs > VIP_DASHBOARD_OVERDUE_GRACE_MS;
+    const state = maintenanceState?.[definition.key] || {};
+    const routineState = state.routine || {};
+    const lastRunAt =
+      routineState.lastAttemptAt || automation?.schedulerLastStartedAt || null;
+    const lastSuccessfulAt = routineState.lastSuccessfulAt || null;
+    const lastFailed =
+      routineState.lastStatus === "failed" &&
+      (!lastSuccessfulAt || Date.parse(lastRunAt || "") > Date.parse(lastSuccessfulAt));
+    const lastSuccessMs = Date.parse(lastSuccessfulAt || "");
+    const recurrenceSettling =
+      !task &&
+      Number.isFinite(lastSuccessMs) &&
+      now.getTime() - lastSuccessMs <= ASANA_RECURRENCE_GENERATION_GRACE_SECONDS * 1000;
+    let status = "healthy";
+    const problems = [];
+    if (!automation || automation.status !== "ACTIVE") problems.push("Automation nicht aktiv");
+    if (!task && !recurrenceSettling) problems.push("offene Asana-Routine nicht gefunden");
+    if (automation?.scheduledRunMissed) problems.push("geplanter Automationslauf verpasst");
+    if (overdue) problems.push("Routine länger als eine Stunde überfällig");
+    if (lastFailed) problems.push(`letzter Wartungslauf fehlgeschlagen${routineState.lastError ? `: ${routineState.lastError}` : ""}`);
+    if (problems.length) status = "critical";
+
+    const detail = recurrenceSettling && problems.length === 0
+      ? `Letzter Lauf erfolgreich; Asana erzeugt die Folgeinstanz innerhalb der geschuetzten Wartefrist.`
+      : problems.length
+      ? problems.join(" · ")
+      : `${lastSuccessfulAt ? `Letzter erfolgreicher Lauf ${lastSuccessfulAt}` : "Eingerichtet; erster bestätigter Lauf steht noch aus"} · ${
+          dueAt ? `nächste Fälligkeit ${dueAt}` : definition.schedule
+        }`;
+    return {
+      id: definition.id,
+      name: definition.name,
+      status,
+      detail,
+      schedule: definition.schedule,
+      automationId: definition.automationId,
+      automationStatus: automation?.status || "MISSING",
+      taskGid: task?.gid || null,
+      taskUrl: task?.permalink_url || (task?.gid ? `https://app.asana.com/0/0/${task.gid}` : null),
+      dueAt,
+      lastRunAt,
+      lastSuccessfulAt,
+      lastRunStatus: routineState.lastStatus || null
+    };
+  });
 }
 
 async function buildVipDashboardSnapshot() {
@@ -22431,6 +22839,12 @@ async function buildVipDashboardSnapshot() {
   const failedAgents = agents.filter((agent) => agent.asanaStatus === "critical");
   const telemetry = currentDashboardTelemetry(now);
   const marketing = await readDashboardMarketing(now);
+  const operationsAgent = agents.find((agent) => agent.id === "vip-ai-operations");
+  const maintenanceRoutines = dashboardMaintenanceRoutines(now, telemetry, operationsAgent);
+  const services = [
+    ...dashboardLocalServices(now, telemetry),
+    ...(await dashboardIntegrationServices(now, agents, marketing, telemetry))
+  ];
   const alerts = [];
 
   if (failedAgents.length) {
@@ -22522,8 +22936,31 @@ async function buildVipDashboardSnapshot() {
       detail: String(marketing.error?.message || "Google-Ads-Readback fehlgeschlagen.").slice(0, 220)
     });
   }
+  const integrationProblems = services.filter(
+    (service) => service.required !== false && service.status !== "healthy"
+  );
+  if (integrationProblems.length) {
+    alerts.push({
+      id: "required-integrations",
+      level: integrationProblems.some((service) => service.status === "critical")
+        ? "critical"
+        : "attention",
+      title: `${integrationProblems.length} erforderliche Schnittstellen benötigen Aufmerksamkeit`,
+      detail: integrationProblems.slice(0, 8).map((service) => service.name).join(" · ")
+    });
+  }
+  const maintenanceProblems = maintenanceRoutines.filter((routine) => routine.status !== "healthy");
+  if (maintenanceProblems.length) {
+    alerts.push({
+      id: "maintenance-routines",
+      level: "critical",
+      title: `${maintenanceProblems.length} Operations-Wartungsroutinen nicht im Soll`,
+      detail: maintenanceProblems.map((routine) => routine.name).join(" · ")
+    });
+  }
 
   const hasCriticalAlert = alerts.some((alert) => alert.level === "critical");
+  const publicAgents = agents.map(({ _tasks, ...agent }) => agent);
   return {
     generatedAt: now.toISOString(),
     source: "remote-mcp",
@@ -22548,13 +22985,12 @@ async function buildVipDashboardSnapshot() {
       splitRequired: null,
       sizeWarnings: null
     },
-    agents,
-    services: [
-      ...dashboardLocalServices(now, telemetry),
-      ...dashboardIntegrationServices(now, agents)
-    ],
+    agents: publicAgents,
+    services,
     alerts,
-    operations: telemetry?.codex || null,
+    operations: telemetry?.codex
+      ? { ...telemetry.codex, maintenanceRoutines }
+      : null,
     finance: telemetry?.finance || null,
     resources: telemetry?.resources || null,
     marketing
@@ -22808,10 +23244,9 @@ app.post(
       }
       vipDashboardControlResultNonces.set(payload.nonce, now);
 
-      const request = vipDashboardActionRequests.get(String(payload.actionRequestId || ""));
-      if (!request) {
-        return res.status(404).json({ ok: false, error: "Dashboard-Auftrag nicht gefunden." });
-      }
+      const requestId = String(payload.actionRequestId || "");
+      const request =
+        vipDashboardActionRequests.get(requestId) || recoverSignedDashboardAction(payload, now);
       if (!["running", "pending"].includes(request.status)) {
         return res.status(409).json({ ok: false, error: "Dashboard-Auftrag ist bereits beendet." });
       }
