@@ -41,6 +41,7 @@ import {
   validateRoutineFollowUpTaskContract,
   validateRoutineVisibleFollowUpStatus
 } from "./lib/asana-completion-guard.js";
+import { createAsanaMaterialCommentCoordinator } from "./lib/asana-material-comment-coordinator.js";
 import {
   classifyAsanaCommentAuthority,
   validateAsanaObserverCommentIntent
@@ -68,6 +69,7 @@ const ASANA_TIMEOUT_MS = Number(process.env.ASANA_TIMEOUT_MS || 30_000);
 const ASANA_WRITE_TIMEOUT_MS = Number(process.env.ASANA_WRITE_TIMEOUT_MS || 30_000);
 const ASANA_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ASANA_RETRY_ATTEMPTS || 3));
 const ASANA_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ASANA_RETRY_BASE_DELAY_MS || 750));
+const ASANA_MATERIAL_COMMENT_COORDINATOR = createAsanaMaterialCommentCoordinator();
 const execFileAsync = promisify(execFile);
 const VIP_INTAKE_MAX_FILES = Math.max(0, Number(process.env.VIP_INTAKE_MAX_FILES || 12));
 const VIP_INTAKE_MAX_FILE_MB = Math.max(1, Number(process.env.VIP_INTAKE_MAX_FILE_MB || 25));
@@ -12787,27 +12789,8 @@ function createServer() {
           "supersedes_story_gid ist nur fuer result|handoff|completion in einer Routine-Aufgabe zulaessig."
         );
       }
-      if (materialRoutineComment) {
-        const existingStories = await readAllAsanaTaskStories(asana, task_gid);
-        routine_material_comment_idempotency = {
-          applicable: true,
-          ...inspectRoutineMaterialCommentIdempotency({
-            stories: existingStories,
-            agentUserGid: commentAgentUser.gid,
-            supersedesStoryGid: supersedes_story_gid
-          })
-        };
-        if (!routine_material_comment_idempotency.allowed) {
-          throw new Error(
-            `Routine-Kommentar-Idempotenz blockiert (${routine_material_comment_idempotency.status}). Nutze den bereits vorhandenen Evidenzkommentar ${routine_material_comment_idempotency.prior_material_story_gids.join(
-              ", "
-            ) || "-"} als final_comment_story_gid. Nur eine echte Korrektur darf mit supersedes_story_gid auf genau diesen Kommentar verweisen.`
-          );
-        }
-      }
-
-      if (dry_run) {
-        return out({
+      const buildDryRunResult = () =>
+        out({
           agent_id,
           dry_run: true,
           task_gid,
@@ -12824,13 +12807,50 @@ function createServer() {
           html_bytes: Buffer.byteLength(html_text, "utf8"),
           html_sha256
         });
-      }
+      const postComment = async () =>
+        asana.post(
+          `/tasks/${task_gid}/stories`,
+          { data: { html_text } },
+          { params: { opt_fields: "gid,text,html_text,created_at,created_by" } }
+        );
 
-      const res = await asana.post(
-        `/tasks/${task_gid}/stories`,
-        { data: { html_text } },
-        { params: { opt_fields: "gid,text,html_text,created_at,created_by" } }
-      );
+      let res;
+      if (materialRoutineComment) {
+        const coordinatorKey = `${commentAgentUser.gid}:${task_gid}`;
+        const coordinatedResult = await ASANA_MATERIAL_COMMENT_COORDINATOR.run(
+          coordinatorKey,
+          async ({ recentStories, rememberStory }) => {
+            const existingStories = await readAllAsanaTaskStories(asana, task_gid);
+            routine_material_comment_idempotency = {
+              applicable: true,
+              ...inspectRoutineMaterialCommentIdempotency({
+                stories: [...existingStories, ...recentStories],
+                agentUserGid: commentAgentUser.gid,
+                supersedesStoryGid: supersedes_story_gid
+              })
+            };
+            if (!routine_material_comment_idempotency.allowed) {
+              throw new Error(
+                `Routine-Kommentar-Idempotenz blockiert (${routine_material_comment_idempotency.status}). Nutze den bereits vorhandenen Evidenzkommentar ${routine_material_comment_idempotency.prior_material_story_gids.join(
+                  ", "
+                ) || "-"} als final_comment_story_gid. Nur eine echte Korrektur darf mit supersedes_story_gid auf genau diesen Kommentar verweisen.`
+              );
+            }
+            if (dry_run) return { dry_run: true };
+            const posted = await postComment();
+            rememberStory({
+              ...posted.data.data,
+              created_by: posted.data.data?.created_by || { gid: commentAgentUser.gid }
+            });
+            return { posted };
+          }
+        );
+        if (coordinatedResult.dry_run) return buildDryRunResult();
+        res = coordinatedResult.posted;
+      } else {
+        if (dry_run) return buildDryRunResult();
+        res = await postComment();
+      }
 
       let observer_leave_result = null;
       let observer_leave_error = null;

@@ -5,6 +5,7 @@ import {
   validateRoutineFollowUpTaskContract,
   validateRoutineVisibleFollowUpStatus
 } from "../lib/asana-completion-guard.js";
+import { createAsanaMaterialCommentCoordinator } from "../lib/asana-material-comment-coordinator.js";
 
 const closedEvidenceStory = {
   gid: "1217000000000001",
@@ -76,6 +77,35 @@ assert.equal(
   }).status,
   "first_material_comment"
 );
+
+const coordinator = createAsanaMaterialCommentCoordinator();
+let releaseFirst;
+const firstCanPost = new Promise((resolve) => {
+  releaseFirst = resolve;
+});
+const firstCoordinatedPost = coordinator.run("agent:task", async ({ recentStories, rememberStory }) => {
+  assert.equal(recentStories.length, 0);
+  await firstCanPost;
+  rememberStory(closedEvidenceStory);
+  return "posted";
+});
+const secondCoordinatedPost = coordinator.run("agent:task", async ({ recentStories }) =>
+  inspectRoutineMaterialCommentIdempotency({
+    stories: recentStories,
+    agentUserGid: closedEvidenceStory.created_by.gid
+  })
+);
+releaseFirst();
+assert.equal(await firstCoordinatedPost, "posted");
+const secondCoordinatedResult = await secondCoordinatedPost;
+assert.deepEqual(
+  {
+    allowed: secondCoordinatedResult.allowed,
+    status: secondCoordinatedResult.status
+  },
+  { allowed: false, status: "blocked_duplicate_material_comment" }
+);
+assert.equal(coordinator.pendingCount(), 0);
 
 const coverageSignal = detectRoutineFollowUpSignals({
   finalComment: { text: "Die bestehende Routine deckt die Nacharbeit ab.", html_text: "" },
@@ -216,6 +246,7 @@ assert.deepEqual(
 console.log(
   JSON.stringify({
     routine_material_comment_idempotency: "ok",
+    routine_material_comment_concurrency_guard: "ok",
     routine_existing_task_coverage_detection: "ok",
     finance_no_follow_up_phrase_detection: "ok",
     routine_visible_follow_up_status: "ok",
