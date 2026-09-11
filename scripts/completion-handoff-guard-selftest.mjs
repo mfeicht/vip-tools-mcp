@@ -5,7 +5,10 @@ import {
   validateRoutineFollowUpTaskContract,
   validateRoutineVisibleFollowUpStatus
 } from "../lib/asana-completion-guard.js";
-import { createAsanaMaterialCommentCoordinator } from "../lib/asana-material-comment-coordinator.js";
+import {
+  createAsanaMaterialCommentCoordinator,
+  isRoutineMaterialComment
+} from "../lib/asana-material-comment-coordinator.js";
 
 const closedEvidenceStory = {
   gid: "1217000000000001",
@@ -106,6 +109,31 @@ assert.deepEqual(
   { allowed: false, status: "blocked_duplicate_material_comment" }
 );
 assert.equal(coordinator.pendingCount(), 0);
+
+assert.equal(
+  isRoutineMaterialComment({
+    routineLike: true,
+    commentKind: "status",
+    materialResultSignals: true
+  }),
+  true
+);
+assert.equal(
+  isRoutineMaterialComment({
+    routineLike: true,
+    commentKind: "status",
+    materialResultSignals: false
+  }),
+  false
+);
+assert.equal(
+  isRoutineMaterialComment({
+    routineLike: false,
+    commentKind: "completion",
+    materialResultSignals: true
+  }),
+  false
+);
 
 const coverageSignal = detectRoutineFollowUpSignals({
   finalComment: { text: "Die bestehende Routine deckt die Nacharbeit ab.", html_text: "" },
@@ -247,6 +275,7 @@ console.log(
   JSON.stringify({
     routine_material_comment_idempotency: "ok",
     routine_material_comment_concurrency_guard: "ok",
+    routine_material_status_signal_guard: "ok",
     routine_existing_task_coverage_detection: "ok",
     finance_no_follow_up_phrase_detection: "ok",
     routine_visible_follow_up_status: "ok",

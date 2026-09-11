@@ -41,7 +41,10 @@ import {
   validateRoutineFollowUpTaskContract,
   validateRoutineVisibleFollowUpStatus
 } from "./lib/asana-completion-guard.js";
-import { createAsanaMaterialCommentCoordinator } from "./lib/asana-material-comment-coordinator.js";
+import {
+  createAsanaMaterialCommentCoordinator,
+  isRoutineMaterialComment
+} from "./lib/asana-material-comment-coordinator.js";
 import {
   classifyAsanaCommentAuthority,
   validateAsanaObserverCommentIntent
@@ -12506,7 +12509,7 @@ function createServer() {
 
   server.tool(
     "asana_comment",
-    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene Ergebnis-/Handoff-/Abschlusskommentar kanonisch; weitere materiale Kommentare werden ohne explizite supersedes_story_gid als Duplikat blockiert. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene materielle Ergebnis-/Handoff-/Abschlusskommentar kanonisch; typische Ergebnis- oder Erfolgssprache bleibt auch bei comment_kind=status materiell. Weitere materielle Kommentare werden ohne explizite supersedes_story_gid als Duplikat blockiert. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -12778,8 +12781,11 @@ function createServer() {
       });
       const expectedCodeSnippets = collectAsanaCodeBlocks(finalSections);
       const html_sha256 = createHash("sha256").update(html_text, "utf8").digest("hex");
-      const materialRoutineComment =
-        routineCommentTask && ["result", "handoff", "completion"].includes(comment_kind);
+      const materialRoutineComment = isRoutineMaterialComment({
+        routineLike: routineCommentTask,
+        commentKind: comment_kind,
+        materialResultSignals
+      });
       let routine_material_comment_idempotency = {
         applicable: materialRoutineComment,
         status: materialRoutineComment ? "checking" : "not_applicable",
@@ -12789,7 +12795,7 @@ function createServer() {
       };
       if (supersedes_story_gid && !materialRoutineComment) {
         throw new Error(
-          "supersedes_story_gid ist nur fuer result|handoff|completion in einer Routine-Aufgabe zulaessig."
+          "supersedes_story_gid ist nur fuer materielle Kommentare in einer Routine-Aufgabe zulaessig."
         );
       }
       const buildDryRunResult = () =>
