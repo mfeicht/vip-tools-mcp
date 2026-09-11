@@ -69,6 +69,8 @@ try {
     draft_template_test_send_tool_present: names.has("email_action_send_test_from_draft_template"),
     adaptive_context_tool_present: names.has("email_action_agent_context"),
     internal_review_proposal_tool_present: names.has("email_action_send_review_proposal"),
+    answered_thread_ancestor_cleanup_tool_present:
+      names.has("email_action_cleanup_answered_thread_ancestor"),
     five_accounts_registered: accounts.account_count === 5,
     every_account_has_self_bcc: (accounts.accounts || []).every(
       (account) => account.mandatory_self_bcc === account.address
@@ -135,6 +137,13 @@ try {
       source.includes("$VIPAI-THREAD-HANDLED") &&
       source.includes("move_failed_but_marked_handled") &&
       source.includes("sent: false"),
+    answered_thread_ancestor_cleanup_is_header_only_and_idempotent:
+      source.includes('"email_action_cleanup_answered_thread_ancestor"') &&
+      source.includes("provider_marker_validated: true") &&
+      source.includes("thread_reference_validated: true") &&
+      source.includes("full_body_fetched: false") &&
+      source.includes('status: "already_moved_and_verified"') &&
+      source.includes("expectedAncestorMessageIdHash"),
     successful_actions_move_to_imap_trash:
       contactActions.every((action) => action.done_mailbox === "INBOX.Trash"),
     internal_review_proposal_is_self_only_and_threaded:

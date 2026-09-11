@@ -7896,6 +7896,328 @@ function parseImapSearchUids(response) {
   return uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
 }
 
+async function parseEmailActionHeaderFetch(response, requestedUid) {
+  const fetchedUid = /\bUID\s+(\d+)\b/i.exec(String(response || ""))?.[1] || "";
+  const headerRaw = extractFirstImapLiteral(response);
+  if (!fetchedUid || fetchedUid !== String(requestedUid) || !headerRaw) return null;
+  const parsed = await parseRawEmail(headerRaw, fetchedUid);
+  return {
+    uid: fetchedUid,
+    flags: parseImapFlagsFromFetchResponse(response),
+    raw_bytes: parseImapRfc822Size(response),
+    header_raw: headerRaw,
+    header_sha256: createHash("sha256").update(headerRaw, "binary").digest("hex"),
+    parsed
+  };
+}
+
+function publicEmailActionHeaderMessage(message) {
+  if (!message) return null;
+  return {
+    uid: message.uid,
+    flags: message.flags || [],
+    from_email: message.parsed?.from_email || null,
+    subject: message.parsed?.subject || null,
+    date: message.parsed?.date || null,
+    message_id: message.parsed?.message_id || null,
+    message_id_hash: message.parsed?.message_id_hash || null,
+    raw_bytes: message.raw_bytes,
+    header_sha256: message.header_sha256
+  };
+}
+
+function assertAnsweredThreadAncestorIdentity(message, {
+  expectedFrom,
+  expectedMessageId,
+  expectedMessageIdHash,
+  label
+}) {
+  if (!message) throw new Error(`${label} wurde nicht gefunden.`);
+  if (isTemplateActionSubjectMarked(message.parsed?.subject || "")) {
+    throw new Error(`${label} ist als Vorlage markiert; Bereinigung blockiert.`);
+  }
+  const actualFrom = extractEmailAddress(message.parsed?.from_email || "");
+  if (actualFrom !== expectedFrom) {
+    throw new Error(`${label}: Absender ${actualFrom || "unbekannt"} passt nicht zu ${expectedFrom}.`);
+  }
+  const actualMessageId = String(message.parsed?.message_id || "").trim();
+  if (!actualMessageId) throw new Error(`${label}: Message-ID fehlt.`);
+  if (expectedMessageId && actualMessageId !== expectedMessageId) {
+    throw new Error(`${label}: Message-ID passt nicht zum erwarteten Wert.`);
+  }
+  if (expectedMessageIdHash && message.parsed?.message_id_hash !== expectedMessageIdHash) {
+    throw new Error(`${label}: Message-ID-Hash passt nicht zum erwarteten Wert.`);
+  }
+  return { actualFrom, actualMessageId };
+}
+
+async function runEmailActionAnsweredThreadAncestorCleanup(config, {
+  action,
+  ancestorUid,
+  expectedAncestorFrom,
+  expectedAncestorMessageId,
+  expectedAncestorMessageIdHash,
+  answeredChildResendProviderId,
+  expectedDoneMailbox,
+  live
+}) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("binary");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  const headerFields =
+    "SUBJECT FROM TO CC BCC REPLY-TO MESSAGE-ID IN-REPLY-TO REFERENCES DATE";
+  const selectMailbox = async (mailbox, readWrite = false) => {
+    await command(`${readWrite ? "SELECT" : "EXAMINE"} ${quoteImapString(mailbox)}`);
+  };
+  const fetchHeader = async (uid) => {
+    const response = await command(
+      `UID FETCH ${uid} (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (${headerFields})])`
+    );
+    return parseEmailActionHeaderFetch(response, uid);
+  };
+  const searchByMessageId = async (mailbox, messageId) => {
+    await selectMailbox(mailbox, false);
+    const response = await command(
+      `UID SEARCH HEADER Message-ID ${quoteImapString(messageId)}`
+    );
+    const messages = [];
+    for (const uid of parseImapSearchUids(response).slice(0, 10)) {
+      const message = await fetchHeader(uid);
+      if (message) messages.push(message);
+    }
+    return messages;
+  };
+
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    const listResponse = await command('LIST "" "*"');
+    const mailboxes = parseImapListMailboxes(listResponse);
+    const resolveMailbox = (name) =>
+      mailboxes.find((mailbox) => mailbox.toLowerCase() === String(name || "").toLowerCase());
+    const sourceMailbox = resolveMailbox(action.mailbox);
+    const doneMailbox = resolveMailbox(action.done_mailbox);
+    if (!sourceMailbox) throw new Error(`Quellordner ${action.mailbox} existiert nicht.`);
+    if (!doneMailbox) throw new Error(`Zielordner ${action.done_mailbox} existiert nicht.`);
+    if (expectedDoneMailbox.toLowerCase() !== action.done_mailbox.toLowerCase()) {
+      throw new Error(
+        `Erwarteter Zielordner ${expectedDoneMailbox} passt nicht zur Action-Konfiguration ${action.done_mailbox}.`
+      );
+    }
+    if (doneMailbox.toLowerCase() === sourceMailbox.toLowerCase()) {
+      throw new Error("Quell- und Zielordner duerfen nicht identisch sein.");
+    }
+
+    await selectMailbox(sourceMailbox, live);
+    let ancestor = await fetchHeader(ancestorUid);
+    let ancestorLocation = ancestor ? "source" : null;
+    if (!ancestor && expectedAncestorMessageId) {
+      const movedMatches = (await searchByMessageId(doneMailbox, expectedAncestorMessageId)).filter(
+        (message) => String(message.parsed?.message_id || "").trim() === expectedAncestorMessageId
+      );
+      if (movedMatches.length > 1) {
+        throw new Error("Der Thread-Vorfahr ist im Zielordner nicht eindeutig; Bereinigung blockiert.");
+      }
+      ancestor = movedMatches[0] || null;
+      ancestorLocation = ancestor ? "target" : null;
+    }
+    if (!ancestor) {
+      throw new Error(
+        `Thread-Vorfahr UID ${ancestorUid} wurde weder im Quellordner noch idempotent im Zielordner gefunden.`
+      );
+    }
+    const ancestorIdentity = assertAnsweredThreadAncestorIdentity(ancestor, {
+      expectedFrom: expectedAncestorFrom,
+      expectedMessageId: expectedAncestorMessageId,
+      expectedMessageIdHash: expectedAncestorMessageIdHash,
+      label: `Thread-Vorfahr UID ${ancestorUid}`
+    });
+
+    const providerFlag = emailActionResendProviderFlag(answeredChildResendProviderId);
+    await selectMailbox(doneMailbox, false);
+    const childSearch = await command(`UID SEARCH KEYWORD ${providerFlag}`);
+    const children = [];
+    for (const uid of parseImapSearchUids(childSearch).slice(0, 10)) {
+      const message = await fetchHeader(uid);
+      if (message && hasImapFlag(message.flags, providerFlag)) children.push(message);
+    }
+    if (children.length !== 1) {
+      throw new Error(
+        `Beantwortetes Kind mit Resend-Provider-Marker ${answeredChildResendProviderId} ist im Zielordner nicht eindeutig (gefunden: ${children.length}).`
+      );
+    }
+    const answeredChild = children[0];
+    const providerIdFromFlag = emailActionResendProviderIdFromFlags(answeredChild.flags);
+    if (providerIdFromFlag.toLowerCase() !== answeredChildResendProviderId.toLowerCase()) {
+      throw new Error("Resend-Provider-ID des beantworteten Kindes stimmt nicht mit dem persistenten Marker ueberein.");
+    }
+    const childFrom = extractEmailAddress(answeredChild.parsed?.from_email || "");
+    if (childFrom !== ancestorIdentity.actualFrom) {
+      throw new Error("Absender von Thread-Vorfahr und beantwortetem Kind stimmen nicht ueberein.");
+    }
+    const childInbound = getInboundHeadersForAction(answeredChild.header_raw);
+    const childReferences = new Set([
+      ...splitReferences(childInbound.references),
+      ...splitReferences(childInbound.in_reply_to)
+    ]);
+    if (!childReferences.has(ancestorIdentity.actualMessageId)) {
+      throw new Error("References/In-Reply-To des beantworteten Kindes binden den Thread-Vorfahr nicht eindeutig.");
+    }
+    if (String(answeredChild.uid) === String(ancestor.uid)) {
+      throw new Error("Thread-Vorfahr und beantwortetes Kind duerfen nicht dieselbe Nachricht sein.");
+    }
+
+    const common = {
+      source_mailbox: sourceMailbox,
+      target_mailbox: doneMailbox,
+      target_mailbox_matches_action: true,
+      ancestor_location_before: ancestorLocation,
+      ancestor: publicEmailActionHeaderMessage(ancestor),
+      answered_child: publicEmailActionHeaderMessage(answeredChild),
+      answered_child_resend_provider_id: answeredChildResendProviderId,
+      answered_child_provider_marker: providerFlag,
+      provider_marker_validated: true,
+      sender_match: true,
+      thread_reference_validated: true,
+      full_body_fetched: false,
+      sends_live_email: false,
+      sent: false
+    };
+
+    if (ancestorLocation === "target") {
+      await command("LOGOUT").catch(() => {});
+      if (!socket.destroyed) socket.destroy();
+      return {
+        ...common,
+        status: "already_moved_and_verified",
+        moved_now: false,
+        in_source_after_move: false,
+        found_in_target_after_move: true
+      };
+    }
+
+    if (!live) {
+      await command("LOGOUT").catch(() => {});
+      if (!socket.destroyed) socket.destroy();
+      return {
+        ...common,
+        status: "ready_for_cleanup",
+        moved_now: false,
+        would_move_to: doneMailbox
+      };
+    }
+
+    await selectMailbox(sourceMailbox, true);
+    const freshAncestor = await fetchHeader(ancestorUid);
+    assertAnsweredThreadAncestorIdentity(freshAncestor, {
+      expectedFrom: expectedAncestorFrom,
+      expectedMessageId: ancestorIdentity.actualMessageId,
+      expectedMessageIdHash: expectedAncestorMessageIdHash,
+      label: `Thread-Vorfahr UID ${ancestorUid} vor Move`
+    });
+    const moveResponse = await command(`UID MOVE ${ancestorUid} ${quoteImapString(doneMailbox)}`);
+    const sourceVerify = await fetchHeader(ancestorUid);
+    const targetMatches = (
+      await searchByMessageId(doneMailbox, ancestorIdentity.actualMessageId)
+    ).filter(
+      (message) =>
+        String(message.parsed?.message_id || "").trim() === ancestorIdentity.actualMessageId &&
+        extractEmailAddress(message.parsed?.from_email || "") === expectedAncestorFrom
+    );
+    const verified = !sourceVerify && targetMatches.length === 1;
+
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return {
+      ...common,
+      status: verified ? "moved_and_verified" : "move_verification_failed",
+      moved_now: true,
+      move_response_preview: cleanImapPreview(moveResponse, 300),
+      in_source_after_move: Boolean(sourceVerify),
+      found_in_target_after_move: targetMatches.length === 1,
+      target_match_count_after_move: targetMatches.length,
+      moved_ancestor: publicEmailActionHeaderMessage(targetMatches[0] || null)
+    };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function cleanupEmailActionAnsweredThreadAncestorWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runEmailActionAnsweredThreadAncestorCleanup(config, options);
+      return {
+        ...result,
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP Thread-Vorfahren-Bereinigung fehlgeschlagen: ${attempts
+      .map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`)
+      .join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
+}
+
 async function runImapActionFolderScan(config, {
   mailbox,
   maxEmailBytes,
@@ -20620,6 +20942,169 @@ function createServer() {
         if (current?.lock_token === lock.lock_token) {
           AGENT_OPERATION_LOCKS.delete(lockKey);
         }
+      }
+    }
+  );
+
+  server.tool(
+    "email_action_cleanup_answered_thread_ancestor",
+    "Prueft einen bereits beantworteten Thread-Vorfahr ausschliesslich ueber IMAP-Header, identischen Absender, References/In-Reply-To, den persistenten Resend-Provider-Marker des beantworteten Kindes und den konfigurierten Zielordner. Shadow-Run ist mutationsfrei. Live verschiebt nur den exakt gebundenen Vorfahren, sendet keine E-Mail und erkennt einen bereits ausgefuehrten Move idempotent per Message-ID-Readback.",
+    {
+      agent_id: z.literal(EMAIL_ACTION_CONTROL_AGENT_ID).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      action_id: z.string(),
+      ancestor_uid: z.string().regex(/^\d+$/),
+      expected_ancestor_from: z.string().email(),
+      expected_ancestor_message_id: z
+        .string()
+        .min(3)
+        .max(998)
+        .regex(/^<[^<>\r\n]+>$/)
+        .optional(),
+      expected_ancestor_message_id_hash: z.string().regex(/^[a-f0-9]{64}$/i),
+      answered_child_resend_provider_id: z
+        .string()
+        .regex(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i),
+      expected_done_mailbox: z.string().min(1).max(500),
+      mode: z.enum(["shadow_run", "live"]).optional().default("shadow_run"),
+      confirm_cleanup: z.boolean().optional().default(false),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      action_id,
+      ancestor_uid,
+      expected_ancestor_from,
+      expected_ancestor_message_id,
+      expected_ancestor_message_id_hash,
+      answered_child_resend_provider_id,
+      expected_done_mailbox,
+      mode,
+      confirm_cleanup,
+      confirmed_by_asana,
+      asana_task_gid,
+      authorization
+    }) => {
+      const { action } = getEmailActionDefinition(action_id);
+      if (!action.enabled) throw new Error(`Action ${action.id} ist deaktiviert.`);
+      const expectedFrom = extractEmailAddress(expected_ancestor_from);
+      if (!expectedFrom) throw new Error("expected_ancestor_from ist keine eindeutige E-Mail-Adresse.");
+      const providerId = answered_child_resend_provider_id.toLowerCase();
+      const commonOptions = {
+        action,
+        ancestorUid: ancestor_uid,
+        expectedAncestorFrom: expectedFrom,
+        expectedAncestorMessageId: expected_ancestor_message_id,
+        expectedAncestorMessageIdHash: expected_ancestor_message_id_hash.toLowerCase(),
+        answeredChildResendProviderId: providerId,
+        expectedDoneMailbox: expected_done_mailbox
+      };
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+
+      if (mode !== "live") {
+        const readback = await cleanupEmailActionAnsweredThreadAncestorWithFallback(configs, {
+          ...commonOptions,
+          live: false
+        });
+        return out({
+          agent_id,
+          action: {
+            id: action.id,
+            mailbox: action.mailbox,
+            done_mailbox: action.done_mailbox
+          },
+          mode,
+          dry_run: true,
+          ...readback,
+          imap: summary,
+          safety: {
+            header_only: true,
+            reads_message_body: false,
+            sends_live_email: false,
+            moves_message: false,
+            marks_seen: false
+          }
+        });
+      }
+
+      if (!confirm_cleanup) {
+        throw new Error("Live-Bereinigung braucht confirm_cleanup=true.");
+      }
+      if (!expected_ancestor_message_id) {
+        throw new Error(
+          "Live-Bereinigung braucht die im Shadow-Readback gelesene expected_ancestor_message_id fuer idempotenten Source-/Target-Readback."
+        );
+      }
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "email_action_cleanup_answered_thread_ancestor",
+        requireMoritz: false
+      });
+
+      cleanupAgentOperationLocks();
+      const resourceKey = `email-action-answered-ancestor:${action.mailbox}:${ancestor_uid}`;
+      const lockKey = buildAgentOperationLockKey({ scope: "resource", agent_id, resource_key: resourceKey });
+      const nowMs = Date.now();
+      const existingLock = AGENT_OPERATION_LOCKS.get(lockKey);
+      if (existingLock && existingLock.expires_at_ms > nowMs) {
+        return out({
+          agent_id,
+          action_id: action.id,
+          mode,
+          status: "locked",
+          moved_now: false,
+          sent: false,
+          active_lock: serializeAgentOperationLock(existingLock, nowMs)
+        });
+      }
+      const lock = {
+        key: lockKey,
+        scope: "resource",
+        agent_id,
+        resource_key: resourceKey,
+        run_id: `email-action-answered-ancestor-${randomUUID()}`,
+        lock_token: randomUUID(),
+        holder: "email_action_cleanup_answered_thread_ancestor",
+        purpose: `Cleanup answered ancestor ${action.id} UID ${ancestor_uid}`,
+        acquired_at_ms: nowMs,
+        renewed_at_ms: nowMs,
+        expires_at_ms: nowMs + 10 * 60 * 1000
+      };
+      AGENT_OPERATION_LOCKS.set(lockKey, lock);
+
+      try {
+        const result = await cleanupEmailActionAnsweredThreadAncestorWithFallback(configs, {
+          ...commonOptions,
+          live: true
+        });
+        return out({
+          agent_id,
+          action: {
+            id: action.id,
+            mailbox: action.mailbox,
+            done_mailbox: action.done_mailbox
+          },
+          mode,
+          dry_run: false,
+          authorization: authorizationReceipt,
+          ...result,
+          imap: summary,
+          safety: {
+            header_only: true,
+            reads_message_body: false,
+            sends_live_email: false,
+            moves_message: result.moved_now === true,
+            marks_seen: false
+          }
+        });
+      } finally {
+        const current = AGENT_OPERATION_LOCKS.get(lockKey);
+        if (current?.lock_token === lock.lock_token) AGENT_OPERATION_LOCKS.delete(lockKey);
       }
     }
   );
