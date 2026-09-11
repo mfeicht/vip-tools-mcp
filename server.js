@@ -53,6 +53,7 @@ import {
   isRoutineInstanceMissingAlarmIntent,
   sameAsanaDateTimeInstant
 } from "./lib/asana-schedule-guards.js";
+import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
 import {
   extractAccountingInvoice as extractAccountingInvoiceV2,
   getNormalizedAccountingInvoiceLines as getNormalizedAccountingInvoiceLinesV2
@@ -992,7 +993,7 @@ async function createIntakeAsanaTask({ body, files, route }) {
     name,
     description: notes,
     creation_basis: [route.form_key, route.template_key, route.agent_id, route.project_gid].filter(Boolean).join(" "),
-    routine_task: Boolean(route.routine_task)
+    routine_task: route.routine_task
   });
   const routineTag = routineTaskDetected ? await findAsanaRoutineTagOrThrow(asana, workspaceGid) : null;
   if (routineTag && !routeTags.includes(routineTag.gid)) {
@@ -1653,23 +1654,6 @@ function isRoutineLikeAsanaTask(task) {
 
 function hasAsanaRoutineTag(task) {
   return (task?.tags || []).some((tag) => normalizeAsanaLabel(tag.name) === "routine");
-}
-
-function isRoutineTaskCreationIntent({ name, description, creation_basis, routine_task }) {
-  if (routine_task) return true;
-  if (/^\s*r\s*:/i.test(String(name || ""))) return true;
-  const normalized = normalizeAsanaLabel([name, description, creation_basis].filter(Boolean).join(" "));
-  const routineSignals = [
-    "routine aufgabe",
-    "routineaufgabe",
-    "wiederkehrende aufgabe",
-    "wiederkehrend eingestellte aufgabe",
-    "regelmaessige aufgabe",
-    "taegliche aufgabe",
-    "woechentliche aufgabe",
-    "monatliche aufgabe"
-  ];
-  return routineSignals.some((signal) => normalized.includes(signal));
 }
 
 function isGovernanceTaskCreationIntent({ agentId, name, description, creationBasis }) {
@@ -12116,7 +12100,7 @@ function createServer() {
       priority_value: z.string().optional().default("Mittel"),
       status_value: z.string().optional().default("Todo"),
       require_standard_custom_fields: z.boolean().optional().default(true),
-      routine_task: z.boolean().optional().default(false),
+      routine_task: z.boolean().optional(),
       ensure_supervisor_follower: z.boolean().optional().default(true),
       allow_routine_supervisor_readd: z.boolean().optional().default(false),
       supervisor_follower_gid: z.string().optional(),
@@ -14243,7 +14227,7 @@ function createServer() {
               agentId: agent_id,
               authorization,
               confirmedByAsana: confirmed_by_asana,
-              asanaTaskGid: task_gid,
+              asanaTaskGid: authorization?.source === "direct_codex" ? undefined : task_gid,
               actionName: "asana_update_task_tags:remove_routine",
               requireMoritz: true
             })

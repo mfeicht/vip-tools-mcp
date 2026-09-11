@@ -110,6 +110,9 @@ try {
     recurrence_direct_origin_not_mixed:
       source.includes('asanaTaskGid: authorization?.source === "direct_codex" ? undefined : task_gid') &&
       source.includes('actionName: "asana_update_task_recurrence"'),
+    routine_tag_direct_origin_not_mixed:
+      source.includes('actionName: "asana_update_task_tags:remove_routine"') &&
+      source.includes('asanaTaskGid: authorization?.source === "direct_codex" ? undefined : task_gid'),
     vague_direct_blocked: Boolean(vagueDirect.isError),
     asana_without_basis_blocked: Boolean(missingAsanaBasis.isError)
   };
