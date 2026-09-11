@@ -9134,6 +9134,44 @@ function validateEmailActionAdaptiveReply(action, decision) {
   };
 }
 
+export function renderEmailActionReplyBodyHtml(value) {
+  const lines = String(value || "").replace(/\r\n/g, "\n").split("\n");
+  const blocks = [];
+  let paragraphLines = [];
+  let listItems = [];
+
+  const flushParagraph = () => {
+    if (!paragraphLines.length) return;
+    blocks.push(paragraphLines.map((line) => escapeAccountingHtml(line)).join("<br>\n"));
+    paragraphLines = [];
+  };
+  const flushList = () => {
+    if (!listItems.length) return;
+    blocks.push(`<ul>${listItems.map((item) => `<li>${escapeAccountingHtml(item)}</li>`).join("")}</ul>`);
+    listItems = [];
+  };
+
+  for (const line of lines) {
+    const listMatch = line.match(/^\s*[-*]\s+(.+?)\s*$/u);
+    if (listMatch) {
+      flushParagraph();
+      listItems.push(listMatch[1]);
+      continue;
+    }
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    flushList();
+    paragraphLines.push(line);
+  }
+  flushParagraph();
+  flushList();
+
+  return `<div>${blocks.join("<br>\n")}</div>`;
+}
+
 function buildEmailActionAdaptiveReplyPlan({
   action,
   templateMessage,
@@ -9160,7 +9198,7 @@ function buildEmailActionAdaptiveReplyPlan({
     decision.reply_body,
     signatureTemplate.binding.trailing_identity_lines
   );
-  const contentHtml = `<div>${escapeAccountingHtml(cleanReplyBody).replace(/\n/g, "<br>\n")}</div>`;
+  const contentHtml = renderEmailActionReplyBodyHtml(cleanReplyBody);
   const contentRaw = buildEmailActionMultipartRawMessage({
     headerLines: ["From: <adaptive-reply@vip-tools-mcp.vip-studios.de>", "To: <adaptive-reply@vip-tools-mcp.vip-studios.de>"],
     html: contentHtml,

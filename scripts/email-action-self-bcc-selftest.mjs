@@ -12,7 +12,7 @@ function parse(result) {
 
 const client = new Client({ name: "vip-email-action-self-bcc-selftest", version: "1.0.0" });
 const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
-await import("../server.js");
+const serverModule = await import("../server.js");
 await new Promise((resolve) => setTimeout(resolve, 300));
 await client.connect(transport);
 
@@ -50,6 +50,9 @@ try {
     ["rs-contact-rabatt-de", "rs-contact-rabatt-en"].includes(action.id)
   );
   const accountById = new Map((accounts.accounts || []).map((account) => [account.id, account]));
+  const adaptiveListHtml = serverModule.renderEmailActionReplyBodyHtml(
+    "Hallo\n\n- Preis: 365 EUR\n- Dauer: mindestens 1 Jahr\n- A & B\n\nJetzt buchen."
+  );
   const report = {
     discovery_tool_present: names.has("email_action_discover_folders"),
     send_account_tool_present: names.has("email_action_list_send_accounts"),
@@ -234,6 +237,12 @@ try {
       source.includes("dynamic_sources_checked_at") &&
       source.includes("buildEmailActionIdempotencyId") &&
       source.includes("adaptive_reply: plan.adaptive_reply"),
+    adaptive_reply_html_uses_semantic_lists:
+      adaptiveListHtml.includes("<ul>") &&
+      adaptiveListHtml.includes("<li>Preis: 365 EUR</li>") &&
+      adaptiveListHtml.includes("<li>Dauer: mindestens 1 Jahr</li>") &&
+      adaptiveListHtml.includes("<li>A &amp; B</li>") &&
+      !adaptiveListHtml.includes("- Preis:"),
     discount_floor_is_staged_and_source_gated:
       source.includes('requestType === "discount_negotiation"') &&
       source.includes("Rabatt-Endpreis unter 100 EUR ist gesperrt") &&
