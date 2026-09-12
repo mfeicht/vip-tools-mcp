@@ -4056,6 +4056,152 @@ async function readUnseenEmailWithFallback(configs, options) {
   throw error;
 }
 
+function formatImapSearchDate(date) {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${date.getUTCDate()}-${months[date.getUTCMonth()]}-${date.getUTCFullYear()}`;
+}
+
+async function runImapCleanupCandidateRead(config, {
+  limit,
+  cursorUid,
+  olderThanDays,
+  includeSnippets,
+  snippetChars
+}) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("utf8");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  try {
+    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
+    const cutoffDate = formatImapSearchDate(cutoff);
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    await command("EXAMINE INBOX");
+    const searchResponse = await command(`UID SEARCH BEFORE ${cutoffDate}`);
+    const searchLine = searchResponse
+      .split(/\r?\n/)
+      .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
+    const uidText = searchLine ? searchLine.replace(/^\* SEARCH[ \t]*/i, "").trim() : "";
+    const uids = uidText.split(/[ \t]+/).filter((value) => /^\d+$/.test(value));
+    const page = selectImapUidPage(uids, {
+      limit,
+      cursorUid,
+      order: "oldest_first"
+    });
+    const messages = [];
+
+    for (const uid of page.uids) {
+      const fetchItems = includeSnippets
+        ? `(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)] BODY.PEEK[TEXT]<0.${snippetChars}>)`
+        : "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])";
+      const fetchResponse = await command(`UID FETCH ${uid} ${fetchItems}`);
+      if (!new RegExp(`\\bUID\\s+${uid}\\b`).test(fetchResponse)) continue;
+      const headers = parseImapHeaderBlock(fetchResponse);
+      const messageIdHash = headers.message_id
+        ? createHash("sha256").update(headers.message_id).digest("hex")
+        : "";
+      messages.push({
+        uid,
+        from: decodeMimeHeaderValue(headers.from) || null,
+        subject: decodeMimeHeaderValue(headers.subject) || null,
+        date: headers.date || null,
+        message_id_hash: messageIdHash || null,
+        preview: includeSnippets ? cleanImapPreview(fetchResponse, snippetChars) : undefined
+      });
+    }
+
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return {
+      mailbox: "INBOX",
+      cutoff_date: cutoffDate,
+      older_than_days: olderThanDays,
+      matching_count: uids.length,
+      cursor_uid: page.cursor_uid,
+      next_cursor_uid: page.next_cursor_uid,
+      has_more: page.has_more,
+      remaining_count: page.remaining_count,
+      returned_count: messages.length,
+      messages
+    };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function readImapCleanupCandidatesWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapCleanupCandidateRead(config, options);
+      return {
+        ...result,
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP Cleanup-Read fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
+}
+
 function extractEmailAddress(value) {
   const raw = String(value || "").trim();
   const bracket = /<([^>]+)>/.exec(raw);
@@ -10039,6 +10185,217 @@ async function moveEmailActionMessageWithFallback(configs, options) {
   }
   const error = new Error(
     `IMAP Move fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
+  );
+  error.imap_attempts = attempts;
+  throw error;
+}
+
+function getAgentEmailTrashMailbox(agentId) {
+  const configured = getEnvWithAgentFallback("EMAIL_TRASH_MAILBOX", agentId);
+  const mailbox = String(configured || "INBOX.Trash").trim();
+  if (!mailbox || /[\r\n\0]/.test(mailbox)) {
+    throw new Error(`Ungueltiger Papierkorb fuer agent_id ${agentId}.`);
+  }
+  if (mailbox.toLowerCase() === "inbox") {
+    throw new Error("Der E-Mail-Papierkorb darf nicht INBOX sein.");
+  }
+  return mailbox;
+}
+
+async function runImapTrashProcessedMessage(config, {
+  uid,
+  trashMailbox,
+  expectedMessageIdHash,
+  expectedFromEmail,
+  expectedSubject,
+  createTrashMailbox,
+  dryRun,
+  verifyAfter
+}) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("utf8");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+
+  const greeting = await readImapUntil(
+    socket,
+    state,
+    (buffer) => {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return null;
+      const line = buffer.slice(0, end + 1);
+      state.buffer = buffer.slice(end + 1);
+      return line;
+    },
+    "greeting"
+  );
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(
+      socket,
+      state,
+      (buffer) => {
+        const regex = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i");
+        const match = regex.exec(buffer);
+        if (!match) return null;
+        const end = match.index + match[0].length;
+        const value = buffer.slice(0, end);
+        state.buffer = buffer.slice(end);
+        return value;
+      },
+      payload.split(/\s+/, 1)[0]
+    );
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
+    }
+    return response;
+  };
+
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    const listResponse = await command('LIST "" "*"');
+    let mailboxes = parseImapListMailboxes(listResponse);
+    const findMailbox = (name) =>
+      mailboxes.find((mailbox) => mailbox.toLowerCase() === String(name || "").toLowerCase());
+    let resolvedTrashMailbox = findMailbox(trashMailbox);
+    let trashMailboxCreated = false;
+    let trashMailboxCreatePlanned = false;
+    if (!resolvedTrashMailbox) {
+      if (!createTrashMailbox) throw new Error(`Papierkorb ${trashMailbox} existiert nicht.`);
+      if (dryRun) {
+        resolvedTrashMailbox = trashMailbox;
+        trashMailboxCreatePlanned = true;
+      } else {
+        await command(`CREATE ${quoteImapString(trashMailbox)}`);
+        trashMailboxCreated = true;
+        const relistResponse = await command('LIST "" "*"');
+        mailboxes = parseImapListMailboxes(relistResponse);
+        resolvedTrashMailbox = findMailbox(trashMailbox) || trashMailbox;
+      }
+    }
+
+    await command("SELECT INBOX");
+    const fetchResponse = await command(
+      `UID FETCH ${uid} (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])`
+    );
+    if (!new RegExp(`\\bUID\\s+${uid}\\b`).test(fetchResponse)) {
+      await command("LOGOUT").catch(() => {});
+      if (!socket.destroyed) socket.destroy();
+      return {
+        status: "source_not_found",
+        dry_run: dryRun,
+        uid,
+        source_mailbox: "INBOX",
+        trash_mailbox: resolvedTrashMailbox
+      };
+    }
+
+    const headers = parseImapHeaderBlock(fetchResponse);
+    const fromEmail = extractEmailAddress(headers.from);
+    const subject = decodeMimeHeaderValue(headers.subject);
+    const messageIdHash = headers.message_id
+      ? createHash("sha256").update(headers.message_id).digest("hex")
+      : "";
+    if (!messageIdHash || messageIdHash !== expectedMessageIdHash) {
+      throw new Error(`UID ${uid}: Message-ID-Hash-Mismatch oder fehlende Message-ID.`);
+    }
+    if (expectedFromEmail && fromEmail !== extractEmailAddress(expectedFromEmail)) {
+      throw new Error(`UID ${uid}: Absender-Mismatch.`);
+    }
+    if (expectedSubject && subject !== String(expectedSubject)) {
+      throw new Error(`UID ${uid}: Betreff-Mismatch.`);
+    }
+
+    const message = {
+      uid,
+      from_email: fromEmail || null,
+      subject: subject || null,
+      date: headers.date || null,
+      message_id_hash: messageIdHash
+    };
+    if (dryRun) {
+      await command("LOGOUT").catch(() => {});
+      if (!socket.destroyed) socket.destroy();
+      return {
+        status: "ready_for_trash",
+        dry_run: true,
+        source_mailbox: "INBOX",
+        trash_mailbox: resolvedTrashMailbox,
+        trash_mailbox_created: false,
+        trash_mailbox_create_planned: trashMailboxCreatePlanned,
+        message
+      };
+    }
+
+    const moveResponse = await command(`UID MOVE ${uid} ${quoteImapString(resolvedTrashMailbox)}`);
+    let inInboxAfterMove = null;
+    let foundInTrash = null;
+    if (verifyAfter) {
+      const sourceReadback = await command(`UID FETCH ${uid} (UID FLAGS)`);
+      inInboxAfterMove = new RegExp(`\\bUID\\s+${uid}\\b`).test(sourceReadback);
+      await command(`SELECT ${quoteImapString(resolvedTrashMailbox)}`);
+      const targetReadback = await command(
+        `UID SEARCH HEADER Message-ID ${quoteImapString(headers.message_id)}`
+      );
+      const targetSearchLine = targetReadback
+        .split(/\r?\n/)
+        .find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
+      foundInTrash = Boolean(
+        targetSearchLine && targetSearchLine.replace(/^\* SEARCH[ \t]*/i, "").trim()
+      );
+    }
+
+    await command("LOGOUT").catch(() => {});
+    if (!socket.destroyed) socket.destroy();
+    return {
+      status: inInboxAfterMove || foundInTrash === false ? "trash_verification_failed" : "trashed",
+      dry_run: false,
+      source_mailbox: "INBOX",
+      trash_mailbox: resolvedTrashMailbox,
+      trash_mailbox_created: trashMailboxCreated,
+      message,
+      move_response_preview: cleanImapPreview(moveResponse, 300),
+      in_inbox_after_move: inInboxAfterMove,
+      found_in_trash_after_move: foundInTrash
+    };
+  } catch (error) {
+    if (!socket.destroyed) socket.destroy();
+    throw error;
+  }
+}
+
+async function trashProcessedEmailWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapTrashProcessedMessage(config, options);
+      return {
+        ...result,
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        label: config.label || "primary",
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  const error = new Error(
+    `IMAP Papierkorb-Move fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
   );
   error.imap_attempts = attempts;
   throw error;
@@ -19736,6 +20093,146 @@ function createServer() {
         selected_uids: result.selected_uids,
         returned_count: result.returned_count,
         messages: result.messages,
+        imap_attempts: result.attempts
+      });
+    }
+  );
+
+  server.tool(
+    "agent_email_list_cleanup_candidates",
+    "Liest ressourcenschonend hoechstens zehn aeltere Nachrichten aus der eigenen Agenten-INBOX als Cleanup-Kandidaten. Nutzt IMAP EXAMINE und BODY.PEEK, markiert und verschiebt nichts. Die Rueckgabe ist nur eine Pruefliste; geloescht wird ausschliesslich ueber agent_email_trash_processed.",
+    {
+      agent_id: agentIdSchema,
+      older_than_days: z.number().int().min(1).max(3650).optional().default(14),
+      limit: z.number().int().min(1).max(10).optional().default(5),
+      cursor_uid: z.string().regex(/^\d+$/).optional(),
+      include_snippets: z.boolean().optional().default(true),
+      snippet_chars: z.number().int().min(200).max(1000).optional().default(500)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, older_than_days, limit, cursor_uid, include_snippets, snippet_chars }) => {
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const result = await readImapCleanupCandidatesWithFallback(configs, {
+        limit,
+        cursorUid: cursor_uid,
+        olderThanDays: older_than_days,
+        includeSnippets: include_snippets,
+        snippetChars: snippet_chars
+      });
+
+      return out({
+        ...summary,
+        mode: "readonly_cleanup_candidates_body_peek",
+        lifecycle_scope: "own_agent_inbox_only",
+        connection: {
+          host: result.host,
+          port: result.port,
+          secure: result.secure,
+          label: result.label
+        },
+        mailbox: result.mailbox,
+        cutoff_date: result.cutoff_date,
+        older_than_days: result.older_than_days,
+        matching_count: result.matching_count,
+        cursor_uid: result.cursor_uid,
+        next_cursor_uid: result.next_cursor_uid,
+        has_more: result.has_more,
+        remaining_count: result.remaining_count,
+        returned_count: result.returned_count,
+        messages: result.messages,
+        imap_attempts: result.attempts
+      });
+    }
+  );
+
+  server.tool(
+    "agent_email_trash_processed",
+    "Verschiebt genau eine sicher verarbeitete Nachricht aus der eigenen Agenten-INBOX in den eigenen IMAP-Papierkorb. Kein Zugriff auf fremde Agentenpostfaecher, kein permanentes EXPUNGE. Der enge Lifecycle-Pfad ist durch die kanonische Moritz-Regel allgemein freigegeben, verlangt aber explizite Abschluss-, Retention- und Identitaets-Readbacks.",
+    {
+      agent_id: agentIdSchema,
+      uid: z.string().regex(/^\d+$/),
+      expected_message_id_hash: z.string().regex(/^[a-f0-9]{64}$/i),
+      expected_from_email: z.string().email().optional(),
+      expected_subject: z.string().max(998).optional(),
+      disposition_reason: z.enum([
+        "processed_and_persisted",
+        "duplicate_or_notification",
+        "obsolete_no_remaining_value"
+      ]),
+      processing_complete: z.boolean().optional().default(false),
+      no_pending_action: z.boolean().optional().default(false),
+      no_retention_hold: z.boolean().optional().default(false),
+      downstream_readback_verified: z.boolean().optional().default(false),
+      decision_note: z.string().min(12).max(500),
+      create_trash_mailbox: z.boolean().optional().default(true),
+      dry_run: z.boolean().optional().default(true),
+      verify_after: z.boolean().optional().default(true)
+    },
+    TOOL_DESTRUCTIVE_IDEMPOTENT_WRITE,
+    async ({
+      agent_id,
+      uid,
+      expected_message_id_hash,
+      expected_from_email,
+      expected_subject,
+      disposition_reason,
+      processing_complete,
+      no_pending_action,
+      no_retention_hold,
+      downstream_readback_verified,
+      decision_note,
+      create_trash_mailbox,
+      dry_run,
+      verify_after
+    }) => {
+      if (!processing_complete) {
+        throw new Error("agent_email_trash_processed braucht processing_complete=true.");
+      }
+      if (!no_pending_action) {
+        throw new Error("agent_email_trash_processed braucht no_pending_action=true.");
+      }
+      if (!no_retention_hold) {
+        throw new Error("agent_email_trash_processed braucht no_retention_hold=true.");
+      }
+      if (disposition_reason === "processed_and_persisted" && !downstream_readback_verified) {
+        throw new Error(
+          "processed_and_persisted braucht downstream_readback_verified=true nach erfolgreicher Weiterverarbeitung."
+        );
+      }
+
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const trashMailbox = getAgentEmailTrashMailbox(agent_id);
+      const result = await trashProcessedEmailWithFallback(configs, {
+        uid,
+        trashMailbox,
+        expectedMessageIdHash: expected_message_id_hash.toLowerCase(),
+        expectedFromEmail: expected_from_email,
+        expectedSubject: expected_subject,
+        createTrashMailbox: create_trash_mailbox,
+        dryRun: dry_run,
+        verifyAfter: verify_after
+      });
+
+      return out({
+        ...summary,
+        mode: dry_run ? "processed_email_trash_shadow" : "processed_email_trash_live",
+        lifecycle_scope: "own_agent_inbox_only",
+        standing_policy_authorization: "email-lifecycle-v1",
+        disposition_reason,
+        processing_complete,
+        no_pending_action,
+        no_retention_hold,
+        downstream_readback_verified,
+        decision_note_sha256: createHash("sha256").update(decision_note, "utf8").digest("hex"),
+        decision_note_bytes: Buffer.byteLength(decision_note, "utf8"),
+        permanent_expunge: false,
+        connection: {
+          host: result.host,
+          port: result.port,
+          secure: result.secure,
+          label: result.label
+        },
+        result,
         imap_attempts: result.attempts
       });
     }
