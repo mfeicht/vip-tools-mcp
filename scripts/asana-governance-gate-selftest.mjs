@@ -32,7 +32,12 @@ const checks = {
     source.includes("failed_still_follower_do_not_retry_comment"),
   full_description_replacement_requires_moritz:
     source.includes("replace_full_description") &&
-    source.includes("requireMoritz: replace_full_description")
+    source.includes("requireMoritz: replace_full_description"),
+  full_description_readback_does_not_require_append_key:
+    source.includes("if (!replace_full_description && dedupe_key && !readback.includes(dedupe_key))"),
+  recurrence_null_fields_are_not_sent:
+    source.includes("value !== null && value !== undefined") &&
+    source.includes("recurrence: normalizedRecurrence")
 };
 
 console.log(JSON.stringify(checks));

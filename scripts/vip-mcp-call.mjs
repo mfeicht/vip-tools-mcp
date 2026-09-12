@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -11,8 +13,17 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 25000;
 const DEFAULT_TOOL_TIMEOUT_MS = 120000;
 const MAX_RETRY_DELAY_MS = 60000;
 const RATE_LIMIT_COOLDOWN_MS = 60000;
+const CONNECT_LOCK_WAIT_MS = 3 * 60 * 1000;
+const CONNECT_LOCK_STALE_MS = 4 * 60 * 1000;
+const MIN_CONNECT_SPACING_MS = 1500;
+const RETRY_JITTER_MS = 2500;
 const MAX_ERROR_OUTPUT_CHARS = 600;
 const MAX_ARGS_BYTES = 2 * 1024 * 1024;
+const COORDINATION_DIR =
+  process.env.VIP_MCP_COORDINATION_DIR ||
+  path.join(os.homedir(), "Library", "Application Support", "VIP-Studios", "mcp-transport");
+const CONNECT_LOCK_PATH = path.join(COORDINATION_DIR, "connect.lock");
+const TRANSPORT_STATE_PATH = path.join(COORDINATION_DIR, "state.json");
 
 function usage() {
   console.error(`Canonical VIP Remote-MCP fallback
@@ -93,6 +104,100 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readJson(pathname, fallback = {}) {
+  try {
+    return JSON.parse(await fs.readFile(pathname, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJsonAtomic(pathname, value) {
+  await fs.mkdir(path.dirname(pathname), { recursive: true, mode: 0o700 });
+  const temporary = `${pathname}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+  await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600
+  });
+  await fs.rename(temporary, pathname);
+}
+
+async function acquireConnectLock() {
+  await fs.mkdir(COORDINATION_DIR, { recursive: true, mode: 0o700 });
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const deadline = Date.now() + CONNECT_LOCK_WAIT_MS;
+
+  while (Date.now() < deadline) {
+    try {
+      const handle = await fs.open(CONNECT_LOCK_PATH, "wx", 0o600);
+      await handle.writeFile(
+        `${JSON.stringify({ pid: process.pid, token, acquiredAt: new Date().toISOString() })}\n`,
+        "utf8"
+      );
+      await handle.close();
+      return { token, waitedMs: CONNECT_LOCK_WAIT_MS - Math.max(0, deadline - Date.now()) };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const lock = await readJson(CONNECT_LOCK_PATH, {});
+      const acquiredAt = Date.parse(lock.acquiredAt || "");
+      const stale =
+        !Number.isFinite(acquiredAt) ||
+        Date.now() - acquiredAt > CONNECT_LOCK_STALE_MS ||
+        !processAlive(Number(lock.pid));
+      if (stale) {
+        await fs.unlink(CONNECT_LOCK_PATH).catch(() => {});
+        continue;
+      }
+      await sleep(400 + Math.floor(Math.random() * 600));
+    }
+  }
+  const error = new Error("MCP coordination timeout while waiting for the shared connect slot");
+  error.code = "VIP_MCP_COORDINATION_TIMEOUT";
+  throw error;
+}
+
+async function releaseConnectLock(lock) {
+  if (!lock) return;
+  const current = await readJson(CONNECT_LOCK_PATH, {});
+  if (current.token === lock.token) await fs.unlink(CONNECT_LOCK_PATH).catch(() => {});
+}
+
+async function waitForSharedTransportWindow() {
+  const state = await readJson(TRANSPORT_STATE_PATH, {});
+  const now = Date.now();
+  const cooldownUntil = Date.parse(state.cooldownUntil || "");
+  if (Number.isFinite(cooldownUntil) && cooldownUntil > now) {
+    const waitMs = cooldownUntil - now + Math.floor(Math.random() * RETRY_JITTER_MS);
+    console.error(`[vip-mcp] shared cooldown active; waiting ${waitMs} ms`);
+    await sleep(waitMs);
+  }
+  const lastAttemptAt = Date.parse(state.lastConnectAttemptAt || "");
+  if (Number.isFinite(lastAttemptAt)) {
+    const spacing = MIN_CONNECT_SPACING_MS - (Date.now() - lastAttemptAt);
+    if (spacing > 0) await sleep(spacing + Math.floor(Math.random() * 500));
+  }
+}
+
+async function recordTransportState(update) {
+  const previous = await readJson(TRANSPORT_STATE_PATH, {});
+  await writeJsonAtomic(TRANSPORT_STATE_PATH, {
+    ...previous,
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    ...update
+  });
+}
+
 function withTimeout(promise, timeoutMs, label) {
   let timer;
   return Promise.race([
@@ -117,6 +222,7 @@ function safeErrorText(error) {
 
 function classifyConnectionError(error) {
   const message = errorText(error);
+  if (error?.code === "VIP_MCP_COORDINATION_TIMEOUT") return "mcp_coordination_timeout";
   if (/Just a moment|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
     return "cloudflare_managed_challenge";
   }
@@ -144,7 +250,10 @@ function isCooldownConnectionError(error) {
 }
 
 function retryDelayMs(baseDelayMs, attempt) {
-  return Math.min(baseDelayMs * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
+  return (
+    Math.min(baseDelayMs * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS) +
+    Math.floor(Math.random() * RETRY_JITTER_MS)
+  );
 }
 
 function runSelfTest() {
@@ -161,7 +270,11 @@ function runSelfTest() {
   if (safeErrorText(cases[2][0]).includes("<title>")) {
     throw new Error("Self-test failed: Cloudflare HTML was not sanitized");
   }
-  console.log(JSON.stringify({ ok: true, checks: cases.length + 1 }));
+  const delay = retryDelayMs(100, 1);
+  if (delay < 100 || delay >= 100 + RETRY_JITTER_MS) {
+    throw new Error("Self-test failed: retry jitter is outside the expected range");
+  }
+  console.log(JSON.stringify({ ok: true, checks: cases.length + 2 }));
 }
 
 async function parseToolArgs(opts) {
@@ -193,29 +306,54 @@ async function connectOnce(opts, attempt) {
 }
 
 async function connectWithRetry(opts) {
+  const lock = await acquireConnectLock();
   let lastError;
-  for (let attempt = 1; attempt <= opts.attempts; attempt += 1) {
-    try {
-      return { client: await connectOnce(opts, attempt), attemptsUsed: attempt };
-    } catch (error) {
-      lastError = error;
-      const cooldown = isCooldownConnectionError(error);
-      const retry = cooldown
-        ? attempt === 1 && opts.attempts > 1
-        : attempt < opts.attempts && isTransientConnectionError(error);
-      const delayMs = cooldown
-        ? RATE_LIMIT_COOLDOWN_MS
-        : retryDelayMs(opts.delayMs, attempt);
-      console.error(
-        `[vip-mcp] connect attempt ${attempt}/${opts.attempts} failed ` +
-          `(${classifyConnectionError(error)}): ${safeErrorText(error)}` +
-          `${retry ? `; ${cooldown ? "cooldown" : "retrying"} in ${delayMs} ms` : ""}`
-      );
-      if (!retry) break;
-      await sleep(delayMs);
+  try {
+    await waitForSharedTransportWindow();
+    for (let attempt = 1; attempt <= opts.attempts; attempt += 1) {
+      await recordTransportState({
+        lastConnectAttemptAt: new Date().toISOString(),
+        lastConnectAttemptPid: process.pid
+      });
+      try {
+        const client = await connectOnce(opts, attempt);
+        await recordTransportState({
+          lastConnectSuccessAt: new Date().toISOString(),
+          lastErrorClass: null,
+          lastError: null,
+          cooldownUntil: null
+        });
+        return { client, attemptsUsed: attempt, coordinationWaitMs: lock.waitedMs };
+      } catch (error) {
+        lastError = error;
+        const cooldown = isCooldownConnectionError(error);
+        const retry = cooldown
+          ? attempt === 1 && opts.attempts > 1
+          : attempt < opts.attempts && isTransientConnectionError(error);
+        const delayMs = cooldown
+          ? RATE_LIMIT_COOLDOWN_MS + Math.floor(Math.random() * RETRY_JITTER_MS)
+          : retryDelayMs(opts.delayMs, attempt);
+        await recordTransportState({
+          lastConnectFailureAt: new Date().toISOString(),
+          lastErrorClass: classifyConnectionError(error),
+          lastError: safeErrorText(error),
+          cooldownUntil: cooldown
+            ? new Date(Date.now() + RATE_LIMIT_COOLDOWN_MS).toISOString()
+            : null
+        });
+        console.error(
+          `[vip-mcp] connect attempt ${attempt}/${opts.attempts} failed ` +
+            `(${classifyConnectionError(error)}): ${safeErrorText(error)}` +
+            `${retry ? `; ${cooldown ? "shared cooldown" : "retrying"} in ${delayMs} ms` : ""}`
+        );
+        if (!retry) break;
+        await sleep(delayMs);
+      }
     }
+    throw lastError;
+  } finally {
+    await releaseConnectLock(lock);
   }
-  throw lastError;
 }
 
 function normalizeContent(content) {
@@ -252,6 +390,7 @@ async function main() {
           transport: "canonical_remote_mcp_fallback",
           endpoint: MCP_URL,
           attempts_used: connected.attemptsUsed,
+          coordination_wait_ms: connected.coordinationWaitMs,
           tools: (result.tools || []).map((tool) => tool.name).sort()
         })
       );
@@ -271,6 +410,7 @@ async function main() {
         transport: "canonical_remote_mcp_fallback",
         endpoint: MCP_URL,
         attempts_used: connected.attemptsUsed,
+        coordination_wait_ms: connected.coordinationWaitMs,
         tool: opts.tool,
         is_error: Boolean(result.isError),
         content: normalizeContent(result.content)

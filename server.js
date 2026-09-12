@@ -13421,7 +13421,7 @@ function createServer() {
         if (snippet && !readback.includes(snippet) && !readback.includes(escapeAsanaXml(snippet))) {
           throw new Error("Asana-Readback zeigt die neue Aufgabenbeschreibung-Ergaenzung nicht sicher.");
         }
-        if (dedupe_key && !readback.includes(dedupe_key)) {
+        if (!replace_full_description && dedupe_key && !readback.includes(dedupe_key)) {
           throw new Error("Asana-Readback zeigt den Dedupe-Key der Aufgabenbeschreibung-Ergaenzung nicht.");
         }
         verification_status = "ok";
@@ -14851,7 +14851,12 @@ function createServer() {
         );
       }
 
-      const data = clear_recurrence ? { recurrence: null } : { recurrence };
+      const normalizedRecurrence = recurrence
+        ? Object.fromEntries(
+            Object.entries(recurrence).filter(([, value]) => value !== null && value !== undefined)
+          )
+        : recurrence;
+      const data = clear_recurrence ? { recurrence: null } : { recurrence: normalizedRecurrence };
       const asana = getAsana(agent_id);
       const beforeRes = await asanaRequestWithRetry(asana, {
         method: "GET",
