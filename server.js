@@ -38,6 +38,7 @@ import {
 import {
   detectRoutineFollowUpSignals,
   inspectRoutineMaterialCommentIdempotency,
+  validateRoutineMaterialCorrection,
   validateRoutineFollowUpTaskContract,
   validateRoutineVisibleFollowUpStatus
 } from "./lib/asana-completion-guard.js";
@@ -13210,7 +13211,7 @@ function createServer() {
 
   server.tool(
     "asana_comment",
-    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene materielle Ergebnis-/Handoff-/Abschlusskommentar kanonisch; typische Ergebnis- oder Erfolgssprache bleibt auch bei comment_kind=status materiell. Weitere materielle Kommentare werden ohne explizite supersedes_story_gid als Duplikat blockiert. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene materielle Ergebnis-/Handoff-/Abschlusskommentar kanonisch; typische Ergebnis- oder Erfolgssprache bleibt auch bei comment_kind=status materiell. Eine echte Korrektur braucht supersedes_story_gid und correction mit konkretem Vorher-/Nachher-Claim, Grund und Quelle; das Tool macht den Story-Verweis sichtbar. Reine Umformulierungen duerfen nicht als Korrektur gepostet werden. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -13250,6 +13251,12 @@ function createServer() {
       observer_comment_basis: z.string().min(20).optional(),
       authorization: actionAuthorizationSchema.optional(),
       supersedes_story_gid: z.string().optional(),
+      correction: z.object({
+        reason: z.string().min(24).max(500),
+        before: z.string().min(8).max(1000),
+        after: z.string().min(8).max(1000),
+        source: z.string().min(10).max(1000)
+      }).optional(),
       effort_note: z.string().optional(),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
@@ -13271,6 +13278,7 @@ function createServer() {
       observer_comment_basis,
       authorization,
       supersedes_story_gid,
+      correction,
       effort_note,
       dry_run,
       verify_after
@@ -13278,9 +13286,29 @@ function createServer() {
       validateAsanaGid(task_gid, "task_gid");
       validateAsanaGid(mention_user_gid, "mention_user_gid");
       validateAsanaGid(supersedes_story_gid, "supersedes_story_gid");
+      if (supersedes_story_gid && !correction) {
+        throw new Error("Eine Routine-Korrektur braucht correction mit sachlichem Grund, Vorher-/Nachher-Claim und Quelle.");
+      }
+      if (correction && !supersedes_story_gid) {
+        throw new Error("correction ist nur zusammen mit supersedes_story_gid zulaessig.");
+      }
+      if (correction && !evidence?.sources?.some((source) =>
+        normalizeAsanaLabel(source) === normalizeAsanaLabel(correction.source)
+      )) {
+        throw new Error("Die Korrekturquelle muss als eigener konkreter Eintrag in evidence.sources stehen.");
+      }
       const materialResultSignals = asanaCommentHasMaterialResultSignals({ greeting, sections });
       const preparedEvidence = prepareAsanaEvidenceSections(comment_kind, evidence, { materialResultSignals });
-      const finalSections = [...sections, ...preparedEvidence.evidence_sections];
+      const correctionSections = correction ? [{
+        title: "Korrektur zur bisherigen Story",
+        paragraphs: [
+          `Ersetzt Story ${supersedes_story_gid}. Sachlicher Grund: ${correction.reason}`,
+          `Bisheriger Claim: ${correction.before}`,
+          `Korrigierter Claim: ${correction.after}`,
+          `Quelle/Readback fuer die Korrektur: ${correction.source}`
+        ]
+      }] : [];
+      const finalSections = [...sections, ...correctionSections, ...preparedEvidence.evidence_sections];
       if (dry_run && !mention_user_gid && !keep_routine_observer_subscription) {
         const html_text = buildAsanaCommentHtml({
           greeting,
@@ -13545,6 +13573,22 @@ function createServer() {
                   ", "
                 ) || "-"} als final_comment_story_gid. Nur eine echte Korrektur darf mit supersedes_story_gid auf genau diesen Kommentar verweisen.`
               );
+            }
+            if (supersedes_story_gid) {
+              const correctionDelta = validateRoutineMaterialCorrection({
+                priorStory: existingStories.find((story) => String(story.gid) === supersedes_story_gid) ||
+                  recentStories.find((story) => String(story.gid) === supersedes_story_gid),
+                correction,
+                proposedText: sections.flatMap((section) => [
+                  section.title || "",
+                  ...(section.paragraphs || []),
+                  ...(section.bullets || [])
+                ]).join("\n")
+              });
+              routine_material_comment_idempotency.correction_delta_gate = correctionDelta;
+              if (!correctionDelta.allowed) {
+                throw new Error(`Routine-Korrektur blockiert (${correctionDelta.issues.join(", ")}). Nur eine belegte sachliche Aenderung darf eine zweite materiale Story erzeugen.`);
+              }
             }
             if (dry_run) return { dry_run: true };
             const posted = await postComment();

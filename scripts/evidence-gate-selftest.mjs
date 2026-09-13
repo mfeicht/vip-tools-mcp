@@ -83,10 +83,45 @@ try {
     dry_run: true
   });
 
+  const correctionWithoutDelta = await call({
+    agent_id: "vip-ai-content",
+    task_gid: "1234567890",
+    comment_kind: "completion",
+    supersedes_story_gid: "1234567891",
+    sections: [{ title: "Korrigiertes Ergebnis", paragraphs: ["Der neue Readback bestaetigt 5 Datensaetze."] }],
+    evidence: {
+      summary: "Der lokale Test prueft die Korrekturpflicht ohne einen Asana-Live-Write.",
+      no_external_factual_claims: true
+    },
+    dry_run: true
+  });
+
+  const correctionMarkup = await call({
+    agent_id: "vip-ai-content",
+    task_gid: "1234567890",
+    comment_kind: "completion",
+    supersedes_story_gid: "1234567891",
+    correction: {
+      reason: "Ein neuer Zielsystem-Readback korrigiert die zuvor falsche Anzahl.",
+      before: "4 Datensaetze",
+      after: "5 Datensaetze",
+      source: "Lokaler Shadow-Readback vom 2026-09-13"
+    },
+    sections: [{ title: "Korrigiertes Ergebnis", paragraphs: ["Der neue Readback bestaetigt 5 Datensaetze."] }],
+    evidence: {
+      summary: "Der lokale Test prueft den sichtbaren Korrekturverweis ohne einen Asana-Live-Write.",
+      sources: ["Lokaler Shadow-Readback vom 2026-09-13"],
+      verified_claims: ["Der lokale Shadow-Readback belegt die korrigierte Testanzahl."],
+      no_external_factual_claims: true
+    },
+    dry_run: true
+  });
+
   const validText = text(valid);
   const report = {
     completion_guard_schema_visible: Boolean(
       asanaCommentTool?.inputSchema?.properties?.supersedes_story_gid &&
+        asanaCommentTool?.inputSchema?.properties?.correction &&
         asanaCompleteTaskTool?.description?.includes("Status=Todo")
     ),
     missing_evidence_blocked: Boolean(missing.isError),
@@ -95,7 +130,10 @@ try {
     valid_evidence_passed: !valid.isError && /"evidence_gate_status"\s*:\s*"ok"/.test(validText),
     valid_comment_has_marker: validText.includes("Evidenz / Verifikation"),
     mislabeled_result_blocked: Boolean(mislabeledResult.isError),
-    unresolved_completion_blocked: Boolean(unresolved.isError)
+    unresolved_completion_blocked: Boolean(unresolved.isError),
+    correction_without_delta_blocked: Boolean(correctionWithoutDelta.isError),
+    correction_story_reference_visible: !correctionMarkup.isError &&
+      text(correctionMarkup).includes("Ersetzt Story 1234567891")
   };
 
   console.log(JSON.stringify(report));

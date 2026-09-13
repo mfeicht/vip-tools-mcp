@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   detectRoutineFollowUpSignals,
   inspectRoutineMaterialCommentIdempotency,
+  validateRoutineMaterialCorrection,
   validateRoutineFollowUpTaskContract,
   validateRoutineVisibleFollowUpStatus
 } from "../lib/asana-completion-guard.js";
@@ -23,6 +24,53 @@ const openEvidenceStory = {
   text:
     "Status\nEvidenz / Verifikation\nDer Zwischenstand ist belegt.\nOffene Evidenzluecken\nDeployment fehlt."
 };
+
+const duplicateCommunicationStory = {
+  gid: "1218428058256536",
+  text: "Vier BCC-Asana-Mails, 0 menschliche Stilbelege. Keine separate Follow-up-Aufgabe nötig. Evidenz / Verifikation. Quelle/Readback: BCC Readback UID 53-56"
+};
+assert.equal(validateRoutineMaterialCorrection({
+  priorStory: duplicateCommunicationStory,
+  proposedText: "Vier BCC-Asana-Mails, 0 menschliche Stilbelege. Keine weitere Folgeaufgabe nötig."
+}).status, "blocked_correction_delta");
+assert.equal(validateRoutineMaterialCorrection({
+  priorStory: duplicateCommunicationStory,
+  correction: {
+    reason: "Der Abschluss wurde bei unveraenderter Datenbasis nur neu formuliert.",
+    before: "Keine separate Follow-up-Aufgabe nötig",
+    after: "Keine weitere Folgeaufgabe nötig",
+    source: "BCC Readback UID 53-56"
+  },
+  proposedText: "Keine weitere Folgeaufgabe nötig."
+}).issues.includes("correction_source_already_in_prior_story"), true);
+assert.equal(validateRoutineMaterialCorrection({
+  priorStory: duplicateCommunicationStory,
+  correction: {
+    reason: "Der Abschlussclaim wurde nur umformuliert und nicht sachlich verändert.",
+    before: "0 menschliche Stilbelege",
+    after: "0 menschliche Stilbelege",
+    source: "Unveränderter BCC-Readback"
+  },
+  proposedText: "Vier BCC-Asana-Mails, 0 menschliche Stilbelege."
+}).status, "blocked_correction_delta");
+assert.deepEqual(validateRoutineMaterialCorrection({
+  priorStory: {
+    gid: "1217000000000010",
+    text: "Ergebnis: 4 Datensaetze. Evidenz / Verifikation"
+  },
+  correction: {
+    reason: "Der neue Zielsystem-Readback korrigiert die zuvor falsch angegebene Anzahl.",
+    before: "4 Datensaetze",
+    after: "5 Datensaetze",
+    source: "Asana Task-Readback 2026-09-13 12:20 CEST"
+  },
+  proposedText: "Korrigiertes Ergebnis: 5 Datensaetze."
+}), {
+  allowed: true,
+  status: "correction_delta_present",
+  issues: [],
+  supersedes_story_gid: "1217000000000010"
+});
 
 assert.deepEqual(
   inspectRoutineMaterialCommentIdempotency({
