@@ -33,6 +33,41 @@ assert.equal(validateRoutineMaterialCorrection({
   priorStory: duplicateCommunicationStory,
   proposedText: "Vier BCC-Asana-Mails, 0 menschliche Stilbelege. Keine weitere Folgeaufgabe nötig."
 }).status, "blocked_correction_delta");
+const bccNoFollowUpRestatement = validateRoutineMaterialCorrection({
+  priorStory: {
+    gid: "1218442568303874",
+    text: "Für diesen read-only Lernlauf ist kein aktives Follow-up nötig; die nächste tägliche Routine übernimmt neue Inbox-UIDs. Evidenz / Verifikation"
+  },
+  correction: {
+    reason: "Der neue Null-Readback soll die Fortsetzung ausführlicher beschreiben.",
+    before: "Für diesen read-only Lernlauf ist kein aktives Follow-up nötig",
+    after: "Keine weitere Folgeaufgabe oder Nacharbeit nötig: Es liegt kein menschlicher Lernbeleg und kein offener Schritt aus diesem Routine-Scope vor",
+    source: "Frischer BCC-Null-Readback nach UID 57 um 09:22Z"
+  },
+  proposedText: "Keine weitere Folgeaufgabe oder Nacharbeit nötig: Es liegt kein menschlicher Lernbeleg und kein offener Schritt aus diesem Routine-Scope vor"
+});
+assert.equal(bccNoFollowUpRestatement.allowed, false);
+assert.equal(bccNoFollowUpRestatement.issues.includes("correction_restates_no_follow_up"), true);
+assert.equal(validateRoutineMaterialCorrection({
+  priorStory: { gid: "1217000000000011", text: "Follow-up: keines erforderlich. Evidenz / Verifikation" },
+  correction: {
+    reason: "Ein weiterer Readback bestätigte denselben Abschlusszustand erneut.",
+    before: "Follow-up: keines erforderlich",
+    after: "Keine weitere Folgeaufgabe nötig",
+    source: "Neuer Zielsystem-Null-Readback 2026-09-14"
+  },
+  proposedText: "Keine weitere Folgeaufgabe nötig"
+}).issues.includes("correction_restates_no_follow_up"), true);
+assert.equal(validateRoutineMaterialCorrection({
+  priorStory: { gid: "1218438096068915", text: "Kein neues High/Critical-Finance-Signal, keine Signal-to-Action- oder Risk-Overlay-Eskalation. Evidenz / Verifikation" },
+  correction: {
+    reason: "Der erste Kommentar ließ den ausdrücklichen Follow-up-Status aus.",
+    before: "Kein neues High/Critical-Finance-Signal, keine Signal-to-Action- oder Risk-Overlay-Eskalation",
+    after: "Kein neues High/Critical-Finance-Signal, keine Signal-to-Action- oder Risk-Overlay-Eskalation. Follow-up: keines erforderlich",
+    source: "Frischer Finance-Snapshot mit Follow-up-Readback 2026-09-14"
+  },
+  proposedText: "Kein neues High/Critical-Finance-Signal, keine Signal-to-Action- oder Risk-Overlay-Eskalation. Follow-up: keines erforderlich"
+}).allowed, true);
 assert.equal(validateRoutineMaterialCorrection({
   priorStory: duplicateCommunicationStory,
   correction: {
