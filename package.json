@@ -26,6 +26,7 @@
     "test:asana-schedule-guard": "node scripts/asana-schedule-guard-selftest.mjs",
     "test:dashboard-health": "node scripts/dashboard-health-selftest.mjs",
     "test:google-drive-upload-contract": "node scripts/google-drive-upload-contract-selftest.mjs",
+    "test:wp-import-path-guard": "node scripts/wp-import-path-guard-selftest.mjs",
     "test:web-research": "node scripts/web-research-selftest.mjs",
     "shadow:web-research": "node scripts/web-research-live-shadow.mjs",
     "mcp:call": "node scripts/vip-mcp-call.mjs"

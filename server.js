@@ -63,6 +63,7 @@ import {
   composeHtmlWithSignature,
   stripTrailingIdentityFromText
 } from "./lib/email-signature-template.js";
+import { assertMcpImportAllowedByTaskNotes } from "./lib/wp-import-path-guard.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -22763,6 +22764,18 @@ function createServer() {
     },
     TOOL_EXTERNAL_WRITE,
     async ({ agent_id, csv_text, source, dry_run, confirmed_by_asana, asana_task_gid, authorization }) => {
+      const verifyTaskPath = async (taskGid) => {
+        const taskRes = await asanaRequestWithRetry(getAsana(agent_id), {
+          method: "GET",
+          url: `/tasks/${taskGid}`,
+          params: { opt_fields: "gid,notes" }
+        });
+        const taskNotes = taskRes.data.data?.notes;
+        if (typeof taskNotes !== "string") {
+          throw new Error(`wp_import_csv: Asana-Aufgabenbeschreibung ${taskGid} konnte nicht verifiziert werden.`);
+        }
+        assertMcpImportAllowedByTaskNotes(taskNotes, taskGid);
+      };
       const trimmedCsv = csv_text.trim();
       if (!trimmedCsv) throw new Error("csv_text darf nicht leer sein.");
       if (Buffer.byteLength(trimmedCsv, "utf8") > 1_000_000) {
@@ -22781,6 +22794,7 @@ function createServer() {
       };
 
       if (dry_run) {
+        if (asana_task_gid) await verifyTaskPath(asana_task_gid);
         return out({ agent_id, dry_run: true, preview });
       }
 
@@ -22791,6 +22805,10 @@ function createServer() {
         asanaTaskGid: asana_task_gid,
         actionName: "wp_import_csv"
       });
+
+      if (authorization_receipt.source === "asana") {
+        await verifyTaskPath(asana_task_gid);
+      }
 
       const apiKey = process.env.WORDPRESS_GK_API_KEY;
       if (!apiKey) throw new Error("WORDPRESS_GK_API_KEY fehlt im MCP-Environment.");
