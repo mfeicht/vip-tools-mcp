@@ -55,6 +55,7 @@ import {
   sameAsanaDateTimeInstant
 } from "./lib/asana-schedule-guards.js";
 import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
+import { buildAsanaTaskSearchParams } from "./lib/asana-search-params.js";
 import {
   extractAccountingInvoice as extractAccountingInvoiceV2,
   getNormalizedAccountingInvoiceLines as getNormalizedAccountingInvoiceLinesV2
@@ -12700,13 +12701,14 @@ function createServer() {
 
   server.tool(
     "asana_search_tasks",
-    "Sucht Asana-Aufgaben im Workspace read-only ueber den korrekten GET-/tasks/search-Pfad. Vermeidet den bekannten 404 durch POST /tasks/search und ist der Standardpfad fuer API-Ersatz-Inbox/Follower-/Collaborator-Deltas.",
+    "Sucht Asana-Aufgaben im Workspace read-only ueber den korrekten GET-/tasks/search-Pfad. Bildet text, modified_since und die User-Selektoren auf Asanas kanonische Search-Parameter ab, vermeidet den bekannten 404 durch POST /tasks/search und ist der Standardpfad fuer API-Ersatz-Inbox/Follower-/Collaborator-Deltas.",
     {
       agent_id: agentIdSchema,
       workspace_gid: z.string().optional(),
       assignee_any: z.string().optional(),
       followers_any: z.string().optional(),
       involved_any: z.string().optional(),
+      text: z.string().min(1).max(512).optional(),
       completed: z.boolean().optional(),
       modified_since: z.string().optional(),
       sort_by: z.string().optional().default("modified_at"),
@@ -12727,6 +12729,7 @@ function createServer() {
       assignee_any,
       followers_any,
       involved_any,
+      text,
       completed,
       modified_since,
       sort_by,
@@ -12749,21 +12752,22 @@ function createServer() {
         return value;
       };
 
-      const params = {
-        ...(extra_params || {}),
-        limit,
-        opt_fields,
-        sort_by
-      };
-      if (sort_ascending !== undefined) params.sort_ascending = sort_ascending;
-      if (completed !== undefined) params.completed = completed;
-      if (modified_since) params.modified_since = modified_since;
       const assignee = normalizeUserSelector(assignee_any, "assignee_any");
       const followers = normalizeUserSelector(followers_any, "followers_any");
       const involved = normalizeUserSelector(involved_any, "involved_any");
-      if (assignee) params["assignee.any"] = assignee;
-      if (followers) params["followers.any"] = followers;
-      if (involved) params["involved.any"] = involved;
+      const params = buildAsanaTaskSearchParams({
+        extraParams: extra_params,
+        text,
+        modifiedSince: modified_since,
+        assignee,
+        followers,
+        involved,
+        completed,
+        sortBy: sort_by,
+        sortAscending: sort_ascending,
+        limit,
+        optFields: opt_fields
+      });
 
       try {
         const res = await asanaRequestWithRetry(asana, {
