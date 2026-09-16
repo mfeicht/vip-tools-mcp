@@ -12701,7 +12701,7 @@ function createServer() {
 
   server.tool(
     "asana_search_tasks",
-    "Sucht Asana-Aufgaben read-only per GET. involved_any bedeutet Assignee ODER Creator ODER Follower: drei dokumentierte Filterzweige, begrenzte created_at-Pagination, GID-Dedupe und gemeinsame Sortierung vor Limit. Sendet kein involved.any. Bei search_complete=false oder result_truncated=true keinen Delta-Cursor fortschreiben. Search ist eventual consistent; direkte Task-Readbacks bleiben vor Writes Pflicht. User-Selektoren akzeptieren komma-getrennte GIDs und me.",
+    "Sucht Asana-Aufgaben read-only per GET. involved_any bedeutet Assignee ODER Creator ODER Follower fuer jede angegebene GID: einzelne User-/Rollenzweige, gemeinsame Filter, begrenzte created_at-Pagination (maximal 30 Seiten insgesamt), GID-Dedupe und gemeinsame Sortierung vor Limit. Sendet kein involved.any. Bei search_complete=false oder result_truncated=true keinen Delta-Cursor fortschreiben. Search ist eventual consistent; direkte Task-Readbacks bleiben vor Writes Pflicht. User-Selektoren akzeptieren komma-getrennte GIDs und me.",
     {
       agent_id: agentIdSchema,
       workspace_gid: z.string().optional(),

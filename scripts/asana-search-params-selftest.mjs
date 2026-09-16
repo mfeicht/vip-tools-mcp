@@ -69,7 +69,8 @@ await test("top-level selectors override legacy and canonical extras", async () 
 await test("shared same-role selectors are intersected; other constraints remain", async () => {
   const p = plan({ assignee: "8", involved: "7", extraParams: { "followers.not": "9" } });
   assert.deepEqual(p.branches[0].user_gids, []);
-  assert.equal(p.branches[1].params["assignee.any"], "8");
+  assert.equal(p.branches[1].params["assignee.any"], undefined);
+  assert.equal(p.user_constraints["assignee.any"], "8");
   const result = await executeAsanaInvolvedSearch(p, mockSearch([task(1, "created_by")]));
   assert.deepEqual(result.tasks.map((row) => row.gid), ["1"]);
   assert.equal(result.branches[0].pages, 0);
@@ -100,6 +101,37 @@ await test("positive assignee/creator/follower membership and negative task excl
 await test("multiple requested users match any selected role", async () => {
   const result = await executeAsanaInvolvedSearch(plan({ involved: "7,8" }), mockSearch([task(1), task(2, "foreign", 1)]));
   assert.deepEqual(result.tasks.map((row) => row.gid), ["2", "1"]);
+});
+await test("multi-user OR survives provider comma selectors behaving as intersection", async () => {
+  const p = plan({ involved: "7,8" });
+  const rows = [task(1), { ...task(2, "followers", 1), followers: [{ gid: "8" }], assignee: { gid: "9" }, created_by: { gid: "9" } }];
+  const provider = mockSearch(rows);
+  const result = await executeAsanaInvolvedSearch(p, async (params) => {
+    assert(["assignee", "created_by", "followers"].every((role) => !params[`${role}.any`]?.includes(",")));
+    return provider(params);
+  });
+  assert.deepEqual(result.tasks.map((row) => row.gid), ["2", "1"]);
+  assert.equal(result.branches.length, 6);
+});
+await test("common multi-user AND constraints are evaluated without provider comma semantics", async () => {
+  const p = plan({ involved: "7", assignee: "8,9", followers: "7,10" });
+  const result = await executeAsanaInvolvedSearch(p, mockSearch([
+    { ...task(1, "created_by"), assignee: { gid: "8" }, followers: [{ gid: "7" }] },
+    { ...task(2, "created_by", 1), assignee: { gid: "9" }, followers: [{ gid: "10" }] },
+    { ...task(3, "created_by", 2), assignee: { gid: "11" }, followers: [{ gid: "10" }] }
+  ]));
+  assert.deepEqual(result.tasks.map((row) => row.gid), ["2", "1"]);
+  assert.equal(result.search_complete, true);
+});
+await test("global 30-page budget bounds multi-user fanout and marks remaining coverage partial", async () => {
+  const p = plan({ involved: Array.from({ length: 11 }, (_, index) => String(index + 1)).join(",") });
+  let calls = 0;
+  const result = await executeAsanaInvolvedSearch(p, async () => { calls++; return []; });
+  assert.equal(calls, 30);
+  assert.equal(result.total_page_budget, 30);
+  assert.equal(result.search_status, "partial");
+  assert.equal(result.delta_cursor_advance_allowed, false);
+  assert.equal(result.branches.filter((branch) => branch.status === "total_page_limit").length, 3);
 });
 await test("cross-branch duplicate is returned once with newest observed version", async () => {
   const duplicate = { ...task(1), created_by: { gid: "7" }, followers: [{ gid: "7" }] };
