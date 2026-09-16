@@ -55,7 +55,7 @@ import {
   sameAsanaDateTimeInstant
 } from "./lib/asana-schedule-guards.js";
 import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
-import { buildAsanaTaskSearchParams } from "./lib/asana-search-params.js";
+import { buildAsanaTaskSearchPlan, executeAsanaInvolvedSearch } from "./lib/asana-search-params.js";
 import {
   extractAccountingInvoice as extractAccountingInvoiceV2,
   getNormalizedAccountingInvoiceLines as getNormalizedAccountingInvoiceLinesV2
@@ -12701,13 +12701,14 @@ function createServer() {
 
   server.tool(
     "asana_search_tasks",
-    "Sucht Asana-Aufgaben im Workspace read-only ueber den korrekten GET-/tasks/search-Pfad. Bildet text, modified_since und die User-Selektoren auf Asanas kanonische Search-Parameter ab, vermeidet den bekannten 404 durch POST /tasks/search und ist der Standardpfad fuer API-Ersatz-Inbox/Follower-/Collaborator-Deltas.",
+    "Sucht Asana-Aufgaben read-only per GET. involved_any bedeutet Assignee ODER Creator ODER Follower: drei dokumentierte Filterzweige, begrenzte created_at-Pagination, GID-Dedupe und gemeinsame Sortierung vor Limit. Sendet kein involved.any. Bei search_complete=false oder result_truncated=true keinen Delta-Cursor fortschreiben. Search ist eventual consistent; direkte Task-Readbacks bleiben vor Writes Pflicht. User-Selektoren akzeptieren komma-getrennte GIDs und me.",
     {
       agent_id: agentIdSchema,
       workspace_gid: z.string().optional(),
       assignee_any: z.string().optional(),
       followers_any: z.string().optional(),
       involved_any: z.string().optional(),
+      max_pages_per_branch: z.number().int().min(1).max(10).optional().default(5),
       text: z.string().min(1).max(512).optional(),
       completed: z.boolean().optional(),
       modified_since: z.string().optional(),
@@ -12729,6 +12730,7 @@ function createServer() {
       assignee_any,
       followers_any,
       involved_any,
+      max_pages_per_branch,
       text,
       completed,
       modified_since,
@@ -12745,31 +12747,36 @@ function createServer() {
       const workspace = workspace_gid || me.data.data.workspaces?.[0]?.gid;
       if (!workspace) throw new Error("Kein Asana-Workspace gefunden.");
 
-      const normalizeUserSelector = (value, label) => {
-        if (!value) return undefined;
-        if (value === "me") return meGid;
-        validateAsanaGid(value, label);
-        return value;
-      };
-
-      const assignee = normalizeUserSelector(assignee_any, "assignee_any");
-      const followers = normalizeUserSelector(followers_any, "followers_any");
-      const involved = normalizeUserSelector(involved_any, "involved_any");
-      const params = buildAsanaTaskSearchParams({
+      const plan = buildAsanaTaskSearchPlan({
         extraParams: extra_params,
         text,
         modifiedSince: modified_since,
-        assignee,
-        followers,
-        involved,
+        assignee: assignee_any,
+        followers: followers_any,
+        involved: involved_any,
+        meGid,
         completed,
         sortBy: sort_by,
         sortAscending: sort_ascending,
         limit,
         optFields: opt_fields
       });
+      const params = plan.params;
 
       try {
+        if (plan.involved_user_gids.length) {
+          const result = await executeAsanaInvolvedSearch(plan, async (branchParams) => {
+            const res = await asanaRequestWithRetry(asana, {
+              method: "GET", url: `/workspaces/${workspace}/tasks/search`, params: branchParams
+            });
+            return res.data.data;
+          }, { maxPagesPerBranch: max_pages_per_branch });
+          return out({
+            agent_id, workspace_gid: workspace, user_gid: meGid,
+            request_method: "GET", request_path: `/workspaces/${workspace}/tasks/search`,
+            params, ...result
+          });
+        }
         const res = await asanaRequestWithRetry(asana, {
           method: "GET",
           url: `/workspaces/${workspace}/tasks/search`,
