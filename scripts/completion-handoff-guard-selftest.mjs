@@ -280,6 +280,52 @@ const explicitCoverageSignal = detectRoutineFollowUpSignals({
 assert.equal(explicitCoverageSignal.has_existing_task_coverage_claim, true);
 assert.equal(explicitCoverageSignal.blocked_without_follow_up_task, true);
 
+// Event-Pulse completion story 1218491009441385 already states its no-follow-up
+// status. Reuse that story instead of allowing a third material restatement.
+const legacyEventPulseText = "Keine eigenständige neue Folgeaufgabe erforderlich.";
+for (const text of [legacyEventPulseText, "Keine eigenstaendige neue Folgeaufgabe erforderlich."]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({
+    finalComment: { text }, hasFollowUpTask: false
+  }).ok, true);
+}
+for (const text of [
+  "Eine eigenständige neue Folgeaufgabe erforderlich.",
+  "Keine eigenständige neue Folgeaufgabe bereits angelegt.",
+  "Keine eigenständige neue Folgeaufgabe möglicherweise erforderlich.",
+  "Keine eigenständige neue Folgeaufgabe nicht erforderlich.",
+  "Keine eigenständige neue Folgeaufgabe NICHT nötig."
+]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({
+    finalComment: { text }, hasFollowUpTask: false
+  }).ok, false);
+}
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: { text: legacyEventPulseText, html_text: '<body><a data-asana-gid="1108801330389276"/></body>' }
+}).blocked_without_follow_up_task, true);
+for (const coverage of [
+  "Die naechste Routine uebernimmt die weitere Bearbeitung.",
+  "Die nächste Routine übernimmt die weitere Bearbeitung.",
+  "Die Routine stellt sicher, dass die Bearbeitung erfolgt.",
+  "Übernimmt die nächste Routine die Bearbeitung?"
+]) {
+  assert.equal(detectRoutineFollowUpSignals({
+    finalComment: { text: `${legacyEventPulseText} ${coverage}` }
+  }).blocked_without_follow_up_task, true);
+}
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: { text: `${legacyEventPulseText} Die Routine unübernimmt keine Arbeit.` }
+}).has_existing_task_coverage_claim, false);
+assert.equal(validateRoutineMaterialCorrection({
+  priorStory: { gid: "1218491009441385", text: legacyEventPulseText },
+  correction: {
+    reason: "Der bereits sichtbare Abschlussstatus soll lediglich präzisiert werden.",
+    before: legacyEventPulseText,
+    after: "Keine weitere Folgeaufgabe oder Nacharbeit nötig",
+    source: "Erneuter schreibfreier Event-Pulse-Readback 2026-09-16"
+  },
+  proposedText: "Keine weitere Folgeaufgabe oder Nacharbeit nötig"
+}).issues.includes("correction_restates_no_follow_up"), true);
+
 assert.deepEqual(
   validateRoutineVisibleFollowUpStatus({
     finalComment: { text: "Evidenz / Verifikation\nAlle Readbacks sind gruen." },
