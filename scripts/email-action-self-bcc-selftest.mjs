@@ -1,6 +1,11 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { readFileSync } from "node:fs";
+import axios from "axios";
+import {
+  RESEND_API_KEY_ENV_BY_DOMAIN,
+  RESEND_DOMAIN_READ_API_KEY_ENV_BY_DOMAIN
+} from "../lib/resend-domain-preflight.js";
 
 const port = process.env.EMAIL_ACTION_SELF_BCC_TEST_PORT || "3009";
 process.env.PORT = port;
@@ -43,6 +48,34 @@ try {
     arguments: { agent_id: "vip-ai-communication" }
   }));
   const source = readFileSync(new URL("../server.js", import.meta.url), "utf8");
+  const preflightSource = readFileSync(new URL("../lib/resend-domain-preflight.js", import.meta.url), "utf8");
+  const domainPreflights = [];
+  const originalGet = axios.get;
+  const testEnvNames = [
+    ...Object.values(RESEND_API_KEY_ENV_BY_DOMAIN),
+    ...Object.values(RESEND_DOMAIN_READ_API_KEY_ENV_BY_DOMAIN)
+  ];
+  const originalEnv = new Map(testEnvNames.map((name) => [name, process.env[name]]));
+  try {
+    for (const name of Object.values(RESEND_API_KEY_ENV_BY_DOMAIN)) process.env[name] = "fake-send-only-test-key";
+    for (const name of Object.values(RESEND_DOMAIN_READ_API_KEY_ENV_BY_DOMAIN)) delete process.env[name];
+    axios.get = async (url) => {
+      if (url !== "https://api.resend.com/domains") throw new Error("Unexpected external read in test");
+      throw { response: { status: 401, data: { message: "This API key is restricted to only send emails" } } };
+    };
+    for (const domain of Object.keys(RESEND_API_KEY_ENV_BY_DOMAIN)) {
+      domainPreflights.push(parse(await client.callTool({
+        name: "email_action_resend_domain_status",
+        arguments: { agent_id: "vip-ai-communication", domain }
+      })));
+    }
+  } finally {
+    axios.get = originalGet;
+    for (const [name, value] of originalEnv) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
   const contactActions = (actions.actions || []).filter((action) =>
     ["rs-contact-de", "rs-contact-en"].includes(action.id)
   );
@@ -65,6 +98,12 @@ try {
       resendDomainStatusTool?.inputSchema?.properties?.agent_id?.enum?.includes(
         "vip-ai-operations"
       ) === true,
+    all_three_send_only_domains_pass_mcp_preflight_without_false_verification:
+      domainPreflights.length === 3 && domainPreflights.every((result) =>
+        result.policy_version === "resend-send-only-preflight-v1" &&
+        result.ready_for_live_send === true && result.domain_read_required === false &&
+        result.domain_registered === null && result.domain_verification_confirmed === false &&
+        result.send_confirmation_required === true && result.error === null && Boolean(result.warning)),
     template_style_tool_present: names.has("email_action_template_style_readback"),
     draft_template_test_send_tool_present: names.has("email_action_send_test_from_draft_template"),
     adaptive_context_tool_present: names.has("email_action_agent_context"),
@@ -95,7 +134,7 @@ try {
       accountById.get("vip-moritz")?.required_env_names?.password_one_of?.includes(
         "SMTP_PASSWORD_EMAIL_AUTOMATION_VIP_MORITZ"
       ) &&
-      source.includes('"vip-studios.de": "RESEND_API_KEY_VIP_STUDIOS_DE"'),
+      preflightSource.includes('"vip-studios.de": "RESEND_API_KEY_VIP_STUDIOS_DE"'),
     two_contact_language_actions_registered:
       contactActions.length === 2 &&
       new Set(contactActions.map((action) => action.inbound_language)).size === 2,
@@ -180,18 +219,22 @@ try {
       source.includes('type: "resend_http_mime_equivalent"'),
     resend_domain_status_is_read_only_and_secret_safe:
       source.includes("async function readResendDomainStatus") &&
-      source.includes('axios.get("https://api.resend.com/domains"') &&
-      source.includes("api_key_env_name: apiKeyEnvName || null") &&
-      source.includes("ready_for_live_send"),
-    resend_domain_read_credential_is_separate_from_send_key:
-      accountById.get("rs-contact")?.required_env_names?.resend_domain_read_api_key ===
+      source.includes("readResendDomainPreflight(domain") &&
+      preflightSource.includes('get("https://api.resend.com/domains"') &&
+      preflightSource.includes("api_key_env_name: apiKeyEnvName || null") &&
+      preflightSource.includes("ready_for_live_send") &&
+      preflightSource.includes('message.replaceAll(secret, "[REDACTED]")'),
+    resend_domain_read_credential_is_optional_and_separate_from_send_key:
+      accountById.get("rs-contact")?.optional_env_names?.resend_domain_read_api_key ===
         "RESEND_DOMAIN_READ_API_KEY_REISE_STORIES_DE" &&
-      accountById.get("vip-moritz")?.required_env_names?.resend_domain_read_api_key ===
+      accountById.get("vip-moritz")?.optional_env_names?.resend_domain_read_api_key ===
         "RESEND_DOMAIN_READ_API_KEY_VIP_STUDIOS_DE" &&
-      source.includes("RESEND_DOMAIN_READ_API_KEY_ENV_BY_DOMAIN") &&
-      source.includes("domain_read_api_key_env_name: domainReadApiKeyEnvName || null") &&
-      source.includes('credential_scope: credentialScope') &&
-      source.includes('credentialScope === "send_key_fallback"'),
+      accountById.get("goklever-support")?.optional_env_names?.resend_domain_read_api_key ===
+        "RESEND_DOMAIN_READ_API_KEY_GOKLEVER_DE" &&
+      (accounts.accounts || []).every((account) =>
+        account.resend_domain_read_required === false &&
+        account.resend_preflight_policy_version === "resend-send-only-preflight-v1" &&
+        !Object.hasOwn(account.required_env_names, "resend_domain_read_api_key")),
     registered_templates_are_fetched_by_uid:
       Boolean(templateReadbackTool) &&
       source.includes("registeredEmailActionTemplateUidsForMailbox") &&
@@ -286,7 +329,7 @@ try {
       source.includes("deutsche Antwort enthaelt ae/oe/ue-Ersatzschreibweisen") &&
       source.includes('if (language === "de") assertGermanEmailOrthography(replyBody, action.id)')
   };
-  console.log(JSON.stringify(report));
+  await new Promise((resolve) => process.stdout.write(`${JSON.stringify(report)}\n`, resolve));
   process.exit(Object.values(report).every(Boolean) ? 0 : 1);
 } finally {
   await client.close().catch(() => {});

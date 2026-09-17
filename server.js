@@ -64,6 +64,12 @@ import {
   composeHtmlWithSignature,
   stripTrailingIdentityFromText
 } from "./lib/email-signature-template.js";
+import {
+  RESEND_API_KEY_ENV_BY_DOMAIN,
+  RESEND_DOMAIN_READ_API_KEY_ENV_BY_DOMAIN,
+  RESEND_PREFLIGHT_POLICY_VERSION,
+  readResendDomainPreflight
+} from "./lib/resend-domain-preflight.js";
 import { assertMcpImportAllowedByTaskNotes } from "./lib/wp-import-path-guard.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -6541,17 +6547,6 @@ function normalizeEmailHttpProvider(value) {
   throw new Error(`Unbekannter EMAIL_HTTP_PROVIDER: ${provider}. Erlaubt: resend, brevo.`);
 }
 
-const RESEND_API_KEY_ENV_BY_DOMAIN = Object.freeze({
-  "reise-stories.de": "RESEND_API_KEY_REISE_STORIES_DE",
-  "vip-studios.de": "RESEND_API_KEY_VIP_STUDIOS_DE",
-  "goklever.de": "RESEND_API_KEY_GOKLEVER_DE"
-});
-const RESEND_DOMAIN_READ_API_KEY_ENV_BY_DOMAIN = Object.freeze({
-  "reise-stories.de": "RESEND_DOMAIN_READ_API_KEY_REISE_STORIES_DE",
-  "vip-studios.de": "RESEND_DOMAIN_READ_API_KEY_VIP_STUDIOS_DE",
-  "goklever.de": "RESEND_DOMAIN_READ_API_KEY_GOKLEVER_DE"
-});
-
 function emailDomainFromAddress(address) {
   return extractEmailAddress(address).split("@")[1] || "";
 }
@@ -6565,94 +6560,11 @@ function resendDomainReadApiKeyEnvName(domain) {
 }
 
 async function readResendDomainStatus(domain) {
-  const normalizedDomain = String(domain || "").trim().toLowerCase();
-  const sendApiKeyEnvName = RESEND_API_KEY_ENV_BY_DOMAIN[normalizedDomain] || "";
-  const domainReadApiKeyEnvName = resendDomainReadApiKeyEnvName(normalizedDomain);
-  const domainReadApiKey = domainReadApiKeyEnvName
-    ? process.env[domainReadApiKeyEnvName]
-    : "";
-  const sendApiKey = sendApiKeyEnvName ? process.env[sendApiKeyEnvName] : "";
-  const apiKeyEnvName = domainReadApiKey ? domainReadApiKeyEnvName : sendApiKeyEnvName;
-  const apiKey = domainReadApiKey || sendApiKey;
-  const credentialScope = domainReadApiKey
-    ? "domain_read"
-    : sendApiKey
-      ? "send_key_fallback"
-      : null;
-  const base = {
-    provider: "resend",
-    domain: normalizedDomain,
-    api_key_env_name: apiKeyEnvName || null,
-    api_key_configured: Boolean(apiKey),
-    credential_scope: credentialScope,
-    send_api_key_env_name: sendApiKeyEnvName || null,
-    send_api_key_configured: Boolean(sendApiKey),
-    domain_read_api_key_env_name: domainReadApiKeyEnvName || null,
-    domain_read_api_key_configured: Boolean(domainReadApiKey),
-    provider_readback_attempted: false,
-    provider_http_status: null,
-    domain_registered: false,
-    domain_status: null,
-    region: null,
-    capabilities: null,
-    ready_for_live_send: false,
-    error: null
-  };
-
-  if (!apiKey) {
-    return {
-      ...base,
-      error:
-        "Weder der getrennte Resend-Domain-Read-Key noch der domain-spezifische Send-Key ist im MCP-Environment konfiguriert."
-    };
-  }
-
-  try {
-    const response = await axios.get("https://api.resend.com/domains", {
-      timeout: EMAIL_HTTP_TIMEOUT_MS,
-      params: { limit: 100 },
-      headers: { Authorization: `Bearer ${apiKey}` }
-    });
-    const domains = Array.isArray(response?.data?.data) ? response.data.data : [];
-    const match = domains.find(
-      (item) => String(item?.name || "").trim().toLowerCase() === normalizedDomain
-    );
-    const status = String(match?.status || "").trim().toLowerCase() || null;
-    const capabilities = match?.capabilities && typeof match.capabilities === "object"
-      ? {
-          sending: match.capabilities.sending || null,
-          receiving: match.capabilities.receiving || null
-        }
-      : null;
-    return {
-      ...base,
-      provider_readback_attempted: true,
-      provider_http_status: response.status,
-      domain_registered: Boolean(match),
-      domain_status: status,
-      region: match?.region || null,
-      capabilities,
-      ready_for_live_send:
-        Boolean(match) &&
-        status === "verified" &&
-        (!capabilities || capabilities.sending !== "disabled")
-    };
-  } catch (caught) {
-    const status = Number(caught?.response?.status || 0) || null;
-    const providerMessage = caught?.response?.data?.message || caught?.response?.data?.error;
-    return {
-      ...base,
-      provider_readback_attempted: true,
-      provider_http_status: status,
-      remediation:
-        status === 401 && credentialScope === "send_key_fallback"
-          ? `Der Send-Key darf GET /domains nicht lesen. ${domainReadApiKeyEnvName} mit einer getrennten read-only Domain-Credential konfigurieren; den Send-Key unveraendert lassen.`
-          : null,
-      error: `Resend-Domain-Readback fehlgeschlagen${status ? ` (HTTP ${status})` : ""}: ${String(
-        providerMessage || caught?.message || "Unbekannter Fehler"
-      ).slice(0, 500)}`
-    };
-  }
+  return readResendDomainPreflight(domain, {
+    env: process.env,
+    get: (url, config) => axios.get(url, config),
+    timeoutMs: EMAIL_HTTP_TIMEOUT_MS
+  });
 }
 
 function getResendApiKeyDetails({ fromAddress, suffix, genericApiKey }) {
@@ -20412,13 +20324,17 @@ function createServer() {
               secure_optional: `SMTP_SECURE_${account.env_suffix}`,
               user_optional: `SMTP_USER_${account.env_suffix}`,
               resend_api_key: resendApiKeyEnvNameForAddress(account.address) || null,
-              resend_domain_read_api_key:
-                resendDomainReadApiKeyEnvName(emailDomainFromAddress(account.address)) || null,
               password_one_of: [
                 `SMTP_PASSWORD_${account.env_suffix}`,
                 `EMAIL_PASSWORD_${account.env_suffix}`
               ]
             },
+            optional_env_names: {
+              resend_domain_read_api_key:
+                resendDomainReadApiKeyEnvName(emailDomainFromAddress(account.address)) || null
+            },
+            resend_domain_read_required: false,
+            resend_preflight_policy_version: RESEND_PREFLIGHT_POLICY_VERSION,
             mandatory_self_bcc: account.address,
             signature_template: account.signature_template
               ? {
@@ -20441,7 +20357,7 @@ function createServer() {
 
   server.tool(
     "email_action_resend_domain_status",
-    "Prueft den aktuellen Resend-Providerstatus einer registrierten Versanddomain read-only ueber GET /domains. Gibt nur Domainstatus, Region, Capabilities und Env-Variablennamen aus, niemals API-Key-Werte.",
+    "Prueft den Resend-Versand-Preflight einer erlaubten Domain und liest GET /domains als optionale Diagnose. Ein Send-only-Key braucht keine Domain-Leserechte. ready_for_live_send bedeutet nur Provider-Preflight, nicht Domainbestaetigung, Aktionsfreigabe oder Versandbestaetigung. Gibt keine API-Key-Werte aus.",
     {
       agent_id: z.enum(EMAIL_ACTION_READ_AGENT_IDS).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
       domain: z

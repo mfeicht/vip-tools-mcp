@@ -18,6 +18,7 @@
     "test:email-action-pagination": "node scripts/email-action-pagination-selftest.mjs",
     "test:email-action-answered-ancestor": "node scripts/email-action-answered-ancestor-selftest.mjs",
     "test:email-action-self-bcc": "node scripts/email-action-self-bcc-selftest.mjs",
+    "test:resend-domain-preflight": "node scripts/resend-domain-preflight-selftest.mjs",
     "test:email-signature-template": "node scripts/email-signature-template-selftest.mjs",
     "test:attachment-visual-contract": "node scripts/attachment-visual-contract-selftest.mjs",
     "test:accounting-ocr-contract": "node scripts/accounting-ocr-contract-selftest.mjs",
