@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import net from "node:net";
+import { createImapTlsTestServer } from "./imap-tls-test-fixture.mjs";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -19,6 +19,7 @@ const subject10 = "Bereits verarbeitete Nachricht";
 let source10Present = true;
 let trash10Present = false;
 let moveCount = 0;
+let loginCount = 0;
 const sockets = new Set();
 
 function header({ subject, messageId, day }) {
@@ -39,7 +40,7 @@ function writeHeaderFetch(socket, tag, uid, value, { withSnippet = false } = {})
   );
 }
 
-const fakeImap = net.createServer((socket) => {
+const { server: fakeImap } = await createImapTlsTestServer((socket) => {
   sockets.add(socket);
   socket.once("close", () => sockets.delete(socket));
   socket.setEncoding("utf8");
@@ -57,6 +58,7 @@ const fakeImap = net.createServer((socket) => {
       if (!match) continue;
       const [, tag, command] = match;
       if (/^LOGIN\b/i.test(command)) {
+        loginCount += 1;
         socket.write(`${tag} OK LOGIN completed\r\n`);
       } else if (/^LIST\b/i.test(command)) {
         socket.write(
@@ -109,7 +111,7 @@ const mcpPort = process.env.EMAIL_LIFECYCLE_TEST_PORT || "3020";
 process.env.PORT = mcpPort;
 process.env.IMAP_HOST_VIP_AI_MARKETING = "127.0.0.1";
 process.env.IMAP_PORT_VIP_AI_MARKETING = String(imapPort);
-process.env.IMAP_SECURE_VIP_AI_MARKETING = "false";
+process.env.IMAP_SECURE_VIP_AI_MARKETING = "true";
 process.env.IMAP_USER_VIP_AI_MARKETING = "marketing-agent@vip-studios.de";
 process.env.IMAP_PASSWORD_VIP_AI_MARKETING = "test-only";
 
@@ -137,6 +139,24 @@ try {
   const tools = await client.listTools();
   assert.equal(tools.tools.some((tool) => tool.name === "agent_email_list_cleanup_candidates"), true);
   assert.equal(tools.tools.some((tool) => tool.name === "agent_email_trash_processed"), true);
+
+  const configArguments = { agent_id: "vip-ai-marketing", check_smtp_auth: false };
+  const tlsConfig = parse(await client.callTool({ name: "agent_email_check_config", arguments: configArguments }));
+  assert.equal(tlsConfig.imap_transport_policy, "implicit-tls-required-v1");
+  assert.equal(tlsConfig.imap_certificate_validation_required, true);
+  assert.equal(tlsConfig.imap_plaintext_fallback_allowed, false);
+  assert.equal(tlsConfig.imap_ready_for_read, true);
+  process.env.IMAP_SECURE_VIP_AI_MARKETING = "false";
+  const blockedConfig = parse(await client.callTool({ name: "agent_email_check_config", arguments: configArguments }));
+  assert.equal(blockedConfig.imap_ready_for_read, false);
+  assert.deepEqual(blockedConfig.imap_candidates, []);
+  const blockedRead = await client.callTool({
+    name: "agent_email_read_unseen", arguments: { agent_id: "vip-ai-marketing", limit: 0 }
+  });
+  assert.equal(blockedRead.isError, true);
+  assert.match(blockedRead.content?.find((item) => item.type === "text")?.text || "", /IMAP_TLS_REQUIRED/);
+  assert.equal(loginCount, 0);
+  process.env.IMAP_SECURE_VIP_AI_MARKETING = "true";
 
   const firstPage = parse(await client.callTool({
     name: "agent_email_list_cleanup_candidates",

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import net from "node:net";
+import { createImapTlsTestServer } from "./imap-tls-test-fixture.mjs";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -38,7 +38,7 @@ function headerBlock(raw) {
 const imapCommands = [];
 const fullBodyUids = [];
 const imapSockets = new Set();
-const fakeImap = net.createServer((socket) => {
+const { server: fakeImap } = await createImapTlsTestServer((socket) => {
   imapSockets.add(socket);
   socket.once("close", () => imapSockets.delete(socket));
   socket.setEncoding("utf8");
@@ -99,7 +99,7 @@ const mcpPort = process.env.EMAIL_ACTION_PAGINATION_TEST_PORT || "3011";
 process.env.PORT = mcpPort;
 process.env.IMAP_HOST_VIP_AI_COMMUNICATION = "127.0.0.1";
 process.env.IMAP_PORT_VIP_AI_COMMUNICATION = String(imapPort);
-process.env.IMAP_SECURE_VIP_AI_COMMUNICATION = "false";
+process.env.IMAP_SECURE_VIP_AI_COMMUNICATION = "true";
 process.env.IMAP_USER_VIP_AI_COMMUNICATION = "communication-agent@vip-studios.de";
 process.env.IMAP_PASSWORD_VIP_AI_COMMUNICATION = "test-only";
 

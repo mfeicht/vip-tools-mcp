@@ -18,6 +18,11 @@ import {
   sortImapMessagesByUidWindow
 } from "./lib/imap-window.js";
 import {
+  IMAP_TRANSPORT_POLICY_VERSION,
+  buildImapTlsCandidates,
+  openImapTlsSocket
+} from "./lib/imap-transport-security.js";
+import {
   WEB_RESEARCH_INCLUDE_VALUES,
   WEB_RESEARCH_PURPOSE_VALUES,
   WEB_RESEARCH_RENDER_MODE_VALUES,
@@ -3797,11 +3802,14 @@ function getImapConfigDetails(agentId) {
       imap_port_source: rawPort ? "env" : "default",
       imap_secure: secure,
       imap_secure_source: rawSecure ? "env" : "default",
+      imap_transport_policy: IMAP_TRANSPORT_POLICY_VERSION,
+      imap_plaintext_fallback_allowed: false,
+      imap_certificate_validation_required: true,
       imap_user_configured: Boolean(configuredUser),
       imap_user: user,
       imap_password_configured: Boolean(password),
       imap_password_env_name: passwordEnvName || null,
-      imap_ready_for_read: Boolean(fromAddress && host && password)
+      imap_ready_for_read: Boolean(fromAddress && host && password && secure)
     }
   };
 }
@@ -3817,29 +3825,15 @@ function getImapConfigCandidates(agentId, { requireCredentials = true } = {}) {
     }
   }
 
-  const candidates = [{ ...config, label: "primary" }];
-  const hasExplicitPort = summary.imap_port_source === "env";
-  const isVipStudiosHost = /^vip-studios\.vip-studios\.de$/i.test(config.host || "");
-  if (!hasExplicitPort && isVipStudiosHost && config.port === 993) {
-    candidates.push({ ...config, port: 143, secure: false, label: "vip_studios_143_plain_fallback" });
-  }
-
-  const uniqueCandidates = [];
-  const seen = new Set();
-  for (const candidate of candidates) {
-    const key = `${candidate.host}:${candidate.port}:${candidate.secure}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    uniqueCandidates.push(candidate);
-  }
+  const candidates = buildImapTlsCandidates(config, { enforce: requireCredentials });
 
   return {
     suffix,
-    configs: uniqueCandidates,
+    configs: candidates,
     summary: {
       ...summary,
       imap_timeout_ms: IMAP_TIMEOUT_MS,
-      imap_candidates: uniqueCandidates.map(publicImapConfig)
+      imap_candidates: candidates.map(publicImapConfig)
     }
   };
 }
@@ -3871,39 +3865,7 @@ function cleanImapPreview(value, maxLength) {
 }
 
 async function openImapSocket(config) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const done = (error, socket) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) {
-        if (socket && !socket.destroyed) socket.destroy();
-        reject(error);
-      } else {
-        resolve(socket);
-      }
-    };
-
-    const timer = setTimeout(() => {
-      done(new Error(`IMAP connect timeout after ${IMAP_TIMEOUT_MS}ms (${config.host}:${config.port})`), socket);
-    }, IMAP_TIMEOUT_MS);
-
-    const socket = config.secure
-      ? tls.connect({
-          host: config.host,
-          port: config.port,
-          servername: config.host,
-          rejectUnauthorized: !parseBooleanEnv(process.env.IMAP_TLS_ALLOW_UNAUTHORIZED, false)
-        })
-      : net.connect({ host: config.host, port: config.port });
-
-    socket.once("secureConnect", () => done(null, socket));
-    socket.once("connect", () => {
-      if (!config.secure) done(null, socket);
-    });
-    socket.once("error", (error) => done(error, socket));
-  });
+  return openImapTlsSocket(config, { timeoutMs: IMAP_TIMEOUT_MS });
 }
 
 async function readImapUntil(socket, state, matcher, label) {
@@ -19986,7 +19948,7 @@ function createServer() {
 
   server.tool(
     "agent_email_check_config",
-    "Prueft die SMTP-Konfiguration eines Agenten ohne E-Mail-Versand. Optional wird nur die SMTP-Anmeldung getestet; es werden keine Empfaenger, kein MAIL FROM und kein DATA gesendet.",
+    "Prueft E-Mail-/IMAP-Konfiguration und verpflichtenden TLS-Transport ohne E-Mail-Versand. Optional wird nur die SMTP-Anmeldung getestet; es werden keine Empfaenger, kein MAIL FROM und kein DATA gesendet.",
     {
       agent_id: agentIdSchema,
       check_smtp_auth: z.boolean().optional().default(false)
@@ -19995,10 +19957,12 @@ function createServer() {
     async ({ agent_id, check_smtp_auth }) => {
       const { configs, summary } = getSmtpConfigCandidates(agent_id, { requireCredentials: check_smtp_auth });
       const { summary: httpSummary } = getEmailHttpConfigDetails(agent_id, { requireCredentials: false });
+      const { summary: imapSummary } = getImapConfigCandidates(agent_id, { requireCredentials: false });
       const smtpReady = summary.ready_for_send;
       const result = {
         ...summary,
         ...httpSummary,
+        ...imapSummary,
         smtp_ready_for_send: smtpReady,
         ready_for_send: httpSummary.email_http_provider_configured ? httpSummary.email_http_ready_for_send : smtpReady,
         active_email_transport: httpSummary.email_http_provider_configured
