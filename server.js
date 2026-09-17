@@ -9552,7 +9552,7 @@ export function renderEmailActionReplyBodyHtml(value) {
   flushParagraph();
   flushList();
 
-  return `<div>${blocks.join("<br>\n")}</div>`;
+  return `<div>${blocks.join("<br><br>\n")}</div>`;
 }
 
 function buildEmailActionAdaptiveReplyPlan({

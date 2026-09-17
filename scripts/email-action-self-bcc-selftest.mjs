@@ -350,6 +350,11 @@ try {
       adaptiveListHtml.includes("<li>Dauer: mindestens 1 Jahr</li>") &&
       adaptiveListHtml.includes("<li>A &amp; B</li>") &&
       !adaptiveListHtml.includes("- Preis:"),
+    adaptive_reply_sections_keep_a_visible_blank_line:
+      adaptiveListHtml.includes("Hallo<br><br>\n<ul>") &&
+      adaptiveListHtml.includes("</ul><br><br>\nJetzt buchen.") &&
+      serverModule.renderEmailActionReplyBodyHtml("Anrede\n\nEinleitung\n\nBuchung\n\nAbschluss") ===
+        "<div>Anrede<br><br>\nEinleitung<br><br>\nBuchung<br><br>\nAbschluss</div>",
     discount_floor_is_staged_and_source_gated:
       source.includes('requestType === "discount_negotiation"') &&
       source.includes("Rabatt-Endpreis unter 100 EUR ist gesperrt") &&
