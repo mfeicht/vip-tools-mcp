@@ -9691,7 +9691,7 @@ function encodeMimeBase64Body(value) {
     .trimEnd();
 }
 
-function buildEmailActionReviewProposalPlan({
+export function buildEmailActionReviewProposalPlan({
   action,
   sourceMessage,
   sendAccount,
@@ -9763,8 +9763,19 @@ function buildEmailActionReviewProposalPlan({
         trailingIdentityLines: signatureTemplate.binding.trailing_identity_lines
       })
     : null;
-  const finalHtml = signatureComposition?.html || html;
-  const finalText = signatureComposition?.text || visibleProposalBody;
+  if (action.include_quoted_original && !signatureComposition) {
+    throw new Error(`Action ${action.id}: sichtbarer Originalverlauf braucht eine registrierte Signaturkomposition.`);
+  }
+  const quotedComposition = action.include_quoted_original
+    ? appendEmailActionQuotedOriginal({
+        html: signatureComposition.html,
+        text: signatureComposition.text,
+        sourceMessage,
+        language: action.inbound_language
+      })
+    : null;
+  const finalHtml = quotedComposition?.html || signatureComposition?.html || html;
+  const finalText = quotedComposition?.text || signatureComposition?.text || visibleProposalBody;
   const finalAttachments = signatureComposition?.attachments || [];
   const rawHeaders = [
     `From: <${internalRecipient}>`,
@@ -9817,6 +9828,7 @@ function buildEmailActionReviewProposalPlan({
     reply_body_sha256: createHash("sha256").update(cleanReplyBody, "utf8").digest("hex"),
     proposal_html: finalHtml,
     proposal_attachments: finalAttachments,
+    quoted_original: quotedComposition?.quoted_original || null,
     signature_template: signatureComposition
       ? {
           uid: signatureComposition.signature_template_uid,
@@ -21133,6 +21145,7 @@ function createServer() {
           message_id_hash: template.parsed.message_id_hash || null
         },
         signature_template: plan.signature_template,
+        quoted_original: plan.quoted_original,
         proposal: {
           idempotency_id: plan.idempotency_id,
           from: plan.from,
@@ -21158,7 +21171,8 @@ function createServer() {
           external_recipient_in_envelope: plan.envelope_recipients.includes(plan.external_recipient),
           reply_to_matches_external_recipient: plan.reply_to === plan.external_recipient,
           bcc_visible_in_mime_headers: false,
-          uses_real_thread_headers: Boolean(plan.in_reply_to && plan.references)
+          uses_real_thread_headers: Boolean(plan.in_reply_to && plan.references),
+          visible_original_history_present: Boolean(plan.quoted_original)
         },
         imap: {
           ...summary,

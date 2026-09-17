@@ -86,7 +86,62 @@ try {
   const adaptiveListHtml = serverModule.renderEmailActionReplyBodyHtml(
     "Hallo\n\n- Preis: 365 EUR\n- Dauer: mindestens 1 Jahr\n- A & B\n\nJetzt buchen."
   );
+  const signatureRaw = [
+    "MIME-Version: 1.0", 'Content-Type: multipart/related; boundary="sig-related"', "",
+    "--sig-related", 'Content-Type: multipart/alternative; boundary="sig-alt"', "",
+    "--sig-alt", "Content-Type: text/plain; charset=utf-8", "", "TEXT\nSIGNATURE-FIXTURE",
+    "--sig-alt", "Content-Type: text/html; charset=utf-8", "",
+    '<html><body><div>TEXT</div><div>SIGNATURE-FIXTURE<img src="cid:signature-fixture"></div></body></html>',
+    "--sig-alt--", "--sig-related", "Content-Type: image/png", "Content-ID: <signature-fixture>",
+    'Content-Disposition: inline; filename="fixture.png"', "Content-Transfer-Encoding: base64", "", "aWNvbg==",
+    "--sig-related--"
+  ].join("\r\n");
+  const proposalSignature = {
+    binding: { body_marker: "TEXT", trailing_identity_lines: [] },
+    template: { uid: "23", raw: signatureRaw, raw_sha256: "fixture-signature-hash", parsed: {} }
+  };
+  const reviewPlans = ["de", "en"].flatMap((language) => ["plain", "html"].map((bodyType) => {
+    const raw = [
+      "From: Original <original@example.com>", "Reply-To: reply@example.com",
+      "Subject: Existing request", "Message-ID: <original@example.com>",
+      "References: <parent@example.com>", "Date: Thu, 17 Sep 2026 11:00:00 +0200", "MIME-Version: 1.0",
+      `Content-Type: text/${bodyType}; charset=utf-8`, "",
+      bodyType === "html"
+        ? '<p>ORIGINAL-FIXTURE &amp; context cid:untrusted</p><img src="https://tracker.example.com/image"><script>bad()</script>'
+        : "ORIGINAL-FIXTURE & context cid:untrusted"
+    ].join("\r\n");
+    return serverModule.buildEmailActionReviewProposalPlan({
+      action: { id: `fixture-${language}`, idempotency_scope: "fixture", mailbox: "INBOX.Fixture", inbound_language: language, include_quoted_original: true },
+      sourceMessage: { uid: "42", raw, raw_sha256: "fixture-source-hash", parsed: {} },
+      sendAccount: { from: "contact@reise-stories.de" }, signatureTemplate: proposalSignature,
+      proposalBody: "REPLY-FIXTURE\n\nBest regards"
+    });
+  }));
+  let missingReviewSignatureBlocked = false;
+  try {
+    serverModule.buildEmailActionReviewProposalPlan({
+      action: { id: "fixture", mailbox: "INBOX.Fixture", include_quoted_original: true },
+      sourceMessage: { uid: "42", raw: "From: original@example.com\r\nMessage-ID: <fixture@example.com>\r\n\r\nOriginal", parsed: {} },
+      sendAccount: { from: "contact@reise-stories.de" }, proposalBody: "Reply"
+    });
+  } catch (error) {
+    missingReviewSignatureBlocked = error.message.includes("registrierte Signaturkomposition");
+  }
   const report = {
+    review_original_history_follows_signature_in_html_and_text: reviewPlans.every((plan) =>
+      plan.quoted_original?.body_chars > 0 &&
+      plan.proposal_html.indexOf("REPLY-FIXTURE") < plan.proposal_html.indexOf("SIGNATURE-FIXTURE") &&
+      plan.proposal_html.indexOf("SIGNATURE-FIXTURE") < plan.proposal_html.indexOf("ORIGINAL-FIXTURE") &&
+      plan.proposal_body.indexOf("SIGNATURE-FIXTURE") < plan.proposal_body.indexOf("ORIGINAL-FIXTURE")),
+    review_original_history_preserves_internal_envelope_thread_and_signature: reviewPlans.every((plan) =>
+      plan.to === plan.from && plan.envelope_recipients.length === 1 && plan.reply_to === "reply@example.com" &&
+      plan.in_reply_to === "<original@example.com>" && plan.references.includes("<parent@example.com>") &&
+      plan.signature_template.sha256 === "fixture-signature-hash" && plan.signature_template.inline_resource_count === 1 &&
+      plan.proposal_attachments.length === 1 && plan.proposal_html.includes('src="cid:signature-fixture"')),
+    review_original_history_does_not_embed_untrusted_resources: reviewPlans.every((plan) =>
+      !plan.proposal_html.includes('<img src="https://tracker') && !plan.proposal_html.includes("<script>") &&
+      !plan.proposal_html.includes("cid:untrusted")),
+    review_original_history_requires_registered_signature: missingReviewSignatureBlocked,
     discovery_tool_present: names.has("email_action_discover_folders"),
     send_account_tool_present: names.has("email_action_list_send_accounts"),
     send_account_tool_allows_operations_readback:
