@@ -15,6 +15,7 @@
     "test:completion-handoff-guard": "node scripts/completion-handoff-guard-selftest.mjs",
     "test:imap-window": "node scripts/imap-window-selftest.mjs",
     "test:imap-transport-security": "node scripts/imap-transport-security-selftest.mjs",
+    "test:imap-response-reader": "node scripts/imap-response-reader-selftest.mjs",
     "test:email-lifecycle": "node scripts/email-lifecycle-selftest.mjs",
     "test:email-action-pagination": "node scripts/email-action-pagination-selftest.mjs",
     "test:email-action-answered-ancestor": "node scripts/email-action-answered-ancestor-selftest.mjs",

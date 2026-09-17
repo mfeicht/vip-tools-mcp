@@ -23,6 +23,12 @@ import {
   openImapTlsSocket
 } from "./lib/imap-transport-security.js";
 import {
+  IMAP_RESPONSE_POLICY_VERSION,
+  getImapResponseLimits,
+  imapResponseCommandLabel,
+  readImapResponseUntil
+} from "./lib/imap-response-reader.js";
+import {
   WEB_RESEARCH_INCLUDE_VALUES,
   WEB_RESEARCH_PURPOSE_VALUES,
   WEB_RESEARCH_RENDER_MODE_VALUES,
@@ -3803,6 +3809,8 @@ function getImapConfigDetails(agentId) {
       imap_secure: secure,
       imap_secure_source: rawSecure ? "env" : "default",
       imap_transport_policy: IMAP_TRANSPORT_POLICY_VERSION,
+      imap_response_policy: IMAP_RESPONSE_POLICY_VERSION,
+      imap_fetch_response_limits: getImapResponseLimits("UID FETCH", IMAP_TIMEOUT_MS),
       imap_plaintext_fallback_allowed: false,
       imap_certificate_validation_required: true,
       imap_user_configured: Boolean(configuredUser),
@@ -3869,37 +3877,7 @@ async function openImapSocket(config) {
 }
 
 async function readImapUntil(socket, state, matcher, label) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const cleanup = () => {
-      clearTimeout(timer);
-      socket.off("data", onData);
-      socket.off("error", onError);
-    };
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) reject(error);
-      else resolve(value);
-    };
-    const check = () => {
-      const match = matcher(state.buffer);
-      if (match) finish(null, match);
-    };
-    const onData = (chunk) => {
-      state.buffer += chunk;
-      check();
-    };
-    const onError = (error) => finish(error);
-    const timer = setTimeout(
-      () => finish(new Error(`IMAP response timeout after ${IMAP_TIMEOUT_MS}ms (${label})`)),
-      IMAP_TIMEOUT_MS
-    );
-    socket.on("data", onData);
-    socket.once("error", onError);
-    check();
-  });
+  return readImapResponseUntil(socket, state, matcher, label, getImapResponseLimits(label, IMAP_TIMEOUT_MS));
 }
 
 async function runImapReadUnseen(config, { limit, offset, order, includeSnippets, snippetChars }) {
@@ -3940,7 +3918,7 @@ async function runImapReadUnseen(config, { limit, offset, order, includeSnippets
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
@@ -4076,7 +4054,7 @@ async function runImapCleanupCandidateRead(config, {
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
@@ -5283,7 +5261,7 @@ async function runImapFetchUnseenRaw(config, {
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
@@ -5602,7 +5580,7 @@ async function runImapListMailboxes(config) {
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
@@ -5727,7 +5705,7 @@ async function runImapArchiveUid(config, {
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
@@ -8021,7 +7999,7 @@ async function runEmailActionAnsweredThreadAncestorCleanup(config, {
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
@@ -8289,7 +8267,7 @@ async function runImapActionFolderScan(config, {
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
@@ -9845,7 +9823,7 @@ async function runImapAddKeyword(config, { mailbox, uid, flag, expectedRawSha256
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
@@ -9951,7 +9929,7 @@ async function runImapMoveUidBetweenMailboxes(config, {
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
@@ -10138,7 +10116,7 @@ async function runImapTrashProcessedMessage(config, {
         state.buffer = buffer.slice(end);
         return value;
       },
-      payload.split(/\s+/, 1)[0]
+      imapResponseCommandLabel(payload)
     );
     if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
       throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 500)}`);
