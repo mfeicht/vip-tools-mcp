@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   detectRoutineFollowUpSignals,
   inspectRoutineMaterialCommentIdempotency,
@@ -218,6 +219,44 @@ assert.equal(
   false
 );
 
+// Actual closed-evidence Retail story and the Review reproductions must agree
+// across plain text and HTML. Separate evidence rows are not task coverage.
+const retailStory = JSON.parse(readFileSync(new URL("./fixtures/retail-completion-story-1218613928272290.json", import.meta.url), "utf8"));
+const evidenceRows = "Eigene faellige Routine\nQuellenversuche und Scope-Output vorhanden";
+for (const finalComment of [
+  retailStory,
+  { text: `Follow-up: keines erforderlich.\n${evidenceRows}` },
+  { html_text: "<body>Follow-up: keines erforderlich.<ul><li>Eigene faellige Routine</li><li>Quellenversuche und Scope-Output vorhanden</li></ul></body>" },
+  { text: `Follow-up: keines erforderlich.\n${evidenceRows}`, html_text: "<body>Follow-up: keines erforderlich.<ul><li>Eigene faellige Routine</li><li>Quellenversuche und Scope-Output vorhanden</li></ul></body>" }
+]) {
+  const signals = detectRoutineFollowUpSignals({ finalComment });
+  assert.equal(signals.no_follow_up_claim, true);
+  assert.equal(signals.has_existing_task_coverage_claim, false);
+  assert.equal(signals.blocked_without_follow_up_task, false);
+}
+for (const ending of ["", "e", "en", "er", "es", "em"]) {
+  for (const separator of ["-", " "]) {
+    assert.equal(detectRoutineFollowUpSignals({
+      finalComment: { text: `Task${separator}spezifisch${ending} Szenariodossiers und Quellenreadback vorhanden. Follow-up: keines erforderlich.` }
+    }).blocked_without_follow_up_task, false);
+  }
+}
+for (const html_text of [
+  "<body>Follow-up: keines erforderlich.<p>Eigene faellige Routine</p><p>Quellenversuche und Scope-Output vorhanden</p></body>",
+  "<body>Follow-up: keines erforderlich.<div>Eigene faellige Routine</div><div>Quellenversuche und Scope-Output vorhanden</div></body>",
+  "<body>Follow-up: keines erforderlich.<strong>Eigene faellige Routine</strong><br>Quellenversuche und Scope-Output vorhanden</body>"
+]) {
+  assert.equal(detectRoutineFollowUpSignals({ finalComment: { html_text } }).blocked_without_follow_up_task, false);
+}
+for (const html_text of [
+  "<body>Follow-up: keines erforderlich.<ul><li>Die bestehende <strong>Routine</strong> uebernimmt die Nacharbeit.</li></ul></body>",
+  "<body>Follow-up: keines erforderlich.<p>Die Routine &uuml;bernimmt die Nacharbeit.</p></body>",
+  "<body>Follow-up: keines erforderlich.<p>Der vorhandene Task ist eingeplant.</p></body>",
+  '<body>Follow-up: keines erforderlich.<a data-asana-gid="1108801330389276"/></body>'
+]) {
+  assert.equal(detectRoutineFollowUpSignals({ finalComment: { html_text } }).blocked_without_follow_up_task, true);
+}
+
 const coverageSignal = detectRoutineFollowUpSignals({
   finalComment: { text: "Die bestehende Routine deckt die Nacharbeit ab.", html_text: "" },
   completionBasis: "Die künftige Routine ist eingeplant.",
@@ -384,6 +423,21 @@ const validFollowUpContract = validateRoutineFollowUpTaskContract({
 assert.equal(validFollowUpContract.ok, true);
 assert.deepEqual(validFollowUpContract.issues, []);
 
+const workerC = JSON.parse(readFileSync(new URL("./fixtures/worker-c-followup-story-1218568446337764.json", import.meta.url), "utf8"));
+const workerCSource = { gid: "1218388727116488", memberships: workerC.followup.memberships };
+assert.equal(validateRoutineFollowUpTaskContract({ sourceTask: workerCSource, followUpTask: workerC.followup, finalComment: workerC.story }).ok, true);
+for (const dueText of ["20.09.2026", "20.9.2026", "2026-09-20"]) {
+  const finalComment = { text: `${workerC.followup.gid}; Assignee ${workerC.followup.assignee.gid}; Status Todo; faellig ${dueText}.` };
+  assert.equal(validateRoutineFollowUpTaskContract({ sourceTask: workerCSource, followUpTask: workerC.followup, finalComment }).ok, true);
+}
+for (const dueText of ["19.09.2026", "20.09.", "morgen", "120.09.2026", "20.09.20260", "31.02.2026"]) {
+  const finalComment = { text: `${workerC.followup.gid}; Assignee ${workerC.followup.assignee.gid}; Status Todo; faellig ${dueText}.` };
+  assert.equal(validateRoutineFollowUpTaskContract({ sourceTask: workerCSource, followUpTask: workerC.followup, finalComment }).issues.includes("final_comment_missing_follow_up_due_readback"), true);
+}
+assert.equal(validateRoutineFollowUpTaskContract({ sourceTask: workerCSource, followUpTask: { ...workerC.followup, due_on: "2026-03-03" }, finalComment: { ...workerC.story, text: workerC.story.text.replaceAll("20.09.2026", "31.02.2026"), html_text: "" } }).ok, false);
+assert.equal(validateRoutineFollowUpTaskContract({ sourceTask: workerCSource, followUpTask: { ...workerC.followup, completed: true }, finalComment: workerC.story }).ok, false);
+assert.equal(validateRoutineFollowUpTaskContract({ sourceTask: workerCSource, followUpTask: { ...workerC.followup, assignee: null }, finalComment: workerC.story }).ok, false);
+
 const missingReadbackContract = validateRoutineFollowUpTaskContract({
   sourceTask,
   followUpTask,
@@ -406,6 +460,7 @@ console.log(
     routine_material_comment_concurrency_guard: "ok",
     routine_material_status_signal_guard: "ok",
     routine_existing_task_coverage_detection: "ok",
+    retail_html_evidence_and_task_artifact_regressions: "ok",
     finance_no_follow_up_phrase_detection: "ok",
     routine_visible_follow_up_status: "ok",
     routine_follow_up_readback_contract: "ok"

@@ -1,0 +1,59 @@
+{
+  "story": {
+    "gid": "1218568446337764",
+    "created_at": "2026-09-17T07:45:39.130Z",
+    "created_by": {
+      "gid": "1215003777954631"
+    },
+    "html_text": "<body>Der definierte Quellenbewertungsumfang ist ausgeführt und zurückgelesen: zehn Quellen-/Kennzahlenbewertungen, Frische-/Qualitätsgrenzen und drei Umsetzungsvorschläge. evidence.unresolved=[].\n\nDer Makro-Quellenpilot ist als Folgeaufgabe 1218568782324253 gesichert. Link: <a href=\"https://app.asana.com/1/1108802683611047/project/1214338226145911/task/1218568782324253\" data-asana-gid=\"1218568782324253\" data-asana-accessible=\"true\" data-asana-type=\"task\" data-asana-dynamic=\"true\">OFR/NFCI/GSCPI/BIS: Makro-Quellenpilot validieren</a> Readback: VIP AI-Finance (1215003777954631), offen, Status Todo, fällig 20.09.2026. Andere Umsetzungsideen bleiben optional.\n\n<strong>Korrektur zur bisherigen Story</strong>\nErsetzt Story 1218568295393605. Sachlicher Grund: Das Abschluss-Gate verlangt konkrete Folgearbeit für die Umsetzungsvorschläge; die Folgearbeitsentscheidung wurde deshalb materiell geändert und ein begrenzter Pilot angelegt.\n\nBisheriger Claim: Keine neue Folgeaufgabe erforderlich\n\nKorrigierter Claim: Der Makro-Quellenpilot ist als Folgeaufgabe 1218568782324253 gesichert.\n\nQuelle/Readback fuer die Korrektur: <a href=\"https://app.asana.com/1/1108802683611047/project/1214338226145911/task/1218568782324253\" data-asana-gid=\"1218568782324253\" data-asana-accessible=\"true\" data-asana-type=\"task\" data-asana-dynamic=\"true\">OFR/NFCI/GSCPI/BIS: Makro-Quellenpilot validieren</a>\n\n<strong>Evidenz / Verifikation</strong>\nBewertungsscope ausgeführt und zurückgelesen; Folgeaufgabe mit Assignee, Status und Frist verifiziert.\n\n<ul><li>Quelle/Readback: <a href=\"https://app.asana.com/1/1108802683611047/project/1214338226145911/task/1218568782324253\" data-asana-gid=\"1218568782324253\" data-asana-accessible=\"true\" data-asana-type=\"task\" data-asana-dynamic=\"true\">OFR/NFCI/GSCPI/BIS: Makro-Quellenpilot validieren</a></li><li>Verifiziert: Bewertungsscope vollständig; Folgeaufgabe 1218568782324253 offen, Todo, VIP AI-Finance, 20.09.2026.</li></ul>\n</body>",
+    "text": "Der definierte Quellenbewertungsumfang ist ausgeführt und zurückgelesen: zehn Quellen-/Kennzahlenbewertungen, Frische-/Qualitätsgrenzen und drei Umsetzungsvorschläge. evidence.unresolved=[].\n\nDer Makro-Quellenpilot ist als Folgeaufgabe 1218568782324253 gesichert. Link: https://app.asana.com/1/1108802683611047/project/1214338226145911/task/1218568782324253 Readback: VIP AI-Finance (1215003777954631), offen, Status Todo, fällig 20.09.2026. Andere Umsetzungsideen bleiben optional.\n\nKorrektur zur bisherigen Story\nErsetzt Story 1218568295393605. Sachlicher Grund: Das Abschluss-Gate verlangt konkrete Folgearbeit für die Umsetzungsvorschläge; die Folgearbeitsentscheidung wurde deshalb materiell geändert und ein begrenzter Pilot angelegt.\n\nBisheriger Claim: Keine neue Folgeaufgabe erforderlich\n\nKorrigierter Claim: Der Makro-Quellenpilot ist als Folgeaufgabe 1218568782324253 gesichert.\n\nQuelle/Readback fuer die Korrektur: https://app.asana.com/1/1108802683611047/project/1214338226145911/task/1218568782324253\n\nEvidenz / Verifikation\nBewertungsscope ausgeführt und zurückgelesen; Folgeaufgabe mit Assignee, Status und Frist verifiziert.\n\n    Quelle/Readback: https://app.asana.com/1/1108802683611047/project/1214338226145911/task/1218568782324253\n    Verifiziert: Bewertungsscope vollständig; Folgeaufgabe 1218568782324253 offen, Todo, VIP AI-Finance, 20.09.2026.\n\n",
+    "target": {
+      "gid": "1218388727116488"
+    }
+  },
+  "followup": {
+    "gid": "1218568782324253",
+    "assignee": {
+      "gid": "1215003777954631",
+      "name": "VIP AI-Finance"
+    },
+    "completed": false,
+    "custom_fields": [
+      {
+        "gid": "1163311635969184",
+        "enum_value": {
+          "gid": "1163311635969186",
+          "name": "Mittel"
+        },
+        "name": "Priorität",
+        "display_value": "Mittel"
+      },
+      {
+        "gid": "1200527008079359",
+        "enum_value": {
+          "gid": "1200527008079360",
+          "name": "Todo"
+        },
+        "name": "Status",
+        "display_value": "Todo"
+      },
+      {
+        "gid": "1211661336218680",
+        "name": "Geplante Stunden",
+        "display_value": null
+      }
+    ],
+    "due_at": null,
+    "due_on": "2026-09-20",
+    "memberships": [
+      {
+        "project": {
+          "gid": "1214338226145911",
+          "name": "(VIP) AI-Büro"
+        }
+      }
+    ],
+    "name": "OFR/NFCI/GSCPI/BIS: Makro-Quellenpilot validieren",
+    "permalink_url": "https://app.asana.com/1/1108802683611047/project/1214338226145911/task/1218568782324253"
+  }
+}

@@ -11,6 +11,7 @@ import { existsSync, readdirSync, readFileSync } from "fs";
 import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
+import { assertLinkedGoogleDocScope, linkedGoogleDocReadback } from "./lib/google-docs-linked-reader.js";
 
 import {
   selectImapUidPage,
@@ -19194,6 +19195,45 @@ function createServer() {
         ...summary,
         token_check
       });
+    }
+  );
+
+  server.tool(
+    "google_docs_read_linked",
+    "Liest ausschliesslich ein in der aktuellen Asana-Aufgabenbeschreibung verlinktes Google Doc authentifiziert read-only. Explizite eigene agent_id und eigene Asana-Beteiligung sind Pflicht. Keine Cookie-, Secret-, Sharing- oder Schreibaktion. includeTabsContent=true, explizite Tab-Auswahl bei mehreren Tabs, begrenzter Body-Text mit SHA256 und frischem Dateimetadaten-Readback. Bilder, Header, Footer und Kommentare sind kein Teil des Textclaims.",
+    {
+      agent_id: z.enum(Object.keys(ASANA_TOKEN_ENVS)),
+      asana_task_gid: z.string().regex(/^\d+$/),
+      document_id: z.string().regex(/^[a-zA-Z0-9_-]{20,200}$/),
+      tab_id: z.string().min(1).max(200).optional(),
+      start_char: z.number().int().min(0).max(10000000).optional().default(0),
+      max_chars: z.number().int().min(1).max(50000).optional().default(20000),
+      dry_run: z.boolean().optional().default(false)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id, asana_task_gid, document_id, tab_id, start_char, max_chars, dry_run }) => {
+      const asana = getAsana(agent_id);
+      const me = await asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" });
+      const taskRes = await asanaRequestWithRetry(asana, {
+        method: "GET", url: `/tasks/${asana_task_gid}`,
+        params: { opt_fields: "gid,notes,assignee.gid,created_by.gid,followers.gid" }
+      });
+      assertLinkedGoogleDocScope({ task: taskRes.data.data, userGid: me.data.data.gid, documentId: document_id });
+      if (dry_run) return out({ agent_id, asana_task_gid, document_id, tab_id, dry_run: true, scope_verified: true, google_requests: 0 });
+      const googleContext = { agent_id };
+      const fields = "id,name,mimeType,trashed,modifiedTime,webViewLink";
+      const metadataRequest = { method: "GET", url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(document_id)}`, params: { fields, supportsAllDrives: true }, timeout: 30000 };
+      const before = (await googleRequest(metadataRequest, googleContext)).data;
+      if (before.mimeType !== GOOGLE_DOC_MIME_TYPE || before.trashed) throw new Error("Quelle ist kein aktives natives Google Doc.");
+      const docRes = await googleRequest({
+        method: "GET", url: `https://docs.googleapis.com/v1/documents/${encodeURIComponent(document_id)}`,
+        params: { includeTabsContent: true, suggestionsViewMode: "PREVIEW_WITHOUT_SUGGESTIONS" },
+        timeout: 30000, maxContentLength: 10 * 1024 * 1024
+      }, googleContext);
+      const readback = linkedGoogleDocReadback(docRes.data, { documentId: document_id, tabId: tab_id, startChar: start_char, maxChars: max_chars });
+      const after = (await googleRequest(metadataRequest, googleContext)).data;
+      if (!before.modifiedTime || after.modifiedTime !== before.modifiedTime || after.trashed || after.mimeType !== GOOGLE_DOC_MIME_TYPE) throw new Error("Google Doc hat sich waehrend des Reads geaendert; erneut read-only pruefen.");
+      return out({ agent_id, asana_task_gid, mode: "authenticated_linked_doc_readonly", checked_at: new Date().toISOString(), metadata: after, ...readback, suggestions_view: "PREVIEW_WITHOUT_SUGGESTIONS", verification_status: "verified" });
     }
   );
 
