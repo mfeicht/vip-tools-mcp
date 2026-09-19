@@ -62,6 +62,7 @@ import {
   classifyAsanaCommentAuthority,
   validateAsanaObserverCommentIntent
 } from "./lib/asana-observer-guard.js";
+import { inspectAsanaCommentReadability } from "./lib/asana-comment-readability.js";
 import {
   isRoutineInstanceMissingAlarmIntent,
   sameAsanaDateTimeInstant
@@ -13132,7 +13133,7 @@ function createServer() {
 
   server.tool(
     "asana_comment",
-    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene materielle Ergebnis-/Handoff-/Abschlusskommentar kanonisch; typische Ergebnis- oder Erfolgssprache bleibt auch bei comment_kind=status materiell. Eine echte Korrektur braucht supersedes_story_gid und correction mit konkretem Vorher-/Nachher-Claim, Grund und Quelle; das Tool macht den Story-Verweis sichtbar. Reine Umformulierungen duerfen nicht als Korrektur gepostet werden. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Der Readability-Check meldet verdaechtige sichtbare Wort-/Zahlverklebungen derzeit als report_only-Diagnose; URLs, E-Mail-Adressen, bekannte technische Tokens und code_blocks werden bewusst ausgenommen. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene materielle Ergebnis-/Handoff-/Abschlusskommentar kanonisch; typische Ergebnis- oder Erfolgssprache bleibt auch bei comment_kind=status materiell. Eine echte Korrektur braucht supersedes_story_gid und correction mit konkretem Vorher-/Nachher-Claim, Grund und Quelle; das Tool macht den Story-Verweis sichtbar. Reine Umformulierungen duerfen nicht als Korrektur gepostet werden. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -13230,6 +13231,12 @@ function createServer() {
         ]
       }] : [];
       const finalSections = [...sections, ...correctionSections, ...preparedEvidence.evidence_sections];
+      const readabilityGate = inspectAsanaCommentReadability({
+        greeting,
+        sections: finalSections,
+        mentionText: mention_text,
+        effortNote: effort_note
+      });
       if (dry_run && !mention_user_gid && !keep_routine_observer_subscription) {
         const html_text = buildAsanaCommentHtml({
           greeting,
@@ -13247,6 +13254,7 @@ function createServer() {
           evidence_gate_status: preparedEvidence.evidence_gate_status,
           evidence_required_by_content: preparedEvidence.evidence_required_by_content,
           evidence_sha256: preparedEvidence.evidence_sha256,
+          readability_gate: readabilityGate,
           routine_supervisor_mention_gate: {
             applicable: false,
             status: "not_applicable",
@@ -13457,6 +13465,7 @@ function createServer() {
           evidence_gate_status: preparedEvidence.evidence_gate_status,
           evidence_required_by_content: preparedEvidence.evidence_required_by_content,
           evidence_sha256: preparedEvidence.evidence_sha256,
+          readability_gate: readabilityGate,
           routine_supervisor_mention_gate,
           routine_observer_gate,
           observer_comment_gate,
@@ -13587,6 +13596,7 @@ function createServer() {
         evidence_gate_status: preparedEvidence.evidence_gate_status,
         evidence_required_by_content: preparedEvidence.evidence_required_by_content,
         evidence_sha256: preparedEvidence.evidence_sha256,
+        readability_gate: readabilityGate,
         routine_supervisor_mention_gate,
         routine_observer_gate,
         observer_comment_gate,

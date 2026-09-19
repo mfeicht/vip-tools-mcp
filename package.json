@@ -12,6 +12,7 @@
     "test:asana-governance-gates": "node scripts/asana-governance-gate-selftest.mjs",
     "test:asana-routine-intent": "node scripts/asana-routine-intent-selftest.mjs",
     "test:asana-observer-comment-guard": "node scripts/asana-observer-comment-guard-selftest.mjs",
+    "test:asana-comment-readability": "node scripts/asana-comment-readability-selftest.mjs",
     "test:completion-handoff-guard": "node scripts/completion-handoff-guard-selftest.mjs",
     "test:imap-window": "node scripts/imap-window-selftest.mjs",
     "test:imap-transport-security": "node scripts/imap-transport-security-selftest.mjs",

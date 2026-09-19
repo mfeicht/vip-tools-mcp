@@ -117,7 +117,16 @@ try {
     dry_run: true
   });
 
+  const gluedReadability = await call({
+    agent_id: "vip-ai-content",
+    task_gid: "1234567890",
+    comment_kind: "question",
+    greeting: "Bitte Toolliste114 und Tagespreisstand18.09.2026 pruefen.",
+    dry_run: true
+  });
+
   const validText = text(valid);
+  const gluedReadabilityText = text(gluedReadability);
   const report = {
     completion_guard_schema_visible: Boolean(
       asanaCommentTool?.inputSchema?.properties?.supersedes_story_gid &&
@@ -133,7 +142,12 @@ try {
     unresolved_completion_blocked: Boolean(unresolved.isError),
     correction_without_delta_blocked: Boolean(correctionWithoutDelta.isError),
     correction_story_reference_visible: !correctionMarkup.isError &&
-      text(correctionMarkup).includes("Ersetzt Story 1234567891")
+      text(correctionMarkup).includes("Ersetzt Story 1234567891"),
+    readable_control_reports_ok: /"readability_gate"[\s\S]*"status"\s*:\s*"ok"/.test(validText),
+    glued_prose_reports_warning: !gluedReadability.isError &&
+      /"status"\s*:\s*"warning_suspicious_alphanumeric_boundaries"/.test(gluedReadabilityText) &&
+      gluedReadabilityText.includes("Toolliste114") &&
+      gluedReadabilityText.includes("Tagespreisstand18.09.2026")
   };
 
   console.log(JSON.stringify(report));
