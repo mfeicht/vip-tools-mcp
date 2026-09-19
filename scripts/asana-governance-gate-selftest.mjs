@@ -16,6 +16,10 @@ const checks = {
     source.includes("asana_create_task_observer_gate") &&
     source.includes("authorization_story_mentions_agent") &&
     source.includes("Beobachter-Gate: Der Agent ist in der Ausgangsaufgabe weder Assignee noch Creator"),
+  nonroutine_supervisor_follower_cannot_be_disabled:
+    source.includes("nonroutine_supervisor_follower_enforced") &&
+    source.includes("supervisor_follower_disable_override_ignored") &&
+    source.includes("Neue Nicht-Routine-Aufgaben erhalten immer den verantwortlichen Supervisor als Follower"),
   observer_comment_gate:
     source.includes("asana_comment_observer_gate") &&
     source.includes("observer_comment_reason") &&

@@ -39,6 +39,9 @@ try {
   const templateReadbackTool = (toolList.tools || []).find(
     (tool) => tool.name === "email_action_template_readback"
   );
+  const templateStyleReadbackTool = (toolList.tools || []).find(
+    (tool) => tool.name === "email_action_template_style_readback"
+  );
   const accounts = parse(await client.callTool({
     name: "email_action_list_send_accounts",
     arguments: { agent_id: "vip-ai-communication" }
@@ -160,6 +163,13 @@ try {
         result.domain_registered === null && result.domain_verification_confirmed === false &&
         result.send_confirmation_required === true && result.error === null && Boolean(result.warning)),
     template_style_tool_present: names.has("email_action_template_style_readback"),
+    signature_readback_tool_present: names.has("email_action_signature_readback"),
+    operations_readback_is_rs_contact_scoped:
+      templateReadbackTool?.inputSchema?.properties?.agent_id?.enum?.includes("vip-ai-operations") === true &&
+      templateStyleReadbackTool?.inputSchema?.properties?.agent_id?.enum?.includes("vip-ai-operations") === true &&
+      shadowRunTool?.inputSchema?.properties?.agent_id?.enum?.includes("vip-ai-operations") === true &&
+      source.includes("EMAIL_ACTION_OPERATIONS_READ_ACTION_IDS") &&
+      source.includes("delegated_read_only"),
     draft_template_test_send_tool_present: names.has("email_action_send_test_from_draft_template"),
     adaptive_context_tool_present: names.has("email_action_agent_context"),
     internal_review_proposal_tool_present: names.has("email_action_send_review_proposal"),
@@ -332,6 +342,7 @@ try {
       source.includes("buildDraftTemplateResendPayload"),
     routine_signature_composition_is_readback_gated:
       source.includes("resolveEmailActionSignatureTemplate") &&
+      source.includes("fehlgeschlagen: ${failedChecks.join") &&
       source.includes("composeEmailActionContentWithSignature") &&
       source.includes("signatureTemplate.binding.trailing_identity_lines") &&
       source.includes("signature_template: plan.signature_template"),

@@ -323,6 +323,12 @@ const EMAIL_ACTION_READ_AGENT_IDS = Object.freeze([
   EMAIL_ACTION_CONTROL_AGENT_ID,
   "vip-ai-operations"
 ]);
+const EMAIL_ACTION_OPERATIONS_AGENT_ID = "vip-ai-operations";
+const EMAIL_ACTION_OPERATIONS_READ_ACTION_IDS = Object.freeze([
+  "rs-contact-de",
+  "rs-contact-en",
+  "rs-signatur-de-en"
+]);
 const EMAIL_ACTION_MAX_EMAIL_BYTES = Number(process.env.EMAIL_ACTION_MAX_EMAIL_BYTES || 4 * 1024 * 1024);
 const EMAIL_ACTION_MAX_SCAN_MESSAGES = Number(process.env.EMAIL_ACTION_MAX_SCAN_MESSAGES || 100);
 const EMAIL_ACTION_QUEUE_PAGE_SIZE = Math.min(
@@ -7684,6 +7690,33 @@ function getEmailActionDefinition(actionId) {
   return { config, action };
 }
 
+function getEmailActionReadImapContext(agentId, actionId) {
+  if (!EMAIL_ACTION_READ_AGENT_IDS.includes(agentId)) {
+    throw new Error(`E-Mail-Action-Readback ist fuer agent_id ${agentId} nicht freigegeben.`);
+  }
+  const normalizedActionId = normalizeActionSlug(actionId);
+  if (
+    agentId === EMAIL_ACTION_OPERATIONS_AGENT_ID &&
+    !EMAIL_ACTION_OPERATIONS_READ_ACTION_IDS.includes(normalizedActionId)
+  ) {
+    throw new Error(
+      `Operations-Readback ist auf ${EMAIL_ACTION_OPERATIONS_READ_ACTION_IDS.join(", ")} begrenzt.`
+    );
+  }
+  const context = getImapConfigCandidates(EMAIL_ACTION_CONTROL_AGENT_ID, {
+    requireCredentials: true
+  });
+  return {
+    ...context,
+    summary: {
+      ...context.summary,
+      agent_id: agentId,
+      mailbox_owner_agent_id: EMAIL_ACTION_CONTROL_AGENT_ID,
+      delegated_read_only: agentId !== EMAIL_ACTION_CONTROL_AGENT_ID
+    }
+  };
+}
+
 function registeredEmailActionTemplateUidsForMailbox(mailbox) {
   const normalizedMailbox = String(mailbox || "").trim().toLowerCase();
   if (!normalizedMailbox) return [];
@@ -8530,9 +8563,12 @@ function resolveEmailActionSignatureTemplate(sendAccount, scan) {
     from: template.template_subject?.from === sendAccount.from,
     draft: hasImapFlag(template.flags, "\\Draft")
   };
-  if (!Object.values(checks).every(Boolean)) {
+  const failedChecks = Object.entries(checks)
+    .filter(([, ok]) => !ok)
+    .map(([name]) => name);
+  if (failedChecks.length) {
     throw new Error(
-      `Signaturvorlage ${binding.action_id}: registrierter UID-/Message-ID-/SHA256-/FROM-/Draft-Readback stimmt nicht.`
+      `Signaturvorlage ${binding.action_id}: registrierter UID-/Message-ID-/SHA256-/FROM-/Draft-Readback stimmt nicht; fehlgeschlagen: ${failedChecks.join(", ")}.`
     );
   }
   const probe = buildDraftTemplateResendPayload({
@@ -12680,7 +12716,7 @@ function createServer() {
 
   server.tool(
     "asana_create_task",
-    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Routine-Tag bei Routine-Erkennung und bei Follow-ups einen Link zur Ausgangsaufgabe. Eine blosse Follower-/Beobachterrolle in der Ausgangsaufgabe berechtigt nicht zur Aufgabenanlage; noetig sind Assignee-/Creator-Rolle, eine echte Asana-Mention, eine direkte Moritz-Anweisung oder der eng dokumentierte Governance-Auftrag von Operations/Memory/Monitoring/Review. Bei Routinen wird Moritz nie ueber einen Bool-Override automatisch hinzugefuegt; eine konkrete Problem-Mention ist der einzige Reaktivierungspfad.",
+    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Routine-Tag bei Routine-Erkennung und bei Follow-ups einen Link zur Ausgangsaufgabe. Neue Nicht-Routine-Aufgaben erhalten immer den verantwortlichen Supervisor als Follower; ensure_supervisor_follower=false kann dieses Gate nicht abschalten. Eine blosse Follower-/Beobachterrolle in der Ausgangsaufgabe berechtigt nicht zur Aufgabenanlage; noetig sind Assignee-/Creator-Rolle, eine echte Asana-Mention, eine direkte Moritz-Anweisung oder der eng dokumentierte Governance-Auftrag von Operations/Memory/Monitoring/Review. Bei Routinen wird Moritz nie ueber einen Bool-Override automatisch hinzugefuegt; eine konkrete Problem-Mention ist der einzige Reaktivierungspfad.",
     {
       agent_id: agentIdSchema,
       name: z.string().min(12).max(200),
@@ -12735,7 +12771,7 @@ function createServer() {
       validateAsanaGid(source_task_gid, "source_task_gid");
       validateAsanaDate(due_on, "due_on");
       const finalSupervisorFollowerGid = supervisor_follower_gid || ASANA_DEFAULT_SUPERVISOR_GID;
-      if (ensure_supervisor_follower) validateAsanaGid(finalSupervisorFollowerGid, "supervisor_follower_gid");
+      validateAsanaGid(finalSupervisorFollowerGid, "supervisor_follower_gid");
       ensureNoUnsafeAsanaText(name, "Asana-Aufgabentitel");
       ensureNoUnsafeAsanaText(creation_basis, "Asana-Aufgabenanlage-Begruendung");
 
@@ -12933,8 +12969,12 @@ function createServer() {
         ensure_supervisor_follower &&
         routine_task_detected &&
         isDefaultSupervisorFollowerGid(finalSupervisorFollowerGid);
-      const effective_ensure_supervisor_follower =
-        ensure_supervisor_follower && !supervisor_follower_readd_guarded;
+      const nonroutine_supervisor_follower_enforced = !routine_task_detected;
+      const supervisor_follower_disable_override_ignored =
+        nonroutine_supervisor_follower_enforced && !ensure_supervisor_follower;
+      const effective_ensure_supervisor_follower = nonroutine_supervisor_follower_enforced
+        ? true
+        : ensure_supervisor_follower && !supervisor_follower_readd_guarded;
       const supervisor_follower_guard_reason = supervisor_follower_readd_guarded
         ? "Routine-Aufgabe wird neu angelegt: Default-Supervisor/Moritz wird wegen Routine-do_not_readd-Schutz nicht automatisch als Follower hinzugefuegt. allow_routine_supervisor_readd ist kein Bypass; bei einem echten Problem Moritz ausschliesslich im konkreten Problemkommentar erwaehnen."
         : null;
@@ -12981,6 +13021,8 @@ function createServer() {
           routine_tag_required: Boolean(routine_task_detected),
           ensure_supervisor_follower,
           effective_ensure_supervisor_follower,
+          nonroutine_supervisor_follower_enforced,
+          supervisor_follower_disable_override_ignored,
           allow_routine_supervisor_readd,
           supervisor_follower_readd_guarded,
           supervisor_follower_guard_reason,
@@ -13064,6 +13106,8 @@ function createServer() {
         supervisor_follower_add_result,
         ensure_supervisor_follower,
         effective_ensure_supervisor_follower,
+        nonroutine_supervisor_follower_enforced,
+        supervisor_follower_disable_override_ignored,
         allow_routine_supervisor_readd,
         supervisor_follower_readd_guarded,
         supervisor_follower_guard_reason,
@@ -20480,7 +20524,7 @@ function createServer() {
     "email_action_list_actions",
     "Listet die versionierten E-Mail-Aktionsordner fuer VIP AI-Communication und prueft die Sendekonto-Zuordnung ohne IMAP-Zugriff, Versand oder Verschiebung.",
     {
-      agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID)
+      agent_id: z.enum(EMAIL_ACTION_READ_AGENT_IDS).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID)
     },
     TOOL_READ_ONLY,
     async ({ agent_id }) => {
@@ -20504,7 +20548,7 @@ function createServer() {
     "email_action_template_readback",
     "Liest eine registrierte Action-Vorlage gezielt per IMAP-UID read-only; nur fuer noch unregistrierte Actions wird ein begrenztes Ordnerfenster durchsucht. Gibt Message-ID-Hash und SHA256 fuer die Registrierung zurueck, sendet und verschiebt nichts.",
     {
-      agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      agent_id: z.enum(EMAIL_ACTION_READ_AGENT_IDS).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
       action_id: z.string(),
       max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
       max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
@@ -20512,7 +20556,7 @@ function createServer() {
     TOOL_EXTERNAL_READ,
     async ({ agent_id, action_id, max_scan_messages, max_email_bytes }) => {
       const { action } = getEmailActionDefinition(action_id);
-      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const { configs, summary } = getEmailActionReadImapContext(agent_id, action.id);
       let scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: action.mailbox,
         maxEmailBytes: max_email_bytes,
@@ -20609,7 +20653,7 @@ function createServer() {
     "email_action_template_style_readback",
     "Liest den Text- und Stilkontext einer exakt identifizierten Action-Vorlage read-only fuer das absenderspezifische Communication-Lernen. Gibt keine Anhaenge oder eingebetteten Bilddaten aus und autorisiert keinen Versand.",
     {
-      agent_id: z.literal(EMAIL_ACTION_CONTROL_AGENT_ID).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      agent_id: z.enum(EMAIL_ACTION_READ_AGENT_IDS).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
       action_id: z.string(),
       max_body_chars: z.number().int().min(1000).max(30_000).optional().default(20_000),
       max_scan_messages: z.number().int().min(1).max(500).optional().default(EMAIL_ACTION_MAX_SCAN_MESSAGES),
@@ -20618,7 +20662,7 @@ function createServer() {
     TOOL_EXTERNAL_READ,
     async ({ agent_id, action_id, max_body_chars, max_scan_messages, max_email_bytes }) => {
       const { action } = getEmailActionDefinition(action_id);
-      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const { configs, summary } = getEmailActionReadImapContext(agent_id, action.id);
       const scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: action.mailbox,
         maxEmailBytes: max_email_bytes,
@@ -20660,6 +20704,128 @@ function createServer() {
             label: scan.label
           },
           attempts: scan.attempts
+        }
+      });
+    }
+  );
+
+  server.tool(
+    "email_action_signature_readback",
+    "Prueft eine versioniert gebundene Signaturvorlage exakt und read-only gegen UID, Message-ID, SHA256, FROM und Draft-Flag. Gibt keine Mailtexte oder Anhangsinhalte aus und sendet oder verschiebt nichts.",
+    {
+      agent_id: z.enum(EMAIL_ACTION_READ_AGENT_IDS).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      send_account_id: z.string().min(2).max(100),
+      max_email_bytes: z.number().int().min(1024).max(20 * 1024 * 1024).optional().default(EMAIL_ACTION_MAX_EMAIL_BYTES)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, send_account_id, max_email_bytes }) => {
+      const sendAccountConfig = loadEmailActionSendAccounts();
+      const normalizedAccountId = normalizeActionSlug(send_account_id);
+      const account = sendAccountConfig.accounts.find((item) => item.id === normalizedAccountId);
+      if (!account) throw new Error(`Unbekanntes E-Mail-Sendekonto: ${normalizedAccountId}`);
+      const binding = account.signature_template;
+      if (!binding) throw new Error(`E-Mail-Sendekonto ${normalizedAccountId} hat keine Signaturvorlage.`);
+      const { configs, summary } = getEmailActionReadImapContext(agent_id, binding.action_id);
+      const scan = await scanEmailActionFolderWithFallback(configs, {
+        mailbox: binding.mailbox,
+        maxEmailBytes: max_email_bytes,
+        maxScanMessages: 1,
+        scanOrder: "oldest_first",
+        includeQueuePage: false,
+        requiredUids: [binding.uid]
+      });
+      const matches = scan.messages.filter(
+        (message) => message.template_subject?.action_id === binding.action_id
+      );
+      const template = matches.length === 1 ? matches[0] : null;
+      const checks = {
+        uid: Boolean(template) && String(template.uid) === binding.uid,
+        message_id: Boolean(template) && String(template.parsed?.message_id || "") === binding.message_id,
+        sha256: Boolean(template) && template.raw_sha256 === binding.sha256,
+        from: Boolean(template) && template.template_subject?.from === account.address,
+        draft: Boolean(template) && hasImapFlag(template.flags, "\\Draft")
+      };
+      const failedChecks = Object.entries(checks)
+        .filter(([, ok]) => !ok)
+        .map(([name]) => name);
+      let composition = null;
+      let compositionError = null;
+      if (template) {
+        try {
+          const probe = buildDraftTemplateResendPayload({
+            templateRaw: template.raw,
+            from: account.address,
+            to: account.address,
+            bcc: account.address,
+            subject: "Signatur-Shadow-Readback",
+            body: "SIGNATURE_TEMPLATE_READBACK",
+            bodyMarker: binding.body_marker
+          });
+          composition = {
+            html_marker_count: probe.html_marker_count,
+            plain_marker_count: probe.plain_marker_count,
+            attachment_manifest: probe.attachment_manifest
+          };
+        } catch (error) {
+          compositionError = String(error?.message || error);
+        }
+      }
+      return out({
+        agent_id,
+        send_account_id: normalizedAccountId,
+        registry_version: sendAccountConfig.version,
+        binding: {
+          action_id: binding.action_id,
+          mailbox: binding.mailbox,
+          uid: binding.uid,
+          message_id_hash: createHash("sha256").update(binding.message_id).digest("hex"),
+          sha256: binding.sha256,
+          from: account.address,
+          body_marker: binding.body_marker
+        },
+        observed: template
+          ? {
+              uid: String(template.uid),
+              message_id: template.parsed?.message_id || null,
+              message_id_hash: template.parsed?.message_id_hash || null,
+              sha256: template.raw_sha256,
+              from: template.template_subject?.from || null,
+              draft_flag_present: hasImapFlag(template.flags, "\\Draft"),
+              raw_bytes: template.raw_bytes,
+              content_types: uniqueValues(parseMimeMessageTextParts(template.raw).map((part) => part.content_type)),
+              inline_resource_count: parseMimeMessageInlineResources(template.raw).length
+            }
+          : null,
+        checks,
+        all_checks_ok: failedChecks.length === 0,
+        failed_checks: failedChecks,
+        composition,
+        composition_error: compositionError,
+        proposed_signature_registry: template
+          ? {
+              uid: String(template.uid),
+              message_id: template.parsed?.message_id || "",
+              sha256: template.raw_sha256
+            }
+          : null,
+        imap: {
+          ...summary,
+          connection: {
+            host: scan.host,
+            port: scan.port,
+            secure: scan.secure,
+            label: scan.label
+          },
+          attempts: scan.attempts,
+          missing_required_uids: scan.missing_required_uids
+        },
+        safety: {
+          read_only: true,
+          marks_seen: false,
+          moves_messages: false,
+          sends_messages: false,
+          returns_body_text: false,
+          returns_attachment_content: false
         }
       });
     }
@@ -21583,7 +21749,7 @@ function createServer() {
     "email_action_shadow_run",
     "Erzeugt deterministisch Raw-MIME-Antwortplaene fuer registrierte Vorlagenantworten oder einen explizit belegten adaptiven Antworttext. Shadow-Run: kein Live-Versand, keine IMAP-Verschiebung, kein Gelesen-Markieren.",
     {
-      agent_id: z.enum([EMAIL_ACTION_CONTROL_AGENT_ID]).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
+      agent_id: z.enum(EMAIL_ACTION_READ_AGENT_IDS).optional().default(EMAIL_ACTION_CONTROL_AGENT_ID),
       action_id: z.string(),
       message_uid: z.string().optional(),
       limit: z.number().int().min(1).max(25).optional().default(5),
@@ -21621,7 +21787,7 @@ function createServer() {
     }) => {
       const { action } = getEmailActionDefinition(action_id);
       if (!action.enabled) throw new Error(`Action ${action.id} ist deaktiviert.`);
-      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const { configs, summary } = getEmailActionReadImapContext(agent_id, action.id);
       const scan = await scanEmailActionFolderWithFallback(configs, {
         mailbox: action.mailbox,
         maxEmailBytes: max_email_bytes,
