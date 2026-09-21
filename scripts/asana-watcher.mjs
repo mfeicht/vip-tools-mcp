@@ -391,9 +391,11 @@ function getAgentState(state, agentId) {
     state.agents[agentId] = {
       last_checked_at: null,
       workspace_gid: null,
-      tasks: {}
+      tasks: {},
+      pending_signals: {}
     };
   }
+  state.agents[agentId].pending_signals ||= {};
   return state.agents[agentId];
 }
 
@@ -677,6 +679,24 @@ function coalesceSignalsByTask(signals) {
   return [...byTask.values()];
 }
 
+function planSignalBatch({ candidateSignals, pendingSignals, emittedSignals, limit, baseline }) {
+  const unique = new Map();
+  for (const signal of [...Object.values(pendingSignals), ...candidateSignals]) {
+    if (!emittedSignals[signal.id]) unique.set(signal.id, signal);
+  }
+  const freshRawSignals = sortSignals([...unique.values()]);
+  const freshSignals = coalesceSignalsByTask(freshRawSignals);
+  const queuedSignals = baseline ? [] : freshSignals.slice(0, limit);
+  const signalIdsToMarkSeen = baseline
+    ? freshRawSignals.map((signal) => signal.id)
+    : queuedSignals.flatMap((signal) => signal.related_signal_ids || [signal.id]);
+  const marked = new Set(signalIdsToMarkSeen);
+  const nextPendingSignals = Object.fromEntries(
+    freshRawSignals.filter((signal) => !marked.has(signal.id)).map((signal) => [signal.id, signal])
+  );
+  return { freshRawSignals, freshSignals, queuedSignals, signalIdsToMarkSeen, nextPendingSignals };
+}
+
 async function run() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.limitWasClamped) {
@@ -706,6 +726,26 @@ async function run() {
       safeMcpErrorText(new Error("Just a moment... challenges.cloudflare.com")) ===
         "Cloudflare managed challenge on the canonical MCP endpoint" &&
       safeMcpErrorText(new Error("ordinary watcher failure")) === "ordinary watcher failure";
+    const firstBatch = planSignalBatch({
+      candidateSignals: sample,
+      pendingSignals: {},
+      emittedSignals: {},
+      limit: 1,
+      baseline: false
+    });
+    const secondBatch = planSignalBatch({
+      candidateSignals: [],
+      pendingSignals: firstBatch.nextPendingSignals,
+      emittedSignals: Object.fromEntries(firstBatch.signalIdsToMarkSeen.map((id) => [id, "2026-09-21T00:00:00Z"])),
+      limit: 1,
+      baseline: false
+    });
+    const backlogChecksPassed =
+      firstBatch.queuedSignals.length === 1 &&
+      Object.keys(firstBatch.nextPendingSignals).length === 1 &&
+      secondBatch.queuedSignals.length === 1 &&
+      secondBatch.queuedSignals[0].task_gid === "2" &&
+      Object.keys(secondBatch.nextPendingSignals).length === 0;
     const selfTestDir = await fs.mkdtemp(path.join(os.tmpdir(), "vip-asana-watcher-selftest-"));
     let persistenceChecksPassed = false;
     try {
@@ -744,8 +784,8 @@ async function run() {
       await fs.rm(selfTestDir, { recursive: true, force: true });
     }
 
-    const passed = signalChecksPassed && persistenceChecksPassed;
-    console.log(JSON.stringify({ passed, signal_checks: signalChecksPassed, persistence_checks: persistenceChecksPassed, result }));
+    const passed = signalChecksPassed && backlogChecksPassed && persistenceChecksPassed;
+    console.log(JSON.stringify({ passed, signal_checks: signalChecksPassed, backlog_checks: backlogChecksPassed, persistence_checks: persistenceChecksPassed, result }));
     if (!passed) process.exitCode = 1;
     return;
   }
@@ -862,12 +902,15 @@ async function run() {
           agentSummary.tasks_checked += 1;
         }
 
-        const freshRawSignals = sortSignals(candidateSignals).filter((signal) => !state.emitted_signals[signal.id]);
-        const freshSignals = coalesceSignalsByTask(freshRawSignals);
-        const queuedSignals = effectiveBaseline ? [] : freshSignals.slice(0, opts.maxSignalsPerAgent);
-        const signalIdsToMarkSeen = effectiveBaseline
-          ? freshRawSignals.map((signal) => signal.id)
-          : queuedSignals.flatMap((signal) => signal.related_signal_ids || [signal.id]);
+        const { freshRawSignals, freshSignals, queuedSignals, signalIdsToMarkSeen, nextPendingSignals } =
+          planSignalBatch({
+            candidateSignals,
+            pendingSignals: agentState.pending_signals,
+            emittedSignals: state.emitted_signals,
+            limit: opts.maxSignalsPerAgent,
+            baseline: effectiveBaseline
+          });
+        agentState.pending_signals = nextPendingSignals;
 
         for (const signalId of signalIdsToMarkSeen) {
           state.emitted_signals[signalId] = detectedAt;

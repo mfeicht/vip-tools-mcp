@@ -2068,7 +2068,7 @@ function uniqueObjectsByGid(values = []) {
   return result;
 }
 
-function buildAsanaTaskHtmlNotes({ description, source_task, project_selection_reason }) {
+function buildAsanaTaskHtmlNotes({ description, description_sections, source_task, project_selection_reason }) {
   const parts = [];
 
   if (source_task?.permalink_url) {
@@ -2082,6 +2082,9 @@ function buildAsanaTaskHtmlNotes({ description, source_task, project_selection_r
   if (description) {
     ensureNoUnsafeAsanaText(description, "Asana-Aufgabenbeschreibung");
     parts.push(`${escapeAsanaTextWithLinks(description)}\n\n`);
+  }
+  for (const section of description_sections || []) {
+    if (plainAsanaSections([section]).trim()) parts.push(`${asanaSection(section)}\n`);
   }
 
   if (project_selection_reason) {
@@ -2098,7 +2101,7 @@ function buildAsanaTaskHtmlNotes({ description, source_task, project_selection_r
   return html;
 }
 
-function buildAsanaDescriptionAppendSection({ section_title, section_text, dedupe_key }) {
+function buildAsanaDescriptionAppendSection({ section_title, section_text, rich_sections, dedupe_key }) {
   ensureNoUnsafeAsanaText(section_title, "Asana-Aufgabenbeschreibung-Ueberschrift");
   ensureNoUnsafeAsanaText(section_text, "Asana-Aufgabenbeschreibung-Ergaenzung");
   ensureNoUnsafeAsanaText(dedupe_key, "Asana-Aufgabenbeschreibung-Dedupe-Key");
@@ -2110,7 +2113,8 @@ function buildAsanaDescriptionAppendSection({ section_title, section_text, dedup
   if (section_title) {
     parts.push(`<strong>${escapeAsanaXml(section_title)}</strong>\n`);
   }
-  parts.push(`${escapeAsanaTextWithLinks(section_text)}\n`);
+  if (section_text) parts.push(`${escapeAsanaTextWithLinks(section_text)}\n`);
+  for (const section of rich_sections || []) parts.push(`${asanaSection(section)}\n`);
 
   const sectionHtml = parts.join("");
   assertGeneratedAsanaHtml(`<body>${sectionHtml}</body>`);
@@ -2196,6 +2200,44 @@ function asanaParagraph(text) {
   return `${escapeAsanaTextWithLinks(text)}\n\n`;
 }
 
+function asanaParagraphContent(paragraph) {
+  if (typeof paragraph === "string") return asanaParagraph(paragraph);
+  const html = paragraph.runs.map(({ text, style }) => {
+    ensureNoUnsafeAsanaText(text, "Asana-Kommentartext");
+    const content = escapeAsanaTextWithLinks(text);
+    return style === "plain" ? content : `<${style}>${content}</${style}>`;
+  }).join("");
+  return `${html}\n\n`;
+}
+
+function plainAsanaParagraph(paragraph) {
+  return typeof paragraph === "string" ? paragraph : paragraph.runs.map((run) => run.text).join("");
+}
+
+function plainAsanaSections(sections = []) {
+  return sections.flatMap((section) => [
+    section.title || "",
+    ...(section.paragraphs || []).map(plainAsanaParagraph),
+    ...(section.bullets || []),
+    ...(section.numbered || []),
+    ...(section.code_blocks || [])
+  ]).join("\n");
+}
+
+const asanaRichSectionSchema = z.object({
+  title: z.string().optional(),
+  paragraphs: z.array(z.union([
+    z.string(),
+    z.object({ runs: z.array(z.object({
+      text: z.string().min(1),
+      style: z.enum(["plain", "strong", "em", "u"]).optional().default("plain")
+    })).min(1) })
+  ])).optional().default([]),
+  bullets: z.array(z.string()).optional().default([]),
+  numbered: z.array(z.string()).optional().default([]),
+  code_blocks: z.array(z.string()).optional().default([])
+});
+
 function asanaSection(section) {
   const parts = [];
   if (section.title) {
@@ -2203,7 +2245,17 @@ function asanaSection(section) {
     parts.push(`<strong>${escapeAsanaXml(section.title)}</strong>\n`);
   }
   for (const paragraph of section.paragraphs || []) {
-    parts.push(asanaParagraph(paragraph));
+    parts.push(asanaParagraphContent(paragraph));
+  }
+  if (section.numbered?.length) {
+    parts.push(
+      `<ol>${section.numbered
+        .map((item) => {
+          ensureNoUnsafeAsanaText(item, "Asana-Kommentar-Nummerierung");
+          return `<li>${escapeAsanaTextWithLinks(item)}</li>`;
+        })
+        .join("")}</ol>\n`
+    );
   }
   if (section.bullets?.length) {
     parts.push(
@@ -2232,8 +2284,9 @@ function asanaCommentHasMaterialResultSignals({ greeting, sections }) {
     greeting || "",
     ...(sections || []).flatMap((section) => [
       section.title || "",
-      ...(section.paragraphs || []),
-      ...(section.bullets || [])
+      ...(section.paragraphs || []).map(plainAsanaParagraph),
+      ...(section.bullets || []),
+      ...(section.numbered || [])
     ])
   ]
     .join("\n")
@@ -2374,7 +2427,7 @@ function assertGeneratedAsanaHtml(html) {
     throw new Error("Asana-Kommentar darf keine <p>-Tags verwenden; Asana-Stories escapen sie sichtbar.");
   }
 
-  const allowedTags = new Set(["body", "strong", "em", "code", "ul", "li", "a"]);
+  const allowedTags = new Set(["body", "strong", "em", "u", "code", "ol", "ul", "li", "a"]);
   for (const tagMatch of html.matchAll(/<\/?([A-Za-z][A-Za-z0-9:-]*)(?:\s[^<>]*)?\/?>/g)) {
     const tag = tagMatch[1];
     const raw = tagMatch[0];
@@ -12723,7 +12776,7 @@ function createServer() {
 
   server.tool(
     "asana_create_task",
-    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Routine-Tag bei Routine-Erkennung und bei Follow-ups einen Link zur Ausgangsaufgabe. Supervisor-Follower werden nicht automatisch gesetzt; fuer echte Entscheidung, Freigabe, Blockade oder eigene Handlung ist eine konkrete supervisor_action_basis erforderlich. Eine blosse Follower-/Beobachterrolle in der Ausgangsaufgabe berechtigt nicht zur Aufgabenanlage; noetig sind Assignee-/Creator-Rolle, eine echte Asana-Mention, eine direkte Moritz-Anweisung oder der eng dokumentierte Governance-Auftrag von Operations/Memory/Monitoring/Review. Bei Routinen wird Moritz nie ueber einen Bool-Override automatisch hinzugefuegt; eine konkrete Problem-Mention ist der einzige Reaktivierungspfad.",
+    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Beschreibung mit konkreter Bitte/Ergebnis zuerst, Hintergrund danach; description_sections erlaubt Abschnitte, nummerierte Listen und Absatz-Runs mit strong/em/u ohne rohes HTML. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Routine-Tag bei Routine-Erkennung und bei Follow-ups einen Link zur Ausgangsaufgabe. Supervisor-Follower werden nicht automatisch gesetzt; fuer echte Entscheidung, Freigabe, Blockade oder eigene Handlung ist eine konkrete supervisor_action_basis erforderlich. Eine blosse Follower-/Beobachterrolle in der Ausgangsaufgabe berechtigt nicht zur Aufgabenanlage; noetig sind Assignee-/Creator-Rolle, eine echte Asana-Mention, eine direkte Moritz-Anweisung oder der eng dokumentierte Governance-Auftrag von Operations/Memory/Monitoring/Review. Bei Routinen wird Moritz nie ueber einen Bool-Override automatisch hinzugefuegt; eine konkrete Problem-Mention ist der einzige Reaktivierungspfad.",
     {
       agent_id: agentIdSchema,
       name: z.string().min(12).max(200),
@@ -12731,6 +12784,7 @@ function createServer() {
       project_gid: z.string().optional(),
       source_task_gid: z.string().optional(),
       description: z.string().optional(),
+      description_sections: z.array(asanaRichSectionSchema).optional().default([]),
       project_selection_reason: z.string().optional(),
       allow_different_project_than_source: z.boolean().optional().default(false),
       due_on: z.string().optional(),
@@ -12757,6 +12811,7 @@ function createServer() {
       project_gid,
       source_task_gid,
       description,
+      description_sections,
       project_selection_reason,
       allow_different_project_than_source,
       due_on,
@@ -12971,7 +13026,7 @@ function createServer() {
       const finalDueOn = due_on || dueOnInBerlinDaysFromNow(due_in_days);
       const routine_task_detected = isRoutineTaskCreationIntent({
         name,
-        description,
+        description: `${description || ""}\n${plainAsanaSections(description_sections)}`,
         creation_basis,
         routine_task
       });
@@ -12996,6 +13051,7 @@ function createServer() {
 
       const html_notes = buildAsanaTaskHtmlNotes({
         description,
+        description_sections,
         source_task,
         project_selection_reason
       });
@@ -13139,23 +13195,13 @@ function createServer() {
 
   server.tool(
     "asana_comment",
-    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, Listen und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Der Readability-Check meldet verdaechtige sichtbare Wort-/Zahlverklebungen derzeit als report_only-Diagnose; URLs, E-Mail-Adressen, bekannte technische Tokens und code_blocks werden bewusst ausgenommen. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene materielle Ergebnis-/Handoff-/Abschlusskommentar kanonisch; typische Ergebnis- oder Erfolgssprache bleibt auch bei comment_kind=status materiell. Eine echte Korrektur braucht supersedes_story_gid und correction mit konkretem Vorher-/Nachher-Claim, Grund und Quelle; das Tool macht den Story-Verweis sichtbar. Reine Umformulierungen duerfen nicht als Korrektur gepostet werden. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
+    "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Beginne mit konkretem Ergebnis, benoetigter Entscheidung oder Frage; Hintergrund und Evidenz danach. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, nummerierte oder ungeordnete Listen, Absatz-Runs mit strong/em/u und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Der Readability-Check meldet verdaechtige sichtbare Wort-/Zahlverklebungen derzeit als report_only-Diagnose; URLs, E-Mail-Adressen, bekannte technische Tokens und code_blocks werden bewusst ausgenommen. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene materielle Ergebnis-/Handoff-/Abschlusskommentar kanonisch; typische Ergebnis- oder Erfolgssprache bleibt auch bei comment_kind=status materiell. Eine echte Korrektur braucht supersedes_story_gid und correction mit konkretem Vorher-/Nachher-Claim, Grund und Quelle; das Tool macht den Story-Verweis sichtbar. Reine Umformulierungen duerfen nicht als Korrektur gepostet werden. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
       comment_kind: z.enum(["status", "question", "result", "handoff", "completion"]).optional().default("status"),
       greeting: z.string().optional(),
-      sections: z
-        .array(
-          z.object({
-            title: z.string().optional(),
-            paragraphs: z.array(z.string()).optional().default([]),
-            bullets: z.array(z.string()).optional().default([]),
-            code_blocks: z.array(z.string()).optional().default([])
-          })
-        )
-        .optional()
-        .default([]),
+      sections: z.array(asanaRichSectionSchema).optional().default([]),
       evidence: z
         .object({
           summary: z.string().min(20).max(3000),
@@ -13517,8 +13563,9 @@ function createServer() {
                 correction,
                 proposedText: sections.flatMap((section) => [
                   section.title || "",
-                  ...(section.paragraphs || []),
-                  ...(section.bullets || [])
+                  ...(section.paragraphs || []).map(plainAsanaParagraph),
+                  ...(section.bullets || []),
+                  ...(section.numbered || [])
                 ]).join("\n")
               });
               routine_material_comment_idempotency.correction_delta_gate = correctionDelta;
@@ -13626,12 +13673,13 @@ function createServer() {
 
   server.tool(
     "asana_update_task_description",
-    "Ergaenzt eine Asana-Aufgabenbeschreibung kontrolliert und mit Readback. Standardpfad fuer dauerhafte Aenderungen an Routine-Aufgaben; Kommentare allein reichen dafuer nicht. replace_full_description=true ersetzt widerspruechliche oder veraltete Beschreibungen nur mit verifizierter Moritz-Freigabe.",
+    "Ergaenzt eine Asana-Aufgabenbeschreibung kontrolliert und mit Readback. section_text oder rich_sections muss vorhanden sein; rich_sections erlaubt Abschnitte, nummerierte Listen und Absatz-Runs mit strong/em/u ohne rohes HTML. Standardpfad fuer dauerhafte Aenderungen an Routine-Aufgaben; Kommentare allein reichen dafuer nicht. replace_full_description=true ersetzt widerspruechliche oder veraltete Beschreibungen nur mit verifizierter Moritz-Freigabe.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
       section_title: z.string().min(3).max(140).optional().default("Dauerhafte Routine-Anweisung"),
-      section_text: z.string().min(20).max(8000),
+      section_text: z.string().min(20).max(8000).optional(),
+      rich_sections: z.array(asanaRichSectionSchema).optional().default([]),
       dedupe_key: z.string().min(3).max(160).optional(),
       update_basis: z.string().min(20),
       require_routine_context: z.boolean().optional().default(true),
@@ -13648,6 +13696,7 @@ function createServer() {
       task_gid,
       section_title,
       section_text,
+      rich_sections,
       dedupe_key,
       update_basis,
       require_routine_context,
@@ -13660,6 +13709,9 @@ function createServer() {
     }) => {
       validateAsanaGid(task_gid, "task_gid");
       ensureNoUnsafeAsanaText(update_basis, "Asana-Aufgabenbeschreibung-Aenderungsgrund");
+      if (!section_text && !plainAsanaSections(rich_sections).trim()) {
+        throw new Error("asana_update_task_description braucht section_text oder nichtleere rich_sections.");
+      }
 
       const authorization_receipt = dry_run
         ? null
@@ -13704,15 +13756,17 @@ function createServer() {
       }
 
       const html_notes = replace_full_description
-        ? `<body>${escapeAsanaTextWithLinks(section_text)}</body>`
+        ? `<body>${section_text ? `${escapeAsanaTextWithLinks(section_text)}\n\n` : ""}${rich_sections.map(asanaSection).join("\n")}</body>`
         : appendAsanaHtmlNotesSection(
             before_task.html_notes || escapeAsanaTextWithLinks(before_task.notes || ""),
             buildAsanaDescriptionAppendSection({
               section_title,
               section_text,
+              rich_sections,
               dedupe_key
             })
           );
+      if (replace_full_description) assertGeneratedAsanaHtml(html_notes);
       const html_sha256 = createHash("sha256").update(html_notes, "utf8").digest("hex");
       const update_basis_sha256 = createHash("sha256").update(update_basis, "utf8").digest("hex");
 

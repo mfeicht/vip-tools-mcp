@@ -63,6 +63,18 @@ const readableControl = inspectAsanaCommentReadability({
     code_blocks: ["Toolliste114 bleibt als bewusst gezeigtes Rohbeispiel unveraendert."]
   }]
 });
+
+const richTextFinding = inspectAsanaCommentReadability({
+  sections: [{
+    paragraphs: [{ runs: [
+      { text: "Bitte pruefen: ", style: "plain" },
+      { text: "Deadline22.09.", style: "strong" }
+    ] }],
+    numbered: ["Aktion1 sofort pruefen"]
+  }]
+});
+assert.equal(richTextFinding.issue_count >= 2, true);
+assert.equal(richTextFinding.issues.some((issue) => issue.path.includes("numbered")), true);
 assert.deepEqual(
   {
     status: readableControl.status,
