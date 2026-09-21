@@ -543,6 +543,7 @@ function updateTaskState(agentState, task) {
   agentState.tasks[task.gid] = {
     last_seen_at: nowIso(),
     last_modified_at: task.modified_at || null,
+    last_due_signal_type: getDueSignal(task),
     due_on: task.due_on || null,
     due_at: task.due_at || null,
     completed: Boolean(task.completed),
@@ -557,6 +558,15 @@ function buildSignalsForTask(agentId, task, previousTaskState, details, detected
   const signals = [];
   const dueInfo = getDueInfo(task);
   const dueSignal = dueInfo?.signal_type || null;
+  const previousDueSignal = previousTaskState?.last_due_signal_type ?? (
+    previousTaskState?.last_seen_at
+      ? getDueInfo(previousTaskState, new Date(previousTaskState.last_seen_at))?.signal_type || null
+      : null
+  );
+  const dueChanged = previousTaskState && (
+    (previousTaskState.due_on || null) !== (task.due_on || null) ||
+    (previousTaskState.due_at || null) !== (task.due_at || null)
+  );
 
   if (!previousTaskState) {
     signals.push(
@@ -593,7 +603,7 @@ function buildSignalsForTask(agentId, task, previousTaskState, details, detected
     );
   }
 
-  if (dueSignal) {
+  if (dueSignal && (!previousTaskState || dueChanged || previousDueSignal !== dueSignal)) {
     signals.push(
       makeSignal({
         detected_at: detectedAt,
@@ -736,6 +746,29 @@ async function run() {
       safeMcpErrorText(new Error("Just a moment... challenges.cloudflare.com")) ===
         "Cloudflare managed challenge on the canonical MCP endpoint" &&
       safeMcpErrorText(new Error("ordinary watcher failure")) === "ordinary watcher failure";
+    const previousDueTask = {
+      last_seen_at: "2026-09-21T10:00:00.000Z",
+      last_modified_at: "2026-09-21T10:00:00.000Z",
+      due_on: "2020-01-01",
+      due_at: null
+    };
+    const modifiedDueTask = {
+      gid: "3",
+      name: "Existing overdue task",
+      modified_at: "2026-09-21T10:05:00.000Z",
+      due_on: "2020-01-01"
+    };
+    const unchangedDueSignals = buildSignalsForTask(
+      "vip-ai-test", modifiedDueTask, previousDueTask, null, "2026-09-21T10:05:00.000Z"
+    );
+    const changedDueSignals = buildSignalsForTask(
+      "vip-ai-test", { ...modifiedDueTask, due_on: "2020-01-02" },
+      previousDueTask, null, "2026-09-21T10:05:00.000Z"
+    );
+    const dueDedupeChecksPassed =
+      unchangedDueSignals.length === 1 &&
+      unchangedDueSignals[0].signal_type === "modified_task" &&
+      changedDueSignals.some((signal) => signal.signal_type === "overdue");
     let truncatedRejected = false;
     try {
       assertCompleteAgentSnapshot({ ok: true, truncated: true, pages_fetched: 10 });
@@ -800,8 +833,8 @@ async function run() {
       await fs.rm(selfTestDir, { recursive: true, force: true });
     }
 
-    const passed = signalChecksPassed && backlogChecksPassed && persistenceChecksPassed && truncatedRejected;
-    console.log(JSON.stringify({ passed, signal_checks: signalChecksPassed, backlog_checks: backlogChecksPassed, persistence_checks: persistenceChecksPassed, result }));
+    const passed = signalChecksPassed && dueDedupeChecksPassed && backlogChecksPassed && persistenceChecksPassed && truncatedRejected;
+    console.log(JSON.stringify({ passed, signal_checks: signalChecksPassed, due_dedupe_checks: dueDedupeChecksPassed, backlog_checks: backlogChecksPassed, persistence_checks: persistenceChecksPassed, result }));
     if (!passed) process.exitCode = 1;
     return;
   }
