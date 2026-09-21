@@ -16,10 +16,13 @@ const checks = {
     source.includes("asana_create_task_observer_gate") &&
     source.includes("authorization_story_mentions_agent") &&
     source.includes("Beobachter-Gate: Der Agent ist in der Ausgangsaufgabe weder Assignee noch Creator"),
-  nonroutine_supervisor_follower_cannot_be_disabled:
-    source.includes("nonroutine_supervisor_follower_enforced") &&
-    source.includes("supervisor_follower_disable_override_ignored") &&
-    source.includes("Neue Nicht-Routine-Aufgaben erhalten immer den verantwortlichen Supervisor als Follower"),
+  supervisor_follower_is_opt_in_with_basis:
+    source.includes("Supervisor-Follower werden nicht automatisch gesetzt") &&
+    source.includes("ensure_supervisor_follower: z.boolean().optional().default(false)") &&
+    source.includes("supervisor_action_basis: z.string().min(20).optional()") &&
+    source.includes("if (ensure_supervisor_follower && !supervisor_action_basis)") &&
+    source.includes("if (toAdd.some(isDefaultSupervisorFollowerGid) && !supervisor_action_basis)") &&
+    !source.includes("nonroutine_supervisor_follower_enforced"),
   observer_comment_gate:
     source.includes("asana_comment_observer_gate") &&
     source.includes("observer_comment_reason") &&

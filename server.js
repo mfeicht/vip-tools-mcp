@@ -12723,7 +12723,7 @@ function createServer() {
 
   server.tool(
     "asana_create_task",
-    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Routine-Tag bei Routine-Erkennung und bei Follow-ups einen Link zur Ausgangsaufgabe. Neue Nicht-Routine-Aufgaben erhalten immer den verantwortlichen Supervisor als Follower; ensure_supervisor_follower=false kann dieses Gate nicht abschalten. Eine blosse Follower-/Beobachterrolle in der Ausgangsaufgabe berechtigt nicht zur Aufgabenanlage; noetig sind Assignee-/Creator-Rolle, eine echte Asana-Mention, eine direkte Moritz-Anweisung oder der eng dokumentierte Governance-Auftrag von Operations/Memory/Monitoring/Review. Bei Routinen wird Moritz nie ueber einen Bool-Override automatisch hinzugefuegt; eine konkrete Problem-Mention ist der einzige Reaktivierungspfad.",
+    "Legt eine Asana-Aufgabe ueber einen engen Pfad an. Erzwingt genau ein Projekt, klaren Titel, Assignee, Faelligkeit, Standardfelder Prioritaet=Mittel/Status=Todo, Routine-Tag bei Routine-Erkennung und bei Follow-ups einen Link zur Ausgangsaufgabe. Supervisor-Follower werden nicht automatisch gesetzt; fuer echte Entscheidung, Freigabe, Blockade oder eigene Handlung ist eine konkrete supervisor_action_basis erforderlich. Eine blosse Follower-/Beobachterrolle in der Ausgangsaufgabe berechtigt nicht zur Aufgabenanlage; noetig sind Assignee-/Creator-Rolle, eine echte Asana-Mention, eine direkte Moritz-Anweisung oder der eng dokumentierte Governance-Auftrag von Operations/Memory/Monitoring/Review. Bei Routinen wird Moritz nie ueber einen Bool-Override automatisch hinzugefuegt; eine konkrete Problem-Mention ist der einzige Reaktivierungspfad.",
     {
       agent_id: agentIdSchema,
       name: z.string().min(12).max(200),
@@ -12739,7 +12739,8 @@ function createServer() {
       status_value: z.string().optional().default("Todo"),
       require_standard_custom_fields: z.boolean().optional().default(true),
       routine_task: z.boolean().optional(),
-      ensure_supervisor_follower: z.boolean().optional().default(true),
+      ensure_supervisor_follower: z.boolean().optional().default(false),
+      supervisor_action_basis: z.string().min(20).optional(),
       allow_routine_supervisor_readd: z.boolean().optional().default(false),
       supervisor_follower_gid: z.string().optional(),
       confirmed_by_asana: z.boolean().optional().default(false),
@@ -12765,6 +12766,7 @@ function createServer() {
       require_standard_custom_fields,
       routine_task,
       ensure_supervisor_follower,
+      supervisor_action_basis,
       allow_routine_supervisor_readd,
       supervisor_follower_gid,
       confirmed_by_asana,
@@ -12779,6 +12781,10 @@ function createServer() {
       validateAsanaDate(due_on, "due_on");
       const finalSupervisorFollowerGid = supervisor_follower_gid || ASANA_DEFAULT_SUPERVISOR_GID;
       validateAsanaGid(finalSupervisorFollowerGid, "supervisor_follower_gid");
+      if (ensure_supervisor_follower && !supervisor_action_basis) {
+        throw new Error("Supervisor-Follower nur bei konkreter Entscheidung, Freigabe, Blockade oder eigener Handlung; supervisor_action_basis ist Pflicht.");
+      }
+      ensureNoUnsafeAsanaText(supervisor_action_basis, "Supervisor-Beteiligungsgrund");
       ensureNoUnsafeAsanaText(name, "Asana-Aufgabentitel");
       ensureNoUnsafeAsanaText(creation_basis, "Asana-Aufgabenanlage-Begruendung");
 
@@ -12976,12 +12982,8 @@ function createServer() {
         ensure_supervisor_follower &&
         routine_task_detected &&
         isDefaultSupervisorFollowerGid(finalSupervisorFollowerGid);
-      const nonroutine_supervisor_follower_enforced = !routine_task_detected;
-      const supervisor_follower_disable_override_ignored =
-        nonroutine_supervisor_follower_enforced && !ensure_supervisor_follower;
-      const effective_ensure_supervisor_follower = nonroutine_supervisor_follower_enforced
-        ? true
-        : ensure_supervisor_follower && !supervisor_follower_readd_guarded;
+      const effective_ensure_supervisor_follower =
+        ensure_supervisor_follower && !supervisor_follower_readd_guarded;
       const supervisor_follower_guard_reason = supervisor_follower_readd_guarded
         ? "Routine-Aufgabe wird neu angelegt: Default-Supervisor/Moritz wird wegen Routine-do_not_readd-Schutz nicht automatisch als Follower hinzugefuegt. allow_routine_supervisor_readd ist kein Bypass; bei einem echten Problem Moritz ausschliesslich im konkreten Problemkommentar erwaehnen."
         : null;
@@ -13028,8 +13030,7 @@ function createServer() {
           routine_tag_required: Boolean(routine_task_detected),
           ensure_supervisor_follower,
           effective_ensure_supervisor_follower,
-          nonroutine_supervisor_follower_enforced,
-          supervisor_follower_disable_override_ignored,
+          supervisor_action_basis: supervisor_action_basis || null,
           allow_routine_supervisor_readd,
           supervisor_follower_readd_guarded,
           supervisor_follower_guard_reason,
@@ -13113,8 +13114,7 @@ function createServer() {
         supervisor_follower_add_result,
         ensure_supervisor_follower,
         effective_ensure_supervisor_follower,
-        nonroutine_supervisor_follower_enforced,
-        supervisor_follower_disable_override_ignored,
+        supervisor_action_basis: supervisor_action_basis || null,
         allow_routine_supervisor_readd,
         supervisor_follower_readd_guarded,
         supervisor_follower_guard_reason,
@@ -13785,7 +13785,7 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Supervisor-Follower, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Behauptete Abdeckung durch bestehende Routinen braucht eine konkrete offene Follow-up-Aufgabe; deren Link/GID, Assignee, Status=Todo und Faelligkeit muessen im finalen Kommentar readback-dokumentiert sein. Wenn keine Folgeaufgabe noetig ist, muss dieser Status zusaetzlich zur Tool-Basis sichtbar im finalen Kommentar stehen. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden vorab ausschliesslich per problemgebundener Asana-Mention adressiert.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Supervisor-Follower werden nicht automatisch gesetzt; nur bei konkreter Entscheidung, Freigabe, Blockade oder eigener Handlung mit supervisor_action_basis. Behauptete Abdeckung durch bestehende Routinen braucht eine konkrete offene Follow-up-Aufgabe; deren Link/GID, Assignee, Status=Todo und Faelligkeit muessen im finalen Kommentar readback-dokumentiert sein. Wenn keine Folgeaufgabe noetig ist, muss dieser Status zusaetzlich zur Tool-Basis sichtbar im finalen Kommentar stehen. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden vorab ausschliesslich per problemgebundener Asana-Mention adressiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -13793,7 +13793,8 @@ function createServer() {
       final_comment_story_gid: z.string().optional(),
       require_final_comment: z.boolean().optional().default(true),
       require_evidence_gate: z.boolean().optional().default(true),
-      ensure_supervisor_follower: z.boolean().optional().default(true),
+      ensure_supervisor_follower: z.boolean().optional().default(false),
+      supervisor_action_basis: z.string().min(20).optional(),
       allow_routine_supervisor_readd: z.boolean().optional().default(false),
       supervisor_follower_gid: z.string().optional(),
       follow_up_required: z.boolean().optional().default(false),
@@ -13811,6 +13812,7 @@ function createServer() {
       require_final_comment,
       require_evidence_gate,
       ensure_supervisor_follower,
+      supervisor_action_basis,
       allow_routine_supervisor_readd,
       supervisor_follower_gid,
       follow_up_required,
@@ -13834,6 +13836,10 @@ function createServer() {
         throw new Error("asana_complete_task erlaubt kein Deaktivieren des Evidenz-Gates.");
       }
       const finalSupervisorFollowerGid = supervisor_follower_gid || ASANA_DEFAULT_SUPERVISOR_GID;
+      if (ensure_supervisor_follower && !supervisor_action_basis) {
+        throw new Error("Supervisor-Follower nur bei konkreter Entscheidung, Freigabe, Blockade oder eigener Handlung; supervisor_action_basis ist Pflicht.");
+      }
+      ensureNoUnsafeAsanaText(supervisor_action_basis, "Supervisor-Beteiligungsgrund");
       if (ensure_supervisor_follower) validateAsanaGid(finalSupervisorFollowerGid, "supervisor_follower_gid");
 
       const asana = getAsana(agent_id);
@@ -14625,18 +14631,19 @@ function createServer() {
 
   server.tool(
     "asana_ensure_task_followers",
-    "Stellt idempotent sicher, dass bestimmte Asana-Nutzer als Beteiligte/Follower einer Aufgabe gesetzt sind, und verifiziert den Readback. Nicht per rohem asana_request nutzen. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden per problemgebundener Asana-Mention adressiert.",
+    "Stellt idempotent sicher, dass bestimmte Asana-Nutzer als Beteiligte/Follower einer Aufgabe gesetzt sind, und verifiziert den Readback. Moritz/Supervisor nur bei konkreter Entscheidung, Freigabe, Blockade oder eigener Handlung mit supervisor_action_basis hinzufuegen; reine Sichtbarkeit ist kein Grund. Nicht per rohem asana_request nutzen. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden per problemgebundener Asana-Mention adressiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
       follower_gids: z.array(z.string()).min(1),
       ensure_basis: z.string().optional(),
+      supervisor_action_basis: z.string().min(20).optional(),
       allow_routine_supervisor_readd: z.boolean().optional().default(false),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
     },
     TOOL_IDEMPOTENT_SAFE_WRITE,
-    async ({ agent_id, task_gid, follower_gids, ensure_basis, allow_routine_supervisor_readd, dry_run, verify_after }) => {
+    async ({ agent_id, task_gid, follower_gids, ensure_basis, supervisor_action_basis, allow_routine_supervisor_readd, dry_run, verify_after }) => {
       validateAsanaGid(task_gid, "task_gid");
       const followersToEnsure = uniqueValues(follower_gids);
       for (const followerGid of followersToEnsure) validateAsanaGid(followerGid, "follower_gids");
@@ -14651,6 +14658,10 @@ function createServer() {
       const before_task = beforeRes.data.data;
       const currentFollowerGids = getAsanaTaskFollowerGids(before_task);
       const toAdd = followersToEnsure.filter((followerGid) => !currentFollowerGids.includes(followerGid));
+      if (toAdd.some(isDefaultSupervisorFollowerGid) && !supervisor_action_basis) {
+        throw new Error("Moritz/Supervisor nur bei konkreter Entscheidung, Freigabe, Blockade oder eigener Handlung hinzufuegen; supervisor_action_basis ist Pflicht.");
+      }
+      ensureNoUnsafeAsanaText(supervisor_action_basis, "Supervisor-Beteiligungsgrund");
       const guardedSkipFollowerGids = toAdd.filter(
         (followerGid) =>
           isRoutineSupervisorDoNotReaddCandidate(before_task, followerGid)
@@ -14672,7 +14683,8 @@ function createServer() {
           guarded_skip_reason: guardedSkipReason,
           allow_routine_supervisor_readd,
           skipped_already_present: followersToEnsure.filter((followerGid) => currentFollowerGids.includes(followerGid)),
-          ensure_basis: ensure_basis || null
+          ensure_basis: ensure_basis || null,
+          supervisor_action_basis: supervisor_action_basis || null
         });
       }
 
@@ -14722,7 +14734,8 @@ function createServer() {
         add_result,
         verified_task,
         verification_status,
-        ensure_basis: ensure_basis || null
+        ensure_basis: ensure_basis || null,
+        supervisor_action_basis: supervisor_action_basis || null
       });
     }
   );

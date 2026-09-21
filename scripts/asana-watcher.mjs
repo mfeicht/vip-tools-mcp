@@ -904,11 +904,12 @@ async function run() {
 
     if (opts.write) {
       await fs.mkdir(BetriebDir, { recursive: true });
-      await atomicWriteJson(stateLastGoodPath, state);
-      await atomicWriteJson(statePath, state);
       if (allQueuedSignals.length > 0) {
         await fs.appendFile(queuePath, `${allQueuedSignals.map((signal) => JSON.stringify(signal)).join("\n")}\n`);
       }
+      // Persist the queue before marking signals seen; a crash may duplicate an ID, not lose work.
+      await atomicWriteJson(stateLastGoodPath, state);
+      await atomicWriteJson(statePath, state);
       await fs.appendFile(logPath, renderLog(summary, allQueuedSignals));
     }
 
