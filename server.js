@@ -13840,7 +13840,7 @@ function createServer() {
 
   server.tool(
     "asana_complete_task",
-    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Supervisor-Follower werden nicht automatisch gesetzt; nur bei konkreter Entscheidung, Freigabe, Blockade oder eigener Handlung mit supervisor_action_basis. Behauptete Abdeckung durch bestehende Routinen braucht eine konkrete offene Follow-up-Aufgabe; deren Link/GID, Assignee, Status=Todo und Faelligkeit muessen im finalen Kommentar readback-dokumentiert sein. Wenn keine Folgeaufgabe noetig ist, muss dieser Status zusaetzlich zur Tool-Basis sichtbar im finalen Kommentar stehen. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden vorab ausschliesslich per problemgebundener Asana-Mention adressiert.",
+    "Schliesst eine Asana-Aufgabe kontrolliert ab. Nur fuer eigene zugewiesene Aufgaben nach erfolgreicher Bearbeitung; prueft Assignee, finalen Evidenz-Kommentar, Routine-Due-Gate, Routine-Handoff-Gate und Readback. Supervisor-Follower werden nicht automatisch gesetzt; nur bei konkreter Entscheidung, Freigabe, Blockade oder eigener Handlung mit supervisor_action_basis. Behauptete Abdeckung durch bestehende Routinen braucht eine konkrete offene Follow-up-Aufgabe; deren Link/GID, Assignee, Status=Todo und Faelligkeit muessen im finalen Kommentar readback-dokumentiert sein. Wenn keine Folgeaufgabe noetig ist, muss dieser Status zusaetzlich zur Tool-Basis sichtbar im finalen Kommentar stehen. Fehlt nur dieser Status in einer bereits vorhandenen materiellen Ergebnisstory, kann der Assignee einen knappen, evidenzbelegten asana_comment mit comment_kind=status und ausschliesslich dem neuen Follow-up-Entscheid posten; dessen Story-GID ist dann final_comment_story_gid. Kein zweiter Ergebnis-/Abschlussclaim und kein Supersedes ohne sachliche Korrektur. Bei bestehenden Routine-Aufgaben wird ein fehlender Default-Supervisor/Moritz nie automatisch wieder hinzugefuegt; allow_routine_supervisor_readd ist kein Bypass. Echte Probleme werden vorab ausschliesslich per problemgebundener Asana-Mention adressiert.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -13951,7 +13951,7 @@ function createServer() {
         const hasOpenEvidenceGaps = /offene\s+evidenzluecken|offene\s+evidenzlücken/.test(finalCommentEvidenceText);
         if (require_evidence_gate && !hasEvidenceMarker) {
           throw new Error(
-            "Abschluss blockiert: Der finale Asana-Kommentar enthaelt keinen standardisierten Abschnitt Evidenz / Verifikation. Poste zuerst asana_comment mit comment_kind=completion und Evidenzblock."
+            "Abschluss blockiert: Der finale Asana-Kommentar enthaelt keinen standardisierten Abschnitt Evidenz / Verifikation. Poste zuerst asana_comment mit Evidenzblock; bei bereits vorhandener materieller Ergebnisstory darf ein knapper comment_kind=status nur den fehlenden Follow-up-Entscheid ergaenzen."
           );
         }
         if (require_evidence_gate && hasOpenEvidenceGaps) {
@@ -13989,7 +13989,7 @@ function createServer() {
         : { ok: true, issues: [], mode: "not_applicable" };
       if (!routine_visible_follow_up_status.ok) {
         throw new Error(
-          "Routine-Abschluss blockiert: follow_up_not_required_basis ist nur interne Tool-Evidenz. Der finale Asana-Kommentar muss sichtbar festhalten, dass keine weitere Folgeaufgabe oder Nacharbeit noetig ist."
+          "Routine-Abschluss blockiert: follow_up_not_required_basis ist nur interne Tool-Evidenz. Der finale Asana-Kommentar muss sichtbar festhalten, dass keine weitere Folgeaufgabe oder Nacharbeit noetig ist. Falls nur dieser Entscheid in einer vorhandenen Ergebnisstory fehlt, darf ein knapper evidenzbelegter asana_comment mit comment_kind=status den Follow-up-Status ergaenzen; dessen GID danach als final_comment_story_gid verwenden."
         );
       }
 

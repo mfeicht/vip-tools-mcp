@@ -219,6 +219,38 @@ assert.equal(
   false
 );
 
+// A prior Finance result can be followed by one status-only decision when its
+// visible follow-up sentence was omitted. The second story must not repeat the
+// material result, and the completion gate must see its new decision.
+const financeResultWithoutFollowUp = {
+  gid: "1218696346033144",
+  created_by: { gid: "1215003777954631" },
+  text: "Execution Quality – 21.09.2026\nKeine offenen Orders.\nEvidenz / Verifikation\nBroker-No-op 14:05 UTC"
+};
+const financeFollowUpStatus = {
+  gid: "1218696346033999",
+  created_by: { gid: "1215003777954631" },
+  text: "Follow-up: keines erforderlich. Aus diesem Routine-Scope ist keine aktive Nacharbeit fuer eine andere Person offen.\nEvidenz / Verifikation\nQuelle/Readback: Finance-Ergebnisstory 1218696346033144"
+};
+assert.equal(inspectRoutineMaterialCommentIdempotency({
+  stories: [financeResultWithoutFollowUp],
+  agentUserGid: "1215003777954631"
+}).status, "blocked_duplicate_material_comment");
+assert.equal(isRoutineMaterialComment({
+  routineLike: true,
+  commentKind: "status",
+  materialResultSignals: false
+}), false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: financeFollowUpStatus,
+  hasFollowUpTask: false
+}).ok, true);
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: financeFollowUpStatus,
+  completionBasis: "Execution-Quality-Scope bearbeitet; keine aktive Nacharbeit aus dieser Instanz.",
+  followUpNotRequiredBasis: "Keine aktive Nacharbeit aus dem Routine-Scope, da keine offenen Orders und kein eigener neuer Arbeitsschritt belegt sind."
+}).blocked_without_follow_up_task, false);
+
 // Actual closed-evidence Retail story and the Review reproductions must agree
 // across plain text and HTML. Separate evidence rows are not task coverage.
 const retailStory = JSON.parse(readFileSync(new URL("./fixtures/retail-completion-story-1218613928272290.json", import.meta.url), "utf8"));
