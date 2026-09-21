@@ -84,6 +84,12 @@ import {
   readResendDomainPreflight
 } from "./lib/resend-domain-preflight.js";
 import { assertMcpImportAllowedByTaskNotes } from "./lib/wp-import-path-guard.js";
+import {
+  fetchInstagramBusinessDiscoveryImage,
+  getInstagramBusinessDiscoveryConfig,
+  getInstagramBusinessDiscoveryMedia,
+  getInstagramBusinessDiscoveryProfile
+} from "./lib/instagram-business-discovery.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -16781,6 +16787,66 @@ function createServer() {
         verified_task,
         verification_status
       });
+    }
+  );
+
+  server.tool(
+    "instagram_business_discovery_check_config",
+    "Prueft die zentrale Instagram-Business-Discovery-Konfiguration ohne Secret-Ausgabe oder API-Aufruf.",
+    {},
+    TOOL_READ_ONLY,
+    async () => out(getInstagramBusinessDiscoveryConfig())
+  );
+
+  server.tool(
+    "instagram_business_discovery_profile",
+    "Liest oeffentliche Profildaten eines professionellen Instagram-Kontos ueber die feste Meta Business-Discovery-Abfrage. Nur GET, keine Publishing- oder Nachrichtenaktionen.",
+    {
+      agent_id: z.string().trim().regex(/^vip-ai-[a-z][a-z-]*$/),
+      username: z.string().trim().min(1).max(31)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, username }) => out({ agent_id, ...(await getInstagramBusinessDiscoveryProfile({ username })) })
+  );
+
+  server.tool(
+    "instagram_business_discovery_media",
+    "Liest die neuesten Medien-Metadaten samt Karussell-Kindern und verfuegbaren Medienadressen ueber eine feste Meta Business-Discovery-Abfrage. Medienadressen allein sind keine visuelle Auswertung.",
+    {
+      agent_id: z.string().trim().regex(/^vip-ai-[a-z][a-z-]*$/),
+      username: z.string().trim().min(1).max(31),
+      limit: z.number().int().min(1).max(10).optional().default(3)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, username, limit }) =>
+      out({ agent_id, ...(await getInstagramBusinessDiscoveryMedia({ username, limit })) })
+  );
+
+  server.tool(
+    "instagram_business_discovery_image",
+    "Ruft genau ein Bild von einer zuvor ermittelten Meta-CDN-Medienadresse ab und gibt die Bildbytes fuer die visuelle Auswertung aus. Nur HTTPS auf Meta-CDNs, ohne Graph-Token, ohne Redirects und mit Groessenlimit; keine Videos.",
+    {
+      agent_id: z.string().trim().regex(/^vip-ai-[a-z][a-z-]*$/),
+      media_url: z.string().url().max(6_000)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, media_url }) => {
+      const image = await fetchInstagramBusinessDiscoveryImage({ media_url });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              agent_id,
+              source: "Meta Instagram CDN",
+              fetched_at: image.fetchedAt,
+              mime_type: image.mimeType,
+              bytes: image.byteLength
+            })
+          },
+          { type: "image", data: image.bytes.toString("base64"), mimeType: image.mimeType }
+        ]
+      };
     }
   );
 

@@ -36,6 +36,8 @@
     "test:wp-import-path-guard": "node scripts/wp-import-path-guard-selftest.mjs",
     "test:web-research": "node scripts/web-research-selftest.mjs",
     "shadow:web-research": "node scripts/web-research-live-shadow.mjs",
+    "test:instagram-business-discovery": "node scripts/instagram-business-discovery-selftest.mjs",
+    "test:instagram-business-discovery-mcp": "node scripts/instagram-business-discovery-mcp-selftest.mjs",
     "mcp:call": "node scripts/vip-mcp-call.mjs"
   },
   "keywords": [],
