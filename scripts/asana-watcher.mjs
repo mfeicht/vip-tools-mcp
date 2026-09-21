@@ -38,6 +38,7 @@ const WATCHER_LOCK_STALE_MS = Number.parseInt(
   10
 );
 const MAX_OPEN_TASK_SNAPSHOT_LIMIT = 100;
+const MAX_OPEN_TASK_SNAPSHOT_PAGES = 10;
 
 let activeWatcherLock = null;
 
@@ -214,6 +215,15 @@ async function retryTransient(label, operation) {
 
 function safeArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function assertCompleteAgentSnapshot(snapshot) {
+  if (!snapshot.ok) {
+    throw new Error(snapshot.error || "Gebündelter Asana-Readback fehlgeschlagen.");
+  }
+  if (snapshot.truncated) {
+    throw new Error(`Asana-Snapshot nach ${snapshot.pages_fetched || MAX_OPEN_TASK_SNAPSHOT_PAGES} Seiten unvollstaendig; kein Cursor-Fortschritt.`);
+  }
 }
 
 async function withTimeout(promise, timeoutMs, label) {
@@ -726,6 +736,12 @@ async function run() {
       safeMcpErrorText(new Error("Just a moment... challenges.cloudflare.com")) ===
         "Cloudflare managed challenge on the canonical MCP endpoint" &&
       safeMcpErrorText(new Error("ordinary watcher failure")) === "ordinary watcher failure";
+    let truncatedRejected = false;
+    try {
+      assertCompleteAgentSnapshot({ ok: true, truncated: true, pages_fetched: 10 });
+    } catch (error) {
+      truncatedRejected = error.message.includes("kein Cursor-Fortschritt");
+    }
     const firstBatch = planSignalBatch({
       candidateSignals: sample,
       pendingSignals: {},
@@ -784,7 +800,7 @@ async function run() {
       await fs.rm(selfTestDir, { recursive: true, force: true });
     }
 
-    const passed = signalChecksPassed && backlogChecksPassed && persistenceChecksPassed;
+    const passed = signalChecksPassed && backlogChecksPassed && persistenceChecksPassed && truncatedRejected;
     console.log(JSON.stringify({ passed, signal_checks: signalChecksPassed, backlog_checks: backlogChecksPassed, persistence_checks: persistenceChecksPassed, result }));
     if (!passed) process.exitCode = 1;
     return;
@@ -846,6 +862,7 @@ async function run() {
     const taskSnapshot = await callTool(client, "asana_agents_open_task_snapshot", {
       ...(opts.agents ? { agent_ids: opts.agents } : {}),
       limit: opts.limit,
+      max_pages: MAX_OPEN_TASK_SNAPSHOT_PAGES,
       concurrency: 4
     });
     const agentSnapshots = safeArray(taskSnapshot?.agents).filter((agent) =>
@@ -878,9 +895,7 @@ async function run() {
       summary.agents_checked += 1;
 
       try {
-        if (!agentSnapshot.ok) {
-          throw new Error(agentSnapshot.error || "Gebündelter Asana-Readback fehlgeschlagen.");
-        }
+        assertCompleteAgentSnapshot(agentSnapshot);
         const workspaceGid = agentSnapshot.workspace_gid;
         if (!workspaceGid) throw new Error("Kein Asana-Workspace im whoami-Result gefunden.");
         agentState.workspace_gid = workspaceGid;

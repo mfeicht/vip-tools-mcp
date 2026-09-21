@@ -12623,10 +12623,11 @@ function createServer() {
     {
       agent_ids: z.array(agentIdSchema).max(25).optional(),
       limit: z.number().int().min(1).max(100).optional().default(100),
+      max_pages: z.number().int().min(1).max(10).optional().default(10),
       concurrency: z.number().int().min(1).max(4).optional().default(4)
     },
     TOOL_READ_ONLY,
-    async ({ agent_ids, limit, concurrency }) => {
+    async ({ agent_ids, limit, max_pages, concurrency }) => {
       const selectedAgentIds = [
         ...new Set(
           (agent_ids?.length
@@ -12639,7 +12640,7 @@ function createServer() {
       const generatedAt = new Date().toISOString();
       const agents = await mapWithConcurrency(selectedAgentIds, concurrency, async (agentId) => {
         try {
-          return await readAsanaAgentOpenTaskSnapshot(agentId, limit);
+          return await readAsanaAgentOpenTaskSnapshot(agentId, limit, max_pages);
         } catch (error) {
           return {
             agent_id: agentId,
@@ -23465,7 +23466,7 @@ async function mapWithConcurrency(values, concurrency, mapper) {
   return results;
 }
 
-async function readAsanaAgentOpenTaskSnapshot(agentId, limit = 100) {
+async function readAsanaAgentOpenTaskSnapshot(agentId, limit = 100, maxPages = 10) {
   const asana = getAsana(agentId);
   const userResponse = await asanaRequestWithRetry(asana, {
     method: "GET",
@@ -23475,26 +23476,36 @@ async function readAsanaAgentOpenTaskSnapshot(agentId, limit = 100) {
   const workspaceGid = user.workspaces?.[0]?.gid;
   if (!workspaceGid) throw new Error("Kein Asana-Workspace gefunden.");
 
-  const taskResponse = await asanaRequestWithRetry(asana, {
-    method: "GET",
-    url: "/tasks",
-    params: {
-      assignee: "me",
-      workspace: workspaceGid,
-      completed_since: "now",
-      limit,
-      opt_fields:
-        "gid,name,modified_at,due_on,due_at,completed,permalink_url,assignee.gid,assignee.name,tags.gid,tags.name,memberships.project.gid,memberships.project.name,custom_fields.name,custom_fields.display_value,custom_fields.text_value,custom_fields.enum_value.name"
-    }
-  });
+  const tasks = [];
+  let offset = null;
+  let pagesFetched = 0;
+  do {
+    const taskResponse = await asanaRequestWithRetry(asana, {
+      method: "GET",
+      url: "/tasks",
+      params: {
+        assignee: "me",
+        workspace: workspaceGid,
+        completed_since: "now",
+        limit,
+        ...(offset ? { offset } : {}),
+        opt_fields:
+          "gid,name,modified_at,due_on,due_at,completed,permalink_url,assignee.gid,assignee.name,tags.gid,tags.name,memberships.project.gid,memberships.project.name,custom_fields.name,custom_fields.display_value,custom_fields.text_value,custom_fields.enum_value.name"
+      }
+    });
+    tasks.push(...(taskResponse.data.data || []));
+    offset = taskResponse.data.next_page?.offset || null;
+    pagesFetched += 1;
+  } while (offset && pagesFetched < maxPages);
 
   return {
     agent_id: agentId,
     ok: true,
     user_gid: user.gid,
     workspace_gid: workspaceGid,
-    tasks: taskResponse.data.data || [],
-    truncated: Boolean(taskResponse.data.next_page)
+    tasks,
+    pages_fetched: pagesFetched,
+    truncated: Boolean(offset)
   };
 }
 
