@@ -836,6 +836,7 @@ async function run() {
     raw_signals_found: 0,
     signals_found: 0,
     signals_queued: 0,
+    signals_pending: 0,
     agents: {}
   };
 
@@ -870,6 +871,7 @@ async function run() {
         raw_signals_found: 0,
         signals_found: 0,
         signals_queued: 0,
+        signals_pending: 0,
         errors: []
       };
       summary.agents[agentId] = agentSummary;
@@ -923,6 +925,7 @@ async function run() {
         agentSummary.raw_signals_found = freshRawSignals.length;
         agentSummary.signals_found = freshSignals.length;
         agentSummary.signals_queued = queuedSignals.length;
+        agentSummary.signals_pending = Object.keys(nextPendingSignals).length;
         agentState.last_checked_at = detectedAt;
         summary.agents_succeeded += 1;
         summary.tasks_checked += agentSummary.tasks_checked;
@@ -937,6 +940,7 @@ async function run() {
         summary.raw_signals_found += agentSummary.raw_signals_found;
         summary.signals_found += agentSummary.signals_found;
         summary.signals_queued += agentSummary.signals_queued;
+        summary.signals_pending += agentSummary.signals_pending;
       } catch (error) {
         agentSummary.errors.push(error.message);
         summary.agents_failed += 1;
@@ -979,6 +983,7 @@ async function run() {
       raw_signals_found: summary.raw_signals_found,
       signals_found: summary.signals_found,
       signals_queued: summary.signals_queued,
+      signals_pending: summary.signals_pending,
       state_source: summary.state_source,
       state_recovered: summary.state_recovered
     });
@@ -1010,12 +1015,13 @@ function renderLog(summary, signals) {
     `- routine_missing_tag: ${summary.routine_missing_tag}`,
     `- raw_signals_found: ${summary.raw_signals_found}`,
     `- signals_found: ${summary.signals_found}`,
-    `- signals_queued: ${summary.signals_queued}`
+    `- signals_queued: ${summary.signals_queued}`,
+    `- signals_pending: ${summary.signals_pending}`
   ];
 
   for (const [agentId, data] of Object.entries(summary.agents)) {
     lines.push(
-      `- ${agentId}: tasks=${data.tasks_checked}, overdue=${data.overdue_tasks}, due_today=${data.due_today_tasks}, due_later_today=${data.due_later_today_tasks}, due_tomorrow=${data.due_tomorrow_tasks}, future=${data.future_tasks}, no_due=${data.tasks_without_due}, routines=${data.routine_tasks}, routine_missing_tag=${data.routine_missing_tag}, raw=${data.raw_signals_found}, found=${data.signals_found}, queued=${data.signals_queued}`
+      `- ${agentId}: tasks=${data.tasks_checked}, overdue=${data.overdue_tasks}, due_today=${data.due_today_tasks}, due_later_today=${data.due_later_today_tasks}, due_tomorrow=${data.due_tomorrow_tasks}, future=${data.future_tasks}, no_due=${data.tasks_without_due}, routines=${data.routine_tasks}, routine_missing_tag=${data.routine_missing_tag}, raw=${data.raw_signals_found}, found=${data.signals_found}, queued=${data.signals_queued}, pending=${data.signals_pending}`
     );
     for (const error of data.errors.slice(0, 3)) {
       lines.push(`  - error: ${truncate(error, 220)}`);
