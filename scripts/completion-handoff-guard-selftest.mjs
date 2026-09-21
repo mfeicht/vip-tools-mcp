@@ -282,6 +282,25 @@ const noFollowUpSignal = detectRoutineFollowUpSignals({
 assert.equal(noFollowUpSignal.no_follow_up_claim, true);
 assert.equal(noFollowUpSignal.blocked_without_follow_up_task, false);
 
+// Natural Sales completion stories use a heading or a coordinated negative
+// phrase. Both must be visible no-follow-up claims without creating a dummy task.
+for (const text of [
+  "Follow-up\nKeines erforderlich: Der Routine-Scope einschließlich Import ist erledigt. Die reguläre Folgeinstanz wird nach dem Abschluss live geprüft.",
+  "Folgearbeit\nKeine weitere Recherche oder Folgeaufgabe erforderlich; die reguläre Routinefolge wird nach dem Abschluss live geprüft."
+]) {
+  const finalComment = { text: `${text}\nEvidenz / Verifikation\nDer lokale Pflichtimport meldete success_count=1 und error_count=0.` };
+  const signals = detectRoutineFollowUpSignals({ finalComment });
+  assert.equal(signals.no_follow_up_claim, true);
+  assert.equal(signals.blocked_without_follow_up_task, false);
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment, hasFollowUpTask: false }).ok, true);
+  assert.equal(detectRoutineFollowUpSignals({
+    finalComment: { text: `${text} Die bestehende Routine uebernimmt die Nacharbeit.` }
+  }).blocked_without_follow_up_task, true);
+}
+for (const text of ["Follow-up\nKeines nachgewiesen.", "Keine weitere Recherche oder Folgeaufgabe angelegt."]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: { text }, hasFollowUpTask: false }).ok, false);
+}
+
 const coordinatedNoFollowUpSignal = detectRoutineFollowUpSignals({
   finalComment: {
     text:
