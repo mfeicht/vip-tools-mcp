@@ -103,6 +103,48 @@ try {
     binding: { body_marker: "TEXT", trailing_identity_lines: [] },
     template: { uid: "23", raw: signatureRaw, raw_sha256: "fixture-signature-hash", parsed: {} }
   };
+  const standardInfoSource = {
+    uid: "501",
+    raw: [
+      "From: Ayesha <ayesha@example.com>",
+      "Subject: Guest post pricing",
+      "Message-ID: <guest-post-501@example.com>",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      "Could you share the guest article price for reise-stories.de?"
+    ].join("\r\n"),
+    raw_sha256: "fixture-standard-info-source-hash",
+    parsed: {
+      subject: "Guest post pricing",
+      message_id_hash: "fixture-standard-info-message-id-hash",
+      text_parts: [{ content_type: "text/plain", text: "Could you share the guest article price for reise-stories.de?" }]
+    }
+  };
+  const standardInfoPlan = serverModule.buildEmailActionAdaptiveReplyPlan({
+    action: {
+      id: "rs-contact-en", idempotency_scope: "rs-contact", mailbox: "INBOX.RS Contact",
+      inbound_language: "en", include_quoted_original: true, adaptive_external_enabled: true,
+      adaptive_request_types: ["guest_article"]
+    },
+    templateMessage: { uid: "5", raw_sha256: "fixture-template-hash" },
+    sourceMessage: standardInfoSource,
+    sendAccount: { from: "contact@reise-stories.de" },
+    signatureTemplate: proposalSignature,
+    adaptiveDecision: {
+      language: "en", request_type: "guest_article", offer_strategy: "requested_product_only",
+      answer_scope: "general_information_only", reply_body: "Hi Ayesha,\n\nThe current guest article price is €365 plus VAT.\n\nBest regards",
+      template_style_followed: true, knowledge_confidence: "high", industry_risk: "uncertain",
+      industry_evidence_note: "The sender did not provide a client industry or target URL.",
+      dynamic_sources_checked: ["https://reise-stories.de/cooperations/"],
+      dynamic_sources_checked_at: new Date().toISOString(),
+      evidence_note: "Current listed Guest Article price verified from the official cooperation page."
+    }
+  });
+  const encodedStandardInfoPlain = standardInfoPlan.raw_message
+    .split("Content-Transfer-Encoding: base64\r\n\r\n")[1]
+    ?.split("\r\n--")[0]
+    ?.replace(/\s+/gu, "");
+  const standardInfoPlain = Buffer.from(encodedStandardInfoPlain || "", "base64").toString("utf8");
   const reviewPlans = ["de", "en"].flatMap((language) => ["plain", "html"].map((bodyType) => {
     const raw = [
       "From: Original <original@example.com>", "Reply-To: reply@example.com",
@@ -355,6 +397,15 @@ try {
       source.includes("dynamic_sources_checked_at") &&
       source.includes("buildEmailActionIdempotencyId") &&
       source.includes("adaptive_reply: plan.adaptive_reply"),
+    general_information_reply_is_conditional_and_threaded:
+      standardInfoPlan.adaptive_reply.answer_scope === "general_information_only" &&
+      standardInfoPlan.adaptive_reply.industry_risk === "uncertain" &&
+      standardInfoPlan.to === "ayesha@example.com" &&
+      standardInfoPlan.bcc === "contact@reise-stories.de" &&
+      standardInfoPlan.in_reply_to === "<guest-post-501@example.com>" &&
+      standardInfoPlain.includes("Before we can confirm a specific placement") &&
+      standardInfoPlain.indexOf("editorial review") < standardInfoPlain.indexOf("Best regards") &&
+      standardInfoPlain.includes("SIGNATURE-FIXTURE"),
     adaptive_reply_html_uses_semantic_lists:
       adaptiveListHtml.includes("<ul>") &&
       adaptiveListHtml.includes("<li>Preis: 365 EUR</li>") &&

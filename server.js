@@ -12,6 +12,10 @@ import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 import { assertLinkedGoogleDocScope, linkedGoogleDocReadback } from "./lib/google-docs-linked-reader.js";
+import {
+  appendGeneralInformationQualification,
+  validateGeneralInformationReply
+} from "./lib/email-action-general-information.js";
 
 import {
   selectImapUidPage,
@@ -263,6 +267,7 @@ const emailActionAdaptiveReplySchema = z
     template_style_followed: z.literal(true),
     knowledge_confidence: z.literal("high"),
     industry_risk: z.enum(["safe", "prohibited", "uncertain"]),
+    answer_scope: z.enum(["placement_offer", "general_information_only"]).optional(),
     industry_evidence_note: z.string().min(12).max(1000),
     dynamic_sources_checked: z.array(z.string().url()).min(1).max(8),
     dynamic_sources_checked_at: z.string().datetime({ offset: true }),
@@ -9420,11 +9425,15 @@ function validateEmailActionAdaptiveReply(action, decision) {
     throw new Error(`Action ${action.id}: externe adaptive Antwort braucht hohe Wissenssicherheit.`);
   }
   const industryRisk = String(decision.industry_risk || "").trim().toLowerCase();
+  const answerScope = String(decision.answer_scope || "placement_offer").trim().toLowerCase();
   const industryEvidenceNote = String(decision.industry_evidence_note || "").trim();
+  if (answerScope === "general_information_only" && !["rs-contact-de", "rs-contact-en"].includes(action.id)) {
+    throw new Error(`Action ${action.id}: allgemeiner Auskunftsmodus ist nur fuer RS Contact freigegeben.`);
+  }
   if (industryRisk === "prohibited") {
     throw new Error(`Action ${action.id}: Casino-, Gluecksspiel-, Crypto-, Spam- oder sonstige unserioese Linkziele sind gesperrt.`);
   }
-  if (industryRisk !== "safe") {
+  if (industryRisk !== "safe" && !(industryRisk === "uncertain" && answerScope === "general_information_only")) {
     throw new Error(`Action ${action.id}: unklare Branche oder Linkziel braucht den sicheren Pruefweg.`);
   }
   if (industryEvidenceNote.length < 12 || industryEvidenceNote.length > 1000) {
@@ -9555,6 +9564,7 @@ function validateEmailActionAdaptiveReply(action, decision) {
     template_style_followed: true,
     knowledge_confidence: "high",
     industry_risk: industryRisk,
+    answer_scope: answerScope,
     industry_evidence_note: industryEvidenceNote,
     dynamic_sources_checked: sourceUrls,
     dynamic_sources_checked_at: new Date(sourcesCheckedAtMs).toISOString(),
@@ -9607,7 +9617,7 @@ export function renderEmailActionReplyBodyHtml(value) {
   return `<div>${blocks.join("<br><br>\n")}</div>`;
 }
 
-function buildEmailActionAdaptiveReplyPlan({
+export function buildEmailActionAdaptiveReplyPlan({
   action,
   templateMessage,
   sourceMessage,
@@ -9629,8 +9639,29 @@ function buildEmailActionAdaptiveReplyPlan({
     sourceMailbox: action.mailbox,
     sourceMessage
   });
+  if (decision.answer_scope === "general_information_only") {
+    const inboundBody = emailLearningBodyText(sourceMessage.parsed?.text_parts || [], 20_000);
+    validateGeneralInformationReply({
+      answerScope: decision.answer_scope,
+      requestType: decision.request_type,
+      industryRisk: decision.industry_risk,
+      inboundSubject: sourceMessage.parsed?.subject,
+      inboundBody: inboundBody.text,
+      inboundBodyTruncated: inboundBody.truncated,
+      replyBody: decision.reply_body,
+      discountStage: decision.discount_stage,
+      proposedPriceEur: decision.proposed_price_eur,
+      negotiationRoundsCompleted: decision.negotiation_rounds_completed,
+      negotiationRoundsFailed: decision.negotiation_rounds_failed,
+      includedLinkCount: decision.included_link_count,
+      previousOfferAmountsEur: decision.previous_offer_amounts_eur
+    });
+  }
+  const scopedReplyBody = decision.answer_scope === "general_information_only"
+    ? appendGeneralInformationQualification(decision.reply_body, decision.language)
+    : decision.reply_body;
   const cleanReplyBody = stripTrailingIdentityFromText(
-    decision.reply_body,
+    scopedReplyBody,
     signatureTemplate.binding.trailing_identity_lines
   );
   const contentHtml = renderEmailActionReplyBodyHtml(cleanReplyBody);
@@ -9718,6 +9749,7 @@ function buildEmailActionAdaptiveReplyPlan({
       template_style_followed: decision.template_style_followed,
       knowledge_confidence: decision.knowledge_confidence,
       industry_risk: decision.industry_risk,
+      answer_scope: decision.answer_scope,
       industry_evidence_note_sha256: createHash("sha256").update(decision.industry_evidence_note, "utf8").digest("hex"),
       industry_evidence_note_bytes: Buffer.byteLength(decision.industry_evidence_note, "utf8"),
       dynamic_sources_checked: decision.dynamic_sources_checked,
