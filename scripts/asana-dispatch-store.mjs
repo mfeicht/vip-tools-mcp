@@ -367,6 +367,50 @@ export class AsanaDispatchStore {
     });
   }
 
+  reviewDeadLetters({ signalIds, agentId, taskGid, outcome = "acknowledged",
+    evidence, now = Date.now() } = {}) {
+    if (!Array.isArray(signalIds) || signalIds.length === 0 || signalIds.length > 20 ||
+        new Set(signalIds).size !== signalIds.length) {
+      throw new Error("dead-letter review requires one to twenty unique signal IDs");
+    }
+    signalIds.forEach((id) => assertId(id, "signal_id"));
+    assertId(agentId, "agent_id");
+    assertId(taskGid, "task_gid");
+    assertTime(now, "now");
+    if (!["acknowledged", "retry_after"].includes(outcome)) {
+      throw new Error("dead-letter review outcome must be acknowledged or retry_after");
+    }
+    if (typeof evidence !== "string" || evidence.trim().length < 40) {
+      throw new Error("dead-letter review requires concrete evidence");
+    }
+    return this.transaction(() => {
+      const activeAgentLease = this.db.prepare("SELECT run_id FROM leases WHERE key=?")
+        .get(`agent:${agentId}`);
+      const activeTaskLease = this.db.prepare("SELECT run_id FROM leases WHERE key=?")
+        .get(`task:${taskGid}`);
+      if (activeAgentLease || activeTaskLease) {
+        throw new Error("dead-letter review blocked by an active agent or task lease");
+      }
+      const rows = signalIds.map((id) => this.db.prepare("SELECT * FROM signals WHERE id=?").get(id));
+      if (rows.some((row) => !row || row.status !== "dead_letter" ||
+          row.agent_id !== agentId || row.task_gid !== taskGid || row.run_id ||
+          row.lease_token || row.lease_fence)) {
+        throw new Error("dead-letter signal state or scope changed");
+      }
+      const note = `Dead-letter review (${outcome}): ${evidence.trim()}`.slice(0, 500);
+      const availableAt = outcome === "retry_after" ? now + 60_000 : now;
+      const update = this.db.prepare(`UPDATE signals SET status=?, available_at_ms=?,
+        updated_at_ms=?, last_error=? WHERE id=? AND status='dead_letter'`);
+      for (const id of signalIds) {
+        if (update.run(outcome, availableAt, now, note, id).changes !== 1) {
+          throw new Error("dead-letter signal changed during review");
+        }
+      }
+      return { agent_id: agentId, task_gid: taskGid, outcome,
+        signals_resolved: signalIds.length, signal_ids: [...signalIds] };
+    });
+  }
+
   counts() {
     return Object.fromEntries(this.db.prepare("SELECT status,COUNT(*) AS n FROM signals GROUP BY status")
       .all().map((row) => [row.status, row.n]));

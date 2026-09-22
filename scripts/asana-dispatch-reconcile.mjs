@@ -78,6 +78,11 @@ export async function resolveReconciliationRun(store, { runId, outcome, evidence
     outcome, signals_resolved: claim.signals.length, archived, archive_error: archiveError };
 }
 
+export function resolveDeadLetters(store, { signalIds, agentId, taskGid, outcome,
+  evidence, now = Date.now() } = {}) {
+  return store.reviewDeadLetters({ signalIds, agentId, taskGid, outcome, evidence, now });
+}
+
 export async function reconcileCompletedRuns(store, { readTask = null,
   archive = archiveCompletedThread, limit = 5 } = {}) {
   const runs = store.runsNeedingReconciliation()
@@ -131,8 +136,16 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
   const inspectRunId = value("inspect-run");
   const outcome = value("outcome");
   const evidence = value("evidence");
+  const deadLetterTask = value("dead-letter-task");
+  const deadLetterAgent = value("dead-letter-agent");
+  const deadLetterSignals = value("dead-letter-signals")?.split(",").filter(Boolean);
+  const deadLetterOutcome = value("dead-letter-outcome");
   const store = new AsanaDispatchStore(dbPath);
-  const operation = inspectRunId
+  const operation = deadLetterTask || deadLetterAgent || deadLetterSignals || deadLetterOutcome
+    ? Promise.resolve(resolveDeadLetters(store, { taskGid: deadLetterTask,
+      agentId: deadLetterAgent, signalIds: deadLetterSignals,
+      outcome: deadLetterOutcome, evidence }))
+    : inspectRunId
     ? inspectReconciliationRun(store, { runId: inspectRunId })
     : runId || outcome || evidence
     ? resolveReconciliationRun(store, { runId, outcome, evidence })

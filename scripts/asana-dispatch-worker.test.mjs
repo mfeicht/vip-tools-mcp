@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
-import { assertCodexOutputSchema, cleanNoWriteDueTask, documentedDependencyNoWrite, noWriteDisposition } from "./asana-dispatch-worker.mjs";
+import { assertCodexOutputSchema, cleanNoWriteDueTask, documentedDependencyNoWrite,
+  noStorySignalsDeferredByDue, noWriteDisposition } from "./asana-dispatch-worker.mjs";
 
 test("Codex output schema requires every property and permits null dependency fields", () => {
   const schema = JSON.parse(fs.readFileSync(path.join(import.meta.dirname,
@@ -25,6 +26,22 @@ test("worker rejects invalid output schema before a model turn", async (t) => {
   const invalidPath = path.join(dir, "invalid.json");
   fs.writeFileSync(invalidPath, JSON.stringify(invalid));
   await assert.rejects(assertCodexOutputSchema(invalidPath), /require exactly every/);
+});
+
+test("future due gate suppresses mixed non-story continuation signals before a model turn", () => {
+  const now = new Date("2026-09-22T11:45:00.000Z");
+  const task = { due_on: "2026-09-23", due_at: "2026-09-23T08:30:00.000Z" };
+  const mixed = { signals: [
+    { kind: "due_task", story_gid: null },
+    { kind: "continuation", story_gid: null }
+  ] };
+  assert.equal(noStorySignalsDeferredByDue(mixed, task, now), true);
+  assert.equal(noStorySignalsDeferredByDue({ signals: [
+    ...mixed.signals, { kind: "human_comment", story_gid: "999001" }
+  ] }, task, now), false);
+  assert.equal(noStorySignalsDeferredByDue({ signals: [
+    { kind: "continuation", story_gid: null }
+  ] }, { due_on: "2026-09-22", due_at: "2026-09-22T08:30:00.000Z" }, now), false);
 });
 
 test("MCP failure before agent start retries and releases both leases", (t) => {

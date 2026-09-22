@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
-import { inspectReconciliationRun, reconcileCompletedRuns, resolveReconciliationRun } from "./asana-dispatch-reconcile.mjs";
+import { inspectReconciliationRun, reconcileCompletedRuns, resolveDeadLetters,
+  resolveReconciliationRun } from "./asana-dispatch-reconcile.mjs";
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dispatch-reconcile-"));
@@ -94,4 +95,33 @@ test("read-only reconciliation inspection reports post-run stories without relea
   assert.equal(result.stories_after_start[0].gid, "story-1");
   assert.equal(store.activeLeases().length, 2);
   assert.deepEqual(store.counts(), { leased: 1 });
+});
+
+test("operator can acknowledge exact dead letters only after scoped evidence and without active leases", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dead-letter-review-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new AsanaDispatchStore(path.join(dir, "store.sqlite"));
+  t.after(() => store.close());
+  for (const id of ["dead-1", "dead-2"]) {
+    store.enqueue({ id, agent_id: "vip-ai-sales", task_gid: "123456",
+      source_version: id, kind: id === "dead-1" ? "due_task" : "continuation",
+      priority: 50, available_at_ms: 1000 }, 1000);
+  }
+  const claim = store.claimNext("run-dead", { now: 1000 });
+  store.settle(claim, { outcome: "dead_letter", error: "review required", now: 2000 });
+  assert.throws(() => resolveDeadLetters(store, { signalIds: ["dead-1", "dead-2"],
+    agentId: "vip-ai-sales", taskGid: "123456", outcome: "acknowledged",
+    evidence: "short" }), /concrete evidence/);
+  const result = resolveDeadLetters(store, { signalIds: ["dead-1", "dead-2"],
+    agentId: "vip-ai-sales", taskGid: "123456", outcome: "acknowledged",
+    evidence: "Archived Codex output and current Asana due timestamp prove the run was a completed no-op.",
+    now: 3000 });
+  assert.equal(result.signals_resolved, 2);
+  assert.deepEqual(store.counts(), { acknowledged: 2 });
+  assert.match(store.db.prepare("SELECT last_error FROM signals LIMIT 1").get().last_error,
+    /Archived Codex output/);
+  assert.throws(() => resolveDeadLetters(store, { signalIds: ["dead-1"],
+    agentId: "vip-ai-sales", taskGid: "123456", outcome: "acknowledged",
+    evidence: "Archived Codex output and current Asana due timestamp prove the run was a completed no-op." }),
+  /state or scope changed/);
 });

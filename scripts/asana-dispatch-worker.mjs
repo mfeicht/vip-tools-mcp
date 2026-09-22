@@ -99,6 +99,13 @@ export function noWriteDisposition(input) {
   return documentedDependencyNoWrite(input) ? "acknowledged" : "dead_letter";
 }
 
+export function noStorySignalsDeferredByDue(claim, task, now = new Date()) {
+  return Boolean(claim?.signals?.length &&
+    claim.signals.every((signal) => !signal.story_gid &&
+      ["due_task", "continuation", "dependency_ready"].includes(signal.kind)) &&
+    !dueIsReady(task, now));
+}
+
 async function selectModel(agentId, task) {
   const policy = JSON.parse(await fs.readFile(path.join(ROOT,
     "VIP-AI-Memory/03-Betrieb/Adaptive-Modellrouting.json"), "utf8"));
@@ -246,7 +253,7 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null } 
       return Boolean(source && (ownedNow || storyMentionsUser(source, ownGid)));
     });
     const relevant = relevantSignals.length > 0;
-    const dueSignalStale = claim.signals.every((signal) => signal.kind === "due_task") && !dueIsReady(before);
+    const dueSignalStale = noStorySignalsDeferredByDue(claim, before);
     if (before.completed || !relevant || dueSignalStale ||
       (claim.signals.every((signal) => signal.story_gid) &&
         allCommentSignalsAnswered(claim, beforeStories, ownGid))) {
