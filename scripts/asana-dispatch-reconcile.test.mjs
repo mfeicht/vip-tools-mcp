@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
-import { reconcileCompletedRuns } from "./asana-dispatch-reconcile.mjs";
+import { reconcileCompletedRuns, resolveReconciliationRun } from "./asana-dispatch-reconcile.mjs";
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dispatch-reconcile-"));
@@ -43,4 +43,40 @@ test("open task stays fenced after ambiguous worker outcome", async (t) => {
   assert.equal(result.acknowledged, 0);
   assert.equal(store.activeLeases().length, 2);
   assert.deepEqual(store.counts(), { leased: 1 });
+});
+
+test("operator can acknowledge an open run only with concrete reconciliation evidence", async (t) => {
+  const store = fixture(t);
+  const archived = [];
+  await assert.rejects(resolveReconciliationRun(store, {
+    runId: "run-1", outcome: "acknowledged", evidence: "too short"
+  }), /concrete evidence note/);
+  const result = await resolveReconciliationRun(store, {
+    runId: "run-1", outcome: "acknowledged",
+    evidence: "Codex thread completed and the expected Asana story was read back.",
+    archive: async (id) => { archived.push(id); return true; }, now: 3000
+  });
+  assert.deepEqual(result, { run_id: "run-1", agent_id: "vip-ai-test", task_gid: "123456",
+    outcome: "acknowledged", signals_resolved: 1, archived: true, archive_error: null });
+  assert.deepEqual(archived, ["thread-1"]);
+  assert.deepEqual(store.activeLeases(), []);
+  assert.deepEqual(store.counts(), { acknowledged: 1 });
+  const run = store.db.prepare("SELECT state,last_error FROM runs WHERE run_id='run-1'").get();
+  assert.equal(run.state, "completed");
+  assert.match(run.last_error, /expected Asana story/);
+});
+
+test("operator can safely retry a run proven to have made no external change", async (t) => {
+  const store = fixture(t);
+  const result = await resolveReconciliationRun(store, {
+    runId: "run-1", outcome: "retry_after",
+    evidence: "Codex stopped before mutation and the task modified timestamp is unchanged.",
+    archive: async () => { throw new Error("must not archive retries"); }, now: 3000
+  });
+  assert.equal(result.outcome, "retry_after");
+  assert.equal(result.archived, false);
+  assert.deepEqual(store.activeLeases(), []);
+  assert.deepEqual(store.counts(), { retry_after: 1 });
+  assert.match(store.db.prepare("SELECT last_error FROM signals").get().last_error,
+    /stopped before mutation/);
 });

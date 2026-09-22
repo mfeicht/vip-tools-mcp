@@ -6,6 +6,36 @@ import { archiveCompletedThread } from "./codex-app-rpc.mjs";
 
 const MCP_URL = process.env.WATCHER_MCP_URL || "https://vip-tools-mcp.onrender.com/mcp";
 
+export async function resolveReconciliationRun(store, { runId, outcome, evidence,
+  archive = archiveCompletedThread, now = Date.now() } = {}) {
+  if (typeof runId !== "string" || !/^[a-zA-Z0-9_-]{2,180}$/.test(runId)) {
+    throw new Error("A valid reconciliation runId is required");
+  }
+  if (!["acknowledged", "retry_after"].includes(outcome)) {
+    throw new Error("Reconciliation outcome must be acknowledged or retry_after");
+  }
+  if (typeof evidence !== "string" || evidence.trim().length < 20) {
+    throw new Error("Reconciliation requires a concrete evidence note");
+  }
+  const run = store.db.prepare("SELECT * FROM runs WHERE run_id=?").get(runId);
+  if (!run) throw new Error(`Unknown reconciliation run ${runId}`);
+  if (run.state !== "needs_reconciliation") {
+    throw new Error(`Run ${runId} is not awaiting reconciliation`);
+  }
+  const claim = store.claimForRun(runId);
+  store.settle(claim, { outcome, error: outcome === "retry_after" ? evidence.trim() : null, now });
+  store.recordRun(claim, { threadId: run.thread_id, turnId: run.turn_id, state: "completed",
+    error: `Manual reconciliation (${outcome}): ${evidence.trim()}`, now });
+  let archived = false;
+  let archiveError = null;
+  if (outcome === "acknowledged" && run.thread_id) {
+    try { archived = await archive(run.thread_id); }
+    catch (error) { archiveError = String(error).slice(0, 500); }
+  }
+  return { run_id: runId, agent_id: run.agent_id, task_gid: run.task_gid,
+    outcome, signals_resolved: claim.signals.length, archived, archive_error: archiveError };
+}
+
 export async function reconcileCompletedRuns(store, { readTask = null,
   archive = archiveCompletedThread, limit = 5 } = {}) {
   const runs = store.runsNeedingReconciliation()
@@ -52,10 +82,19 @@ export async function reconcileCompletedRuns(store, { readTask = null,
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
-  const store = new AsanaDispatchStore(DEFAULT_DB_PATH);
-  reconcileCompletedRuns(store).then((result) => {
+  const args = process.argv.slice(2);
+  const value = (name) => args.find((arg) => arg.startsWith(`--${name}=`))?.slice(name.length + 3);
+  const dbPath = value("db") || DEFAULT_DB_PATH;
+  const runId = value("run");
+  const outcome = value("outcome");
+  const evidence = value("evidence");
+  const store = new AsanaDispatchStore(dbPath);
+  const operation = runId || outcome || evidence
+    ? resolveReconciliationRun(store, { runId, outcome, evidence })
+    : reconcileCompletedRuns(store);
+  operation.then((result) => {
     console.log(JSON.stringify(result));
-    if (result.errors.length) process.exitCode = 2;
+    if (result.errors?.length || result.archive_error) process.exitCode = 2;
   }).catch((error) => { console.error(error); process.exitCode = 1; })
     .finally(() => store.close());
 }
