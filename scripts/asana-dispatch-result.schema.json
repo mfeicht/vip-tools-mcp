@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome", "summary"],
+  "properties": {
+    "outcome": {
+      "type": "string",
+      "enum": ["completed", "progress", "blocked", "no_action", "failed"]
+    },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 1200 }
+  }
+}

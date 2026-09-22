@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.vipstudios.asana-dispatch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/moritzfeichtmeyer/Documents/Codex/VIP-Studios/vip-tools-mcp/scripts/asana-dispatch-watch.mjs</string>
+    <string>--dispatch</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>DISPATCH_MAX_WORKERS</key><string>2</string></dict>
+  <key>WorkingDirectory</key><string>/Users/moritzfeichtmeyer/Documents/Codex/VIP-Studios/vip-tools-mcp</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>5</integer></dict>
+    <dict><key>Minute</key><integer>10</integer></dict>
+    <dict><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Minute</key><integer>20</integer></dict>
+    <dict><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Minute</key><integer>40</integer></dict>
+    <dict><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Minute</key><integer>50</integer></dict>
+    <dict><key>Minute</key><integer>55</integer></dict>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/Users/moritzfeichtmeyer/Documents/Codex/VIP-Studios/VIP-AI-Workspace/10-Agenten/VIP-AI-Operations/run_state/Asana-Dispatch-launchd-error.log</string>
+</dict>
+</plist>
