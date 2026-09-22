@@ -17,6 +17,19 @@ const RESULT_SCHEMA = path.join(import.meta.dirname, "asana-dispatch-result.sche
 const TASK_FIELDS = "gid,name,completed,assignee.gid,created_by.gid,due_on,due_at,modified_at,permalink_url";
 const RUN_LIMIT_MS = 45 * 60_000;
 
+export async function assertCodexOutputSchema(filename = RESULT_SCHEMA) {
+  const schema = JSON.parse(await fs.readFile(filename, "utf8"));
+  const keys = Object.keys(schema.properties || {});
+  if (schema.type !== "object" || schema.additionalProperties !== false ||
+      !Array.isArray(schema.required) ||
+      keys.length === 0 ||
+      keys.some((key) => !schema.required.includes(key)) ||
+      schema.required.some((key) => !keys.includes(key))) {
+    throw new Error("Codex output schema must require exactly every declared property");
+  }
+  return schema;
+}
+
 async function readTask(client, agentId, taskGid) {
   const result = await tool(client, "asana_request", { agent_id: agentId,
     method: "GET", path: `/tasks/${taskGid}`, params: { opt_fields: TASK_FIELDS } });
@@ -120,7 +133,7 @@ function promptFor(claim, task, route) {
     `Bei einem reinen Due-Signal, dessen einziger offener Schritt bereits in einer bestehenden Asana-Story als Abhaengigkeit von einem anderen offenen Task belegt ist, vermeide einen doppelten Kommentar. Melde blocked/no_action und setze linked_task_gid und evidence_story_gid auf die direkt nachgelesenen GIDs. Ohne diesen Beleg dokumentiere den Blocker im aktuellen Task; ein stiller No-Write-Ausgang wird zur Operations-Pruefung eskaliert. ` +
     `Plane diesen Lauf auf hoechstens etwa 25 Minuten fachliche Arbeit; bei mehr Umfang dokumentiere einen verifizierbaren Zwischenstand und setze spaeter fort. ` +
     `Kein Subagent, keine weitere Aufgabe ausser notwendigem, vertraglich erlaubtem Handoff. ` +
-    `Antworte am Ende ausschliesslich im vorgegebenen JSON-Schema. outcome=progress nur bei nachpruefbarem Fortschritt, ` +
+    `Antworte am Ende ausschliesslich im vorgegebenen JSON-Schema. Setze linked_task_gid und evidence_story_gid ausserhalb eines belegten Abhaengigkeitsfalls auf null. outcome=progress nur bei nachpruefbarem Fortschritt, ` +
     `blocked bei echtem externem Hindernis, no_action nur wenn keine Handlung mehr noetig ist.\n`;
 }
 
@@ -220,6 +233,7 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null } 
   let codex = null;
   let codexStarted = false;
   try {
+    await assertCodexOutputSchema();
     await client.connect(new StreamableHTTPClientTransport(new URL(MCP_URL)));
     const before = await readTask(client, agentId, taskGid);
     const ownGid = await userGid(client, agentId);

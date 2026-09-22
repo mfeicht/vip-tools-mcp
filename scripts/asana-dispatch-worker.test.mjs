@@ -5,7 +5,27 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
-import { cleanNoWriteDueTask, documentedDependencyNoWrite, noWriteDisposition } from "./asana-dispatch-worker.mjs";
+import { assertCodexOutputSchema, cleanNoWriteDueTask, documentedDependencyNoWrite, noWriteDisposition } from "./asana-dispatch-worker.mjs";
+
+test("Codex output schema requires every property and permits null dependency fields", () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(import.meta.dirname,
+    "asana-dispatch-result.schema.json"), "utf8"));
+  assert.deepEqual([...schema.required].sort(), Object.keys(schema.properties).sort());
+  assert.deepEqual(schema.properties.linked_task_gid.type, ["string", "null"]);
+  assert.deepEqual(schema.properties.evidence_story_gid.type, ["string", "null"]);
+});
+
+test("worker rejects invalid output schema before a model turn", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-output-schema-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const valid = path.join(import.meta.dirname, "asana-dispatch-result.schema.json");
+  assert.equal((await assertCodexOutputSchema(valid)).type, "object");
+  const invalid = JSON.parse(fs.readFileSync(valid, "utf8"));
+  invalid.required.pop();
+  const invalidPath = path.join(dir, "invalid.json");
+  fs.writeFileSync(invalidPath, JSON.stringify(invalid));
+  await assert.rejects(assertCodexOutputSchema(invalidPath), /require exactly every/);
+});
 
 test("MCP failure before agent start retries and releases both leases", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dispatch-worker-"));

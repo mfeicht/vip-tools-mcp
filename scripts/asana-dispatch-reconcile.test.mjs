@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
-import { reconcileCompletedRuns, resolveReconciliationRun } from "./asana-dispatch-reconcile.mjs";
+import { inspectReconciliationRun, reconcileCompletedRuns, resolveReconciliationRun } from "./asana-dispatch-reconcile.mjs";
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dispatch-reconcile-"));
@@ -79,4 +79,19 @@ test("operator can safely retry a run proven to have made no external change", a
   assert.deepEqual(store.counts(), { retry_after: 1 });
   assert.match(store.db.prepare("SELECT last_error FROM signals").get().last_error,
     /stopped before mutation/);
+});
+
+test("read-only reconciliation inspection reports post-run stories without releasing leases", async (t) => {
+  const store = fixture(t);
+  const result = await inspectReconciliationRun(store, { runId: "run-1", readback: {
+    task: { gid: "123456", completed: false, modified_at: "1970-01-01T00:00:01Z",
+      assignee: { gid: "user-1" } },
+    stories: [{ gid: "story-1", created_at: "1970-01-01T00:00:03Z",
+      created_by: { gid: "user-1" } }], ownGid: "user-1"
+  } });
+  assert.equal(result.task_modified_after_start, false);
+  assert.equal(result.own_stories_after_start, 1);
+  assert.equal(result.stories_after_start[0].gid, "story-1");
+  assert.equal(store.activeLeases().length, 2);
+  assert.deepEqual(store.counts(), { leased: 1 });
 });
