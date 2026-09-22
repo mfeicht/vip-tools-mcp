@@ -56,8 +56,10 @@ import {
 } from "./lib/asana-completion-guard.js";
 import {
   createAsanaMaterialCommentCoordinator,
+  hashMaterialCommentProbe,
   isRoutineMaterialComment
 } from "./lib/asana-material-comment-coordinator.js";
+import { createRedisMaterialCommentStore } from "./lib/asana-material-comment-store.js";
 import {
   classifyAsanaCommentAuthority,
   validateAsanaObserverCommentIntent
@@ -101,7 +103,20 @@ const ASANA_TIMEOUT_MS = Number(process.env.ASANA_TIMEOUT_MS || 30_000);
 const ASANA_WRITE_TIMEOUT_MS = Number(process.env.ASANA_WRITE_TIMEOUT_MS || 30_000);
 const ASANA_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ASANA_RETRY_ATTEMPTS || 3));
 const ASANA_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ASANA_RETRY_BASE_DELAY_MS || 750));
-const ASANA_MATERIAL_COMMENT_COORDINATOR = createAsanaMaterialCommentCoordinator();
+const ASANA_MATERIAL_COMMENT_REDIS_URL = String(
+  process.env.ASANA_MATERIAL_COMMENT_REDIS_URL || ""
+).trim();
+const ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED = parseBooleanEnv(
+  process.env.ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED,
+  Boolean(ASANA_MATERIAL_COMMENT_REDIS_URL)
+);
+const ASANA_MATERIAL_COMMENT_STORE = ASANA_MATERIAL_COMMENT_REDIS_URL
+  ? createRedisMaterialCommentStore({ url: ASANA_MATERIAL_COMMENT_REDIS_URL })
+  : null;
+const ASANA_MATERIAL_COMMENT_COORDINATOR = createAsanaMaterialCommentCoordinator({
+  distributedStore: ASANA_MATERIAL_COMMENT_STORE,
+  distributedRequired: ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED
+});
 const execFileAsync = promisify(execFile);
 const VIP_INTAKE_MAX_FILES = Math.max(0, Number(process.env.VIP_INTAKE_MAX_FILES || 12));
 const VIP_INTAKE_MAX_FILE_MB = Math.max(1, Number(process.env.VIP_INTAKE_MAX_FILE_MB || 25));
@@ -13497,6 +13512,12 @@ function createServer() {
         commentKind: comment_kind,
         materialResultSignals
       });
+      const materialCommentProbe = materialRoutineComment
+        ? buildAsanaCommentHtml({ sections: finalSections })
+        : "";
+      const materialCommentPayloadHash = materialRoutineComment
+        ? hashMaterialCommentProbe(materialCommentProbe)
+        : "";
       let routine_material_comment_idempotency = {
         applicable: materialRoutineComment,
         status: materialRoutineComment ? "checking" : "not_applicable",
@@ -13524,6 +13545,12 @@ function createServer() {
           observer_comment_gate,
           observer_authorization: observerAuthorizationReceipt,
           routine_material_comment_idempotency,
+          material_comment_coordination: {
+            applicable: materialRoutineComment,
+            distributed_required: ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED,
+            distributed_configured: ASANA_MATERIAL_COMMENT_COORDINATOR.distributedConfigured(),
+            status: materialRoutineComment ? "not_evaluated_dry_run" : "not_applicable"
+          },
           html_text,
           html_bytes: Buffer.byteLength(html_text, "utf8"),
           html_sha256
@@ -13536,11 +13563,21 @@ function createServer() {
         );
 
       let res;
+      let material_comment_coordination = {
+        applicable: materialRoutineComment,
+        distributed_required: ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED,
+        distributed_configured: ASANA_MATERIAL_COMMENT_COORDINATOR.distributedConfigured(),
+        status: materialRoutineComment ? "checking" : "not_applicable"
+      };
       if (materialRoutineComment) {
         const coordinatorKey = `${commentAgentUser.gid}:${task_gid}`;
         const coordinatedResult = await ASANA_MATERIAL_COMMENT_COORDINATOR.run(
           coordinatorKey,
-          async ({ recentStories, rememberStory }) => {
+          async ({ recentStories, rememberStory, beforePost, coordination }) => {
+            material_comment_coordination = {
+              ...material_comment_coordination,
+              ...coordination
+            };
             const existingStories = await readAllAsanaTaskStories(asana, task_gid);
             routine_material_comment_idempotency = {
               applicable: true,
@@ -13575,15 +13612,35 @@ function createServer() {
               }
             }
             if (dry_run) return { dry_run: true };
+            await beforePost();
             const posted = await postComment();
             rememberStory({
               ...posted.data.data,
               created_by: posted.data.data?.created_by || { gid: commentAgentUser.gid }
             });
             return { posted };
+          },
+          {
+            distributed: !dry_run,
+            payloadHash: materialCommentPayloadHash,
+            payloadProbe: materialCommentProbe,
+            readTargetStories: () => readAllAsanaTaskStories(asana, task_gid),
+            getStoryGid: (result) => result?.posted?.data?.data?.gid,
+            recoverResult: (story, coordination) => ({
+              posted: { data: { data: story } },
+              recovered: true,
+              coordination
+            })
           }
         );
         if (coordinatedResult.dry_run) return buildDryRunResult();
+        material_comment_coordination = {
+          ...material_comment_coordination,
+          ...(coordinatedResult.coordination || {}),
+          status: coordinatedResult.recovered
+            ? coordinatedResult.coordination?.status || "recovered"
+            : "receipt_committed"
+        };
         res = coordinatedResult.posted;
       } else {
         if (dry_run) return buildDryRunResult();
@@ -13656,6 +13713,7 @@ function createServer() {
         observer_comment_gate,
         observer_authorization: observerAuthorizationReceipt,
         routine_material_comment_idempotency,
+        material_comment_coordination,
         observer_leave_result,
         observer_leave_error,
         observer_leave_verification,
@@ -24748,6 +24806,10 @@ app.get(["/", "/health"], (req, res) => {
     service: "vip-tools-mcp",
     deployment_commit:
       process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown",
+    material_comment_coordination: {
+      distributed_required: ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED,
+      distributed_configured: ASANA_MATERIAL_COMMENT_COORDINATOR.distributedConfigured()
+    },
     uptime_seconds: Math.floor(process.uptime()),
     checked_at: new Date().toISOString()
   });
@@ -24788,5 +24850,8 @@ const keepAlive = setInterval(() => {}, 1 << 30);
 
 process.on("SIGTERM", () => {
   clearInterval(keepAlive);
-  httpServer.close(() => process.exit(0));
+  httpServer.close(async () => {
+    await ASANA_MATERIAL_COMMENT_STORE?.close().catch(() => undefined);
+    process.exit(0);
+  });
 });
