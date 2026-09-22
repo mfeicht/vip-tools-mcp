@@ -83,6 +83,15 @@ export class AsanaDispatchStore {
         agent_id TEXT PRIMARY KEY,
         completed_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS dependency_watches (
+        agent_id TEXT NOT NULL,
+        task_gid TEXT NOT NULL,
+        linked_task_gid TEXT NOT NULL,
+        evidence_story_gid TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        last_checked_at_ms INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(agent_id, task_gid)
+      );
     `);
   }
 
@@ -127,6 +136,58 @@ export class AsanaDispatchStore {
   pollCursor(agentId) {
     return this.db.prepare("SELECT completed_at FROM poll_cursors WHERE agent_id=?")
       .get(assertId(agentId, "agent_id"))?.completed_at || null;
+  }
+
+  dependencyWatches(agentId, now = Date.now(), intervalMs = 15 * 60_000) {
+    return this.db.prepare(`SELECT * FROM dependency_watches
+      WHERE agent_id=? AND last_checked_at_ms <= ? ORDER BY last_checked_at_ms, task_gid`)
+      .all(assertId(agentId, "agent_id"), now - intervalMs);
+  }
+
+  markDependencyChecked(agentId, taskGid, now = Date.now()) {
+    this.db.prepare(`UPDATE dependency_watches SET last_checked_at_ms=?
+      WHERE agent_id=? AND task_gid=?`)
+      .run(assertTime(now, "now"), assertId(agentId, "agent_id"), assertId(taskGid, "task_gid"));
+  }
+
+  clearDependencyWatch(agentId, taskGid) {
+    this.db.prepare("DELETE FROM dependency_watches WHERE agent_id=? AND task_gid=?")
+      .run(assertId(agentId, "agent_id"), assertId(taskGid, "task_gid"));
+  }
+
+  backfillDependencyWatch({ runId, agentId, taskGid, linkedTaskGid,
+    evidenceStoryGid, now = Date.now() }) {
+    assertId(runId, "run_id");
+    assertId(agentId, "agent_id");
+    assertId(taskGid, "task_gid");
+    assertId(linkedTaskGid, "linked_task_gid");
+    assertId(evidenceStoryGid, "evidence_story_gid");
+    assertTime(now, "now");
+    return this.transaction(() => {
+      const run = this.db.prepare("SELECT agent_id,task_gid,state FROM runs WHERE run_id=?").get(runId);
+      const acknowledgedDue = this.db.prepare(`SELECT 1 FROM signals
+        WHERE agent_id=? AND task_gid=? AND kind='due_task' AND status='acknowledged' LIMIT 1`)
+        .get(agentId, taskGid);
+      const activeTaskLease = this.db.prepare("SELECT 1 FROM leases WHERE key=?")
+        .get(`task:${taskGid}`);
+      if (run?.agent_id !== agentId || run?.task_gid !== taskGid ||
+          run?.state !== "completed" || !acknowledgedDue || activeTaskLease ||
+          linkedTaskGid === taskGid) {
+        throw new Error("backfill requires a completed, acknowledged due run without an active task lease");
+      }
+      const existing = this.db.prepare("SELECT * FROM dependency_watches WHERE agent_id=? AND task_gid=?")
+        .get(agentId, taskGid);
+      if (existing && (existing.linked_task_gid !== linkedTaskGid ||
+          existing.evidence_story_gid !== evidenceStoryGid)) {
+        throw new Error("conflicting dependency watch already exists");
+      }
+      this.db.prepare(`INSERT INTO dependency_watches
+        (agent_id,task_gid,linked_task_gid,evidence_story_gid,created_at_ms,last_checked_at_ms)
+        VALUES (?,?,?,?,?,?) ON CONFLICT(agent_id,task_gid) DO NOTHING`)
+        .run(agentId, taskGid, linkedTaskGid, evidenceStoryGid, now, now);
+      return this.db.prepare("SELECT * FROM dependency_watches WHERE agent_id=? AND task_gid=?")
+        .get(agentId, taskGid);
+    });
   }
 
   setPollCursor(agentId, completedAt) {
@@ -256,7 +317,8 @@ export class AsanaDispatchStore {
     });
   }
 
-  settle(claim, { outcome, error = null, now = Date.now(), maxAttempts = 5 } = {}) {
+  settle(claim, { outcome, error = null, now = Date.now(), maxAttempts = 5,
+    dependencyWatch = null } = {}) {
     if (!claim?.signals?.length || !["acknowledged", "retry_after", "dead_letter"].includes(outcome)) {
       throw new Error("invalid settlement");
     }
@@ -279,6 +341,25 @@ export class AsanaDispatchStore {
         this.db.prepare(`UPDATE signals SET status=?, available_at_ms=?, run_id=NULL,
           lease_token=NULL, lease_fence=NULL, updated_at_ms=?, last_error=? WHERE id=?`)
           .run(next, availableAt, now, error ? String(error).slice(0, 500) : null, signal.id);
+      }
+      if (dependencyWatch) {
+        if (outcome !== "acknowledged" ||
+            dependencyWatch.task_gid !== claim.signals[0].task_gid ||
+            dependencyWatch.agent_id !== claim.signals[0].agent_id ||
+            dependencyWatch.linked_task_gid === dependencyWatch.task_gid) {
+          throw new Error("invalid dependency watch settlement");
+        }
+        this.db.prepare(`INSERT INTO dependency_watches
+          (agent_id,task_gid,linked_task_gid,evidence_story_gid,created_at_ms,last_checked_at_ms)
+          VALUES (?,?,?,?,?,?) ON CONFLICT(agent_id,task_gid) DO UPDATE SET
+          linked_task_gid=excluded.linked_task_gid,
+          evidence_story_gid=excluded.evidence_story_gid,
+          created_at_ms=excluded.created_at_ms,
+          last_checked_at_ms=excluded.last_checked_at_ms`)
+          .run(assertId(dependencyWatch.agent_id, "agent_id"),
+            assertId(dependencyWatch.task_gid, "task_gid"),
+            assertId(dependencyWatch.linked_task_gid, "linked_task_gid"),
+            assertId(dependencyWatch.evidence_story_gid, "evidence_story_gid"), now, now);
       }
       this.releaseLease(claim.task_lease);
       this.releaseLease(claim.agent_lease);

@@ -54,7 +54,9 @@ test("documented due-task dependency qualifies for a no-write acknowledgement", 
   assert.equal(cleanNoWriteDueTask({ ...input,
     claim: { signals: [{ kind: "human_comment", story_gid: "999001" }] } }), false);
   assert.equal(noWriteDisposition({ ...input,
-    claim: { signals: [{ kind: "human_comment", story_gid: "999001" }] } }), null);
+    claim: { signals: [{ kind: "human_comment", story_gid: "999001" }] } }), "dead_letter");
+  assert.equal(noWriteDisposition({ ...input,
+    claim: { signals: [{ kind: "dependency_ready", story_gid: null }] } }), "dead_letter");
   assert.equal(cleanNoWriteDueTask({ ...input,
     after: { ...before, modified_at: "2026-09-22T05:40:00Z" } }), false);
   assert.equal(cleanNoWriteDueTask({ ...input,

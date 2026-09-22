@@ -109,6 +109,39 @@ test("observations and cursors persist atomically", (t) => {
   assert.equal(second.pollCursor("vip-ai-research"), "2026-09-21T10:01:00Z");
 });
 
+test("verified dependency acknowledgement stores a durable watch and releases leases", (t) => {
+  const { first, second } = fixture(t);
+  first.enqueue({ id: "due-1", agent_id: "vip-ai-sales", task_gid: "123",
+    source_version: "due-1", kind: "due_task", priority: 60, available_at_ms: 1000 }, 1000);
+  const claim = first.claimNext("run-1", { now: 1000 });
+  first.settle(claim, { outcome: "acknowledged", now: 2000, dependencyWatch: {
+    agent_id: "vip-ai-sales", task_gid: "123", linked_task_gid: "456",
+    evidence_story_gid: "789" } });
+  assert.deepEqual(first.activeLeases(), []);
+  assert.equal(second.dependencyWatches("vip-ai-sales", 2000 + 15 * 60_000)[0].linked_task_gid, "456");
+  second.markDependencyChecked("vip-ai-sales", "123", 3000);
+  assert.deepEqual(first.dependencyWatches("vip-ai-sales", 3000 + 14 * 60_000), []);
+  first.clearDependencyWatch("vip-ai-sales", "123");
+  assert.deepEqual(second.dependencyWatches("vip-ai-sales", 999999999), []);
+});
+
+test("historical dependency watch backfill requires a settled due run", (t) => {
+  const { first } = fixture(t);
+  first.enqueue({ id: "due-1", agent_id: "vip-ai-sales", task_gid: "123",
+    source_version: "due-1", kind: "due_task", priority: 60, available_at_ms: 1000 }, 1000);
+  const claim = first.claimNext("run-1", { now: 1000 });
+  const input = { runId: "run-1", agentId: "vip-ai-sales", taskGid: "123",
+    linkedTaskGid: "456", evidenceStoryGid: "789", now: 2000 };
+  first.recordRun(claim, { state: "started", now: 1000 });
+  assert.throws(() => first.backfillDependencyWatch(input), /completed, acknowledged due run/);
+  first.settle(claim, { outcome: "acknowledged", now: 2000 });
+  first.recordRun(claim, { state: "completed", now: 2000 });
+  assert.equal(first.backfillDependencyWatch(input).linked_task_gid, "456");
+  assert.equal(first.backfillDependencyWatch(input).linked_task_gid, "456");
+  assert.throws(() => first.backfillDependencyWatch({ ...input, linkedTaskGid: "999" }),
+    /conflicting dependency/);
+});
+
 test("uncertain runs surface immediately and progress updates prevent false stalls", (t) => {
   const { first } = fixture(t);
   first.enqueue(signal("story-1"), 1000);

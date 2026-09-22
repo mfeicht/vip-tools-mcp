@@ -44,6 +44,17 @@ export function taskSignal(agentId, task, { firstSeen, now = new Date() } = {}) 
   };
 }
 
+export function dependencyReadySignal(agentId, taskGid, linkedTask) {
+  if (linkedTask?.completed !== true || !linkedTask.gid || !linkedTask.modified_at) return null;
+  const version = `${linkedTask.gid}:${linkedTask.modified_at}`;
+  return {
+    id: signalId(agentId, taskGid, "dependency_ready", version),
+    agent_id: agentId, task_gid: taskGid,
+    source_version: signalId(agentId, taskGid, "dependency_version", version),
+    kind: "dependency_ready", priority: 70
+  };
+}
+
 export function storyIsComment(story) {
   return story?.resource_subtype === "comment_added" || story?.type === "comment";
 }

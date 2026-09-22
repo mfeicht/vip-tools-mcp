@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
+import { taskSignal } from "./asana-dispatch-signals.mjs";
 import { scanAgent } from "./asana-dispatch-poller.mjs";
 
-function fakeClient({ searchTasks = [], stories = [], searchComplete = true } = {}) {
+function fakeClient({ searchTasks = [], stories = [], searchComplete = true,
+  linkedTask = null } = {}) {
   const calls = [];
   return {
     calls,
@@ -12,7 +14,9 @@ function fakeClient({ searchTasks = [], stories = [], searchComplete = true } = 
       const data = name === "asana_search_tasks"
         ? { search_status: "ok", search_complete: searchComplete,
           result_truncated: !searchComplete, tasks: searchTasks }
-        : { response: { data: stories, next_page: null } };
+        : args.path === `/tasks/${linkedTask?.gid}`
+          ? { response: { data: linkedTask } }
+          : { response: { data: stories, next_page: null } };
       return { content: [{ type: "text", text: JSON.stringify(data) }] };
     }
   };
@@ -36,6 +40,45 @@ test("assigned due task and new human comment enqueue once across polls", async 
     assert.equal(second.signals_inserted, 0);
     assert.equal(second.stories_read, 0);
     assert.equal(store.readyCount(), 2);
+  } finally { store.close(); }
+});
+
+test("completed linked task wakes the source once without rerunning while dependency is open", async () => {
+  const store = new AsanaDispatchStore(":memory:");
+  try {
+    const start = Date.parse("2026-09-21T10:00:00Z");
+    const task = { gid: "123", name: "Source task", completed: false,
+      assignee: { gid: "sales-user" }, due_on: "2026-09-20",
+      modified_at: "2026-09-21T09:00:00Z" };
+    store.enqueue({ ...taskSignal("vip-ai-sales", task, { now: new Date(start) }),
+      available_at_ms: start }, start);
+    const claim = store.claimNext("run-1", { now: start });
+    store.settle(claim, { outcome: "acknowledged", now: start, dependencyWatch: {
+      agent_id: "vip-ai-sales", task_gid: "123", linked_task_gid: "456",
+      evidence_story_gid: "789" } });
+    const snapshot = { agent_id: "vip-ai-sales", ok: true, user_gid: "sales-user",
+      workspace_gid: "111", tasks: [task], truncated: false };
+    const linkedTask = { gid: "456", completed: false,
+      modified_at: "2026-09-21T09:30:00Z" };
+    const client = fakeClient({ linkedTask });
+    const agents = new Set(["sales-user"]);
+    const early = await scanAgent(client, store, snapshot, agents,
+      new Date(start + 5 * 60_000), true);
+    assert.equal(early.dependencies_checked, 0);
+    const pending = await scanAgent(client, store, snapshot, agents,
+      new Date(start + 15 * 60_000), true);
+    assert.equal(pending.dependencies_checked, 1);
+    assert.equal(pending.signals_inserted, 0);
+    linkedTask.completed = true;
+    linkedTask.modified_at = "2026-09-21T10:20:00Z";
+    const ready = await scanAgent(client, store, snapshot, agents,
+      new Date(start + 30 * 60_000), true);
+    assert.equal(ready.signals_inserted, 1);
+    assert.equal(store.counts().pending, 1);
+    assert.deepEqual(store.dependencyWatches("vip-ai-sales", start + 60 * 60_000), []);
+    const repeated = await scanAgent(client, store, snapshot, agents,
+      new Date(start + 35 * 60_000), true);
+    assert.equal(repeated.signals_inserted, 0);
   } finally { store.close(); }
 });
 

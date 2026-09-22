@@ -3,7 +3,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import fs from "node:fs/promises";
 import path from "node:path";
 import { AsanaDispatchStore, DEFAULT_DB_PATH } from "./asana-dispatch-store.mjs";
-import { newCommentSignals, taskSignal } from "./asana-dispatch-signals.mjs";
+import { dependencyReadySignal, newCommentSignals, taskSignal } from "./asana-dispatch-signals.mjs";
 
 const MCP_URL = process.env.WATCHER_MCP_URL || "https://vip-tools-mcp.onrender.com/mcp";
 const TASK_FIELDS = "gid,name,completed,created_by.gid,assignee.gid,due_on,due_at,modified_at,permalink_url,tags.name,followers.gid";
@@ -116,17 +116,41 @@ export async function scanAgent(client, store, snapshot, agentUserGids, scanStar
       latest_story_at: latest?.at || null, latest_story_gid: latest?.gid || null });
   }
 
+  const dependencyUpdates = [];
+  for (const watch of store.dependencyWatches(agentId, scanStartedAt.getTime())) {
+    const result = await tool(client, "asana_request", {
+      agent_id: agentId, method: "GET", path: `/tasks/${watch.linked_task_gid}`,
+      params: { opt_fields: "gid,completed,modified_at" }
+    });
+    const linkedTask = result.response?.data;
+    if (String(linkedTask?.gid || "") !== watch.linked_task_gid ||
+        typeof linkedTask.completed !== "boolean") {
+      throw new Error(`Dependency readback incomplete for ${watch.task_gid}`);
+    }
+    const ready = dependencyReadySignal(agentId, watch.task_gid, linkedTask);
+    if (linkedTask.completed && !ready) {
+      throw new Error(`Dependency completion version missing for ${watch.task_gid}`);
+    }
+    if (ready) newSignals.push(ready);
+    dependencyUpdates.push({ watch, ready: Boolean(ready) });
+  }
+
   let inserted = 0;
   if (write) {
     store.transaction(() => {
       for (const signal of newSignals) if (store.enqueue(signal, scanStartedAt.getTime())) inserted += 1;
       for (const observation of observations) store.observeTask(observation, scanStartedAt.getTime());
+      for (const item of dependencyUpdates) {
+        if (item.ready) store.clearDependencyWatch(agentId, item.watch.task_gid);
+        else store.markDependencyChecked(agentId, item.watch.task_gid, scanStartedAt.getTime());
+      }
       store.setPollCursor(agentId, scanStartedAt.toISOString());
     });
   }
   return { agent_id: agentId, assigned_tasks: (snapshot.tasks || []).length,
     involved_tasks: search.tasks.length, tasks_scanned: tasks.size, stories_read: storiesRead,
-    candidate_signals: newSignals.length, signals_inserted: inserted };
+    candidate_signals: newSignals.length, signals_inserted: inserted,
+    dependencies_checked: dependencyUpdates.length };
 }
 
 export async function poll({ write = false, agentIds = null, db = DEFAULT_DB_PATH } = {}) {

@@ -42,10 +42,9 @@ function allCommentSignalsAnswered(claim, stories, userId) {
   });
 }
 
-export function cleanNoWriteDueTask({ claim, before, after, afterStories,
+export function cleanNoWriteFinishedRun({ claim, before, after, afterStories,
   answer, codex, ownGid, startedAt }) {
   return Boolean(claim.signals.length &&
-    claim.signals.every((signal) => signal.kind === "due_task" && !signal.story_gid) &&
     codex.exitCode === 0 && !codex.timedOut &&
     typeof codex.threadId === "string" && codex.threadId.length > 0 &&
     ["blocked", "no_action"].includes(answer?.outcome) &&
@@ -56,6 +55,11 @@ export function cleanNoWriteDueTask({ claim, before, after, afterStories,
     String(after.assignee?.gid || "") === ownGid &&
     Boolean(before.modified_at) && before.modified_at === after.modified_at &&
     !laterOwnStory(afterStories, ownGid, startedAt));
+}
+
+export function cleanNoWriteDueTask(input) {
+  return cleanNoWriteFinishedRun(input) &&
+    input.claim.signals.every((signal) => signal.kind === "due_task" && !signal.story_gid);
 }
 
 export function documentedDependencyNoWrite({ claim, before, after, beforeStories, afterStories,
@@ -78,7 +82,7 @@ export function documentedDependencyNoWrite({ claim, before, after, beforeStorie
 }
 
 export function noWriteDisposition(input) {
-  if (!cleanNoWriteDueTask(input)) return null;
+  if (!cleanNoWriteFinishedRun(input)) return null;
   return documentedDependencyNoWrite(input) ? "acknowledged" : "dead_letter";
 }
 
@@ -109,6 +113,7 @@ function promptFor(claim, task, route) {
     `Nutze fuer Asana ausschliesslich vip-tools-remote mit agent_id=${agentId}. Beginne mit einem schmalen Task-Readback ueber opt_fields; lade Beschreibung, Stories und Anhaenge nur im fuer diesen Task noetigen Umfang. ` +
     `Bearbeite hoechstens diesen einen Task und alle aktuell offenen Kommentare darin, soweit Kapazitaet und Kontext reichen. ` +
     `Wenn der Task bereits erledigt, nicht mehr dir zugewiesen oder das Signal fachlich nicht mehr aktuell ist, tue nichts. ` +
+    `Bei bewaehrten Aufgaben vergleiche vor blocked/no_action den letzten belegten Erfolgsweg dieses Aufgabentyps mit aktuellem Scope, aktiven Regeln und Readbacks; dokumentiere ein relevantes Delta statt den bekannten Pfad still zu verwerfen. ` +
     `Bei echter Arbeit dokumentiere Ergebnis oder Mehr-Run-Checkpoint in Asana; ein stiller Abschluss ohne verifizierbares Task-/Story-Readback zaehlt nicht. ` +
     `Wenn Moritz eine Entscheidung treffen muss, formuliere eine knappe konkrete Bitte mit Kontext. ` +
     `Wenn die Aufgabe zu gross ist, schliesse sie nicht voreilig ab; liefere echten Fortschritt und einen naechsten Schritt. ` +
@@ -248,7 +253,7 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null } 
       store.recordRun(claim, { threadId: codex.threadId, turnId: codex.turnId, state: "completed" });
       return { status: "no_action_acknowledged", run_id: runId, agent_id: agentId, task_gid: taskGid };
     }
-    if (!verifiedProgress && cleanNoWriteDueTask({ claim, before, after, afterStories,
+    if (!verifiedProgress && cleanNoWriteFinishedRun({ claim, before, after, afterStories,
       answer: codex.answer, codex, ownGid, startedAt })) {
       let linkedTask = null;
       let linkedReadError = null;
@@ -263,7 +268,12 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null } 
       const dependencyVerified = disposition === "acknowledged";
       const reviewNote = dependencyVerified ? null :
         `Clean ${codex.answer.outcome} without a verified dependency; Operations review required${linkedReadError ? `: ${linkedReadError}` : ""}`;
-      store.settle(claim, { outcome: disposition, error: reviewNote });
+      store.settle(claim, { outcome: disposition, error: reviewNote,
+        dependencyWatch: dependencyVerified ? {
+          agent_id: agentId, task_gid: taskGid,
+          linked_task_gid: linkedTask.gid,
+          evidence_story_gid: codex.answer.evidence_story_gid
+        } : null });
       store.recordRun(claim, { threadId: codex.threadId, turnId: codex.turnId,
         state: "completed", error: reviewNote });
       let archived = false;
