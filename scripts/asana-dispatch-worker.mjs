@@ -42,6 +42,46 @@ function allCommentSignalsAnswered(claim, stories, userId) {
   });
 }
 
+export function cleanNoWriteDueTask({ claim, before, after, afterStories,
+  answer, codex, ownGid, startedAt }) {
+  return Boolean(claim.signals.length &&
+    claim.signals.every((signal) => signal.kind === "due_task" && !signal.story_gid) &&
+    codex.exitCode === 0 && !codex.timedOut &&
+    typeof codex.threadId === "string" && codex.threadId.length > 0 &&
+    ["blocked", "no_action"].includes(answer?.outcome) &&
+    typeof answer.summary === "string" && answer.summary.length >= 20 &&
+    before.completed === false && after.completed === false &&
+    String(before.gid) === String(after.gid) &&
+    String(before.assignee?.gid || "") === ownGid &&
+    String(after.assignee?.gid || "") === ownGid &&
+    Boolean(before.modified_at) && before.modified_at === after.modified_at &&
+    !laterOwnStory(afterStories, ownGid, startedAt));
+}
+
+export function documentedDependencyNoWrite({ claim, before, after, beforeStories, afterStories,
+  linkedTask, answer, codex, ownGid, startedAt }) {
+  if (!cleanNoWriteDueTask({ claim, before, after, afterStories, answer, codex,
+    ownGid, startedAt })) return false;
+  const linkedGid = String(answer.linked_task_gid || "");
+  const evidenceGid = String(answer.evidence_story_gid || "");
+  if (!/^\d+$/.test(linkedGid) || !/^\d+$/.test(evidenceGid) ||
+      linkedGid === String(before.gid) || linkedTask?.completed !== false ||
+      String(linkedTask.gid) !== linkedGid ||
+      !Number.isFinite(Date.parse(linkedTask.modified_at || "")) ||
+      Date.parse(linkedTask.modified_at) >= startedAt) return false;
+  const evidence = beforeStories.find((story) => String(story.gid) === evidenceGid);
+  return Boolean(evidence && afterStories.some((story) => String(story.gid) === evidenceGid) &&
+    evidence.resource_subtype === "comment_added" &&
+    typeof evidence.text === "string" && evidence.text.includes(linkedGid) &&
+    Number.isFinite(Date.parse(evidence.created_at || "")) &&
+    Date.parse(evidence.created_at) < startedAt);
+}
+
+export function noWriteDisposition(input) {
+  if (!cleanNoWriteDueTask(input)) return null;
+  return documentedDependencyNoWrite(input) ? "acknowledged" : "dead_letter";
+}
+
 async function selectModel(agentId, task) {
   const policy = JSON.parse(await fs.readFile(path.join(ROOT,
     "VIP-AI-Memory/03-Betrieb/Adaptive-Modellrouting.json"), "utf8"));
@@ -72,6 +112,7 @@ function promptFor(claim, task, route) {
     `Bei echter Arbeit dokumentiere Ergebnis oder Mehr-Run-Checkpoint in Asana; ein stiller Abschluss ohne verifizierbares Task-/Story-Readback zaehlt nicht. ` +
     `Wenn Moritz eine Entscheidung treffen muss, formuliere eine knappe konkrete Bitte mit Kontext. ` +
     `Wenn die Aufgabe zu gross ist, schliesse sie nicht voreilig ab; liefere echten Fortschritt und einen naechsten Schritt. ` +
+    `Bei einem reinen Due-Signal, dessen einziger offener Schritt bereits in einer bestehenden Asana-Story als Abhaengigkeit von einem anderen offenen Task belegt ist, vermeide einen doppelten Kommentar. Melde blocked/no_action und setze linked_task_gid und evidence_story_gid auf die direkt nachgelesenen GIDs. Ohne diesen Beleg dokumentiere den Blocker im aktuellen Task; ein stiller No-Write-Ausgang wird zur Operations-Pruefung eskaliert. ` +
     `Plane diesen Lauf auf hoechstens etwa 25 Minuten fachliche Arbeit; bei mehr Umfang dokumentiere einen verifizierbaren Zwischenstand und setze spaeter fort. ` +
     `Kein Subagent, keine weitere Aufgabe ausser notwendigem, vertraglich erlaubtem Handoff. ` +
     `Antworte am Ende ausschliesslich im vorgegebenen JSON-Schema. outcome=progress nur bei nachpruefbarem Fortschritt, ` +
@@ -206,6 +247,31 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null } 
       store.settle(claim, { outcome: "acknowledged" });
       store.recordRun(claim, { threadId: codex.threadId, turnId: codex.turnId, state: "completed" });
       return { status: "no_action_acknowledged", run_id: runId, agent_id: agentId, task_gid: taskGid };
+    }
+    if (!verifiedProgress && cleanNoWriteDueTask({ claim, before, after, afterStories,
+      answer: codex.answer, codex, ownGid, startedAt })) {
+      let linkedTask = null;
+      let linkedReadError = null;
+      if (/^\d+$/.test(String(codex.answer.linked_task_gid || "")) &&
+          /^\d+$/.test(String(codex.answer.evidence_story_gid || ""))) {
+        try { linkedTask = await readTask(client, agentId, codex.answer.linked_task_gid); }
+        catch (error) { linkedReadError = String(error).slice(0, 300); }
+      }
+      const disposition = noWriteDisposition({ claim, before, after,
+        beforeStories, afterStories, linkedTask, answer: codex.answer, codex,
+        ownGid, startedAt });
+      const dependencyVerified = disposition === "acknowledged";
+      const reviewNote = dependencyVerified ? null :
+        `Clean ${codex.answer.outcome} without a verified dependency; Operations review required${linkedReadError ? `: ${linkedReadError}` : ""}`;
+      store.settle(claim, { outcome: disposition, error: reviewNote });
+      store.recordRun(claim, { threadId: codex.threadId, turnId: codex.turnId,
+        state: "completed", error: reviewNote });
+      let archived = false;
+      try { archived = await archiveCompletedThread(codex.threadId); }
+      catch { /* Daily native audit is fallback. */ }
+      return { status: dependencyVerified ? "blocked_dependency_acknowledged" : "no_write_review",
+        run_id: runId, agent_id: agentId, task_gid: taskGid,
+        linked_task_gid: dependencyVerified ? linkedTask.gid : null, archived };
     }
     if (!verifiedProgress) {
       throw new Error(`No verified Asana postcondition; Codex exit ${codex.exitCode}. Manual reconciliation required.`);

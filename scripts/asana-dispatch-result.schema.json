@@ -8,6 +8,8 @@
       "type": "string",
       "enum": ["completed", "progress", "blocked", "no_action", "failed"]
     },
-    "summary": { "type": "string", "minLength": 1, "maxLength": 1200 }
+    "summary": { "type": "string", "minLength": 1, "maxLength": 1200 },
+    "linked_task_gid": { "type": "string", "pattern": "^[0-9]+$" },
+    "evidence_story_gid": { "type": "string", "pattern": "^[0-9]+$" }
   }
 }
