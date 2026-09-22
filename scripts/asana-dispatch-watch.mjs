@@ -73,6 +73,17 @@ export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
   health.duration_ms = Date.now() - start;
   health.status = health.errors.length ? "degraded" :
     health.stale_leases || health.stalled_runs || health.counts.dead_letter ? "attention" : "ok";
+  let metricsStore;
+  try {
+    metricsStore = new AsanaDispatchStore();
+    metricsStore.recordPollRun(health);
+    health.history_24h = metricsStore.pollStats(start - 24 * 60 * 60_000);
+  } catch (error) {
+    health.errors.push({ source: "poll_history", error: String(error?.message || error).slice(0, 500) });
+    health.status = "degraded";
+  } finally {
+    metricsStore?.close();
+  }
   await saveHealth(health);
   return health;
 }

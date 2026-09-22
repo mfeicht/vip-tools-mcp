@@ -92,6 +92,29 @@ export class AsanaDispatchStore {
         last_checked_at_ms INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(agent_id, task_gid)
       );
+      CREATE TABLE IF NOT EXISTS poll_runs (
+        started_at_ms INTEGER PRIMARY KEY,
+        finished_at_ms INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('ok','attention','degraded')),
+        dispatch_enabled INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        agent_count INTEGER NOT NULL,
+        tasks_scanned INTEGER NOT NULL,
+        stories_read INTEGER NOT NULL,
+        signals_inserted INTEGER NOT NULL,
+        errors_count INTEGER NOT NULL,
+        workers_started INTEGER NOT NULL,
+        ready INTEGER NOT NULL,
+        active_agents INTEGER NOT NULL,
+        stale_leases INTEGER NOT NULL,
+        stalled_runs INTEGER NOT NULL,
+        queue_acknowledged INTEGER NOT NULL,
+        queue_pending INTEGER NOT NULL,
+        queue_leased INTEGER NOT NULL,
+        queue_retry_after INTEGER NOT NULL,
+        queue_dead_letter INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS poll_runs_finished ON poll_runs(finished_at_ms);
     `);
   }
 
@@ -414,6 +437,84 @@ export class AsanaDispatchStore {
   counts() {
     return Object.fromEntries(this.db.prepare("SELECT status,COUNT(*) AS n FROM signals GROUP BY status")
       .all().map((row) => [row.status, row.n]));
+  }
+
+  recordPollRun(health, { now = Date.now(), retentionMs = 30 * 24 * 60 * 60_000 } = {}) {
+    const startedAt = Date.parse(health?.started_at);
+    const finishedAt = Date.parse(health?.finished_at);
+    if (!Number.isSafeInteger(startedAt) || !Number.isSafeInteger(finishedAt) || finishedAt < startedAt) {
+      throw new Error("poll run timestamps are invalid");
+    }
+    if (!["ok", "attention", "degraded"].includes(health?.status)) {
+      throw new Error("poll run status is invalid");
+    }
+    if (!Number.isSafeInteger(retentionMs) || retentionMs < 24 * 60 * 60_000) {
+      throw new Error("poll run retention is invalid");
+    }
+    assertTime(now, "now");
+    const count = (value, label) => {
+      const number = Number(value ?? 0);
+      if (!Number.isSafeInteger(number) || number < 0) throw new Error(`${label} is invalid`);
+      return number;
+    };
+    const agents = Array.isArray(health.poll?.agents) ? health.poll.agents : [];
+    const sumAgent = (field) => agents.reduce((total, agent) => total + count(agent?.[field], field), 0);
+    const counts = health.counts || {};
+    const values = [
+      startedAt, finishedAt, health.status, health.dispatch_enabled ? 1 : 0,
+      count(health.duration_ms, "duration_ms"), agents.length,
+      sumAgent("tasks_scanned"), sumAgent("stories_read"), sumAgent("signals_inserted"),
+      count(health.errors?.length, "errors_count"), count(health.workers_started, "workers_started"),
+      count(health.ready, "ready"), count(health.active_agents, "active_agents"),
+      count(health.stale_leases, "stale_leases"), count(health.stalled_runs, "stalled_runs"),
+      count(counts.acknowledged, "queue_acknowledged"), count(counts.pending, "queue_pending"),
+      count(counts.leased, "queue_leased"), count(counts.retry_after, "queue_retry_after"),
+      count(counts.dead_letter, "queue_dead_letter")
+    ];
+    return this.transaction(() => {
+      this.db.prepare(`INSERT INTO poll_runs
+        (started_at_ms,finished_at_ms,status,dispatch_enabled,duration_ms,agent_count,
+         tasks_scanned,stories_read,signals_inserted,errors_count,workers_started,ready,
+         active_agents,stale_leases,stalled_runs,queue_acknowledged,queue_pending,
+         queue_leased,queue_retry_after,queue_dead_letter)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(started_at_ms) DO UPDATE SET
+          finished_at_ms=excluded.finished_at_ms,status=excluded.status,
+          dispatch_enabled=excluded.dispatch_enabled,duration_ms=excluded.duration_ms,
+          agent_count=excluded.agent_count,tasks_scanned=excluded.tasks_scanned,
+          stories_read=excluded.stories_read,signals_inserted=excluded.signals_inserted,
+          errors_count=excluded.errors_count,workers_started=excluded.workers_started,
+          ready=excluded.ready,active_agents=excluded.active_agents,
+          stale_leases=excluded.stale_leases,stalled_runs=excluded.stalled_runs,
+          queue_acknowledged=excluded.queue_acknowledged,queue_pending=excluded.queue_pending,
+          queue_leased=excluded.queue_leased,queue_retry_after=excluded.queue_retry_after,
+          queue_dead_letter=excluded.queue_dead_letter`).run(...values);
+      this.db.prepare("DELETE FROM poll_runs WHERE started_at_ms < ?").run(now - retentionMs);
+      return this.db.prepare("SELECT * FROM poll_runs WHERE started_at_ms=?").get(startedAt);
+    });
+  }
+
+  pollStats(sinceMs = Date.now() - 24 * 60 * 60_000) {
+    assertTime(sinceMs, "since_ms");
+    const row = this.db.prepare(`SELECT
+      COUNT(*) AS runs,
+      COALESCE(SUM(status='ok'),0) AS ok,
+      COALESCE(SUM(status='attention'),0) AS attention,
+      COALESCE(SUM(status='degraded'),0) AS degraded,
+      COALESCE(SUM(errors_count),0) AS errors,
+      COALESCE(SUM(workers_started),0) AS workers_started,
+      ROUND(COALESCE(AVG(duration_ms),0)) AS average_duration_ms,
+      COALESCE(MAX(duration_ms),0) AS maximum_duration_ms,
+      COALESCE(MAX(queue_pending),0) AS maximum_pending,
+      COALESCE(MAX(queue_dead_letter),0) AS maximum_dead_letter,
+      MIN(started_at_ms) AS first_started_at_ms,
+      MAX(finished_at_ms) AS last_finished_at_ms
+      FROM poll_runs WHERE started_at_ms >= ?`).get(sinceMs);
+    return {
+      ...row,
+      first_started_at: row.first_started_at_ms == null ? null : new Date(row.first_started_at_ms).toISOString(),
+      last_finished_at: row.last_finished_at_ms == null ? null : new Date(row.last_finished_at_ms).toISOString()
+    };
   }
 
   readyCount(now = Date.now()) {

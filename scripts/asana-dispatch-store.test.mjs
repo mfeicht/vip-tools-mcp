@@ -153,3 +153,42 @@ test("uncertain runs surface immediately and progress updates prevent false stal
   first.recordRun(claim, { state: "needs_reconciliation", error: "unknown side effect", now: 25 * 60_000 });
   assert.equal(first.runsNeedingReconciliation(25 * 60_000).length, 1);
 });
+
+test("poll history keeps compact load and reliability evidence", (t) => {
+  const { first, second } = fixture(t);
+  const health = (startedAt, status, overrides = {}) => ({
+    started_at: new Date(startedAt).toISOString(),
+    finished_at: new Date(startedAt + 60_000).toISOString(),
+    status,
+    dispatch_enabled: true,
+    duration_ms: 60_000,
+    poll: { agents: [{ tasks_scanned: 7, stories_read: 2, signals_inserted: 1 }] },
+    errors: status === "degraded" ? [{ source: "poll" }] : [],
+    workers_started: 1,
+    ready: 3,
+    active_agents: 1,
+    stale_leases: 0,
+    stalled_runs: 0,
+    counts: { acknowledged: 10, pending: 3 },
+    ...overrides
+  });
+  const day = 24 * 60 * 60_000;
+  first.recordPollRun(health(day, "ok"), { now: 3 * day, retentionMs: 2 * day });
+  first.recordPollRun(health(2 * day, "attention", { workers_started: 0,
+    counts: { acknowledged: 11, pending: 4, dead_letter: 1 } }),
+  { now: 3 * day, retentionMs: 2 * day });
+  first.recordPollRun(health(3 * day, "degraded"), { now: 3 * day, retentionMs: 2 * day });
+  first.recordPollRun(health(3 * day, "degraded", { workers_started: 2 }),
+    { now: 3 * day, retentionMs: 2 * day });
+  const stats = second.pollStats(day + 1);
+  assert.equal(stats.runs, 2);
+  assert.equal(stats.attention, 1);
+  assert.equal(stats.degraded, 1);
+  assert.equal(stats.ok, 0);
+  assert.equal(stats.errors, 1);
+  assert.equal(stats.workers_started, 2);
+  assert.equal(stats.maximum_pending, 4);
+  assert.equal(stats.maximum_dead_letter, 1);
+  assert.equal(stats.first_started_at, new Date(2 * day).toISOString());
+  assert.equal(stats.last_finished_at, new Date(3 * day + 60_000).toISOString());
+});
