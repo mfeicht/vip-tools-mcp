@@ -75,6 +75,7 @@ import {
 } from "./lib/asana-schedule-guards.js";
 import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
 import { buildAsanaTaskSearchPlan, executeAsanaInvolvedSearch } from "./lib/asana-search-params.js";
+import { readAsanaResourceEvents } from "./lib/asana-events.js";
 import {
   extractAccountingInvoice as extractAccountingInvoiceV2,
   getNormalizedAccountingInvoiceLines as getNormalizedAccountingInvoiceLinesV2
@@ -12937,6 +12938,29 @@ function createServer() {
         }
         throw error;
       }
+    }
+  );
+
+  server.tool(
+    "asana_read_resource_events",
+    "Liest Asana-Events fuer genau eine Task-, Projekt- oder Goal-Ressource read-only. Der erste Aufruf ohne sync gibt den HTTP-412-Bootstrap-Cursor kontrolliert zurueck; abgelaufene Cursor werden als sync_reset_required markiert. Events sind at-most-once und nur Beschleuniger: Der deterministische Task-/Story-Readback bleibt fuer Vollstaendigkeit und vor jeder Aktion Pflicht.",
+    {
+      agent_id: agentIdSchema,
+      resource_gid: z.string(),
+      sync: z.string().min(1).max(2048).optional(),
+      opt_fields: z.string().max(2000).optional()
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id, resource_gid, sync, opt_fields }) => {
+      validateAsanaGid(resource_gid, "resource_gid");
+      const asana = getAsana(agent_id);
+      const result = await readAsanaResourceEvents({
+        resourceGid: resource_gid,
+        sync,
+        optFields: opt_fields,
+        request: (config) => asanaRequestWithRetry(asana, config)
+      });
+      return out({ agent_id, ...result });
     }
   );
 
