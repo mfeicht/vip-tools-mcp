@@ -115,6 +115,15 @@ export class AsanaDispatchStore {
         queue_dead_letter INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS poll_runs_finished ON poll_runs(finished_at_ms);
+      CREATE TABLE IF NOT EXISTS poll_run_errors (
+        started_at_ms INTEGER NOT NULL,
+        ordinal INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        agent_id TEXT,
+        error TEXT NOT NULL,
+        PRIMARY KEY(started_at_ms, ordinal)
+      );
+      CREATE INDEX IF NOT EXISTS poll_run_errors_started ON poll_run_errors(started_at_ms);
     `);
   }
 
@@ -460,6 +469,13 @@ export class AsanaDispatchStore {
     const agents = Array.isArray(health.poll?.agents) ? health.poll.agents : [];
     const sumAgent = (field) => agents.reduce((total, agent) => total + count(agent?.[field], field), 0);
     const counts = health.counts || {};
+    const pollErrors = (Array.isArray(health.errors) ? health.errors : []).slice(0, 50)
+      .map((entry, ordinal) => ({
+        ordinal,
+        source: String(entry?.source || "unknown").slice(0, 80),
+        agent_id: entry?.agent_id == null ? null : String(entry.agent_id).slice(0, 180),
+        error: String(entry?.error || entry?.message || "unknown error").slice(0, 500)
+      }));
     const values = [
       startedAt, finishedAt, health.status, health.dispatch_enabled ? 1 : 0,
       count(health.duration_ms, "duration_ms"), agents.length,
@@ -489,7 +505,14 @@ export class AsanaDispatchStore {
           queue_acknowledged=excluded.queue_acknowledged,queue_pending=excluded.queue_pending,
           queue_leased=excluded.queue_leased,queue_retry_after=excluded.queue_retry_after,
           queue_dead_letter=excluded.queue_dead_letter`).run(...values);
+      this.db.prepare("DELETE FROM poll_run_errors WHERE started_at_ms=?").run(startedAt);
+      const insertError = this.db.prepare(`INSERT INTO poll_run_errors
+        (started_at_ms,ordinal,source,agent_id,error) VALUES (?,?,?,?,?)`);
+      for (const item of pollErrors) {
+        insertError.run(startedAt, item.ordinal, item.source, item.agent_id, item.error);
+      }
       this.db.prepare("DELETE FROM poll_runs WHERE started_at_ms < ?").run(now - retentionMs);
+      this.db.prepare("DELETE FROM poll_run_errors WHERE started_at_ms < ?").run(now - retentionMs);
       return this.db.prepare("SELECT * FROM poll_runs WHERE started_at_ms=?").get(startedAt);
     });
   }
@@ -506,14 +529,29 @@ export class AsanaDispatchStore {
       ROUND(COALESCE(AVG(duration_ms),0)) AS average_duration_ms,
       COALESCE(MAX(duration_ms),0) AS maximum_duration_ms,
       COALESCE(MAX(queue_pending),0) AS maximum_pending,
+      COALESCE(MAX(queue_leased),0) AS maximum_leased,
+      COALESCE(MAX(queue_retry_after),0) AS maximum_retry_after,
       COALESCE(MAX(queue_dead_letter),0) AS maximum_dead_letter,
+      COALESCE(MAX(stale_leases),0) AS maximum_stale_leases,
+      COALESCE(MAX(stalled_runs),0) AS maximum_stalled_runs,
       MIN(started_at_ms) AS first_started_at_ms,
       MAX(finished_at_ms) AS last_finished_at_ms
       FROM poll_runs WHERE started_at_ms >= ?`).get(sinceMs);
+    const errorSources = Object.fromEntries(this.db.prepare(`SELECT source,COUNT(*) AS n
+      FROM poll_run_errors WHERE started_at_ms >= ? GROUP BY source ORDER BY source`)
+      .all(sinceMs).map((item) => [item.source, item.n]));
+    const recentErrorSamples = this.db.prepare(`SELECT started_at_ms,source,agent_id,error
+      FROM poll_run_errors WHERE started_at_ms >= ?
+      ORDER BY started_at_ms DESC,ordinal LIMIT 10`).all(sinceMs).map((item) => ({
+      at: new Date(item.started_at_ms).toISOString(), source: item.source,
+      agent_id: item.agent_id, error: item.error
+    }));
     return {
       ...row,
       first_started_at: row.first_started_at_ms == null ? null : new Date(row.first_started_at_ms).toISOString(),
-      last_finished_at: row.last_finished_at_ms == null ? null : new Date(row.last_finished_at_ms).toISOString()
+      last_finished_at: row.last_finished_at_ms == null ? null : new Date(row.last_finished_at_ms).toISOString(),
+      error_sources: errorSources,
+      recent_error_samples: recentErrorSamples
     };
   }
 

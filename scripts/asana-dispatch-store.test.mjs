@@ -163,7 +163,8 @@ test("poll history keeps compact load and reliability evidence", (t) => {
     dispatch_enabled: true,
     duration_ms: 60_000,
     poll: { agents: [{ tasks_scanned: 7, stories_read: 2, signals_inserted: 1 }] },
-    errors: status === "degraded" ? [{ source: "poll" }] : [],
+    errors: status === "degraded" ? [{ source: "poll_agent", agent_id: "vip-ai-test",
+      error: "temporary MCP failure" }] : [],
     workers_started: 1,
     ready: 3,
     active_agents: 1,
@@ -188,7 +189,16 @@ test("poll history keeps compact load and reliability evidence", (t) => {
   assert.equal(stats.errors, 1);
   assert.equal(stats.workers_started, 2);
   assert.equal(stats.maximum_pending, 4);
+  assert.equal(stats.maximum_leased, 0);
+  assert.equal(stats.maximum_retry_after, 0);
   assert.equal(stats.maximum_dead_letter, 1);
+  assert.equal(stats.maximum_stale_leases, 0);
+  assert.equal(stats.maximum_stalled_runs, 0);
+  assert.deepEqual(stats.error_sources, { poll_agent: 1 });
+  assert.deepEqual(stats.recent_error_samples, [{
+    at: new Date(3 * day).toISOString(), source: "poll_agent", agent_id: "vip-ai-test",
+    error: "temporary MCP failure"
+  }]);
   assert.equal(stats.first_started_at, new Date(2 * day).toISOString());
   assert.equal(stats.last_finished_at, new Date(3 * day + 60_000).toISOString());
 });

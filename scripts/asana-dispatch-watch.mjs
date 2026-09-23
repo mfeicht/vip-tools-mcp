@@ -46,7 +46,7 @@ export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
   let pollHealthy = false;
   try {
     health.poll = await poll({ write: true });
-    health.errors.push(...health.poll.errors);
+    health.errors.push(...health.poll.errors.map((error) => ({ source: "poll_agent", ...error })));
     pollHealthy = health.poll.errors.length === 0;
   } catch (error) {
     health.errors.push({ source: "poll", error: String(error?.message || error).slice(0, 500) });
