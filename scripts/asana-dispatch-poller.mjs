@@ -37,7 +37,7 @@ export async function tool(client, name, args) {
       await new Promise((resolve) => setTimeout(resolve, /429|cloudflare/i.test(String(error)) ? 60_000 : 10_000));
     }
   }
-  throw lastError;
+  throw new Error(`${name}: ${String(lastError?.message || lastError || "unknown tool error")}`);
 }
 
 export async function storiesForTask(client, agentId, taskGid) {

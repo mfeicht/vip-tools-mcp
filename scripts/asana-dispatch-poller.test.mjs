@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
 import { taskSignal } from "./asana-dispatch-signals.mjs";
-import { scanAgent } from "./asana-dispatch-poller.mjs";
+import { scanAgent, tool } from "./asana-dispatch-poller.mjs";
 
 function fakeClient({ searchTasks = [], stories = [], searchComplete = true,
   linkedTask = null } = {}) {
@@ -116,4 +116,10 @@ test("truncated involved search does not advance cursor or enqueue", async () =>
     assert.equal(store.pollCursor("vip-ai-research"), null);
     assert.deepEqual(store.counts(), {});
   } finally { store.close(); }
+});
+
+test("tool failures retain the failing MCP tool name for poll diagnostics", async () => {
+  const client = { async callTool() { throw new Error("Streamable HTTP error: endpoint unavailable"); } };
+  await assert.rejects(tool(client, "asana_search_tasks", {}),
+    /asana_search_tasks: Streamable HTTP error: endpoint unavailable/);
 });
