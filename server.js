@@ -312,7 +312,16 @@ const GOOGLE_ADS_API_BASE = (process.env.GOOGLE_ADS_API_BASE || "https://googlea
   /\/$/,
   ""
 );
-const GOOGLE_ADS_API_VERSION = process.env.GOOGLE_ADS_API_VERSION || "v22";
+const GOOGLE_ADS_API_VERSION_DEFAULT = "v25";
+const GOOGLE_ADS_API_VERSION_SOURCE = String(process.env.GOOGLE_ADS_API_VERSION || "").trim()
+  ? "environment"
+  : "default";
+const GOOGLE_ADS_API_VERSION = String(
+  process.env.GOOGLE_ADS_API_VERSION || GOOGLE_ADS_API_VERSION_DEFAULT
+).trim();
+if (!/^v\d+$/.test(GOOGLE_ADS_API_VERSION)) {
+  throw new Error("GOOGLE_ADS_API_VERSION muss ein Major-Endpunkt wie v25 sein.");
+}
 const GOOGLE_ADS_TIMEOUT_MS = Number(process.env.GOOGLE_ADS_TIMEOUT_MS || 30_000);
 const GOOGLE_ADS_BUDGET_EXTRA_APPROVAL_PERCENT = Number(
   process.env.GOOGLE_ADS_BUDGET_EXTRA_APPROVAL_PERCENT || 12
@@ -19034,6 +19043,7 @@ function createServer() {
         env_configured: oauthEnvSummary(GOOGLE_ADS_OAUTH_PREFIXES),
         selected_env_prefix: selectedConfig?.prefix || null,
         api_version: GOOGLE_ADS_API_VERSION,
+        api_version_source: GOOGLE_ADS_API_VERSION_SOURCE,
         developer_token_configured: Boolean(getGoogleAdsDeveloperToken()),
         default_login_customer_id_configured: Boolean(
           process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID || process.env.GOOGLE_ADS_MANAGER_CUSTOMER_ID

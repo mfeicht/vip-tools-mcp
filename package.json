@@ -37,6 +37,7 @@
     "test:dashboard-health": "node scripts/dashboard-health-selftest.mjs",
     "test:google-drive-upload-contract": "node scripts/google-drive-upload-contract-selftest.mjs",
     "test:google-docs-linked-reader": "node scripts/google-docs-linked-reader-selftest.mjs",
+    "test:google-ads-v25": "node scripts/google-ads-v25-contract-selftest.mjs",
     "shadow:google-docs-linked-reader": "node scripts/google-docs-linked-reader-mcp-shadow.mjs",
     "test:wp-import-path-guard": "node scripts/wp-import-path-guard-selftest.mjs",
     "test:web-research": "node scripts/web-research-selftest.mjs",
