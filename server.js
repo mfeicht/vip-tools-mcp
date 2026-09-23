@@ -11799,7 +11799,7 @@ const BUFFER_POST_STATUSES = ["draft", "error", "needs_approval", "scheduled", "
 
 async function fetchBufferPosts(
   projectKey,
-  { organizationId, channelIds = [], first = 100, statuses = ["scheduled"] }
+  { organizationId, channelIds = [], first = 100, statuses = ["scheduled"], newestFirst = false }
 ) {
   const safeFirst = Math.min(Math.max(Number(first) || 20, 1), 100);
   const invalidChannelIds = channelIds.filter((id) => id && !isValidBufferChannelId(id));
@@ -11819,13 +11819,16 @@ async function fetchBufferPosts(
     ? `, channelIds: [${channelIds.map((id) => `"${escapeGraphqlString(id)}"`).join(", ")}]`
     : "";
   const statusFilter = normalizedStatuses.join(", ");
+  const sortInput = newestFirst
+    ? "[{ field: createdAt, direction: desc }]"
+    : "[{ field: dueAt, direction: asc }, { field: createdAt, direction: desc }]";
   const response = await bufferGraphqlRequest(projectKey, {
     query: `query GetPosts {
       posts(
         first: ${safeFirst}
         input: {
           organizationId: "${escapeGraphqlString(organizationId)}"
-          sort: [{ field: dueAt, direction: asc }, { field: createdAt, direction: desc }]
+          sort: ${sortInput}
           filter: { status: [${statusFilter}]${channelFilter} }
         }
       ) {
@@ -11859,6 +11862,37 @@ async function fetchBufferPosts(
 
 async function fetchBufferScheduledPosts(projectKey, options) {
   return fetchBufferPosts(projectKey, { ...options, statuses: ["scheduled"] });
+}
+
+async function fetchBufferPost(projectKey, postId) {
+  if (!/^[a-f0-9]{24}$/i.test(String(postId || ""))) {
+    throw new Error("Buffer Post-Read blockiert: post_id muss 24 hexadezimale Zeichen enthalten.");
+  }
+  const response = await bufferGraphqlRequest(projectKey, {
+    query: `query GetPost {
+      post(input: { id: "${escapeGraphqlString(postId)}" }) {
+        id
+        text
+        dueAt
+        createdAt
+        updatedAt
+        channelId
+        status
+        sentAt
+        externalLink
+        error {
+          message
+          supportUrl
+        }
+        assets {
+          id
+          mimeType
+        }
+      }
+    }`
+  });
+  assertBufferGraphqlOk(response, "Buffer Post-Read");
+  return response.data?.data?.post || null;
 }
 
 function escapeGraphqlString(value) {
@@ -17546,15 +17580,16 @@ function createServer() {
 
   server.tool(
     "buffer_get_scheduled_posts",
-    "Liest geplante Buffer-Posts fuer ein Projekt und optional einen oder mehrere Kanaele read-only. Gibt zusaetzlich die juengsten Posts aller Buffer-Zustaende fuer belastbare Status- und Fehler-Readbacks aus.",
+    "Liest geplante Buffer-Posts fuer ein Projekt und optional einen oder mehrere Kanaele read-only. Gibt zusaetzlich die juengsten Posts aller Buffer-Zustaende aus und kann eine exakte Post-ID fuer belastbare Status- und Fehler-Readbacks pruefen.",
     {
       agent_id: agentIdSchema,
       project_key: z.string().min(2).max(80).optional().default("holzpunkt"),
       channels: z.array(z.enum(["instagram", "pinterest", "linkedin"])).min(1).max(3).optional(),
+      post_id: z.string().regex(/^[a-f0-9]{24}$/i).optional(),
       first: z.number().int().min(1).max(100).optional().default(100)
     },
     TOOL_EXTERNAL_READ,
-    async ({ agent_id, project_key, channels, first }) => {
+    async ({ agent_id, project_key, channels, post_id, first }) => {
       const { config } = getBufferProjectConfigDetails(project_key, {
         requireApiKey: true,
         requireOrganizationId: true
@@ -17573,14 +17608,18 @@ function createServer() {
         organizationId: config.organizationId,
         channelIds,
         first,
-        statuses: BUFFER_POST_STATUSES
+        statuses: BUFFER_POST_STATUSES,
+        newestFirst: true
       });
+      const requestedPost = post_id ? await fetchBufferPost(project_key, post_id) : null;
       return out({
         agent_id,
         project_key: normalizeBufferProjectKey(project_key),
         channels: channelConfigs,
         scheduled_count: posts.length,
         posts,
+        requested_post_id: post_id || null,
+        requested_post: requestedPost,
         recent_posts_count: recentPosts.length,
         recent_posts: recentPosts
       });
