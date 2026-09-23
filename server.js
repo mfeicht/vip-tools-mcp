@@ -2936,8 +2936,7 @@ async function lookupCampaignBudgetAmountMicros({ customerId, resourceName, logi
         FROM campaign_budget
         WHERE campaign_budget.resource_name = '${escapeGaqlString(resourceName)}'
         LIMIT 1
-      `,
-      pageSize: 1
+      `
     }
   });
   return numericMicros(res.data.results?.[0]?.campaignBudget?.amountMicros);
