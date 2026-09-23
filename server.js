@@ -11795,7 +11795,12 @@ async function fetchBufferChannels(projectKey, organizationId) {
   return response.data?.data?.channels || [];
 }
 
-async function fetchBufferScheduledPosts(projectKey, { organizationId, channelIds = [], first = 100 }) {
+const BUFFER_POST_STATUSES = ["draft", "error", "needs_approval", "scheduled", "sending", "sent"];
+
+async function fetchBufferPosts(
+  projectKey,
+  { organizationId, channelIds = [], first = 100, statuses = ["scheduled"] }
+) {
   const safeFirst = Math.min(Math.max(Number(first) || 20, 1), 100);
   const invalidChannelIds = channelIds.filter((id) => id && !isValidBufferChannelId(id));
   if (invalidChannelIds.length) {
@@ -11803,17 +11808,25 @@ async function fetchBufferScheduledPosts(projectKey, { organizationId, channelId
       `Buffer Scheduled-Posts-Read blockiert: ${invalidChannelIds.length} Channel-ID(s) haben kein gueltiges Buffer-Format. Erwartet werden 24 hexadezimale Zeichen.`
     );
   }
+  const normalizedStatuses = [...new Set(statuses.map((status) => String(status || "").trim()))];
+  const invalidStatuses = normalizedStatuses.filter((status) => !BUFFER_POST_STATUSES.includes(status));
+  if (!normalizedStatuses.length || invalidStatuses.length) {
+    throw new Error(
+      `Buffer Post-Read blockiert: ungueltiger Status. Erlaubt: ${BUFFER_POST_STATUSES.join(", ")}.`
+    );
+  }
   const channelFilter = channelIds.length
     ? `, channelIds: [${channelIds.map((id) => `"${escapeGraphqlString(id)}"`).join(", ")}]`
     : "";
+  const statusFilter = normalizedStatuses.join(", ");
   const response = await bufferGraphqlRequest(projectKey, {
-    query: `query GetScheduledPosts {
+    query: `query GetPosts {
       posts(
         first: ${safeFirst}
         input: {
           organizationId: "${escapeGraphqlString(organizationId)}"
           sort: [{ field: dueAt, direction: asc }, { field: createdAt, direction: desc }]
-          filter: { status: [scheduled]${channelFilter} }
+          filter: { status: [${statusFilter}]${channelFilter} }
         }
       ) {
         edges {
@@ -11822,15 +11835,30 @@ async function fetchBufferScheduledPosts(projectKey, { organizationId, channelId
             text
             dueAt
             createdAt
+            updatedAt
             channelId
             status
+            sentAt
+            externalLink
+            error {
+              message
+              supportUrl
+            }
+            assets {
+              id
+              mimeType
+            }
           }
         }
       }
     }`
   });
-  assertBufferGraphqlOk(response, "Buffer Scheduled-Posts-Read");
+  assertBufferGraphqlOk(response, "Buffer Posts-Read");
   return (response.data?.data?.posts?.edges || []).map((edge) => edge.node).filter(Boolean);
+}
+
+async function fetchBufferScheduledPosts(projectKey, options) {
+  return fetchBufferPosts(projectKey, { ...options, statuses: ["scheduled"] });
 }
 
 function escapeGraphqlString(value) {
@@ -17518,7 +17546,7 @@ function createServer() {
 
   server.tool(
     "buffer_get_scheduled_posts",
-    "Liest geplante Buffer-Posts fuer ein Projekt und optional einen oder mehrere Kanaele read-only. Standard fuer naechsten freien Tag/Slot.",
+    "Liest geplante Buffer-Posts fuer ein Projekt und optional einen oder mehrere Kanaele read-only. Gibt zusaetzlich die juengsten Posts aller Buffer-Zustaende fuer belastbare Status- und Fehler-Readbacks aus.",
     {
       agent_id: agentIdSchema,
       project_key: z.string().min(2).max(80).optional().default("holzpunkt"),
@@ -17541,12 +17569,20 @@ function createServer() {
         channelIds,
         first
       });
+      const recentPosts = await fetchBufferPosts(project_key, {
+        organizationId: config.organizationId,
+        channelIds,
+        first,
+        statuses: BUFFER_POST_STATUSES
+      });
       return out({
         agent_id,
         project_key: normalizeBufferProjectKey(project_key),
         channels: channelConfigs,
         scheduled_count: posts.length,
-        posts
+        posts,
+        recent_posts_count: recentPosts.length,
+        recent_posts: recentPosts
       });
     }
   );
