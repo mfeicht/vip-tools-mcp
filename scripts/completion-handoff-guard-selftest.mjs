@@ -333,6 +333,45 @@ for (const text of ["Follow-up\nKeines nachgewiesen.", "Keine weitere Recherche 
   assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: { text }, hasFollowUpTask: false }).ok, false);
 }
 
+// Actual Sales result wording from story 1218717124815791 must not be
+// misread as active work merely because an earlier sentence mentions import.
+const salesImportedResultWithCompoundFollowUp = {
+  text:
+    "6 neue Leads wurden erfolgreich importiert.\n" +
+    "Keine weitere Nacharbeit oder Follow-up-Aufgabe erforderlich.\n" +
+    "Nächster Suchraum: Für die nächste Routine andere Regionen priorisieren.\n" +
+    "Evidenz / Verifikation\nLive-Readbacks bestätigen den Task-Scope."
+};
+const salesCompoundFollowUpSignals = detectRoutineFollowUpSignals({
+  finalComment: salesImportedResultWithCompoundFollowUp,
+  completionBasis:
+    "The canonical result story records six successfully imported leads and the task-specific clarification confirms that no follow-up work is required.",
+  followUpNotRequiredBasis:
+    "Story 1218717300136922 states that no follow-up task is required for this task scope."
+});
+assert.equal(salesCompoundFollowUpSignals.has_action_signal, true);
+assert.equal(salesCompoundFollowUpSignals.no_follow_up_claim, true);
+assert.equal(salesCompoundFollowUpSignals.has_existing_task_coverage_claim, false);
+assert.equal(salesCompoundFollowUpSignals.blocked_without_follow_up_task, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: salesImportedResultWithCompoundFollowUp,
+  hasFollowUpTask: false
+}).ok, true);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { text: "Keine weitere Follow-up-Aufgabe angelegt." },
+  hasFollowUpTask: false
+}).ok, false);
+assert.equal(validateRoutineMaterialCorrection({
+  priorStory: { gid: "1218717124815791", text: "Keine weitere Follow-up-Aufgabe erforderlich." },
+  correction: {
+    reason: "Der sichtbare Abschlussstatus soll ohne neue Evidenz nur umformuliert werden.",
+    before: "Keine weitere Follow-up-Aufgabe erforderlich",
+    after: "Keine weitere Folgeaufgabe nötig",
+    source: "Unveränderter Sales-Ergebnisreadback"
+  },
+  proposedText: "Keine weitere Folgeaufgabe nötig."
+}).issues.includes("correction_restates_no_follow_up"), true);
+
 const coordinatedNoFollowUpSignal = detectRoutineFollowUpSignals({
   finalComment: {
     text:
