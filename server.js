@@ -11841,6 +11841,7 @@ async function fetchBufferPosts(
             updatedAt
             channelId
             status
+            allowedActions
             sentAt
             externalLink
             error {
@@ -11878,6 +11879,7 @@ async function fetchBufferPost(projectKey, postId) {
         updatedAt
         channelId
         status
+        allowedActions
         sentAt
         externalLink
         error {
@@ -12168,6 +12170,45 @@ function bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls = [], meta
   }`;
 }
 
+function bufferEditPostMutation({ postId, text, dueAt, mediaUrls, metadataInput = "" }) {
+  const textLine = text === undefined ? "" : `\n        text: "${escapeGraphqlString(text)}"`;
+  const dueAtLine = dueAt === undefined ? "" : `\n        dueAt: "${escapeGraphqlString(dueAt)}"`;
+  const assetsLine = mediaUrls === undefined
+    ? ""
+    : `\n        assets: [${bufferAssetInputFromUrls(mediaUrls)}]`;
+  return `mutation EditPost {
+    editPost(
+      input: {
+        id: "${escapeGraphqlString(postId)}"${textLine}${dueAtLine}${assetsLine}${metadataInput}
+      }
+    ) {
+      ... on PostActionSuccess {
+        post {
+          id
+          text
+          dueAt
+          createdAt
+          updatedAt
+          channelId
+          status
+          allowedActions
+          assets {
+            id
+            mimeType
+          }
+          error {
+            message
+            supportUrl
+          }
+        }
+      }
+      ... on MutationError {
+        message
+      }
+    }
+  }`;
+}
+
 async function createBufferPost(projectKey, { text, channelId, dueAt, mediaUrls, metadataInput }) {
   const response = await bufferGraphqlRequest(projectKey, {
     query: bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls, metadataInput })
@@ -12179,6 +12220,21 @@ async function createBufferPost(projectKey, { text, channelId, dueAt, mediaUrls,
   }
   if (!result?.post?.id) {
     throw new Error(`Buffer createPost lieferte keinen Post-Readback: ${JSON.stringify(response.data)}`);
+  }
+  return result.post;
+}
+
+async function editBufferPost(projectKey, { postId, text, dueAt, mediaUrls, metadataInput }) {
+  const response = await bufferGraphqlRequest(projectKey, {
+    query: bufferEditPostMutation({ postId, text, dueAt, mediaUrls, metadataInput })
+  });
+  assertBufferGraphqlOk(response, "Buffer editPost");
+  const result = response.data?.data?.editPost;
+  if (result?.message && !result?.post) {
+    throw new Error(`Buffer editPost MutationError: ${result.message}`);
+  }
+  if (!result?.post?.id) {
+    throw new Error(`Buffer editPost lieferte keinen Post-Readback: ${JSON.stringify(response.data)}`);
   }
   return result.post;
 }
@@ -17878,6 +17934,170 @@ function createServer() {
         note: dry_run
           ? "Dry-Run: keine Cloudinary-Uploads und keine Buffer-Posts erstellt."
           : "Live: Cloudinary-Uploads und Buffer-Planung wurden per Readback bestaetigt."
+      });
+    }
+  );
+
+  server.tool(
+    "buffer_edit_post",
+    "Bearbeitet einen vorhandenen Buffer-Post kontrolliert und ersetzt bei Bedarf Text, Termin oder die geordnete Medienliste. Live-Ausfuehrung braucht einen verifizierten Asana-Auftrag oder einen direkten aktuellen Codex-Auftrag von Moritz Feichtmeyer.",
+    {
+      agent_id: agentIdSchema,
+      project_key: z.string().min(2).max(80).optional().default("holzpunkt"),
+      post_id: z.string().regex(/^[a-f0-9]{24}$/i),
+      channel: z.enum(["instagram", "pinterest", "linkedin"]),
+      asana_task_gid: z.string().optional(),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      authorization: actionAuthorizationSchema.optional(),
+      dry_run: z.boolean().optional().default(true),
+      text: z.string().min(1).max(10000).optional(),
+      public_media_urls: z.array(z.string().url()).max(20).optional(),
+      due_at: z.string().optional(),
+      instagram_type: z.enum(["post", "story", "reel"]).optional(),
+      instagram_should_share_to_feed: z.boolean().optional(),
+      pinterest_title: z.string().min(1).max(200).optional(),
+      pinterest_url: z.string().url().optional(),
+      pinterest_board_service_id: z.string().min(1).max(200).optional(),
+      linkedin_first_comment: z.string().min(1).max(3000).optional(),
+      linkedin_link_url: z.string().url().optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      project_key,
+      post_id,
+      channel,
+      asana_task_gid,
+      confirmed_by_asana,
+      authorization,
+      dry_run,
+      text,
+      public_media_urls,
+      due_at,
+      instagram_type,
+      instagram_should_share_to_feed,
+      pinterest_title,
+      pinterest_url,
+      pinterest_board_service_id,
+      linkedin_first_comment,
+      linkedin_link_url
+    }) => {
+      if (asana_task_gid) validateAsanaGid(asana_task_gid, "asana_task_gid");
+      const authorizationReceipt = dry_run
+        ? null
+        : await assertActionAuthorized({
+            agentId: agent_id,
+            authorization,
+            confirmedByAsana: confirmed_by_asana,
+            asanaTaskGid: asana_task_gid,
+            actionName: "buffer_edit_post"
+          });
+
+      const hasMetadataChange =
+        instagram_type !== undefined ||
+        instagram_should_share_to_feed !== undefined ||
+        pinterest_title !== undefined ||
+        pinterest_url !== undefined ||
+        pinterest_board_service_id !== undefined ||
+        linkedin_first_comment !== undefined ||
+        linkedin_link_url !== undefined;
+      if (text === undefined && public_media_urls === undefined && due_at === undefined && !hasMetadataChange) {
+        throw new Error("buffer_edit_post braucht mindestens eine Aenderung an Text, Medien, Termin oder Metadaten.");
+      }
+      if (channel === "instagram" && hasMetadataChange && instagram_type === undefined) {
+        throw new Error("Instagram-Metadaten duerfen nur zusammen mit instagram_type bearbeitet werden.");
+      }
+
+      let resolvedDueAt;
+      if (due_at !== undefined) {
+        const date = new Date(due_at);
+        if (Number.isNaN(date.getTime())) throw new Error(`due_at ist kein gueltiger ISO-Zeitpunkt: ${due_at}`);
+        if (date.getTime() <= Date.now()) throw new Error(`due_at liegt nicht in der Zukunft: ${due_at}`);
+        resolvedDueAt = date.toISOString();
+      }
+
+      const normalizedProjectKey = normalizeBufferProjectKey(project_key);
+      const normalizedChannel = normalizeBufferChannelKey(channel);
+      const channelConfig = getBufferChannelConfig(normalizedProjectKey, normalizedChannel, { requireChannelId: true });
+      assertBufferChannelConfigsValid([channelConfig]);
+      getBufferProjectConfigDetails(normalizedProjectKey, {
+        requireApiKey: true,
+        requireOrganizationId: true
+      });
+
+      const before = await fetchBufferPost(normalizedProjectKey, post_id);
+      if (!before) throw new Error(`Buffer-Post ${post_id} wurde nicht gefunden.`);
+      if (before.channelId !== channelConfig.channel_id) {
+        throw new Error(
+          `Buffer-Post ${post_id} gehoert nicht zum konfigurierten ${normalizedChannel}-Kanal (${channelConfig.channel_id}).`
+        );
+      }
+      if (!before.allowedActions?.includes("updatePost")) {
+        throw new Error(`Buffer-Post ${post_id} darf laut Live-Readback nicht bearbeitet werden.`);
+      }
+
+      const metadataInput = hasMetadataChange
+        ? bufferMetadataInputForChannel({
+            channel: normalizedChannel,
+            instagramType: instagram_type,
+            instagramShouldShareToFeed: instagram_should_share_to_feed ?? true,
+            pinterestTitle: pinterest_title,
+            pinterestUrl: pinterest_url,
+            pinterestBoardServiceId: pinterest_board_service_id,
+            linkedinFirstComment: linkedin_first_comment,
+            linkedinLinkUrl: linkedin_link_url
+          })
+        : "";
+      const plan = {
+        post_id,
+        channel: normalizedChannel,
+        channel_id: channelConfig.channel_id,
+        text_chars: text === undefined ? null : text.length,
+        media_count: public_media_urls === undefined ? null : public_media_urls.length,
+        due_at: resolvedDueAt || null,
+        metadata_change: hasMetadataChange
+      };
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          project_key: normalizedProjectKey,
+          authorization: authorizationReceipt,
+          dry_run,
+          before,
+          plan,
+          note: "Dry-Run: Buffer-Post wurde nicht veraendert."
+        });
+      }
+
+      const mutationPost = await editBufferPost(normalizedProjectKey, {
+        postId: post_id,
+        text,
+        dueAt: resolvedDueAt,
+        mediaUrls: public_media_urls,
+        metadataInput
+      });
+      const after = await fetchBufferPost(normalizedProjectKey, post_id);
+      if (!after) throw new Error(`Buffer-Post ${post_id} fehlt im Readback nach editPost.`);
+      if (public_media_urls !== undefined && after.assets?.length !== public_media_urls.length) {
+        throw new Error(
+          `Buffer-Edit-Readback unvollstaendig: erwartet ${public_media_urls.length} Medien, erhalten ${after.assets?.length || 0}.`
+        );
+      }
+      if (text !== undefined && after.text !== text) {
+        throw new Error("Buffer-Edit-Readback stimmt beim Text nicht mit der angeforderten Aenderung ueberein.");
+      }
+
+      return out({
+        agent_id,
+        project_key: normalizedProjectKey,
+        authorization: authorizationReceipt,
+        dry_run,
+        before,
+        plan,
+        mutation_post: mutationPost,
+        after,
+        note: "Live: vorhandener Buffer-Post wurde bearbeitet und per exaktem Post-ID-Readback bestaetigt."
       });
     }
   );
