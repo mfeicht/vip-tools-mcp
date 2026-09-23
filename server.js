@@ -18288,6 +18288,28 @@ function createServer() {
   );
 
   server.tool(
+    "templated_get_render",
+    "Liest einen vorhandenen Templated-Render anhand seiner ID read-only und gibt unter anderem die kanonische CDN-URL, Dimensionen und den Status aus.",
+    {
+      agent_id: agentIdSchema,
+      render_id: z.string().uuid()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, render_id }) => {
+      getTemplatedConfigDetails(agent_id, { requireCredentials: true });
+      const response = await templatedRequest(agent_id, {
+        path: `/v1/render/${encodeURIComponent(render_id)}`
+      });
+      return out({
+        agent_id,
+        ok: response.ok,
+        status: response.status,
+        render: response.data
+      });
+    }
+  );
+
+  server.tool(
     "templated_render",
     "Erstellt einen Templated.io-Render aus einer Vorlage. Standard ist dry_run=true; echte Render brauchen einen verifizierten Asana-Auftrag oder einen direkten aktuellen Codex-Auftrag von Moritz Feichtmeyer, weil Credits/Kosten entstehen koennen.",
     {
