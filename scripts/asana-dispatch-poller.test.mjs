@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
 import { taskSignal } from "./asana-dispatch-signals.mjs";
-import { scanAgent, tool } from "./asana-dispatch-poller.mjs";
+import { formatToolError, retryableToolError, scanAgent, tool } from "./asana-dispatch-poller.mjs";
 
 function fakeClient({ searchTasks = [], stories = [], searchComplete = true,
   linkedTask = null } = {}) {
@@ -122,4 +122,17 @@ test("tool failures retain the failing MCP tool name for poll diagnostics", asyn
   const client = { async callTool() { throw new Error("Streamable HTTP error: endpoint unavailable"); } };
   await assert.rejects(tool(client, "asana_search_tasks", {}),
     /asana_search_tasks: Streamable HTTP error: endpoint unavailable/);
+});
+
+test("streamable HTTP status codes are retryable even when the response body omits the status", () => {
+  const transient = new Error("Streamable HTTP error: Error POSTing to endpoint: ");
+  transient.code = 503;
+  assert.equal(retryableToolError(transient), true);
+  assert.equal(formatToolError(transient),
+    "Streamable HTTP error: Error POSTing to endpoint:  (HTTP 503)");
+
+  const permanent = new Error("Streamable HTTP error: Error POSTing to endpoint: bad request");
+  permanent.code = 400;
+  assert.equal(retryableToolError(permanent), false);
+  assert.match(formatToolError(permanent), /HTTP 400/);
 });

@@ -21,6 +21,23 @@ function options(argv) {
   return opts;
 }
 
+function toolErrorStatus(error) {
+  const status = Number(error?.code ?? error?.status ?? error?.statusCode);
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+}
+
+export function retryableToolError(error) {
+  const status = toolErrorStatus(error);
+  if ([429, 502, 503, 504].includes(status)) return true;
+  return /\b(429|502|503|504)\b|timeout|fetch failed|cloudflare/i.test(String(error));
+}
+
+export function formatToolError(error) {
+  const message = String(error?.message || error || "unknown tool error");
+  const status = toolErrorStatus(error);
+  return status ? `${message} (HTTP ${status})` : message;
+}
+
 export async function tool(client, name, args) {
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -33,11 +50,13 @@ export async function tool(client, name, args) {
       return JSON.parse(payload);
     } catch (error) {
       lastError = error;
-      if (attempt === 2 || !/\b(429|502|503|504)\b|timeout|fetch failed|cloudflare/i.test(String(error))) break;
-      await new Promise((resolve) => setTimeout(resolve, /429|cloudflare/i.test(String(error)) ? 60_000 : 10_000));
+      if (attempt === 2 || !retryableToolError(error)) break;
+      const status = toolErrorStatus(error);
+      await new Promise((resolve) => setTimeout(resolve,
+        status === 429 || /429|cloudflare/i.test(String(error)) ? 60_000 : 10_000));
     }
   }
-  throw new Error(`${name}: ${String(lastError?.message || lastError || "unknown tool error")}`);
+  throw new Error(`${name}: ${formatToolError(lastError)}`);
 }
 
 export async function storiesForTask(client, agentId, taskGid) {
