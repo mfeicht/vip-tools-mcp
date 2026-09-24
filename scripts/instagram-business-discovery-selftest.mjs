@@ -247,7 +247,7 @@ await Promise.all(Array.from({ length: 4 }, () => fetchInstagramBusinessDiscover
     }
   }
 )));
-assert.equal(maximumDownloads, 2);
+assert.equal(maximumDownloads, 1);
 
 await assert.rejects(
   fetchInstagramBusinessDiscoveryImage(
