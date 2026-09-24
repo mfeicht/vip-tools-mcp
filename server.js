@@ -98,6 +98,7 @@ import {
   getInstagramBusinessDiscoveryMedia,
   getInstagramBusinessDiscoveryProfile
 } from "./lib/instagram-business-discovery.js";
+import { createMcpRequestCleanup } from "./lib/mcp-request-lifecycle.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -25342,16 +25343,49 @@ app.get(["/", "/health"], (req, res) => {
 
 app.use(express.json());
 
-app.all("/mcp", async (req, res) => {
+let activeMcpRequests = 0;
+let totalMcpRequests = 0;
+
+app.post("/mcp", async (req, res) => {
   const server = createServer();
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true
   });
+  activeMcpRequests += 1;
+  totalMcpRequests += 1;
+  const requestNumber = totalMcpRequests;
+  const cleanup = createMcpRequestCleanup({
+    transport,
+    server,
+    onCleanupError({ resource, error }, reason) {
+      console.error("MCP CLEANUP ERROR", {
+        request_number: requestNumber,
+        resource,
+        reason,
+        error: error?.message || String(error)
+      });
+    },
+    onClosed({ reason, errors }) {
+      activeMcpRequests = Math.max(0, activeMcpRequests - 1);
+      console.log("MCP REQUEST CLOSED", {
+        request_number: requestNumber,
+        reason,
+        cleanup_errors: errors.length,
+        active_requests: activeMcpRequests
+      });
+    }
+  });
+  res.once("close", () => {
+    void cleanup("response_close");
+  });
 
   try {
-    console.log("MCP REQUEST", req.method, req.body?.method);
+    console.log("MCP REQUEST", req.method, req.body?.method, {
+      request_number: requestNumber,
+      active_requests: activeMcpRequests
+    });
 
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
@@ -25361,8 +25395,23 @@ app.all("/mcp", async (req, res) => {
     if (!res.headersSent) {
       res.status(500).send(err.message);
     }
+    await cleanup("handler_error");
   }
 });
+
+function rejectStatelessMcpStream(_req, res) {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: {
+      code: -32000,
+      message: "Method not allowed for stateless MCP transport."
+    },
+    id: null
+  });
+}
+
+app.get("/mcp", rejectStatelessMcpStream);
+app.delete("/mcp", rejectStatelessMcpStream);
 
 /* ---------------- START ---------------- */
 

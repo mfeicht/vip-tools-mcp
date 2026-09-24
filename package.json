@@ -44,6 +44,7 @@
     "shadow:web-research": "node scripts/web-research-live-shadow.mjs",
     "test:instagram-business-discovery": "node scripts/instagram-business-discovery-selftest.mjs",
     "test:instagram-business-discovery-mcp": "node scripts/instagram-business-discovery-mcp-selftest.mjs",
+    "test:mcp-lifecycle": "node scripts/mcp-request-lifecycle-selftest.mjs",
     "mcp:call": "node scripts/vip-mcp-call.mjs"
   },
   "keywords": [],
