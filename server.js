@@ -20812,7 +20812,7 @@ function createServer() {
         ...summary,
         mode: "readonly_unseen_uid_text_body_peek",
         uid: result.uid,
-        from: result.from,
+        message_from: result.from,
         subject: result.subject,
         date: result.date,
         message_id: result.message_id,
