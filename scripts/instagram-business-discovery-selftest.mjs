@@ -221,6 +221,18 @@ await assert.rejects(
 );
 assert.equal(deniedCalls, 1);
 
+await assert.rejects(
+  fetchInstagramBusinessDiscoveryImage(
+    { media_url: cdnUrl },
+    { wait: async () => {}, httpGet: async () => { throw { code: "ERR_BAD_RESPONSE", message: secret }; } }
+  ),
+  (error) => {
+    assert.match(error.message, /Transport ERR_BAD_RESPONSE/);
+    assert.equal(error.message.includes(secret), false);
+    return true;
+  }
+);
+
 let activeDownloads = 0;
 let maximumDownloads = 0;
 await Promise.all(Array.from({ length: 4 }, () => fetchInstagramBusinessDiscoveryImage(
