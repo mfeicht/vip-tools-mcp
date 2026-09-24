@@ -12,6 +12,7 @@ import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 import { assertLinkedGoogleDocScope, linkedGoogleDocReadback } from "./lib/google-docs-linked-reader.js";
+import { selectBoundedEmailText } from "./lib/email-uid-text.js";
 import {
   appendGeneralInformationQualification,
   validateGeneralInformationReply
@@ -4097,6 +4098,104 @@ async function readUnseenEmailWithFallback(configs, options) {
   const error = new Error(
     `IMAP read-only fehlgeschlagen: ${attempts.map((attempt) => `${attempt.label} ${attempt.host}:${attempt.port} ${attempt.error}`).join(" | ")}`
   );
+  error.imap_attempts = attempts;
+  throw error;
+}
+
+async function runImapReadUidText(config, { uid, expectedMessageId, offsetChars, limitChars, maxEmailBytes }) {
+  const socket = await openImapSocket(config);
+  socket.setEncoding("binary");
+  const state = { buffer: "" };
+  let tagCounter = 1;
+  const greeting = await readImapUntil(socket, state, (buffer) => {
+    const end = buffer.indexOf("\n");
+    if (end < 0) return null;
+    state.buffer = buffer.slice(end + 1);
+    return buffer.slice(0, end + 1);
+  }, "greeting");
+  if (!/^\* OK/i.test(greeting)) {
+    socket.destroy();
+    throw new Error(`IMAP greeting nicht OK: ${cleanImapPreview(greeting, 200)}`);
+  }
+  const command = async (payload) => {
+    const tag = `a${tagCounter++}`;
+    socket.write(`${tag} ${payload}\r\n`);
+    const response = await readImapUntil(socket, state, (buffer) => {
+      const match = new RegExp(`(?:^|\\r?\\n)${tag} (OK|NO|BAD)[^\\r\\n]*(?:\\r?\\n|$)`, "i").exec(buffer);
+      if (!match) return null;
+      const end = match.index + match[0].length;
+      state.buffer = buffer.slice(end);
+      return buffer.slice(0, end);
+    }, imapResponseCommandLabel(payload));
+    if (!new RegExp(`(?:^|\\r?\\n)${tag} OK`, "i").test(response)) {
+      throw new Error(`IMAP ${payload.split(/\s+/, 1)[0]} fehlgeschlagen: ${cleanImapPreview(response, 300)}`);
+    }
+    return response;
+  };
+  try {
+    await command(`LOGIN ${quoteImapString(config.user)} ${quoteImapString(config.password)}`);
+    await command("EXAMINE INBOX");
+    const search = await command("UID SEARCH UNSEEN");
+    const searchLine = search.split(/\r?\n/).find((line) => /^\* SEARCH(?:[ \t]|$)/i.test(line));
+    const unseen = (searchLine || "").replace(/^\* SEARCH[ \t]*/i, "").trim().split(/[ \t]+/);
+    if (!unseen.includes(uid)) throw new Error("uid_not_unseen_in_agent_inbox");
+
+    const metadata = await command(`UID FETCH ${uid} (UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])`);
+    if (!new RegExp(`\\bUID\\s+${uid}\\b`).test(metadata)) throw new Error("uid_metadata_missing");
+    const declaredBytes = parseImapRfc822Size(metadata);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 1) throw new Error("message_size_missing");
+    if (declaredBytes > maxEmailBytes) throw new Error("message_too_large");
+    const headerLiteral = extractFirstImapLiteral(metadata);
+    if (!headerLiteral) throw new Error("message_headers_missing");
+    const metadataHeaders = parseMimeHeaders(headerLiteral);
+    const actualMessageId = String(metadataHeaders["message-id"] || "").trim();
+    if (actualMessageId !== expectedMessageId) throw new Error("message_id_mismatch");
+
+    const response = await command(`UID FETCH ${uid} (UID BODY.PEEK[])`);
+    if (!new RegExp(`\\bUID\\s+${uid}\\b`).test(response)) throw new Error("uid_body_missing");
+    const raw = extractImapLiteral(response);
+    if (!raw) throw new Error("message_body_missing");
+    const fetchedBytes = Buffer.byteLength(raw, "binary");
+    if (fetchedBytes > maxEmailBytes) throw new Error("message_too_large");
+    const headers = parseMimeHeaders(splitHeaderAndBody(raw).headersText);
+    if (String(headers["message-id"] || "").trim() !== expectedMessageId) throw new Error("message_id_mismatch");
+    const parts = parseMimeMessageTextParts(raw);
+    const plainText = parts.filter((part) => part.content_type === "text/plain")
+      .map((part) => String(part.text || "").trim()).filter(Boolean).join("\n\n");
+    const htmlText = parts.filter((part) => part.content_type === "text/html")
+      .map((part) => htmlToAccountingText(part.text)).filter(Boolean).join("\n\n");
+    const textWindow = selectBoundedEmailText({ plainText, htmlText, offsetChars, limitChars });
+    await command("LOGOUT").catch(() => {});
+    return {
+      uid,
+      from: decodeMimeHeaderValue(headers.from || metadataHeaders.from || ""),
+      subject: decodeMimeHeaderValue(headers.subject || metadataHeaders.subject || ""),
+      date: headers.date || metadataHeaders.date || "",
+      message_id: actualMessageId,
+      declared_bytes: declaredBytes,
+      fetched_bytes: fetchedBytes,
+      ...textWindow
+    };
+  } finally {
+    if (!socket.destroyed) socket.destroy();
+  }
+}
+
+async function readUidTextWithFallback(configs, options) {
+  const attempts = [];
+  for (const config of configs) {
+    try {
+      const result = await runImapReadUidText(config, options);
+      return { ...result, connection: publicImapConfig(config), attempts };
+    } catch (error) {
+      const code = String(error?.message || error);
+      if (["uid_not_unseen_in_agent_inbox", "uid_metadata_missing", "message_size_missing", "message_too_large", "message_headers_missing", "message_id_mismatch", "uid_body_missing", "message_body_missing"].includes(code)) {
+        throw error;
+      }
+      attempts.push({ ...publicImapConfig(config), ok: false, error: code });
+    }
+  }
+  const error = new Error(`IMAP UID read-only fehlgeschlagen: ${attempts.map((item) => item.error).join(" | ")}`);
   error.imap_attempts = attempts;
   throw error;
 }
@@ -20683,6 +20782,50 @@ function createServer() {
         selected_uids: result.selected_uids,
         returned_count: result.returned_count,
         messages: result.messages,
+        imap_attempts: result.attempts
+      });
+    }
+  );
+
+  server.tool(
+    "agent_email_read_uid_text",
+    "Liest einen durch UID und Message-ID gebundenen ungelesenen Mailtext aus dem eigenen Agentenpostfach. Read-only mit IMAP EXAMINE und BODY.PEEK ueber verifiziertes TLS; begrenzte Nachrichtengroesse und Textfenster, keine Anhaenge.",
+    {
+      agent_id: agentIdSchema,
+      uid: z.string().regex(/^\d+$/),
+      expected_message_id: z.string().min(3).max(512).refine((value) => !/[\r\n]/.test(value)),
+      offset_chars: z.number().int().min(0).max(200000).optional().default(0),
+      limit_chars: z.number().int().min(500).max(12000).optional().default(8000),
+      max_email_bytes: z.number().int().min(1024).max(2000000).optional().default(1000000)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, uid, expected_message_id, offset_chars, limit_chars, max_email_bytes }) => {
+      const { configs, summary } = getImapConfigCandidates(agent_id, { requireCredentials: true });
+      const result = await readUidTextWithFallback(configs, {
+        uid,
+        expectedMessageId: expected_message_id,
+        offsetChars: offset_chars,
+        limitChars: limit_chars,
+        maxEmailBytes: max_email_bytes
+      });
+      return out({
+        ...summary,
+        mode: "readonly_unseen_uid_text_body_peek",
+        uid: result.uid,
+        from: result.from,
+        subject: result.subject,
+        date: result.date,
+        message_id: result.message_id,
+        declared_bytes: result.declared_bytes,
+        fetched_bytes: result.fetched_bytes,
+        text: result.text,
+        source: result.source,
+        total_chars: result.total_chars,
+        offset_chars: result.offset_chars,
+        end_chars: result.end_chars,
+        has_more: result.has_more,
+        coverage_status: result.coverage_status,
+        connection: result.connection,
         imap_attempts: result.attempts
       });
     }
