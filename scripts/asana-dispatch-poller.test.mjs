@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
 import { taskSignal } from "./asana-dispatch-signals.mjs";
-import { formatToolError, retryableToolError, scanAgent, tool } from "./asana-dispatch-poller.mjs";
+import { connectMcpClient, formatToolError, retryableToolError, scanAgent, tool } from "./asana-dispatch-poller.mjs";
 
 function fakeClient({ searchTasks = [], stories = [], searchComplete = true,
   linkedTask = null } = {}) {
@@ -135,4 +135,46 @@ test("streamable HTTP status codes are retryable even when the response body omi
   permanent.code = 400;
   assert.equal(retryableToolError(permanent), false);
   assert.match(formatToolError(permanent), /HTTP 400/);
+});
+
+test("MCP connection retries one transient failure with a fresh client", async () => {
+  const waits = [];
+  const clients = [];
+  const createPair = () => {
+    const index = clients.length;
+    const client = {
+      closed: false,
+      async connect() {
+        if (index === 0) {
+          const error = new Error("Streamable HTTP error: Error POSTing to endpoint: ");
+          error.code = 503;
+          throw error;
+        }
+      },
+      async close() { this.closed = true; }
+    };
+    clients.push(client);
+    return { client, transport: {} };
+  };
+  const connected = await connectMcpClient(createPair, async (ms) => waits.push(ms));
+  assert.equal(connected, clients[1]);
+  assert.equal(clients[0].closed, true);
+  assert.equal(clients[1].closed, false);
+  assert.deepEqual(waits, [10_000]);
+});
+
+test("MCP connection does not retry permanent failures", async () => {
+  let attempts = 0;
+  await assert.rejects(connectMcpClient(() => {
+    attempts += 1;
+    return { client: {
+      async connect() {
+        const error = new Error("bad request");
+        error.code = 400;
+        throw error;
+      },
+      async close() {}
+    }, transport: {} };
+  }, async () => { throw new Error("unexpected retry"); }), /mcp_connect: bad request \(HTTP 400\)/);
+  assert.equal(attempts, 1);
 });

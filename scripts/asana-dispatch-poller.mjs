@@ -38,6 +38,33 @@ export function formatToolError(error) {
   return status ? `${message} (HTTP ${status})` : message;
 }
 
+export async function connectMcpClient(
+  createPair = () => ({
+    client: new Client({ name: "vip-asana-dispatch-sensor", version: "1.0.0" }),
+    transport: new StreamableHTTPClientTransport(new URL(MCP_URL))
+  }),
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+) {
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const { client, transport } = createPair();
+    try {
+      await client.connect(transport);
+      return client;
+    } catch (error) {
+      lastError = error;
+      await Promise.race([
+        client.close().catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 5_000))
+      ]);
+      if (attempt === 2 || !retryableToolError(error)) break;
+      const status = toolErrorStatus(error);
+      await wait(status === 429 || /429|cloudflare/i.test(String(error)) ? 60_000 : 10_000);
+    }
+  }
+  throw new Error(`mcp_connect: ${formatToolError(lastError)}`);
+}
+
 export async function tool(client, name, args) {
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -180,11 +207,11 @@ export async function poll({ write = false, agentIds = null, db = DEFAULT_DB_PAT
   const expectedAgentIds = agentIds || Object.keys(registry.agents || {});
   if (!expectedAgentIds.length) throw new Error("Agent registry is empty");
   const store = new AsanaDispatchStore(write ? db : ":memory:");
-  const client = new Client({ name: "vip-asana-dispatch-sensor", version: "1.0.0" });
+  let client;
   const result = { at: scanStartedAt.toISOString(), mode: write ? "write" : "dry-run",
     agents: [], errors: [], counts: {} };
   try {
-    await client.connect(new StreamableHTTPClientTransport(new URL(MCP_URL)));
+    client = await connectMcpClient();
     const snapshots = await tool(client, "asana_agents_open_task_snapshot", {
       agent_ids: expectedAgentIds, limit: 100, max_pages: 10, concurrency: 4
     });
@@ -211,7 +238,7 @@ export async function poll({ write = false, agentIds = null, db = DEFAULT_DB_PAT
     if (result.errors.length) process.exitCode = 2;
     return result;
   } finally {
-    await Promise.race([
+    if (client) await Promise.race([
       client.close().catch(() => {}),
       new Promise((resolve) => setTimeout(resolve, 5_000))
     ]);
