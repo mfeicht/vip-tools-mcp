@@ -197,12 +197,12 @@ const retriedImage = await fetchInstagramBusinessDiscoveryImage(
     wait: async () => {},
     httpGet: async () => {
       retries += 1;
-      if (retries === 1) throw { code: "ECONNRESET" };
+      if (retries <= 2) throw { code: "ECONNRESET" };
       return { status: 200, headers: { "content-type": "image/jpeg" }, data: jpeg };
     }
   }
 );
-assert.equal(retries, 2);
+assert.equal(retries, 3);
 assert.equal(retriedImage.byteLength, jpeg.length);
 
 let deniedCalls = 0;
