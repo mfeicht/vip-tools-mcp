@@ -83,6 +83,14 @@ export class AsanaDispatchStore {
         agent_id TEXT PRIMARY KEY,
         completed_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS resource_event_cursors (
+        agent_id TEXT NOT NULL,
+        resource_gid TEXT NOT NULL,
+        sync_token TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('needs_reconciliation','draining','ready')),
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(agent_id, resource_gid)
+      );
       CREATE TABLE IF NOT EXISTS dependency_watches (
         agent_id TEXT NOT NULL,
         task_gid TEXT NOT NULL,
@@ -168,6 +176,71 @@ export class AsanaDispatchStore {
   pollCursor(agentId) {
     return this.db.prepare("SELECT completed_at FROM poll_cursors WHERE agent_id=?")
       .get(assertId(agentId, "agent_id"))?.completed_at || null;
+  }
+
+  eventCursor(agentId, resourceGid) {
+    return this.db.prepare(`SELECT * FROM resource_event_cursors
+      WHERE agent_id=? AND resource_gid=?`)
+      .get(assertId(agentId, "agent_id"), assertId(resourceGid, "resource_gid")) || null;
+  }
+
+  stageEventReconciliation(agentId, resourceGid, syncToken, now = Date.now()) {
+    assertId(agentId, "agent_id");
+    assertId(resourceGid, "resource_gid");
+    if (typeof syncToken !== "string" || !syncToken || syncToken.length > 4096 ||
+        /[\x00-\x1f\x7f]/.test(syncToken)) throw new Error("sync_token is invalid");
+    assertTime(now, "now");
+    this.db.prepare(`INSERT INTO resource_event_cursors
+      (agent_id,resource_gid,sync_token,state,updated_at_ms)
+      VALUES (?,?,?,'needs_reconciliation',?)
+      ON CONFLICT(agent_id,resource_gid) DO UPDATE SET
+        sync_token=excluded.sync_token,state='needs_reconciliation',updated_at_ms=excluded.updated_at_ms`)
+      .run(agentId, resourceGid, syncToken, now);
+    return this.eventCursor(agentId, resourceGid);
+  }
+
+  finishEventReconciliation(agentId, resourceGid, expectedToken, reconcile, now = Date.now()) {
+    if (typeof reconcile !== "function") throw new Error("reconciliation callback is required");
+    return this.transaction(() => {
+      const cursor = this.eventCursor(agentId, resourceGid);
+      if (cursor?.state !== "needs_reconciliation" || cursor.sync_token !== expectedToken) {
+        throw new Error("event reconciliation cursor changed");
+      }
+      const result = reconcile();
+      if (result && typeof result.then === "function") {
+        throw new Error("reconciliation callback must be synchronous");
+      }
+      this.db.prepare(`UPDATE resource_event_cursors SET state='ready',updated_at_ms=?
+        WHERE agent_id=? AND resource_gid=?`)
+        .run(assertTime(now, "now"), agentId, resourceGid);
+      return this.eventCursor(agentId, resourceGid);
+    });
+  }
+
+  applyEventPage(agentId, resourceGid, expectedToken, nextToken, hasMore, apply,
+    now = Date.now()) {
+    if (typeof apply !== "function") throw new Error("event page callback is required");
+    if (typeof hasMore !== "boolean") throw new Error("has_more is invalid");
+    if (typeof nextToken !== "string" || !nextToken || nextToken.length > 4096 ||
+        /[\x00-\x1f\x7f]/.test(nextToken) || nextToken === expectedToken) {
+      throw new Error("next sync_token is invalid");
+    }
+    return this.transaction(() => {
+      const cursor = this.eventCursor(agentId, resourceGid);
+      if (!cursor || !["ready", "draining"].includes(cursor.state) ||
+          cursor.sync_token !== expectedToken) {
+        throw new Error("event page cursor changed or requires reconciliation");
+      }
+      const result = apply();
+      if (result && typeof result.then === "function") {
+        throw new Error("event page callback must be synchronous");
+      }
+      this.db.prepare(`UPDATE resource_event_cursors
+        SET sync_token=?,state=?,updated_at_ms=? WHERE agent_id=? AND resource_gid=?`)
+        .run(nextToken, hasMore ? "draining" : "ready", assertTime(now, "now"),
+          agentId, resourceGid);
+      return this.eventCursor(agentId, resourceGid);
+    });
   }
 
   dependencyWatches(agentId, now = Date.now(), intervalMs = 15 * 60_000) {

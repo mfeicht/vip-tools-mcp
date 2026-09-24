@@ -109,6 +109,51 @@ test("observations and cursors persist atomically", (t) => {
   assert.equal(second.pollCursor("vip-ai-research"), "2026-09-21T10:01:00Z");
 });
 
+test("resource events require reconciliation before cursor pages can advance", (t) => {
+  const { first, second } = fixture(t);
+  const agent = "vip-ai-research";
+  const resource = "123456";
+  assert.equal(first.stageEventReconciliation(agent, resource, "bootstrap-1", 1000).state,
+    "needs_reconciliation");
+  assert.throws(() => second.applyEventPage(agent, resource, "bootstrap-1", "page-1", false,
+    () => second.enqueue(signal("event-1")), 2000), /requires reconciliation/);
+  assert.equal(second.counts().pending || 0, 0);
+  assert.throws(() => first.finishEventReconciliation(agent, resource, "old-token", () => {}, 2000),
+    /cursor changed/);
+  const ready = first.finishEventReconciliation(agent, resource, "bootstrap-1",
+    () => first.enqueue(signal("reconciled-1")), 2000);
+  assert.equal(ready.state, "ready");
+  assert.equal(second.counts().pending, 1);
+  assert.equal(second.eventCursor(agent, resource).sync_token, "bootstrap-1");
+});
+
+test("resource event pages commit signals and cursor together across connections", (t) => {
+  const { first, second } = fixture(t);
+  const agent = "vip-ai-research";
+  const resource = "123456";
+  first.stageEventReconciliation(agent, resource, "bootstrap-1", 1000);
+  first.finishEventReconciliation(agent, resource, "bootstrap-1", () => {}, 2000);
+  assert.throws(() => first.applyEventPage(agent, resource, "bootstrap-1", "page-1", true,
+    () => { first.enqueue(signal("event-1")); throw new Error("page processing failed"); }, 3000),
+  /page processing failed/);
+  assert.equal(second.counts().pending || 0, 0);
+  assert.equal(second.eventCursor(agent, resource).sync_token, "bootstrap-1");
+
+  assert.equal(first.applyEventPage(agent, resource, "bootstrap-1", "page-1", true,
+    () => first.enqueue(signal("event-1")), 3000).state, "draining");
+  assert.throws(() => second.applyEventPage(agent, resource, "bootstrap-1", "page-2", false,
+    () => second.enqueue(signal("event-2")), 4000), /cursor changed/);
+  assert.equal(second.applyEventPage(agent, resource, "page-1", "page-2", false,
+    () => second.enqueue(signal("event-2")), 4000).state, "ready");
+  assert.equal(first.counts().pending, 2);
+  assert.equal(first.eventCursor(agent, resource).sync_token, "page-2");
+
+  second.stageEventReconciliation(agent, resource, "reset-1", 5000);
+  assert.equal(first.eventCursor(agent, resource).state, "needs_reconciliation");
+  assert.throws(() => first.applyEventPage(agent, resource, "reset-1", "page-3", false,
+    () => {}, 6000), /requires reconciliation/);
+});
+
 test("verified dependency acknowledgement stores a durable watch and releases leases", (t) => {
   const { first, second } = fixture(t);
   first.enqueue({ id: "due-1", agent_id: "vip-ai-sales", task_gid: "123",
