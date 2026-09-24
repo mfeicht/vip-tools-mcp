@@ -190,6 +190,53 @@ assert.equal(image.mimeType, "image/jpeg");
 assert.equal(image.byteLength, jpeg.length);
 assert.deepEqual(image.bytes, jpeg);
 
+let retries = 0;
+const retriedImage = await fetchInstagramBusinessDiscoveryImage(
+  { media_url: cdnUrl },
+  {
+    wait: async () => {},
+    httpGet: async () => {
+      retries += 1;
+      if (retries === 1) throw { code: "ECONNRESET" };
+      return { status: 200, headers: { "content-type": "image/jpeg" }, data: jpeg };
+    }
+  }
+);
+assert.equal(retries, 2);
+assert.equal(retriedImage.byteLength, jpeg.length);
+
+let deniedCalls = 0;
+await assert.rejects(
+  fetchInstagramBusinessDiscoveryImage(
+    { media_url: cdnUrl },
+    {
+      wait: async () => {},
+      httpGet: async () => {
+        deniedCalls += 1;
+        throw { response: { status: 403 } };
+      }
+    }
+  ),
+  /HTTP 403/
+);
+assert.equal(deniedCalls, 1);
+
+let activeDownloads = 0;
+let maximumDownloads = 0;
+await Promise.all(Array.from({ length: 4 }, () => fetchInstagramBusinessDiscoveryImage(
+  { media_url: cdnUrl },
+  {
+    httpGet: async () => {
+      activeDownloads += 1;
+      maximumDownloads = Math.max(maximumDownloads, activeDownloads);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeDownloads -= 1;
+      return { status: 200, headers: { "content-type": "image/jpeg" }, data: jpeg };
+    }
+  }
+)));
+assert.equal(maximumDownloads, 2);
+
 await assert.rejects(
   fetchInstagramBusinessDiscoveryImage(
     { media_url: cdnUrl },
