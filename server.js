@@ -25326,6 +25326,7 @@ app.get("/dashboard/health", async (req, res) => {
 });
 
 app.get(["/", "/health"], (req, res) => {
+  const memory = process.memoryUsage();
   res.set("cache-control", "no-store");
   res.json({
     ok: true,
@@ -25335,6 +25336,14 @@ app.get(["/", "/health"], (req, res) => {
     material_comment_coordination: {
       distributed_required: ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED,
       distributed_configured: ASANA_MATERIAL_COMMENT_COORDINATOR.distributedConfigured()
+    },
+    mcp_runtime: {
+      active_requests: activeMcpRequests,
+      total_requests: totalMcpRequests,
+      rss_bytes: memory.rss,
+      heap_used_bytes: memory.heapUsed,
+      heap_total_bytes: memory.heapTotal,
+      external_bytes: memory.external
     },
     uptime_seconds: Math.floor(process.uptime()),
     checked_at: new Date().toISOString()
@@ -25382,9 +25391,13 @@ app.post("/mcp", async (req, res) => {
   });
 
   try {
+    const toolName = req.body?.method === "tools/call" && typeof req.body?.params?.name === "string"
+      ? req.body.params.name
+      : null;
     console.log("MCP REQUEST", req.method, req.body?.method, {
       request_number: requestNumber,
-      active_requests: activeMcpRequests
+      active_requests: activeMcpRequests,
+      tool_name: toolName
     });
 
     await server.connect(transport);

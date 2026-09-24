@@ -33,5 +33,7 @@ assert.match(serverSource, /app\.post\("\/mcp"/);
 assert.match(serverSource, /app\.get\("\/mcp", rejectStatelessMcpStream\)/);
 assert.match(serverSource, /app\.delete\("\/mcp", rejectStatelessMcpStream\)/);
 assert.doesNotMatch(serverSource, /app\.all\("\/mcp"/);
+assert.match(serverSource, /tool_name: toolName/);
+assert.match(serverSource, /heap_used_bytes: memory\.heapUsed/);
 
-console.log(JSON.stringify({ mcp_request_lifecycle: "pass", assertions: 11 }));
+console.log(JSON.stringify({ mcp_request_lifecycle: "pass", assertions: 13 }));

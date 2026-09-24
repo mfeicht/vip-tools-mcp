@@ -131,6 +131,36 @@ await assert.rejects(
   }
 );
 
+await assert.rejects(
+  getInstagramBusinessDiscoveryProfile(
+    { username: "daytrading" },
+    {
+      env,
+      httpGet: async () => {
+        throw {
+          response: {
+            status: 400,
+            data: {
+              error: {
+                type: "OAuthException",
+                code: 200,
+                error_subcode: 2332002,
+                message: `Application does not have permission for this action; access_token=${secret}`
+              }
+            }
+          }
+        };
+      }
+    }
+  ),
+  (error) => {
+    assert.match(error.message, /HTTP 400, Meta-Code 200, Subcode 2332002, Typ OAuthException/);
+    assert.match(error.message, /Application does not have permission for this action/);
+    assert.equal(error.message.includes(secret), false);
+    return true;
+  }
+);
+
 const cdnUrl = "https://scontent-muc2-1.cdninstagram.com/v/t51.29350-15/example.jpg?foo=bar";
 assert.equal(normalizeInstagramCdnUrl(cdnUrl), cdnUrl);
 for (const blocked of [
