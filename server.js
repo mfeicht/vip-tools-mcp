@@ -13,6 +13,7 @@ import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 import { assertLinkedGoogleDocScope, linkedGoogleDocReadback } from "./lib/google-docs-linked-reader.js";
 import { selectBoundedEmailText } from "./lib/email-uid-text.js";
+import { assertBufferEditDueAtReadback, bufferEditScheduleFields } from "./lib/buffer-edit-schedule.js";
 import {
   appendGeneralInformationQualification,
   validateGeneralInformationReply
@@ -12281,7 +12282,7 @@ function bufferCreatePostMutation({ text, channelId, dueAt, mediaUrls = [], meta
 
 function bufferEditPostMutation({ postId, text, dueAt, mediaUrls, metadataInput = "" }) {
   const textLine = text === undefined ? "" : `\n        text: "${escapeGraphqlString(text)}"`;
-  const dueAtLine = dueAt === undefined ? "" : `\n        dueAt: "${escapeGraphqlString(dueAt)}"`;
+  const dueAtLine = bufferEditScheduleFields(dueAt, escapeGraphqlString);
   const assetsLine = mediaUrls === undefined
     ? ""
     : `\n        assets: [${bufferAssetInputFromUrls(mediaUrls)}]`;
@@ -18167,6 +18168,9 @@ function createServer() {
       if (!before.allowedActions?.includes("updatePost")) {
         throw new Error(`Buffer-Post ${post_id} darf laut Live-Readback nicht bearbeitet werden.`);
       }
+      if (resolvedDueAt && !before.allowedActions?.includes("updatePostSchedule")) {
+        throw new Error(`Buffer-Post ${post_id} darf laut Live-Readback nicht umterminiert werden.`);
+      }
 
       const metadataInput = hasMetadataChange
         ? bufferMetadataInputForChannel({
@@ -18187,6 +18191,7 @@ function createServer() {
         text_chars: text === undefined ? null : text.length,
         media_count: public_media_urls === undefined ? null : public_media_urls.length,
         due_at: resolvedDueAt || null,
+        scheduling_mode: resolvedDueAt ? "customScheduled" : null,
         metadata_change: hasMetadataChange
       };
 
@@ -18219,6 +18224,7 @@ function createServer() {
       if (text !== undefined && after.text !== text) {
         throw new Error("Buffer-Edit-Readback stimmt beim Text nicht mit der angeforderten Aenderung ueberein.");
       }
+      assertBufferEditDueAtReadback(resolvedDueAt, mutationPost, after);
 
       return out({
         agent_id,
