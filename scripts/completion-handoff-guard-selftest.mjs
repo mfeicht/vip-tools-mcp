@@ -333,6 +333,23 @@ for (const text of ["Follow-up\nKeines nachgewiesen.", "Keine weitere Recherche 
   assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: { text }, hasFollowUpTask: false }).ok, false);
 }
 
+// Actual Sales result and first clarification from 1218769088476682 already
+// make the no-follow-up decision visible; a third decision is redundant.
+for (const text of [
+  "Keine manuelle Folgeaufgabe oder Nacharbeit ist für diesen Lauf erforderlich. Die reguläre Folgeinstanz wird nach der Completion per Live-Readback geprüft.",
+  "Für diesen abgeschlossenen Lauf besteht keine aktive Folgeaufgabe und keine noch ausstehende Handlung für eine Person oder ein System."
+]) {
+  const finalComment = { text: `${text}\nEvidenz / Verifikation\nDer Lead-Scope ist importiert und zurückgelesen.` };
+  const signals = detectRoutineFollowUpSignals({ finalComment });
+  assert.equal(signals.no_follow_up_claim, true);
+  assert.equal(signals.blocked_without_follow_up_task, false);
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment, hasFollowUpTask: false }).ok, true);
+}
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { text: "Keine manuelle Folgeaufgabe erforderlich, aber automatische Nacharbeit ist noch offen." },
+  hasFollowUpTask: false
+}).ok, false);
+
 // Actual Sales result wording from story 1218717124815791 must not be
 // misread as active work merely because an earlier sentence mentions import.
 const salesImportedResultWithCompoundFollowUp = {
