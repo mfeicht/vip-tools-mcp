@@ -329,6 +329,32 @@ for (const text of [
     finalComment: { text: `${text} Die bestehende Routine uebernimmt die Nacharbeit.` }
   }).blocked_without_follow_up_task, true);
 }
+// The two real post-import Sales stories already state that neither active
+// cleanup nor a separate follow-up task is needed. A duplicated status story
+// must not be required merely because of the adjective or scope clause.
+for (const noFollowUpText of [
+  "Keine aktive Nacharbeit oder separate Folgeaufgabe ist erforderlich.",
+  "Keine aktive Nacharbeit oder separate Folgeaufgabe ist für diesen Routine-Scope nötig."
+]) {
+  const finalComment = {
+    text: `Ergebnis: Die Leads wurden erfolgreich importiert.\n${noFollowUpText}\nEvidenz / Verifikation\nImporter: HTTP 200.`
+  };
+  const signals = detectRoutineFollowUpSignals({
+    finalComment,
+    completionBasis: "Der dokumentierte Import ist abgeschlossen.",
+    followUpNotRequiredBasis: noFollowUpText
+  });
+  assert.equal(signals.no_follow_up_claim, true);
+  assert.equal(signals.blocked_without_follow_up_task, false);
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment, hasFollowUpTask: false }).ok, true);
+  assert.equal(detectRoutineFollowUpSignals({
+    finalComment: { text: `${finalComment.text}\nDie bestehende Routine uebernimmt die Nacharbeit.` }
+  }).blocked_without_follow_up_task, true);
+}
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { text: "Keine aktive Nacharbeit oder separate Folgeaufgabe ist möglicherweise nötig." },
+  hasFollowUpTask: false
+}).ok, false);
 for (const text of ["Follow-up\nKeines nachgewiesen.", "Keine weitere Recherche oder Folgeaufgabe angelegt."]) {
   assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: { text }, hasFollowUpTask: false }).ok, false);
 }
