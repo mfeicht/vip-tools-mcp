@@ -359,6 +359,24 @@ for (const text of ["Follow-up\nKeines nachgewiesen.", "Keine weitere Recherche 
   assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: { text }, hasFollowUpTask: false }).ok, false);
 }
 
+// These were the first visible decisions in the 27 Sep Sales examples. The
+// completion gate must accept them without prompting another status story.
+for (const text of [
+  "Für diese Routineinstanz ist keine zusätzliche Folgeaufgabe oder Nacharbeit erforderlich; die reguläre Asana-Folgeinstanz bleibt der nächste operative Lauf.",
+  "Für die vollständig bearbeitete Instanz ist keine zusätzliche Folgeaufgabe, Übergabe oder Nacharbeit erforderlich.",
+  "Für diese abgeschlossene Routineinstanz ist keine separate Folgeaufgabe nötig: Der belegte Lead ist vollständig verarbeitet."
+]) {
+  const finalComment = { text: `${text}\nEvidenz / Verifikation\nDer Instanz-Scope wurde zurückgelesen.` };
+  const signals = detectRoutineFollowUpSignals({ finalComment });
+  assert.equal(signals.no_follow_up_claim, true);
+  assert.equal(signals.blocked_without_follow_up_task, false);
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment, hasFollowUpTask: false }).ok, true);
+}
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { text: "Keine separate Folgeaufgabe nötig, aber die technische Nacharbeit ist noch offen." },
+  hasFollowUpTask: false
+}).ok, false);
+
 // Actual Sales result and first clarification from 1218769088476682 already
 // make the no-follow-up decision visible; a third decision is redundant.
 for (const text of [
