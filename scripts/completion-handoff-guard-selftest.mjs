@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   detectRoutineFollowUpSignals,
+  hasRoutineNoFollowUpDecision,
   inspectRoutineMaterialCommentIdempotency,
+  inspectRoutineNoFollowUpStatusIdempotency,
   validateRoutineMaterialCorrection,
   validateRoutineFollowUpTaskContract,
   validateRoutineVisibleFollowUpStatus
@@ -25,6 +27,41 @@ const openEvidenceStory = {
   text:
     "Status\nEvidenz / Verifikation\nDer Zwischenstand ist belegt.\nOffene Evidenzluecken\nDeployment fehlt."
 };
+
+const socialNoFollowUpStatus = {
+  gid: "1218926405939713",
+  created_by: { gid: "1214979008788664" },
+  text: "Follow-up-Status\nKeine weitere Folgeaufgabe oder Nacharbeit ist für diesen abgeschlossenen Routineumfang nötig. Die nächste reguläre Prüfung erfolgt über die native Routinefolgeinstanz.\nEvidenz / Verifikation\nAsana-Readback."
+};
+assert.equal(hasRoutineNoFollowUpDecision(socialNoFollowUpStatus.text), true);
+assert.equal(hasRoutineNoFollowUpDecision("Abschlussstatus\nKeine weitere Folgeaufgabe oder Nacharbeit nötig."), true);
+assert.equal(hasRoutineNoFollowUpDecision("Nächster Suchraum: weitere nordwestdeutsche Regionen."), false);
+assert.equal(hasRoutineNoFollowUpDecision("Derzeit ist keine Folgeaufgabe offen; Entscheidung folgt nach dem Readback."), false);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [socialNoFollowUpStatus],
+  agentUserGid: "1214979008788664",
+  proposedText: "Abschlussstatus\nKeine weitere Folgeaufgabe oder Nacharbeit nötig."
+}).status, "blocked_duplicate_no_follow_up_status");
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [socialNoFollowUpStatus],
+  agentUserGid: "1214979008788676",
+  proposedText: "Keine weitere Folgeaufgabe nötig."
+}).allowed, true);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [{ ...socialNoFollowUpStatus, text: `${socialNoFollowUpStatus.text}\nOffene Evidenzluecken` }],
+  agentUserGid: "1214979008788664",
+  proposedText: "Keine weitere Folgeaufgabe nötig."
+}).allowed, true);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [{ ...socialNoFollowUpStatus, text: "Korrektur des Ergebnisses.\nEvidenz / Verifikation\nQuelle: frühere Story sagte keine Folgeaufgabe nötig." }],
+  agentUserGid: "1214979008788664",
+  proposedText: "Keine weitere Folgeaufgabe nötig."
+}).allowed, true);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [socialNoFollowUpStatus],
+  agentUserGid: "1214979008788664",
+  proposedText: "Neuer sachlicher Readback ohne Follow-up-Entscheidung."
+}).status, "not_applicable");
 
 const duplicateCommunicationStory = {
   gid: "1218428058256536",

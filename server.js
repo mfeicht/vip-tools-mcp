@@ -55,7 +55,9 @@ import {
 } from "./lib/dashboard-health.js";
 import {
   detectRoutineFollowUpSignals,
+  hasRoutineNoFollowUpDecision,
   inspectRoutineMaterialCommentIdempotency,
+  inspectRoutineNoFollowUpStatusIdempotency,
   validateRoutineMaterialCorrection,
   validateRoutineFollowUpTaskContract,
   validateRoutineVisibleFollowUpStatus
@@ -13795,10 +13797,13 @@ function createServer() {
         commentKind: comment_kind,
         materialResultSignals
       });
-      const materialCommentProbe = materialRoutineComment
+      const routineNoFollowUpStatus = routineCommentTask && comment_kind === "status" &&
+        hasRoutineNoFollowUpDecision([greeting || "", plainAsanaSections(sections)].join("\n"));
+      const coordinatedRoutineComment = materialRoutineComment || routineNoFollowUpStatus;
+      const materialCommentProbe = coordinatedRoutineComment
         ? buildAsanaCommentHtml({ sections: finalSections })
         : "";
-      const materialCommentPayloadHash = materialRoutineComment
+      const materialCommentPayloadHash = coordinatedRoutineComment
         ? hashMaterialCommentProbe(materialCommentProbe)
         : "";
       let routine_material_comment_idempotency = {
@@ -13807,6 +13812,12 @@ function createServer() {
         allowed: true,
         prior_material_story_gids: [],
         supersedes_story_gid: supersedes_story_gid || null
+      };
+      let routine_no_follow_up_idempotency = {
+        applicable: routineNoFollowUpStatus,
+        allowed: true,
+        status: routineNoFollowUpStatus ? "checking" : "not_applicable",
+        prior_story_gids: []
       };
       if (supersedes_story_gid && !materialRoutineComment) {
         throw new Error(
@@ -13828,11 +13839,12 @@ function createServer() {
           observer_comment_gate,
           observer_authorization: observerAuthorizationReceipt,
           routine_material_comment_idempotency,
+          routine_no_follow_up_idempotency,
           material_comment_coordination: {
-            applicable: materialRoutineComment,
+            applicable: coordinatedRoutineComment,
             distributed_required: ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED,
             distributed_configured: ASANA_MATERIAL_COMMENT_COORDINATOR.distributedConfigured(),
-            status: materialRoutineComment ? "not_evaluated_dry_run" : "not_applicable"
+            status: coordinatedRoutineComment ? "not_evaluated_dry_run" : "not_applicable"
           },
           html_text,
           html_bytes: Buffer.byteLength(html_text, "utf8"),
@@ -13847,12 +13859,12 @@ function createServer() {
 
       let res;
       let material_comment_coordination = {
-        applicable: materialRoutineComment,
+        applicable: coordinatedRoutineComment,
         distributed_required: ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED,
         distributed_configured: ASANA_MATERIAL_COMMENT_COORDINATOR.distributedConfigured(),
-        status: materialRoutineComment ? "checking" : "not_applicable"
+        status: coordinatedRoutineComment ? "checking" : "not_applicable"
       };
-      if (materialRoutineComment) {
+      if (coordinatedRoutineComment) {
         const coordinatorKey = `${commentAgentUser.gid}:${task_gid}`;
         const coordinatedResult = await ASANA_MATERIAL_COMMENT_COORDINATOR.run(
           coordinatorKey,
@@ -13862,20 +13874,34 @@ function createServer() {
               ...coordination
             };
             const existingStories = await readAllAsanaTaskStories(asana, task_gid);
-            routine_material_comment_idempotency = {
-              applicable: true,
-              ...inspectRoutineMaterialCommentIdempotency({
+            if (materialRoutineComment) {
+              routine_material_comment_idempotency = {
+                applicable: true,
+                ...inspectRoutineMaterialCommentIdempotency({
+                  stories: [...existingStories, ...recentStories],
+                  agentUserGid: commentAgentUser.gid,
+                  supersedesStoryGid: supersedes_story_gid
+                })
+              };
+              if (!routine_material_comment_idempotency.allowed) {
+                throw new Error(
+                  `Routine-Kommentar-Idempotenz blockiert (${routine_material_comment_idempotency.status}). Nutze den bereits vorhandenen Evidenzkommentar ${routine_material_comment_idempotency.prior_material_story_gids.join(
+                    ", "
+                  ) || "-"} als final_comment_story_gid. Nur eine echte Korrektur darf mit supersedes_story_gid auf genau diesen Kommentar verweisen.`
+                );
+              }
+            }
+            if (routineNoFollowUpStatus) {
+              routine_no_follow_up_idempotency = inspectRoutineNoFollowUpStatusIdempotency({
                 stories: [...existingStories, ...recentStories],
                 agentUserGid: commentAgentUser.gid,
-                supersedesStoryGid: supersedes_story_gid
-              })
-            };
-            if (!routine_material_comment_idempotency.allowed) {
-              throw new Error(
-                `Routine-Kommentar-Idempotenz blockiert (${routine_material_comment_idempotency.status}). Nutze den bereits vorhandenen Evidenzkommentar ${routine_material_comment_idempotency.prior_material_story_gids.join(
-                  ", "
-                ) || "-"} als final_comment_story_gid. Nur eine echte Korrektur darf mit supersedes_story_gid auf genau diesen Kommentar verweisen.`
-              );
+                proposedText: [greeting || "", plainAsanaSections(sections)].join("\n")
+              });
+              if (!routine_no_follow_up_idempotency.allowed) {
+                throw new Error(
+                  `Routine-Follow-up-Status bereits sichtbar (${routine_no_follow_up_idempotency.prior_story_gids.join(", ")}). Keine zweite No-Follow-up-Statusstory posten.`
+                );
+              }
             }
             if (supersedes_story_gid) {
               const correctionDelta = validateRoutineMaterialCorrection({
@@ -13996,6 +14022,7 @@ function createServer() {
         observer_comment_gate,
         observer_authorization: observerAuthorizationReceipt,
         routine_material_comment_idempotency,
+        routine_no_follow_up_idempotency,
         material_comment_coordination,
         observer_leave_result,
         observer_leave_error,
@@ -14330,7 +14357,7 @@ function createServer() {
         : { ok: true, issues: [], mode: "not_applicable" };
       if (!routine_visible_follow_up_status.ok) {
         throw new Error(
-          "Routine-Abschluss blockiert: follow_up_not_required_basis ist nur interne Tool-Evidenz. Der finale Asana-Kommentar muss sichtbar festhalten, dass keine weitere Folgeaufgabe oder Nacharbeit noetig ist. Falls nur dieser Entscheid in einer vorhandenen Ergebnisstory fehlt, darf ein knapper evidenzbelegter asana_comment mit comment_kind=status den Follow-up-Status ergaenzen; dessen GID danach als final_comment_story_gid verwenden."
+          "Routine-Abschluss blockiert: follow_up_not_required_basis ist nur interne Tool-Evidenz. Der finale Asana-Kommentar muss sichtbar festhalten, dass keine weitere Folgeaufgabe oder Nacharbeit noetig ist. Falls nur dieser Entscheid in einer vorhandenen Ergebnisstory fehlt, darf ein knapper evidenzbelegter asana_comment mit comment_kind=status den Follow-up-Status ergaenzen; dessen GID danach als final_comment_story_gid verwenden. Ein Suchraum fuer die regulaere native Folgeinstanz ist allein keine aktive Nacharbeit und begruendet keine separate Handoff-Aufgabe zur Recurrence-Verifikation."
         );
       }
 
