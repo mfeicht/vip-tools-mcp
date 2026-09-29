@@ -506,6 +506,37 @@ assert.equal(financeNoFollowUpSignal.no_follow_up_claim, true);
 assert.equal(financeNoFollowUpSignal.has_existing_task_coverage_claim, false);
 assert.equal(financeNoFollowUpSignal.blocked_without_follow_up_task, false);
 
+// Exact Finance result/status stories 1218927790360342, 1218928148082902
+// and 1218935557506000. Reuse the existing decision; do not prompt for a
+// second result/status story or a dummy follow-up task.
+const financeCompletionStories = JSON.parse(readFileSync(new URL("./fixtures/finance-completion-stories-2026-09-28.json", import.meta.url), "utf8"));
+assert.deepEqual(financeCompletionStories.map((story) => story.gid), [
+  "1218927790360342", "1218928148082902", "1218935557506000"
+]);
+for (const story of financeCompletionStories) {
+  const signals = detectRoutineFollowUpSignals({ finalComment: story });
+  assert.equal(signals.no_follow_up_claim, true, story.gid);
+  assert.equal(signals.has_existing_task_coverage_claim, false, story.gid);
+  assert.equal(signals.blocked_without_follow_up_task, false, story.gid);
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: story, hasFollowUpTask: false }).ok, true, story.gid);
+  assert.equal(hasRoutineNoFollowUpDecision(story.text), true, story.gid);
+  assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+    stories: [{ ...story, created_by: { gid: "1215003777954631" } }],
+    agentUserGid: "1215003777954631",
+    proposedText: "Keine weitere Folgeaufgabe erforderlich."
+  }).status, "blocked_duplicate_no_follow_up_status", story.gid);
+}
+for (const text of [
+  "Keine neue Folgeaufgabe angelegt.",
+  "Keine neue Folgeaufgabe möglicherweise erforderlich.",
+  "Keine weitere Folgeaufgabe oder Nacharbeit für diesen Ledger-Task nötig, aber die Nacharbeit ist noch offen."
+]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: { text }, hasFollowUpTask: false }).ok, false, text);
+}
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: { text: "Follow-up: keines erforderlich. Die bestehende Routine übernimmt die Nacharbeit." }
+}).blocked_without_follow_up_task, true);
+
 const explicitCoverageSignal = detectRoutineFollowUpSignals({
   finalComment: { text: "Die naechste Routine uebernimmt die weitere Bearbeitung.", html_text: "" },
   completionBasis: "Der Scope dieser Instanz ist abgeschlossen.",
@@ -617,6 +648,20 @@ const validFollowUpContract = validateRoutineFollowUpTaskContract({
 });
 assert.equal(validFollowUpContract.ok, true);
 assert.deepEqual(validFollowUpContract.issues, []);
+assert.equal(validateRoutineFollowUpTaskContract({
+  sourceTask: { ...sourceTask, name: "R: Lead-Adressen hinzufügen (Autoentsorgung / Autoankauf für App.Goklever)" },
+  followUpTask: {
+    ...followUpTask,
+    name: "R: Lead-Adressen hinzufügen (Autoentsorgung / Autoankauf für App.Goklever)",
+    tags: [{ name: "Routine" }]
+  },
+  finalComment: { text: `${followUpTask.gid}; Assignee VIP AI-Operations; Status Todo; faellig 2026-08-26.` }
+}).issues.includes("follow_up_task_duplicates_native_recurrence"), true);
+assert.equal(validateRoutineFollowUpTaskContract({
+  sourceTask: { ...sourceTask, name: "R: Lead-Adressen hinzufügen (Autoentsorgung / Autoankauf für App.Goklever)" },
+  followUpTask: { ...followUpTask, name: "Lead-Importer-Zugriff klären", tags: [] },
+  finalComment: { text: `${followUpTask.gid}; Assignee VIP AI-Operations; Status Todo; faellig 2026-08-26.` }
+}).ok, true);
 
 const workerC = JSON.parse(readFileSync(new URL("./fixtures/worker-c-followup-story-1218568446337764.json", import.meta.url), "utf8"));
 const workerCSource = { gid: "1218388727116488", memberships: workerC.followup.memberships };

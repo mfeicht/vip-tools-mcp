@@ -14503,7 +14503,7 @@ function createServer() {
         const followUpRes = await asana.get(`/tasks/${follow_up_task_gid}`, {
           params: {
             opt_fields:
-              "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,permalink_url,memberships.project.gid,memberships.project.name,memberships.section.gid,memberships.section.name,followers.gid,followers.name,custom_fields.gid,custom_fields.name,custom_fields.display_value,custom_fields.text_value,custom_fields.enum_value.gid,custom_fields.enum_value.name"
+              "gid,name,completed,assignee.gid,assignee.name,due_on,due_at,tags.name,permalink_url,memberships.project.gid,memberships.project.name,memberships.section.gid,memberships.section.name,followers.gid,followers.name,custom_fields.gid,custom_fields.name,custom_fields.display_value,custom_fields.text_value,custom_fields.enum_value.gid,custom_fields.enum_value.name"
           }
         });
         follow_up_task = followUpRes.data.data;
@@ -14525,7 +14525,7 @@ function createServer() {
             throw new Error(
               `Routine-Follow-up-Contract blockiert: ${follow_up_contract.issues.join(
                 ", "
-              )}. Der finale Evidenzkommentar muss Link/GID, Assignee, Status=Todo und Faelligkeit aus dem aktuellen Task-Readback enthalten.`
+              )}. Eine gleichnamige, Routine-getaggte Aufgabe ist keine separate Nacharbeit neben der nativen Wiederholung. Bei echter Nacharbeit muss der finale Evidenzkommentar Link/GID, Assignee, Status=Todo und Faelligkeit aus dem aktuellen Task-Readback enthalten.`
             );
           }
         }
