@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import {
   detectRoutineFollowUpSignals,
   hasRoutineNoFollowUpDecision,
+  isDuplicateNativeRoutineTask,
   inspectRoutineMaterialCommentIdempotency,
   inspectRoutineNoFollowUpStatusIdempotency,
   validateRoutineMaterialCorrection,
@@ -648,6 +649,14 @@ const validFollowUpContract = validateRoutineFollowUpTaskContract({
 });
 assert.equal(validFollowUpContract.ok, true);
 assert.deepEqual(validFollowUpContract.issues, []);
+assert.equal(isDuplicateNativeRoutineTask({
+  sourceTask: { name: "R: Lead-Adressen hinzufügen (Autoentsorgung / Autoankauf für App.Goklever)", tags: [{ name: "Routine" }] },
+  proposedName: "R: Lead-Adressen hinzufügen (Autoentsorgung / Autoankauf für App.Goklever)"
+}), true);
+assert.equal(isDuplicateNativeRoutineTask({
+  sourceTask: { name: "R: Lead-Adressen hinzufügen (Autoentsorgung / Autoankauf für App.Goklever)" },
+  proposedName: "Lead-Importer-Zugriff klären"
+}), false);
 assert.equal(validateRoutineFollowUpTaskContract({
   sourceTask: { ...sourceTask, name: "R: Lead-Adressen hinzufügen (Autoentsorgung / Autoankauf für App.Goklever)" },
   followUpTask: {

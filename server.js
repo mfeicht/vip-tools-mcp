@@ -65,6 +65,7 @@ import {
 import {
   detectRoutineFollowUpSignals,
   hasRoutineNoFollowUpDecision,
+  isDuplicateNativeRoutineTask,
   inspectRoutineMaterialCommentIdempotency,
   inspectRoutineNoFollowUpStatusIdempotency,
   validateRoutineMaterialCorrection,
@@ -13309,6 +13310,11 @@ function createServer() {
           params: { opt_fields: ASANA_TASK_CREATE_SOURCE_OPT_FIELDS }
         });
         source_task = sourceRes.data.data;
+        if (isDuplicateNativeRoutineTask({ sourceTask: source_task, proposedName: name })) {
+          throw new Error(
+            "Routine-Duplikat blockiert: Eine gleichnamige Routine-Folgeaufgabe darf nicht neben der nativen Asana-Wiederholung angelegt werden. Nach Abschluss die native Folgeinstanz mit asana_verify_next_routine_instance pruefen."
+          );
+        }
         source_projects = uniqueObjectsByGid(
           (source_task.memberships || []).map((membership) => membership.project).filter(Boolean)
         );
