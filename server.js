@@ -54,7 +54,12 @@ import {
   verifyDashboardRefreshPoll
 } from "./lib/dashboard-health.js";
 import {
+  buildGoogleAdsCountryTargetQuery,
   buildGoogleAdsKeywordHistoricalMetricsRequest,
+  buildGoogleAdsKeywordIdeasRequest,
+  buildGoogleAdsLanguageTargetQuery,
+  normalizeGoogleAdsCountryCodes,
+  normalizeGoogleAdsLanguageCode,
   normalizeGoogleAdsKeywordHistoricalMetricsResponse
 } from "./lib/google-ads-keyword-metrics.js";
 import {
@@ -332,6 +337,13 @@ if (!/^v\d+$/.test(GOOGLE_ADS_API_VERSION)) {
   throw new Error("GOOGLE_ADS_API_VERSION muss ein Major-Endpunkt wie v25 sein.");
 }
 const GOOGLE_ADS_TIMEOUT_MS = Number(process.env.GOOGLE_ADS_TIMEOUT_MS || 30_000);
+const googleAdsKeywordCountryCache = new Map([
+  ["DE", { id: "2276", code: "DE", name: "Germany" }]
+]);
+const googleAdsKeywordLanguageCache = new Map([
+  ["de", { id: "1001", code: "de", name: "German" }]
+]);
+const googleAdsCustomerCurrencyCache = new Map();
 const GOOGLE_ADS_BUDGET_EXTRA_APPROVAL_PERCENT = Number(
   process.env.GOOGLE_ADS_BUDGET_EXTRA_APPROVAL_PERCENT || 12
 );
@@ -3105,6 +3117,126 @@ async function googleAdsRequest({ method = "GET", path, data, params, login_cust
       ...(loginCustomerId ? { "login-customer-id": loginCustomerId } : {})
     }
   });
+}
+
+async function resolveGoogleAdsKeywordTargeting({
+  customerId,
+  loginCustomerId,
+  geoTargetConstantIds,
+  countryCodes,
+  languageConstantId,
+  languageCode
+}) {
+  if (geoTargetConstantIds?.length && countryCodes?.length) {
+    throw new Error("Nur geo_target_constant_ids oder country_codes verwenden, nicht beides.");
+  }
+  if (languageConstantId && languageCode) {
+    throw new Error("Nur language_constant_id oder language_code verwenden, nicht beides.");
+  }
+
+  let apiOperationsUsed = 0;
+  let resolvedCountries = [];
+  let resolvedGeoTargetConstantIds = geoTargetConstantIds?.map((id) =>
+    normalizeGoogleAdsCustomerId(id, "geo_target_constant_id")
+  );
+
+  if (!resolvedGeoTargetConstantIds?.length) {
+    const normalizedCountryCodes = normalizeGoogleAdsCountryCodes(countryCodes?.length ? countryCodes : ["DE"]);
+    const missingCountryCodes = normalizedCountryCodes.filter((code) => !googleAdsKeywordCountryCache.has(code));
+    if (missingCountryCodes.length) {
+      const countryRes = await googleAdsRequest({
+        method: "POST",
+        path: `/customers/${customerId}/googleAds:search`,
+        login_customer_id: loginCustomerId,
+        data: { query: buildGoogleAdsCountryTargetQuery(missingCountryCodes) }
+      });
+      apiOperationsUsed += 1;
+      for (const row of countryRes.data.results || []) {
+        const target = row.geoTargetConstant || {};
+        if (target.countryCode && target.id) {
+          googleAdsKeywordCountryCache.set(String(target.countryCode).toUpperCase(), {
+            id: String(target.id),
+            code: String(target.countryCode).toUpperCase(),
+            name: target.name || null
+          });
+        }
+      }
+    }
+    const unresolved = normalizedCountryCodes.filter((code) => !googleAdsKeywordCountryCache.has(code));
+    if (unresolved.length) {
+      throw new Error(`Keine aktiven Google-Ads-Laenderziele gefunden fuer: ${unresolved.join(", ")}`);
+    }
+    resolvedCountries = normalizedCountryCodes.map((code) => googleAdsKeywordCountryCache.get(code));
+    resolvedGeoTargetConstantIds = resolvedCountries.map((country) => country.id);
+  }
+
+  let resolvedLanguage;
+  let resolvedLanguageConstantId = languageConstantId
+    ? normalizeGoogleAdsCustomerId(languageConstantId, "language_constant_id")
+    : null;
+  if (!resolvedLanguageConstantId) {
+    const normalizedLanguageCode = normalizeGoogleAdsLanguageCode(languageCode || "de");
+    if (!googleAdsKeywordLanguageCache.has(normalizedLanguageCode)) {
+      const languageRes = await googleAdsRequest({
+        method: "POST",
+        path: `/customers/${customerId}/googleAds:search`,
+        login_customer_id: loginCustomerId,
+        data: { query: buildGoogleAdsLanguageTargetQuery(normalizedLanguageCode) }
+      });
+      apiOperationsUsed += 1;
+      const target = languageRes.data.results?.[0]?.languageConstant || {};
+      if (target.code && target.id) {
+        googleAdsKeywordLanguageCache.set(normalizedLanguageCode, {
+          id: String(target.id),
+          code: target.code,
+          name: target.name || null
+        });
+      }
+    }
+    resolvedLanguage = googleAdsKeywordLanguageCache.get(normalizedLanguageCode) || null;
+    if (!resolvedLanguage) {
+      throw new Error(`Keine aktive Google-Ads-Sprache gefunden fuer: ${normalizedLanguageCode}`);
+    }
+    resolvedLanguageConstantId = resolvedLanguage.id;
+  }
+
+  return {
+    geoTargetConstantIds: resolvedGeoTargetConstantIds,
+    languageConstantId: resolvedLanguageConstantId,
+    resolvedCountries,
+    resolvedLanguage,
+    apiOperationsUsed
+  };
+}
+
+async function getGoogleAdsCustomerCurrency({ customerId, loginCustomerId }) {
+  const cacheKey = `${customerId}:${getGoogleAdsLoginCustomerId(loginCustomerId) || "direct"}`;
+  if (googleAdsCustomerCurrencyCache.has(cacheKey)) {
+    return {
+      currencyCode: googleAdsCustomerCurrencyCache.get(cacheKey),
+      lookupError: null,
+      apiOperationsUsed: 0,
+      cacheHit: true
+    };
+  }
+  try {
+    const currencyRes = await googleAdsRequest({
+      method: "POST",
+      path: `/customers/${customerId}/googleAds:search`,
+      login_customer_id: loginCustomerId,
+      data: { query: "SELECT customer.currency_code FROM customer LIMIT 1" }
+    });
+    const currencyCode = currencyRes.data.results?.[0]?.customer?.currencyCode || null;
+    if (currencyCode) googleAdsCustomerCurrencyCache.set(cacheKey, currencyCode);
+    return { currencyCode, lookupError: null, apiOperationsUsed: 1, cacheHit: false };
+  } catch (error) {
+    return {
+      currencyCode: null,
+      lookupError: compactAxiosError(error),
+      apiOperationsUsed: 1,
+      cacheHit: false
+    };
+  }
 }
 
 async function getGoogleTokenInfo(accessToken) {
@@ -19436,13 +19568,15 @@ function createServer() {
 
   server.tool(
     "google_ads_keyword_historical_metrics",
-    "Ruft historische Keyword-Planer-Daten aus der Google Ads API read-only ab, darunter durchschnittliche monatliche Suchanfragen, Wettbewerb und Gebotsspannen.",
+    "Ruft historische Keyword-Planer-Daten aus der Google Ads API read-only ab. Laender und Sprache koennen bequem als Codes wie DE/AT/CH und de/en oder alternativ als Google-Konstanten-IDs angegeben werden.",
     {
       customer_id: z.string(),
-      keywords: z.array(z.string().min(1).max(80)).min(1).max(100),
+      keywords: z.array(z.string().min(1).max(80)).min(1).max(1000),
       login_customer_id: z.string().optional(),
-      geo_target_constant_ids: z.array(z.string().regex(/^\d+$/)).min(1).max(10).optional().default(["2276"]),
-      language_constant_id: z.string().regex(/^\d+$/).optional().default("1001"),
+      country_codes: z.array(z.string().regex(/^[A-Za-z]{2}$/)).min(1).max(10).optional(),
+      geo_target_constant_ids: z.array(z.string().regex(/^\d+$/)).min(1).max(10).optional(),
+      language_code: z.string().regex(/^[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?$/).optional(),
+      language_constant_id: z.string().regex(/^\d+$/).optional(),
       keyword_plan_network: z
         .enum(["GOOGLE_SEARCH", "GOOGLE_SEARCH_AND_PARTNERS"])
         .optional()
@@ -19457,7 +19591,9 @@ function createServer() {
       customer_id,
       keywords,
       login_customer_id,
+      country_codes,
       geo_target_constant_ids,
+      language_code,
       language_constant_id,
       keyword_plan_network,
       include_adult_keywords,
@@ -19466,10 +19602,30 @@ function createServer() {
       year_month_end
     }) => {
       const normalizedCustomerId = normalizeGoogleAdsCustomerId(customer_id);
+      let resolvedTargeting;
+      try {
+        resolvedTargeting = await resolveGoogleAdsKeywordTargeting({
+          customerId: normalizedCustomerId,
+          loginCustomerId: login_customer_id,
+          geoTargetConstantIds: geo_target_constant_ids,
+          countryCodes: country_codes,
+          languageConstantId: language_constant_id,
+          languageCode: language_code
+        });
+      } catch (error) {
+        return out({
+          api_version: GOOGLE_ADS_API_VERSION,
+          customer_id: normalizedCustomerId,
+          login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+          ok: false,
+          stage: "targeting_resolution",
+          error: error.response ? compactAxiosError(error) : { message: error.message }
+        });
+      }
       const request = buildGoogleAdsKeywordHistoricalMetricsRequest({
         keywords,
-        geoTargetConstantIds: geo_target_constant_ids,
-        languageConstantId: language_constant_id,
+        geoTargetConstantIds: resolvedTargeting.geoTargetConstantIds,
+        languageConstantId: resolvedTargeting.languageConstantId,
         keywordPlanNetwork: keyword_plan_network,
         includeAdultKeywords: include_adult_keywords,
         includeAverageCpc: include_average_cpc,
@@ -19491,36 +19647,191 @@ function createServer() {
           customer_id: normalizedCustomerId,
           login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
           ok: false,
-          targeting: request,
+          targeting: {
+            country_codes: country_codes || null,
+            language_code: language_code || null,
+            resolved_countries: resolvedTargeting.resolvedCountries,
+            resolved_language: resolvedTargeting.resolvedLanguage,
+            request
+          },
+          api_operations_used: resolvedTargeting.apiOperationsUsed + 1,
           error: compactAxiosError(error)
         });
       }
 
-      let currencyCode = null;
-      let currencyLookupError = null;
-      try {
-        const currencyRes = await googleAdsRequest({
-          method: "POST",
-          path: `/customers/${normalizedCustomerId}/googleAds:search`,
-          login_customer_id,
-          data: { query: "SELECT customer.currency_code FROM customer LIMIT 1" }
-        });
-        currencyCode = currencyRes.data.results?.[0]?.customer?.currencyCode || null;
-      } catch (error) {
-        currencyLookupError = compactAxiosError(error);
-      }
+      const currency = await getGoogleAdsCustomerCurrency({
+        customerId: normalizedCustomerId,
+        loginCustomerId: login_customer_id
+      });
 
       const normalized = normalizeGoogleAdsKeywordHistoricalMetricsResponse(res.data);
+      const apiOperationsUsed = resolvedTargeting.apiOperationsUsed + 1 + currency.apiOperationsUsed;
       return out({
         api_version: GOOGLE_ADS_API_VERSION,
         customer_id: normalizedCustomerId,
         login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
         ok: true,
         request_id: res.headers?.["request-id"] || null,
-        currency_code: currencyCode,
-        currency_lookup_error: currencyLookupError,
-        targeting: request,
+        currency_code: currency.currencyCode,
+        currency_lookup_error: currency.lookupError,
+        currency_cache_hit: currency.cacheHit,
+        targeting: {
+          country_codes: country_codes || null,
+          language_code: language_code || null,
+          resolved_countries: resolvedTargeting.resolvedCountries,
+          resolved_language: resolvedTargeting.resolvedLanguage,
+          request
+        },
+        api_operations_used: apiOperationsUsed,
+        api_operation_note:
+          "Die Metrics-Anfrage zaehlt als eine Google-Ads-API-Operation, unabhaengig von der Zahl der Keywords. Zusaetzliche Operationen entstehen nur bei erstmaliger Ziel-/Waehrungsaufloesung und werden hier mitgezaehlt.",
         result_count: normalized.results.length,
+        aggregate_metric_results: normalized.aggregate_metric_results,
+        results: normalized.results
+      });
+    }
+  );
+
+  server.tool(
+    "google_ads_keyword_ideas",
+    "Ermittelt neue Keyword-Ideen und historische Keyword-Planer-Metriken read-only aus Seed-Begriffen, einer Landingpage oder beidem. Laender und Sprache sind als Codes flexibel waehbar.",
+    {
+      customer_id: z.string(),
+      seed_keywords: z.array(z.string().min(1).max(80)).max(20).optional().default([]),
+      page_url: z.string().url().optional(),
+      login_customer_id: z.string().optional(),
+      country_codes: z.array(z.string().regex(/^[A-Za-z]{2}$/)).min(1).max(10).optional(),
+      geo_target_constant_ids: z.array(z.string().regex(/^\d+$/)).min(1).max(10).optional(),
+      language_code: z.string().regex(/^[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?$/).optional(),
+      language_constant_id: z.string().regex(/^\d+$/).optional(),
+      keyword_plan_network: z
+        .enum(["GOOGLE_SEARCH", "GOOGLE_SEARCH_AND_PARTNERS"])
+        .optional()
+        .default("GOOGLE_SEARCH"),
+      include_adult_keywords: z.boolean().optional().default(false),
+      include_average_cpc: z.boolean().optional().default(true),
+      include_keyword_concepts: z.boolean().optional().default(false),
+      year_month_start: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+      year_month_end: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+      page_size: z.number().int().min(1).max(1000).optional().default(500),
+      page_token: z.string().optional()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({
+      customer_id,
+      seed_keywords,
+      page_url,
+      login_customer_id,
+      country_codes,
+      geo_target_constant_ids,
+      language_code,
+      language_constant_id,
+      keyword_plan_network,
+      include_adult_keywords,
+      include_average_cpc,
+      include_keyword_concepts,
+      year_month_start,
+      year_month_end,
+      page_size,
+      page_token
+    }) => {
+      const normalizedCustomerId = normalizeGoogleAdsCustomerId(customer_id);
+      let resolvedTargeting;
+      try {
+        resolvedTargeting = await resolveGoogleAdsKeywordTargeting({
+          customerId: normalizedCustomerId,
+          loginCustomerId: login_customer_id,
+          geoTargetConstantIds: geo_target_constant_ids,
+          countryCodes: country_codes,
+          languageConstantId: language_constant_id,
+          languageCode: language_code
+        });
+      } catch (error) {
+        return out({
+          api_version: GOOGLE_ADS_API_VERSION,
+          customer_id: normalizedCustomerId,
+          login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+          ok: false,
+          stage: "targeting_resolution",
+          error: error.response ? compactAxiosError(error) : { message: error.message }
+        });
+      }
+
+      let request;
+      try {
+        request = buildGoogleAdsKeywordIdeasRequest({
+          seedKeywords: seed_keywords,
+          pageUrl: page_url,
+          geoTargetConstantIds: resolvedTargeting.geoTargetConstantIds,
+          languageConstantId: resolvedTargeting.languageConstantId,
+          keywordPlanNetwork: keyword_plan_network,
+          includeAdultKeywords: include_adult_keywords,
+          includeAverageCpc: include_average_cpc,
+          includeKeywordConcepts: include_keyword_concepts,
+          yearMonthStart: year_month_start,
+          yearMonthEnd: year_month_end,
+          pageSize: page_size,
+          pageToken: page_token
+        });
+      } catch (error) {
+        return out({
+          api_version: GOOGLE_ADS_API_VERSION,
+          customer_id: normalizedCustomerId,
+          login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+          ok: false,
+          stage: "request_validation",
+          error: { message: error.message }
+        });
+      }
+
+      let res;
+      try {
+        res = await googleAdsRequest({
+          method: "POST",
+          path: `/customers/${normalizedCustomerId}:generateKeywordIdeas`,
+          login_customer_id,
+          data: request
+        });
+      } catch (error) {
+        return out({
+          api_version: GOOGLE_ADS_API_VERSION,
+          customer_id: normalizedCustomerId,
+          login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+          ok: false,
+          stage: "keyword_ideas",
+          api_operations_used: resolvedTargeting.apiOperationsUsed + 1,
+          error: compactAxiosError(error)
+        });
+      }
+
+      const currency = await getGoogleAdsCustomerCurrency({
+        customerId: normalizedCustomerId,
+        loginCustomerId: login_customer_id
+      });
+      const normalized = normalizeGoogleAdsKeywordHistoricalMetricsResponse(res.data);
+      const apiOperationsUsed = resolvedTargeting.apiOperationsUsed + 1 + currency.apiOperationsUsed;
+      return out({
+        api_version: GOOGLE_ADS_API_VERSION,
+        customer_id: normalizedCustomerId,
+        login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+        ok: true,
+        request_id: res.headers?.["request-id"] || null,
+        currency_code: currency.currencyCode,
+        currency_lookup_error: currency.lookupError,
+        currency_cache_hit: currency.cacheHit,
+        targeting: {
+          country_codes: country_codes || null,
+          language_code: language_code || null,
+          resolved_countries: resolvedTargeting.resolvedCountries,
+          resolved_language: resolvedTargeting.resolvedLanguage,
+          request
+        },
+        api_operations_used: apiOperationsUsed,
+        api_operation_note:
+          "Die Ideen-Anfrage zaehlt als eine Google-Ads-API-Operation, unabhaengig von der Ergebniszahl. Zusaetzliche Operationen entstehen nur bei erstmaliger Ziel-/Waehrungsaufloesung und werden hier mitgezaehlt.",
+        result_count: normalized.results.length,
+        total_size: Number(res.data.totalSize || normalized.results.length),
+        next_page_token: res.data.nextPageToken || null,
         aggregate_metric_results: normalized.aggregate_metric_results,
         results: normalized.results
       });
