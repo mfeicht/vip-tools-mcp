@@ -54,6 +54,10 @@ import {
   verifyDashboardRefreshPoll
 } from "./lib/dashboard-health.js";
 import {
+  buildGoogleAdsKeywordHistoricalMetricsRequest,
+  normalizeGoogleAdsKeywordHistoricalMetricsResponse
+} from "./lib/google-ads-keyword-metrics.js";
+import {
   detectRoutineFollowUpSignals,
   hasRoutineNoFollowUpDecision,
   inspectRoutineMaterialCommentIdempotency,
@@ -19426,6 +19430,99 @@ function createServer() {
         row_count: res.data.results?.length || 0,
         next_page_token: res.data.nextPageToken || null,
         rows: res.data.results || []
+      });
+    }
+  );
+
+  server.tool(
+    "google_ads_keyword_historical_metrics",
+    "Ruft historische Keyword-Planer-Daten aus der Google Ads API read-only ab, darunter durchschnittliche monatliche Suchanfragen, Wettbewerb und Gebotsspannen.",
+    {
+      customer_id: z.string(),
+      keywords: z.array(z.string().min(1).max(80)).min(1).max(100),
+      login_customer_id: z.string().optional(),
+      geo_target_constant_ids: z.array(z.string().regex(/^\d+$/)).min(1).max(10).optional().default(["2276"]),
+      language_constant_id: z.string().regex(/^\d+$/).optional().default("1001"),
+      keyword_plan_network: z
+        .enum(["GOOGLE_SEARCH", "GOOGLE_SEARCH_AND_PARTNERS"])
+        .optional()
+        .default("GOOGLE_SEARCH"),
+      include_adult_keywords: z.boolean().optional().default(false),
+      include_average_cpc: z.boolean().optional().default(true),
+      year_month_start: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+      year_month_end: z.string().regex(/^\d{4}-\d{2}$/).optional()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({
+      customer_id,
+      keywords,
+      login_customer_id,
+      geo_target_constant_ids,
+      language_constant_id,
+      keyword_plan_network,
+      include_adult_keywords,
+      include_average_cpc,
+      year_month_start,
+      year_month_end
+    }) => {
+      const normalizedCustomerId = normalizeGoogleAdsCustomerId(customer_id);
+      const request = buildGoogleAdsKeywordHistoricalMetricsRequest({
+        keywords,
+        geoTargetConstantIds: geo_target_constant_ids,
+        languageConstantId: language_constant_id,
+        keywordPlanNetwork: keyword_plan_network,
+        includeAdultKeywords: include_adult_keywords,
+        includeAverageCpc: include_average_cpc,
+        yearMonthStart: year_month_start,
+        yearMonthEnd: year_month_end
+      });
+
+      let res;
+      try {
+        res = await googleAdsRequest({
+          method: "POST",
+          path: `/customers/${normalizedCustomerId}:generateKeywordHistoricalMetrics`,
+          login_customer_id,
+          data: request
+        });
+      } catch (error) {
+        return out({
+          api_version: GOOGLE_ADS_API_VERSION,
+          customer_id: normalizedCustomerId,
+          login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+          ok: false,
+          targeting: request,
+          error: compactAxiosError(error)
+        });
+      }
+
+      let currencyCode = null;
+      let currencyLookupError = null;
+      try {
+        const currencyRes = await googleAdsRequest({
+          method: "POST",
+          path: `/customers/${normalizedCustomerId}/googleAds:search`,
+          login_customer_id,
+          data: { query: "SELECT customer.currency_code FROM customer LIMIT 1" }
+        });
+        currencyCode = currencyRes.data.results?.[0]?.customer?.currencyCode || null;
+      } catch (error) {
+        currencyLookupError = compactAxiosError(error);
+      }
+
+      const normalized = normalizeGoogleAdsKeywordHistoricalMetricsResponse(res.data);
+      return out({
+        api_version: GOOGLE_ADS_API_VERSION,
+        customer_id: normalizedCustomerId,
+        login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
+        ok: true,
+        request_id: res.headers?.["request-id"] || null,
+        currency_code: currencyCode,
+        currency_lookup_error: currencyLookupError,
+        targeting: request,
+        result_count: normalized.results.length,
+        aggregate_metric_results: normalized.aggregate_metric_results,
+        results: normalized.results
       });
     }
   );

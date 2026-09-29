@@ -22,6 +22,11 @@ assert.match(source, /`\$\{GOOGLE_ADS_API_BASE\}\/\$\{GOOGLE_ADS_API_VERSION\}\$
 
 assert.match(adsTools, /path: "\/customers:listAccessibleCustomers"/);
 assert.match(adsTools, /path: `\/customers\/\$\{normalizedCustomerId\}\/googleAds:search`/);
+assert.match(adsTools, /"google_ads_keyword_historical_metrics"/);
+assert.match(adsTools, /path: `\/customers\/\$\{normalizedCustomerId\}:generateKeywordHistoricalMetrics`/);
+assert.match(adsTools, /default\(\["2276"\]\)/);
+assert.match(adsTools, /default\("1001"\)/);
+assert.match(adsTools, /includeAverageCpc: include_average_cpc/);
 assert.match(adsTools, /path: `\/customers\/\$\{normalizedCustomerId\}\/\$\{service\}:mutate`/);
 assert.match(adsTools, /validateOnly: effectiveValidateOnly/);
 assert.match(adsTools, /live_mutation_executed: !effectiveValidateOnly/);
