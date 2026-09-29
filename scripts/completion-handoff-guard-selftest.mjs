@@ -29,11 +29,18 @@ const openEvidenceStory = {
 };
 
 const socialNoFollowUpStatus = {
-  gid: "1218926405939713",
+  gid: "1218967490328212",
   created_by: { gid: "1214979008788664" },
-  text: "Follow-up-Status\nKeine weitere Folgeaufgabe oder Nacharbeit ist für diesen abgeschlossenen Routineumfang nötig. Die nächste reguläre Prüfung erfolgt über die native Routinefolgeinstanz.\nEvidenz / Verifikation\nAsana-Readback."
+  text: "Follow-up-Status\nKeine weitere Folgeaufgabe oder Nacharbeit ist für diesen abgeschlossenen Routineumfang nötig. Die nächste reguläre Prüfung erfolgt über die native Routinefolgeinstanz.\nEvidenz / Verifikation\nDer Follow-up-Status ergibt sich aus dem vollständig verifizierten Ergebnis dieses Routine-Tasks."
 };
 assert.equal(hasRoutineNoFollowUpDecision(socialNoFollowUpStatus.text), true);
+assert.equal(detectRoutineFollowUpSignals({ finalComment: socialNoFollowUpStatus }).no_follow_up_claim, true);
+assert.equal(detectRoutineFollowUpSignals({ finalComment: socialNoFollowUpStatus }).blocked_without_follow_up_task, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: socialNoFollowUpStatus, hasFollowUpTask: false }).ok, true);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { text: "Keine weitere Folgeaufgabe oder Nacharbeit ist für diesen abgeschlossenen Routineumfang nötig, jedoch ist die Freigabe noch offen." },
+  hasFollowUpTask: false
+}).ok, false);
 assert.equal(hasRoutineNoFollowUpDecision("Abschlussstatus\nKeine weitere Folgeaufgabe oder Nacharbeit nötig."), true);
 assert.equal(hasRoutineNoFollowUpDecision("Nächster Suchraum: weitere nordwestdeutsche Regionen."), false);
 assert.equal(hasRoutineNoFollowUpDecision("Derzeit ist keine Folgeaufgabe offen; Entscheidung folgt nach dem Readback."), false);
