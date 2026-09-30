@@ -527,6 +527,31 @@ for (const story of financeCompletionStories) {
     proposedText: "Keine weitere Folgeaufgabe erforderlich."
   }).status, "blocked_duplicate_no_follow_up_status", story.gid);
 }
+// Content Research 9202 has a visible closed decision in its existing status
+// story. Completion and comment dedupe must agree on that exact wording.
+const research9202Story = JSON.parse(readFileSync(new URL("./fixtures/research-9202-story-1219009500823711.json", import.meta.url), "utf8"));
+assert.equal(research9202Story.gid, "1219009500823711");
+const research9202Signals = detectRoutineFollowUpSignals({ finalComment: research9202Story });
+assert.equal(research9202Signals.no_follow_up_claim, true);
+assert.equal(research9202Signals.blocked_without_follow_up_task, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: research9202Story, hasFollowUpTask: false
+}).ok, true);
+assert.equal(hasRoutineNoFollowUpDecision(research9202Story.text), true);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [research9202Story],
+  agentUserGid: "1214338261069896",
+  proposedText: "Keine weitere Nacharbeit oder separate Folgeaufgabe nötig."
+}).status, "blocked_duplicate_no_follow_up_status");
+for (const text of [
+  "Keine weitere Nacharbeit oder separate Folgeaufgabe möglicherweise nötig.",
+  "Keine weitere Nacharbeit oder separate Folgeaufgabe angelegt.",
+  "Keine weitere Nacharbeit oder separate Folgeaufgabe nötig, aber die Freigabe ist noch offen."
+]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({
+    finalComment: { text }, hasFollowUpTask: false
+  }).ok, false, text);
+}
 for (const text of [
   "Keine neue Folgeaufgabe angelegt.",
   "Keine neue Folgeaufgabe möglicherweise erforderlich.",
