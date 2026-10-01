@@ -43,6 +43,7 @@ try {
     "accounting_email_archive_processed",
     "buffer_schedule_post",
     "templated_render",
+    "gemini_image_generate",
     "freepik_download_resource",
     "unsplash_track_download",
     "google_ads_mutate",

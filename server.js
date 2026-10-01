@@ -111,6 +111,19 @@ import {
   getInstagramBusinessDiscoveryMedia,
   getInstagramBusinessDiscoveryProfile
 } from "./lib/instagram-business-discovery.js";
+import {
+  GEMINI_DEFAULT_IMAGE_MODEL,
+  GEMINI_IMAGE_ASPECT_RATIOS,
+  GEMINI_IMAGE_MIME_TYPES,
+  GEMINI_IMAGE_MODEL_IDS,
+  GEMINI_IMAGE_MODEL_PROFILES,
+  GEMINI_IMAGE_SIZES,
+  GEMINI_IMAGE_THINKING_LEVELS,
+  buildGeminiImageInteractionPayload,
+  extractGeminiImageResult,
+  normalizeGeminiImageFileName,
+  summarizeGeminiApiError
+} from "./lib/gemini-image.js";
 import { createMcpRequestCleanup } from "./lib/mcp-request-lifecycle.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -415,6 +428,15 @@ const PEXELS_API_BASE = (process.env.PEXELS_API_BASE || "https://api.pexels.com"
 const PEXELS_TIMEOUT_MS = Number(process.env.PEXELS_TIMEOUT_MS || 20_000);
 const TEMPLATED_API_BASE = (process.env.TEMPLATED_API_BASE || "https://api.templated.io").replace(/\/$/, "");
 const TEMPLATED_TIMEOUT_MS = Number(process.env.TEMPLATED_TIMEOUT_MS || 30_000);
+const GEMINI_API_BASE = (process.env.GEMINI_API_BASE || "https://generativelanguage.googleapis.com/v1beta").replace(
+  /\/$/,
+  ""
+);
+const GEMINI_IMAGE_TIMEOUT_MS = Math.max(30_000, Number(process.env.GEMINI_IMAGE_TIMEOUT_MS || 180_000));
+const GEMINI_IMAGE_MAX_BYTES = Math.min(
+  Math.max(Number(process.env.GEMINI_IMAGE_MAX_BYTES || 30 * 1024 * 1024), 1024 * 1024),
+  50 * 1024 * 1024
+);
 const FREEPIK_DEFAULT_API_BASE = (process.env.FREEPIK_API_BASE || "https://api.freepik.com").replace(/\/$/, "");
 const MAGNIFIC_API_BASE = (process.env.MAGNIFIC_API_BASE || "https://api.magnific.com").replace(/\/$/, "");
 const FREEPIK_TIMEOUT_MS = Number(process.env.FREEPIK_TIMEOUT_MS || 30_000);
@@ -11800,6 +11822,66 @@ async function templatedRequest(agentId, { method = "GET", path, params, data, t
   };
 }
 
+function getGeminiImageConfigDetails(agentId, { requireCredentials = true } = {}) {
+  const keyDetails = getScopedEnvDetails("GEMINI_API_KEY", agentId);
+  if (requireCredentials && !keyDetails.value) {
+    throw new Error(
+      `Gemini API-Key fehlt. Setze ${keyDetails.agentEnvName} oder ${keyDetails.globalEnvName}.`
+    );
+  }
+
+  return {
+    config: { apiKey: keyDetails.value },
+    summary: {
+      agent_id: agentId,
+      gemini_api_base: GEMINI_API_BASE,
+      api_key_configured: keyDetails.configured,
+      api_key_env_name: keyDetails.configured ? keyDetails.selectedEnvName : null,
+      agent_api_key_env_name: keyDetails.agentEnvName,
+      agent_api_key_configured: keyDetails.agentConfigured,
+      global_api_key_env_name: keyDetails.globalEnvName,
+      global_api_key_configured: keyDetails.globalConfigured,
+      ready_for_generation: keyDetails.configured,
+      default_model: GEMINI_DEFAULT_IMAGE_MODEL,
+      model_routing: Object.fromEntries(
+        Object.entries(GEMINI_IMAGE_MODEL_PROFILES).map(([model, profile]) => [
+          profile.tier,
+          { model, label: profile.label, default_image_size: profile.defaultImageSize }
+        ])
+      ),
+      timeout_ms: GEMINI_IMAGE_TIMEOUT_MS,
+      max_image_bytes: GEMINI_IMAGE_MAX_BYTES
+    }
+  };
+}
+
+async function geminiImageRequest(agentId, { method = "GET", path, params, data, timeout = GEMINI_IMAGE_TIMEOUT_MS }) {
+  const { config } = getGeminiImageConfigDetails(agentId, { requireCredentials: true });
+  const response = await axios.request({
+    method,
+    url: `${GEMINI_API_BASE}${path}`,
+    params,
+    data,
+    timeout,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+    validateStatus: () => true,
+    headers: {
+      "x-goog-api-key": config.apiKey,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": WEB_FETCH_USER_AGENT
+    }
+  });
+
+  return {
+    ok: response.status >= 200 && response.status < 300,
+    status: response.status,
+    status_text: response.statusText,
+    data: response.data
+  };
+}
+
 function getTemplatedItems(data) {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.data)) return data.data;
@@ -18746,6 +18828,194 @@ function createServer() {
         payload_summary: payloadSummary,
         response: response.data
       });
+    }
+  );
+
+  server.tool(
+    "gemini_image_check_config",
+    "Prueft die Gemini-Bildkonfiguration ohne Bildgenerierung. Optional wird die Modellliste read-only abgerufen, um den API-Key und die drei kanonischen Bildmodelle zu validieren.",
+    {
+      agent_id: agentIdSchema,
+      fetch_models: z.boolean().optional().default(true)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, fetch_models }) => {
+      const { summary } = getGeminiImageConfigDetails(agent_id, { requireCredentials: fetch_models });
+      if (!fetch_models) return out({ ...summary, fetch_models: false });
+
+      const response = await geminiImageRequest(agent_id, {
+        path: "/models",
+        params: { pageSize: 1000 },
+        timeout: Math.min(GEMINI_IMAGE_TIMEOUT_MS, 30_000)
+      });
+      const availableModels = (response.data?.models || [])
+        .map((model) => String(model?.name || "").replace(/^models\//, ""))
+        .filter(Boolean);
+      const requestedModels = Object.fromEntries(
+        GEMINI_IMAGE_MODEL_IDS.map((model) => [model, availableModels.includes(model)])
+      );
+
+      return out({
+        ...summary,
+        fetch_models: true,
+        ok: response.ok,
+        status: response.status,
+        configured_models: requestedModels,
+        all_canonical_models_available: Object.values(requestedModels).every(Boolean),
+        provider_error: response.ok ? null : summarizeGeminiApiError(response.data),
+        billing_note: "Die Modellpruefung erzeugt kein Bild. Echte Bildgenerierung kann Google-Gebuehren verursachen."
+      });
+    }
+  );
+
+  server.tool(
+    "gemini_image_generate",
+    "Generiert ein Bild mit Gemini und legt es standardmaessig direkt in einem erlaubten Google-Drive-Ordner ab. Nano Banana 2 ist der Standard; Pro dient finalen Premium-Assets, Lite schnellen Entwuerfen/Serien. Standard ist dry_run=true; echte Generierung braucht einen verifizierten Asana-Auftrag oder einen direkten aktuellen Codex-Auftrag von Moritz Feichtmeyer.",
+    {
+      agent_id: agentIdSchema,
+      prompt: z.string().min(3).max(20_000),
+      model: z.enum(GEMINI_IMAGE_MODEL_IDS).optional().default(GEMINI_DEFAULT_IMAGE_MODEL),
+      aspect_ratio: z.enum(GEMINI_IMAGE_ASPECT_RATIOS).optional().default("16:9"),
+      image_size: z.enum(GEMINI_IMAGE_SIZES).optional(),
+      mime_type: z.enum(GEMINI_IMAGE_MIME_TYPES).optional().default("image/png"),
+      thinking_level: z.enum(GEMINI_IMAGE_THINKING_LEVELS).optional(),
+      file_name: z.string().min(5).max(180).optional(),
+      upload_to_drive: z.boolean().optional().default(true),
+      target_folder_id: z.string().optional().default(GOOGLE_AGENT_FOLDER_ID),
+      include_preview: z.boolean().optional().default(false),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      prompt,
+      model,
+      aspect_ratio,
+      image_size,
+      mime_type,
+      thinking_level,
+      file_name,
+      upload_to_drive,
+      target_folder_id,
+      include_preview,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      authorization
+    }) => {
+      const payload = buildGeminiImageInteractionPayload({
+        prompt,
+        model,
+        aspectRatio: aspect_ratio,
+        imageSize: image_size,
+        mimeType: mime_type,
+        thinkingLevel: thinking_level
+      });
+      const profile = GEMINI_IMAGE_MODEL_PROFILES[model];
+      const { summary } = getGeminiImageConfigDetails(agent_id, { requireCredentials: !dry_run });
+      const promptSha256 = createHash("sha256").update(String(prompt), "utf8").digest("hex");
+      const payloadSummary = {
+        model,
+        model_label: profile.label,
+        routing_tier: profile.tier,
+        aspect_ratio,
+        image_size: payload.response_format.image_size,
+        mime_type,
+        thinking_level: thinking_level || null,
+        prompt_chars: String(prompt).length,
+        prompt_sha256: promptSha256,
+        provider_storage: false,
+        upload_to_drive,
+        target_folder_id: upload_to_drive ? target_folder_id : null,
+        include_preview
+      };
+
+      if (dry_run) {
+        return out({
+          ...summary,
+          dry_run: true,
+          endpoint: `${GEMINI_API_BASE}/interactions`,
+          payload_summary: payloadSummary,
+          payload,
+          note:
+            "Kein Bild wurde generiert. Fuer Live-Generierung dry_run=false plus verifizierten Asana-Auftrag oder authorization.source=direct_codex aus aktuellem Moritz-Auftrag setzen."
+        });
+      }
+      if (!upload_to_drive && !include_preview) {
+        throw new Error("Live-Generierung braucht upload_to_drive=true oder include_preview=true, damit das Bild ausgegeben wird.");
+      }
+
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "gemini_image_generate"
+      });
+      const response = await geminiImageRequest(agent_id, {
+        method: "POST",
+        path: "/interactions",
+        data: payload
+      });
+      if (!response.ok) {
+        const providerError = summarizeGeminiApiError(response.data);
+        throw new Error(`Gemini-Bildgenerierung fehlgeschlagen (HTTP ${response.status}): ${providerError.message}`);
+      }
+
+      const image = extractGeminiImageResult(response.data);
+      if (image.bytes.length > GEMINI_IMAGE_MAX_BYTES) {
+        throw new Error(
+          `Gemini-Bild ist mit ${image.bytes.length} Bytes groesser als das konfigurierte Limit ${GEMINI_IMAGE_MAX_BYTES}.`
+        );
+      }
+      const fallbackStem = `gemini-${profile.tier}-${randomUUID()}`;
+      const normalizedFileName = normalizeGeminiImageFileName(file_name, image.mimeType, fallbackStem);
+      let driveFile = null;
+      if (upload_to_drive) {
+        driveFile = await uploadBufferToDrive({
+          name: normalizedFileName,
+          mimeType: image.mimeType,
+          targetFolderId: target_folder_id,
+          bytes: image.bytes,
+          appProperties: {
+            provider: "google-gemini",
+            model,
+            prompt_sha256: promptSha256,
+            interaction_id: image.interactionId || "not-returned"
+          },
+          googleContext: { agent_id }
+        });
+      }
+
+      const result = {
+        agent_id,
+        dry_run: false,
+        authorization: authorizationReceipt,
+        ok: true,
+        provider_status: response.status,
+        model,
+        model_label: profile.label,
+        routing_tier: profile.tier,
+        interaction_id: image.interactionId,
+        interaction_status: image.status,
+        file_name: normalizedFileName,
+        mime_type: image.mimeType,
+        bytes: image.bytes.length,
+        sha256: image.sha256,
+        usage: image.usage,
+        drive_file: driveFile,
+        provider_storage: false,
+        synthid_note: "Gemini-generierte Bilder enthalten gemaess Google-Dokumentation SynthID.",
+        rights_note: "KI-generiertes Asset; Aufgabenbriefing, Personen-/Markenrechte und Nutzungskontext vor finaler Verwendung pruefen."
+      };
+      const content = [{ type: "text", text: JSON.stringify(result, null, 2) }];
+      if (include_preview) {
+        content.push({ type: "image", data: image.bytes.toString("base64"), mimeType: image.mimeType });
+      }
+      return { content };
     }
   );
 
