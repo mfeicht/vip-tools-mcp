@@ -48,6 +48,11 @@ try {
   assert.ok(toolNames.has("gemini_image_check_config"));
   assert.ok(toolNames.has("gemini_image_generate"));
   assert.ok(toolNames.has("gemini_image_publish_to_cloudinary"));
+  assert.ok(toolNames.has("gemini_image_batch_submit"));
+  assert.ok(toolNames.has("gemini_image_batch_status"));
+  assert.ok(toolNames.has("gemini_image_batch_collect"));
+  assert.ok(toolNames.has("gemini_image_batch_cancel"));
+  assert.ok(toolNames.has("gemini_image_cleanup_generated_assets"));
 
   const config = parseTextResult(
     await client.callTool({
@@ -79,6 +84,35 @@ try {
   assert.equal(dryRun.payload_summary.upload_to_cloudinary, true);
   assert.equal(dryRun.payload_summary.cloudinary_project_key, "reise-stories");
   assert.equal(dryRun.payload_summary.cloudinary_asset_key, "2026-10-02-slide-1");
+
+  const batchDryRun = parseTextResult(
+    await client.callTool({
+      name: "gemini_image_batch_submit",
+      arguments: {
+        agent_id: "vip-ai-social-media",
+        project_key: "tradingpulse",
+        target_publish_date: "2026-10-02",
+        idempotency_key: "tradingpulse-2026-10-02-test",
+        model: "gemini-3-pro-image",
+        requests: [
+          {
+            request_key: "cover",
+            prompt: "A premium editorial finance photograph without text",
+            aspect_ratio: "4:5",
+            image_size: "2K",
+            file_name: "tradingpulse-cover.jpg",
+            slide: 1
+          }
+        ],
+        dry_run: true
+      }
+    })
+  );
+  assert.equal(batchDryRun.dry_run, true);
+  assert.equal(batchDryRun.model, "gemini-3-pro-image");
+  assert.equal(batchDryRun.request_count, 1);
+  assert.equal(batchDryRun.requests[0].request_key, "cover");
+  assert.equal(batchDryRun.requests[0].image_size, "2K");
 
   console.log("Gemini image MCP self-test passed.");
 } finally {

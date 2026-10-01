@@ -125,10 +125,22 @@ import {
   summarizeGeminiApiError
 } from "./lib/gemini-image.js";
 import {
+  GEMINI_IMAGE_BATCH_MAX_REQUESTS,
+  buildGeminiImageBatchPayload,
+  extractGeminiBatchImages,
+  normalizeGeminiBatchName,
+  summarizeGeminiBatchJob
+} from "./lib/gemini-image-batch.js";
+import {
   buildGeneratedCloudinaryLocation,
   validateGeneratedDriveImageMetadata,
   verifyGeneratedImageBytes
 } from "./lib/generated-image-handoff.js";
+import {
+  GENERATED_IMAGE_DELETE_AFTER_TRASH_DAYS,
+  GENERATED_IMAGE_TRASH_AFTER_DAYS,
+  evaluateGeneratedImageCleanup
+} from "./lib/generated-image-retention.js";
 import { createMcpRequestCleanup } from "./lib/mcp-request-lifecycle.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -11909,6 +11921,117 @@ async function geminiImageRequest(agentId, { method = "GET", path, params, data,
   };
 }
 
+function buildGeminiBatchDisplayName({ displayName, projectKey, targetPublishDate, idempotencyKey }) {
+  const base = String(displayName || `vip-${projectKey}-${targetPublishDate}`)
+    .trim()
+    .replace(/[^A-Za-z0-9._ -]+/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .slice(0, 108)
+    .replace(/[-. ]+$/g, "");
+  const suffix = createHash("sha256").update(String(idempotencyKey), "utf8").digest("hex").slice(0, 12);
+  return `${base}-${suffix}`;
+}
+
+function getGeminiBatchItems(data) {
+  const values = [data?.batches, data?.operations, data?.data?.batches, data?.data?.operations];
+  return values.find(Array.isArray) || [];
+}
+
+async function findGeminiBatchByDisplayName(agentId, displayName) {
+  const response = await geminiImageRequest(agentId, {
+    path: "/batches",
+    params: { pageSize: 100 },
+    timeout: Math.min(GEMINI_IMAGE_TIMEOUT_MS, 30_000)
+  });
+  if (!response.ok) return null;
+  return (
+    getGeminiBatchItems(response.data).find((item) => {
+      const summary = summarizeGeminiBatchJob(item);
+      return summary.display_name === displayName;
+    }) || null
+  );
+}
+
+async function getGeminiBatchJob(agentId, batchName) {
+  const normalizedBatchName = normalizeGeminiBatchName(batchName);
+  const response = await geminiImageRequest(agentId, {
+    path: `/${normalizedBatchName}`,
+    timeout: Math.min(GEMINI_IMAGE_TIMEOUT_MS, 60_000)
+  });
+  if (!response.ok) {
+    const providerError = summarizeGeminiApiError(response.data);
+    throw new Error(`Gemini-Batch-Read fehlgeschlagen (HTTP ${response.status}): ${providerError.message}`);
+  }
+  return { response, summary: summarizeGeminiBatchJob(response.data) };
+}
+
+function normalizeCollectedGeminiFileName(metadata, requestKey, actualMimeType) {
+  const extension = actualMimeType === "image/jpeg" ? ".jpg" : ".png";
+  const requested = String(metadata?.file_name || requestKey || "gemini-batch-image")
+    .trim()
+    .replace(/\.(png|jpe?g)$/i, "");
+  const safeStem = requested
+    .replace(/[^A-Za-z0-9._ -]+/g, "-")
+    .replace(/^[^A-Za-z0-9]+/, "")
+    .slice(0, 170)
+    .replace(/[. -]+$/g, "") || "gemini-batch-image";
+  return normalizeGeminiImageFileName(`${safeStem}${extension}`, actualMimeType);
+}
+
+async function findGeneratedBatchDriveDuplicate(
+  { targetFolderId, batchName, requestKey, contentSha256 },
+  googleContext = {}
+) {
+  const query =
+    `'${escapeGoogleDriveQueryString(targetFolderId)}' in parents and trashed = false and ` +
+    `appProperties has { key='pipeline' and value='gemini-batch-v1' } and ` +
+    `appProperties has { key='batch_name' and value='${escapeGoogleDriveQueryString(
+      compactDriveAppProperty(batchName)
+    )}' } and ` +
+    `appProperties has { key='request_key' and value='${escapeGoogleDriveQueryString(requestKey)}' } and ` +
+    `appProperties has { key='content_sha256' and value='${escapeGoogleDriveQueryString(contentSha256)}' }`;
+  const res = await googleRequest(
+    {
+      method: "GET",
+      url: "https://www.googleapis.com/drive/v3/files",
+      params: {
+        q: query,
+        pageSize: 5,
+        fields:
+          "files(id,name,mimeType,size,md5Checksum,parents,webViewLink,webContentLink,appProperties,createdTime,modifiedTime,trashed)",
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
+      }
+    },
+    googleContext
+  );
+  return (res.data.files || [])[0] || null;
+}
+
+async function patchGoogleDriveFile(fileId, data, fields, googleContext = {}) {
+  const res = await googleRequest(
+    {
+      method: "PATCH",
+      url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+      params: { fields, supportsAllDrives: true },
+      data
+    },
+    googleContext
+  );
+  return res.data;
+}
+
+async function verifyGoogleDriveFileDeleted(fileId, googleContext = {}) {
+  try {
+    await getDriveFile(fileId, "id,trashed", googleContext);
+    return false;
+  } catch (error) {
+    if (/Google API request failed \(404\b/.test(String(error?.message || error))) return true;
+    throw error;
+  }
+}
+
 function getTemplatedItems(data) {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.data)) return data.data;
@@ -18999,6 +19122,420 @@ function createServer() {
   );
 
   server.tool(
+    "gemini_image_batch_submit",
+    "Reicht einen kleinen asynchronen Gemini-Bildbatch fuer die Social-Media-Pipeline ein. Jeder Request erhaelt einen stabilen Schluessel und fachliche Metadaten; Google kann bis zu 24 Stunden benoetigen. Der Batch-Create ist providerseitig nicht idempotent, deshalb wird vor dem Schreiben nach dem deterministischen Anzeigenamen gesucht. Standard ist dry_run=true.",
+    {
+      agent_id: agentIdSchema,
+      project_key: z.string().min(2).max(80),
+      target_publish_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      idempotency_key: z.string().min(8).max(160),
+      display_name: z.string().min(3).max(108).optional(),
+      model: z.enum(GEMINI_IMAGE_MODEL_IDS).optional().default("gemini-3-pro-image"),
+      requests: z
+        .array(
+          z.object({
+            request_key: z.string().min(1).max(63),
+            prompt: z.string().min(3).max(20_000),
+            aspect_ratio: z.enum(GEMINI_IMAGE_ASPECT_RATIOS).optional().default("4:5"),
+            image_size: z.enum(GEMINI_IMAGE_SIZES).optional().default("2K"),
+            mime_type: z.enum(GEMINI_IMAGE_MIME_TYPES).optional().default("image/jpeg"),
+            file_name: z.string().min(5).max(180).optional(),
+            slide: z.number().int().min(1).max(99).optional()
+          })
+        )
+        .min(1)
+        .max(GEMINI_IMAGE_BATCH_MAX_REQUESTS),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      project_key,
+      target_publish_date,
+      idempotency_key,
+      display_name,
+      model,
+      requests,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      authorization
+    }) => {
+      const normalizedProjectKey = normalizeBufferProjectKey(project_key);
+      const finalDisplayName = buildGeminiBatchDisplayName({
+        displayName: display_name,
+        projectKey: normalizedProjectKey,
+        targetPublishDate: target_publish_date,
+        idempotencyKey: idempotency_key
+      });
+      const payload = buildGeminiImageBatchPayload({
+        model,
+        displayName: finalDisplayName,
+        projectKey: normalizedProjectKey,
+        targetPublishDate: target_publish_date,
+        requests
+      });
+      const { summary: configSummary } = getGeminiImageConfigDetails(agent_id, {
+        requireCredentials: !dry_run
+      });
+      const requestSummaries = payload.batch.input_config.requests.requests.map((entry) => ({
+        request_key: entry.metadata.key,
+        prompt_sha256: entry.metadata.prompt_sha256,
+        prompt_chars: entry.request.contents[0].parts[0].text.length,
+        aspect_ratio: entry.metadata.aspect_ratio,
+        image_size: entry.metadata.image_size,
+        requested_mime_type: entry.metadata.requested_mime_type,
+        file_name: entry.metadata.file_name,
+        slide: entry.metadata.slide
+      }));
+
+      if (dry_run) {
+        return out({
+          ...configSummary,
+          dry_run: true,
+          endpoint: `${GEMINI_API_BASE}/models/${model}:batchGenerateContent`,
+          model,
+          project_key: normalizedProjectKey,
+          target_publish_date,
+          display_name: finalDisplayName,
+          request_count: requestSummaries.length,
+          requests: requestSummaries,
+          provider_turnaround_note: "Google nennt fuer Batch-Jobs eine Zielzeit von bis zu 24 Stunden.",
+          idempotency_note: "Der deterministische display_name wird vor einem Live-Create gegen vorhandene Jobs geprueft."
+        });
+      }
+
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "gemini_image_batch_submit"
+      });
+      const existing = await findGeminiBatchByDisplayName(agent_id, finalDisplayName);
+      if (existing) {
+        return out({
+          agent_id,
+          dry_run: false,
+          authorization: authorizationReceipt,
+          ok: true,
+          reused_existing_batch: true,
+          model,
+          project_key: normalizedProjectKey,
+          target_publish_date,
+          display_name: finalDisplayName,
+          batch: summarizeGeminiBatchJob(existing),
+          requests: requestSummaries
+        });
+      }
+
+      const response = await geminiImageRequest(agent_id, {
+        method: "POST",
+        path: `/models/${encodeURIComponent(model)}:batchGenerateContent`,
+        data: payload,
+        timeout: Math.min(GEMINI_IMAGE_TIMEOUT_MS, 60_000)
+      });
+      if (!response.ok) {
+        const providerError = summarizeGeminiApiError(response.data);
+        throw new Error(`Gemini-Batch-Create fehlgeschlagen (HTTP ${response.status}): ${providerError.message}`);
+      }
+      const batch = summarizeGeminiBatchJob(response.data);
+      if (!batch.name) {
+        throw new Error("Gemini-Batch-Create war erfolgreich, lieferte aber keinen batches/<ID>-Namen.");
+      }
+      return out({
+        agent_id,
+        dry_run: false,
+        authorization: authorizationReceipt,
+        ok: true,
+        reused_existing_batch: false,
+        provider_status: response.status,
+        model,
+        project_key: normalizedProjectKey,
+        target_publish_date,
+        display_name: finalDisplayName,
+        batch,
+        requests: requestSummaries
+      });
+    }
+  );
+
+  server.tool(
+    "gemini_image_batch_status",
+    "Liest den aktuellen Zustand eines Gemini-Bildbatches ohne Bildbytes auszugeben. Liefert normalisierte Zustands-, Zeit- und Statistikfelder fuer den Routine-State.",
+    {
+      agent_id: agentIdSchema,
+      batch_name: z.string().min(12).max(240)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, batch_name }) => {
+      const { response, summary } = await getGeminiBatchJob(agent_id, batch_name);
+      return out({
+        agent_id,
+        ok: true,
+        provider_status: response.status,
+        batch: summary,
+        ready_to_collect: summary.succeeded,
+        retry_recommended: !summary.terminal,
+        terminal_failure: summary.terminal && !summary.succeeded
+      });
+    }
+  );
+
+  server.tool(
+    "gemini_image_batch_collect",
+    "Sammelt einen erfolgreich abgeschlossenen Inline-Gemini-Bildbatch ein, prueft Signatur und Groesse und legt jedes Ergebnis idempotent im erlaubten privaten Agenten-Drive ab. Standard ist dry_run=true; fehlgeschlagene Einzelrequests werden sichtbar ausgewiesen.",
+    {
+      agent_id: agentIdSchema,
+      batch_name: z.string().min(12).max(240),
+      project_key: z.string().min(2).max(80),
+      target_publish_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      target_folder_id: z.string().optional().default(GOOGLE_AGENT_FOLDER_ID),
+      request_keys: z.array(z.string().min(1).max(63)).max(GEMINI_IMAGE_BATCH_MAX_REQUESTS).optional(),
+      max_image_bytes: z
+        .number()
+        .int()
+        .min(1024 * 1024)
+        .max(50 * 1024 * 1024)
+        .optional()
+        .default(GEMINI_IMAGE_MAX_BYTES),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      batch_name,
+      project_key,
+      target_publish_date,
+      target_folder_id,
+      request_keys,
+      max_image_bytes,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      authorization
+    }) => {
+      const normalizedBatchName = normalizeGeminiBatchName(batch_name);
+      const normalizedProjectKey = normalizeBufferProjectKey(project_key);
+      const { summary, response } = await getGeminiBatchJob(agent_id, normalizedBatchName);
+      if (!summary.succeeded) {
+        throw new Error(
+          `Gemini-Batch ${normalizedBatchName} kann im Zustand ${summary.state} nicht eingesammelt werden.`
+        );
+      }
+      const selectedKeys = request_keys ? new Set(request_keys.map((key) => String(key).toLowerCase())) : null;
+      const extracted = extractGeminiBatchImages(response.data).filter(
+        (entry) => !selectedKeys || selectedKeys.has(entry.requestKey.toLowerCase())
+      );
+      if (!extracted.length) throw new Error("Der abgeschlossene Gemini-Batch enthaelt keine ausgewaehlten Inline-Ergebnisse.");
+      if (selectedKeys) {
+        const returned = new Set(extracted.map((entry) => entry.requestKey.toLowerCase()));
+        const missing = [...selectedKeys].filter((key) => !returned.has(key));
+        if (missing.length) throw new Error(`Gemini-Batch enthaelt die angeforderten request_keys nicht: ${missing.join(", ")}`);
+      }
+
+      const prepared = extracted.map((entry) => {
+        if (entry.metadata?.project_key !== normalizedProjectKey) {
+          throw new Error(`Projekt-Metadaten stimmen fuer ${entry.requestKey} nicht ueberein.`);
+        }
+        if (entry.metadata?.target_publish_date !== target_publish_date) {
+          throw new Error(`Zieldatum-Metadaten stimmen fuer ${entry.requestKey} nicht ueberein.`);
+        }
+        if (entry.error || !entry.image) {
+          return { ...entry, verified: null, fileName: null };
+        }
+        if (entry.image.bytes.length > max_image_bytes) {
+          throw new Error(
+            `Batch-Bild ${entry.requestKey} ist mit ${entry.image.bytes.length} Bytes groesser als ${max_image_bytes}.`
+          );
+        }
+        const verified = verifyGeneratedImageBytes(entry.image.bytes, entry.image.mimeType);
+        const fileName = normalizeCollectedGeminiFileName(
+          entry.metadata,
+          entry.requestKey,
+          verified.detectedMimeType
+        );
+        return { ...entry, verified, fileName };
+      });
+      const preview = prepared.map((entry) => ({
+        request_key: entry.requestKey,
+        status: entry.error ? "failed" : "ready",
+        error: entry.error || null,
+        file_name: entry.fileName,
+        mime_type: entry.verified?.detectedMimeType || null,
+        bytes: entry.verified?.bytes || null,
+        sha256: entry.verified?.sha256 || null,
+        slide: entry.metadata?.slide || null
+      }));
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          batch: summary,
+          project_key: normalizedProjectKey,
+          target_publish_date,
+          target_folder_id,
+          result_count: prepared.length,
+          ready_count: prepared.filter((entry) => !entry.error).length,
+          failed_count: prepared.filter((entry) => entry.error).length,
+          results: preview,
+          note: "Es wurden keine Drive-Dateien erstellt."
+        });
+      }
+
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "gemini_image_batch_collect"
+      });
+      const googleContext = { agent_id };
+      await assertAllowedGoogleFolder(target_folder_id, googleContext);
+      const driveFiles = [];
+      for (const entry of prepared) {
+        if (entry.error || !entry.image || !entry.verified) {
+          driveFiles.push({ request_key: entry.requestKey, status: "failed", error: entry.error });
+          continue;
+        }
+        const duplicate = await findGeneratedBatchDriveDuplicate(
+          {
+            targetFolderId: target_folder_id,
+            batchName: normalizedBatchName,
+            requestKey: entry.requestKey,
+            contentSha256: entry.verified.sha256
+          },
+          googleContext
+        );
+        if (duplicate) {
+          driveFiles.push({
+            request_key: entry.requestKey,
+            status: "reused",
+            reused: true,
+            drive_file: duplicate,
+            sha256: entry.verified.sha256
+          });
+          continue;
+        }
+        const uploaded = await uploadBufferToDrive({
+          name: entry.fileName,
+          mimeType: entry.verified.detectedMimeType,
+          targetFolderId: target_folder_id,
+          bytes: entry.image.bytes,
+          appProperties: {
+            provider: "google-gemini",
+            pipeline: "gemini-batch-v1",
+            model: compactDriveAppProperty(summary?.model || "gemini-image-batch"),
+            batch_name: compactDriveAppProperty(normalizedBatchName),
+            request_key: compactDriveAppProperty(entry.requestKey),
+            project_key: compactDriveAppProperty(normalizedProjectKey),
+            target_date: compactDriveAppProperty(target_publish_date),
+            prompt_sha256: compactDriveAppProperty(entry.metadata?.prompt_sha256 || "not-returned"),
+            content_sha256: entry.verified.sha256,
+            slide: compactDriveAppProperty(entry.metadata?.slide || "unknown")
+          },
+          googleContext
+        });
+        const readback = await getDriveFile(
+          uploaded.id,
+          "id,name,mimeType,size,parents,webViewLink,webContentLink,appProperties,createdTime,modifiedTime,trashed",
+          googleContext
+        );
+        const metadataValidation = validateGeneratedDriveImageMetadata(readback, max_image_bytes);
+        if (readback.appProperties?.content_sha256 !== entry.verified.sha256) {
+          throw new Error(`Drive-Readback fuer ${entry.requestKey} hat einen abweichenden SHA-256-Marker.`);
+        }
+        driveFiles.push({
+          request_key: entry.requestKey,
+          status: "uploaded",
+          reused: false,
+          drive_file: readback,
+          validated: metadataValidation,
+          sha256: entry.verified.sha256
+        });
+      }
+
+      return out({
+        agent_id,
+        dry_run: false,
+        authorization: authorizationReceipt,
+        ok: true,
+        batch: summary,
+        project_key: normalizedProjectKey,
+        target_publish_date,
+        target_folder_id,
+        result_count: driveFiles.length,
+        ready_count: driveFiles.filter((entry) => entry.status === "uploaded" || entry.status === "reused").length,
+        failed_count: driveFiles.filter((entry) => entry.status === "failed").length,
+        results: driveFiles,
+        lifecycle_note:
+          "Die Drive-Dateien bleiben privat. Nach Buffer-Status sent greift gemini_image_cleanup_generated_assets mit 7 Tagen Korrekturfenster und 30 Tagen Papierkorb-Aufbewahrung."
+      });
+    }
+  );
+
+  server.tool(
+    "gemini_image_batch_cancel",
+    "Bricht einen noch laufenden Gemini-Bildbatch ab. Bereits terminale Jobs werden ohne zweite Mutation als No-op zurueckgegeben. Standard ist dry_run=true.",
+    {
+      agent_id: agentIdSchema,
+      batch_name: z.string().min(12).max(240),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({ agent_id, batch_name, dry_run, confirmed_by_asana, asana_task_gid, authorization }) => {
+      const normalizedBatchName = normalizeGeminiBatchName(batch_name);
+      const before = await getGeminiBatchJob(agent_id, normalizedBatchName);
+      if (dry_run || before.summary.terminal) {
+        return out({
+          agent_id,
+          dry_run,
+          no_op: before.summary.terminal,
+          batch_before: before.summary,
+          would_cancel: !before.summary.terminal
+        });
+      }
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "gemini_image_batch_cancel"
+      });
+      const response = await geminiImageRequest(agent_id, {
+        method: "POST",
+        path: `/${normalizedBatchName}:cancel`,
+        data: {},
+        timeout: Math.min(GEMINI_IMAGE_TIMEOUT_MS, 30_000)
+      });
+      if (!response.ok) {
+        const providerError = summarizeGeminiApiError(response.data);
+        throw new Error(`Gemini-Batch-Cancel fehlgeschlagen (HTTP ${response.status}): ${providerError.message}`);
+      }
+      const after = await getGeminiBatchJob(agent_id, normalizedBatchName);
+      return out({
+        agent_id,
+        dry_run: false,
+        authorization: authorizationReceipt,
+        ok: true,
+        provider_status: response.status,
+        batch_before: before.summary,
+        batch_after: after.summary
+      });
+    }
+  );
+
+  server.tool(
     "gemini_image_generate",
     "Generiert ein Bild mit Gemini und legt es standardmaessig in einem erlaubten Google-Drive-Ordner ab. Optional wird dasselbe Bild mit oeffentlichem Readback nach Cloudinary uebergeben, damit Templated es laden kann. Nano Banana 2 ist der Standard; Pro dient finalen Premium-Assets, Lite schnellen Entwuerfen/Serien. Standard ist dry_run=true; echte Generierung braucht einen verifizierten Asana-Auftrag oder einen direkten aktuellen Codex-Auftrag von Moritz Feichtmeyer.",
     {
@@ -19296,6 +19833,163 @@ function createServer() {
         templated_media_url: cloudinaryAsset.secure_url,
         lifecycle_note:
           "Drive-Quelldatei blieb unveraendert. Cloudinary-Asset kann nach dem bestehenden projektbezogenen 30-Tage-Cleanup ueber cleanup_prefix entfernt werden."
+      });
+    }
+  );
+
+  server.tool(
+    "gemini_image_cleanup_generated_assets",
+    "Bereinigt ausschliesslich explizit benannte Gemini-Batchbilder aus dem privaten Agenten-Drive. Vor jeder Mutation werden Gemini-Herkunft, Projektbindung, erlaubter Ordner und der echte Buffer-Status sent geprueft. Stufe 1 verschiebt fruehestens 7 Tage nach Versand in den Papierkorb; Stufe 2 loescht erst 30 Tage nach dem von diesem Tool gesetzten Papierkorb-Marker dauerhaft. Standard ist dry_run=true.",
+    {
+      agent_id: agentIdSchema,
+      project_key: z.string().min(2).max(80),
+      buffer_post_id: z.string().regex(/^[a-f0-9]{24}$/i),
+      drive_file_ids: z.array(z.string().min(10).max(200)).min(1).max(20),
+      action: z.enum(["trash", "permanent_delete"]),
+      trash_after_days: z
+        .number()
+        .int()
+        .min(GENERATED_IMAGE_TRASH_AFTER_DAYS)
+        .max(365)
+        .optional()
+        .default(GENERATED_IMAGE_TRASH_AFTER_DAYS),
+      permanent_delete_after_trash_days: z
+        .number()
+        .int()
+        .min(GENERATED_IMAGE_DELETE_AFTER_TRASH_DAYS)
+        .max(3650)
+        .optional()
+        .default(GENERATED_IMAGE_DELETE_AFTER_TRASH_DAYS),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      project_key,
+      buffer_post_id,
+      drive_file_ids,
+      action,
+      trash_after_days,
+      permanent_delete_after_trash_days,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      authorization
+    }) => {
+      const normalizedProjectKey = normalizeBufferProjectKey(project_key);
+      const uniqueFileIds = [...new Set(drive_file_ids)];
+      if (uniqueFileIds.length !== drive_file_ids.length) {
+        throw new Error("drive_file_ids darf keine doppelten IDs enthalten.");
+      }
+      const post = await fetchBufferPost(normalizedProjectKey, buffer_post_id);
+      if (!post) throw new Error(`Buffer-Post ${buffer_post_id} wurde nicht gefunden.`);
+      const googleContext = { agent_id };
+      const files = [];
+      for (const fileId of uniqueFileIds) {
+        const file = await getDriveFile(
+          fileId,
+          "id,name,mimeType,size,parents,webViewLink,appProperties,createdTime,modifiedTime,trashed",
+          googleContext
+        );
+        validateGeneratedDriveImageMetadata(file, GEMINI_IMAGE_MAX_BYTES);
+        await assertGeneratedDriveFileInAllowedFolder(file, googleContext);
+        files.push(file);
+      }
+      const evaluations = files.map((file) =>
+        evaluateGeneratedImageCleanup({
+          file,
+          post,
+          projectKey: normalizedProjectKey,
+          action,
+          trashAfterDays: trash_after_days,
+          deleteAfterTrashDays: permanent_delete_after_trash_days
+        })
+      );
+      const ineligible = evaluations.filter((entry) => !entry.eligible);
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          action,
+          project_key: normalizedProjectKey,
+          buffer_post: {
+            id: post.id,
+            status: post.status,
+            sent_at: post.sentAt || null,
+            external_link: post.externalLink || null,
+            channel_id: post.channelId || null
+          },
+          eligible_count: evaluations.length - ineligible.length,
+          blocked_count: ineligible.length,
+          evaluations,
+          note: "Dry-Run: Keine Drive-Datei wurde veraendert."
+        });
+      }
+      if (ineligible.length) {
+        throw new Error(
+          `Drive-Cleanup blockiert: ${ineligible
+            .map((entry) => `${entry.file_id}=${entry.reasons.join("+")}`)
+            .join(", ")}`
+        );
+      }
+
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "gemini_image_cleanup_generated_assets"
+      });
+      const changed = [];
+      if (action === "trash") {
+        const trashedAt = new Date().toISOString();
+        for (const file of files) {
+          const updated = await patchGoogleDriveFile(
+            file.id,
+            {
+              trashed: true,
+              appProperties: {
+                ...(file.appProperties || {}),
+                vip_cleanup_post: compactDriveAppProperty(post.id),
+                vip_cleanup_project: compactDriveAppProperty(normalizedProjectKey),
+                vip_trashed_at: compactDriveAppProperty(trashedAt)
+              }
+            },
+            "id,name,mimeType,size,parents,webViewLink,appProperties,createdTime,modifiedTime,trashed",
+            googleContext
+          );
+          if (!updated.trashed || updated.appProperties?.vip_cleanup_post !== post.id) {
+            throw new Error(`Drive-Papierkorb-Readback fuer ${file.id} ist unvollstaendig.`);
+          }
+          changed.push({ file_id: file.id, status: "trashed_and_verified", readback: updated });
+        }
+      } else {
+        for (const file of files) {
+          await deleteGoogleDriveFileWithRetry(file.id, googleContext);
+          const deleted = await verifyGoogleDriveFileDeleted(file.id, googleContext);
+          if (!deleted) throw new Error(`Drive-Datei ${file.id} ist nach DELETE weiterhin lesbar.`);
+          changed.push({ file_id: file.id, status: "permanently_deleted_and_verified" });
+        }
+      }
+
+      return out({
+        agent_id,
+        dry_run: false,
+        authorization: authorizationReceipt,
+        ok: true,
+        action,
+        project_key: normalizedProjectKey,
+        buffer_post: {
+          id: post.id,
+          status: post.status,
+          sent_at: post.sentAt,
+          external_link: post.externalLink || null
+        },
+        changed_count: changed.length,
+        changed
       });
     }
   );
