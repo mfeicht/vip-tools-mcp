@@ -124,6 +124,11 @@ import {
   normalizeGeminiImageFileName,
   summarizeGeminiApiError
 } from "./lib/gemini-image.js";
+import {
+  buildGeneratedCloudinaryLocation,
+  validateGeneratedDriveImageMetadata,
+  verifyGeneratedImageBytes
+} from "./lib/generated-image-handoff.js";
 import { createMcpRequestCleanup } from "./lib/mcp-request-lifecycle.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -6784,6 +6789,28 @@ async function downloadDrivePdfBuffer(fileId, maxBytes, googleContext = {}) {
   return buffer;
 }
 
+async function downloadDriveFileBuffer(fileId, maxBytes, googleContext = {}) {
+  const res = await googleRequest(
+    {
+      method: "GET",
+      url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+      params: {
+        alt: "media",
+        supportsAllDrives: true
+      },
+      responseType: "arraybuffer",
+      maxContentLength: maxBytes,
+      maxBodyLength: maxBytes
+    },
+    googleContext
+  );
+  const buffer = Buffer.from(res.data);
+  if (buffer.length > maxBytes) {
+    throw new Error(`Drive-Datei ${fileId} ist groesser als das konfigurierte Limit.`);
+  }
+  return buffer;
+}
+
 function compactDriveAppProperty(value, maxLength = 124) {
   return String(value || "").slice(0, maxLength);
 }
@@ -12336,6 +12363,109 @@ async function uploadImageToCloudinary({ projectKey, asanaTaskGid, attachment, b
     height: res.data.height,
     format: res.data.format
   };
+}
+
+async function verifyPublicCloudinaryImage(secureUrl) {
+  const response = await axios.head(secureUrl, {
+    timeout: CLOUDINARY_ADMIN_TIMEOUT_MS,
+    validateStatus: () => true,
+    maxRedirects: 3,
+    headers: { "User-Agent": WEB_FETCH_USER_AGENT }
+  });
+  const contentType = String(response.headers?.["content-type"] || "").toLowerCase();
+  if (response.status < 200 || response.status >= 300 || !contentType.startsWith("image/")) {
+    throw new Error(
+      `Cloudinary-Public-Readback fehlgeschlagen: HTTP ${response.status}; Content-Type ${contentType || "unknown"}.`
+    );
+  }
+  return {
+    ok: true,
+    status: response.status,
+    content_type: contentType,
+    content_length: response.headers?.["content-length"] || null
+  };
+}
+
+async function uploadGeneratedImageToCloudinary({
+  projectKey,
+  assetKey,
+  fileName,
+  bytes,
+  contentType,
+  index = 0
+}) {
+  const { config } = getCloudinaryConfigDetails({ requireCredentials: true });
+  const verified = verifyGeneratedImageBytes(bytes, contentType);
+  const { folder, publicId } = buildGeneratedCloudinaryLocation({
+    folderPrefix: config.folderPrefix,
+    projectKey,
+    assetKey,
+    fileName,
+    index,
+    sha256: verified.sha256
+  });
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signParams = { folder, overwrite: "true", public_id: publicId, timestamp };
+  const signature = cloudinarySignature(signParams, config.apiSecret);
+  const dataUri = `data:${contentType};base64,${bytes.toString("base64")}`;
+  const body = new URLSearchParams({
+    file: dataUri,
+    api_key: config.apiKey,
+    timestamp: String(timestamp),
+    folder,
+    overwrite: "true",
+    public_id: publicId,
+    signature
+  });
+
+  const response = await axios.post(
+    `https://api.cloudinary.com/v1_1/${encodeURIComponent(config.cloudName)}/image/upload`,
+    body,
+    {
+      timeout: CLOUDINARY_UPLOAD_TIMEOUT_MS,
+      validateStatus: () => true,
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": WEB_FETCH_USER_AGENT
+      }
+    }
+  );
+  if (response.status < 200 || response.status >= 300 || !response.data?.secure_url) {
+    throw new Error(`Cloudinary-Upload fehlgeschlagen: HTTP ${response.status}; ${JSON.stringify(response.data)}`);
+  }
+
+  const publicReadback = await verifyPublicCloudinaryImage(response.data.secure_url);
+  return {
+    source: "google-gemini",
+    source_file_name: fileName,
+    bytes: verified.bytes,
+    sha256: verified.sha256,
+    content_type: verified.detectedMimeType,
+    cloudinary_folder: folder,
+    cleanup_prefix: `${folder}/`,
+    cloudinary_public_id: response.data.public_id,
+    secure_url: response.data.secure_url,
+    width: response.data.width,
+    height: response.data.height,
+    format: response.data.format,
+    public_readback: publicReadback
+  };
+}
+
+async function assertGeneratedDriveFileInAllowedFolder(file, googleContext = {}) {
+  const parents = Array.isArray(file?.parents) ? file.parents.filter(Boolean) : [];
+  const failures = [];
+  for (const parentId of parents) {
+    try {
+      await assertAllowedGoogleFolder(parentId, googleContext);
+      return parentId;
+    } catch (error) {
+      failures.push(String(error?.message || error));
+    }
+  }
+  throw new Error(
+    `Gemini-Drive-Datei liegt nicht in einem erlaubten Agentenordner.${failures.length ? ` ${failures.join(" | ")}` : ""}`
+  );
 }
 
 function normalizeCloudinaryCleanupPrefix({ folderPrefix, projectKey, targetPrefix }) {
@@ -18870,7 +19000,7 @@ function createServer() {
 
   server.tool(
     "gemini_image_generate",
-    "Generiert ein Bild mit Gemini und legt es standardmaessig direkt in einem erlaubten Google-Drive-Ordner ab. Nano Banana 2 ist der Standard; Pro dient finalen Premium-Assets, Lite schnellen Entwuerfen/Serien. Standard ist dry_run=true; echte Generierung braucht einen verifizierten Asana-Auftrag oder einen direkten aktuellen Codex-Auftrag von Moritz Feichtmeyer.",
+    "Generiert ein Bild mit Gemini und legt es standardmaessig in einem erlaubten Google-Drive-Ordner ab. Optional wird dasselbe Bild mit oeffentlichem Readback nach Cloudinary uebergeben, damit Templated es laden kann. Nano Banana 2 ist der Standard; Pro dient finalen Premium-Assets, Lite schnellen Entwuerfen/Serien. Standard ist dry_run=true; echte Generierung braucht einen verifizierten Asana-Auftrag oder einen direkten aktuellen Codex-Auftrag von Moritz Feichtmeyer.",
     {
       agent_id: agentIdSchema,
       prompt: z.string().min(3).max(20_000),
@@ -18882,6 +19012,10 @@ function createServer() {
       file_name: z.string().min(5).max(180).optional(),
       upload_to_drive: z.boolean().optional().default(true),
       target_folder_id: z.string().optional().default(GOOGLE_AGENT_FOLDER_ID),
+      upload_to_cloudinary: z.boolean().optional().default(false),
+      cloudinary_project_key: z.string().min(2).max(80).optional(),
+      cloudinary_asset_key: z.string().min(2).max(120).optional(),
+      cloudinary_index: z.number().int().min(0).max(99).optional().default(0),
       include_preview: z.boolean().optional().default(false),
       dry_run: z.boolean().optional().default(true),
       confirmed_by_asana: z.boolean().optional().default(false),
@@ -18900,6 +19034,10 @@ function createServer() {
       file_name,
       upload_to_drive,
       target_folder_id,
+      upload_to_cloudinary,
+      cloudinary_project_key,
+      cloudinary_asset_key,
+      cloudinary_index,
       include_preview,
       dry_run,
       confirmed_by_asana,
@@ -18916,6 +19054,12 @@ function createServer() {
       });
       const profile = GEMINI_IMAGE_MODEL_PROFILES[model];
       const { summary } = getGeminiImageConfigDetails(agent_id, { requireCredentials: !dry_run });
+      const cloudinary = getCloudinaryConfigDetails({ requireCredentials: !dry_run && upload_to_cloudinary });
+      if (upload_to_cloudinary && (!cloudinary_project_key || !cloudinary_asset_key)) {
+        throw new Error(
+          "upload_to_cloudinary=true braucht cloudinary_project_key und cloudinary_asset_key fuer einen engen Cleanup-Prefix."
+        );
+      }
       const promptSha256 = createHash("sha256").update(String(prompt), "utf8").digest("hex");
       const payloadSummary = {
         model,
@@ -18930,12 +19074,17 @@ function createServer() {
         provider_storage: false,
         upload_to_drive,
         target_folder_id: upload_to_drive ? target_folder_id : null,
+        upload_to_cloudinary,
+        cloudinary_project_key: upload_to_cloudinary ? normalizeBufferProjectKey(cloudinary_project_key) : null,
+        cloudinary_asset_key: upload_to_cloudinary ? cloudinary_asset_key : null,
+        cloudinary_index: upload_to_cloudinary ? cloudinary_index : null,
         include_preview
       };
 
       if (dry_run) {
         return out({
           ...summary,
+          cloudinary: cloudinary.summary,
           dry_run: true,
           endpoint: `${GEMINI_API_BASE}/interactions`,
           payload_summary: payloadSummary,
@@ -18944,8 +19093,10 @@ function createServer() {
             "Kein Bild wurde generiert. Fuer Live-Generierung dry_run=false plus verifizierten Asana-Auftrag oder authorization.source=direct_codex aus aktuellem Moritz-Auftrag setzen."
         });
       }
-      if (!upload_to_drive && !include_preview) {
-        throw new Error("Live-Generierung braucht upload_to_drive=true oder include_preview=true, damit das Bild ausgegeben wird.");
+      if (!upload_to_drive && !upload_to_cloudinary && !include_preview) {
+        throw new Error(
+          "Live-Generierung braucht upload_to_drive=true, upload_to_cloudinary=true oder include_preview=true, damit das Bild ausgegeben wird."
+        );
       }
 
       const authorizationReceipt = await assertActionAuthorized({
@@ -18984,9 +19135,21 @@ function createServer() {
             provider: "google-gemini",
             model,
             prompt_sha256: promptSha256,
-            interaction_id: image.interactionId || "not-returned"
+            interaction_id: image.interactionId || "not-returned",
+            content_sha256: image.sha256
           },
           googleContext: { agent_id }
+        });
+      }
+      let cloudinaryAsset = null;
+      if (upload_to_cloudinary) {
+        cloudinaryAsset = await uploadGeneratedImageToCloudinary({
+          projectKey: normalizeBufferProjectKey(cloudinary_project_key),
+          assetKey: cloudinary_asset_key,
+          fileName: normalizedFileName,
+          bytes: image.bytes,
+          contentType: image.mimeType,
+          index: cloudinary_index
         });
       }
 
@@ -19007,6 +19170,7 @@ function createServer() {
         sha256: image.sha256,
         usage: image.usage,
         drive_file: driveFile,
+        cloudinary_asset: cloudinaryAsset,
         provider_storage: false,
         synthid_note: "Gemini-generierte Bilder enthalten gemaess Google-Dokumentation SynthID.",
         rights_note: "KI-generiertes Asset; Aufgabenbriefing, Personen-/Markenrechte und Nutzungskontext vor finaler Verwendung pruefen."
@@ -19016,6 +19180,123 @@ function createServer() {
         content.push({ type: "image", data: image.bytes.toString("base64"), mimeType: image.mimeType });
       }
       return { content };
+    }
+  );
+
+  server.tool(
+    "gemini_image_publish_to_cloudinary",
+    "Uebergibt eine im erlaubten Agenten-Drive gespeicherte, eindeutig als Google-Gemini-Ausgabe markierte JPEG-/PNG-Datei an einen engen projektbezogenen Cloudinary-Prefix. Liefert die URL erst nach oeffentlichem Bild-Readback fuer Templated. Standard ist dry_run=true; der Drive-Ursprung bleibt privat und unveraendert.",
+    {
+      agent_id: agentIdSchema,
+      drive_file_id: z.string().min(10).max(200),
+      project_key: z.string().min(2).max(80),
+      asset_key: z.string().min(2).max(120),
+      index: z.number().int().min(0).max(99).optional().default(0),
+      max_image_bytes: z
+        .number()
+        .int()
+        .min(1024 * 1024)
+        .max(50 * 1024 * 1024)
+        .optional()
+        .default(GEMINI_IMAGE_MAX_BYTES),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({
+      agent_id,
+      drive_file_id,
+      project_key,
+      asset_key,
+      index,
+      max_image_bytes,
+      dry_run,
+      confirmed_by_asana,
+      asana_task_gid,
+      authorization
+    }) => {
+      const googleContext = { agent_id };
+      const normalizedProjectKey = normalizeBufferProjectKey(project_key);
+      const file = await getDriveFile(
+        drive_file_id,
+        "id,name,mimeType,size,parents,webViewLink,appProperties,createdTime,modifiedTime,trashed",
+        googleContext
+      );
+      if (file.trashed) throw new Error("Gemini-Drive-Datei liegt im Papierkorb.");
+      const validated = validateGeneratedDriveImageMetadata(file, max_image_bytes);
+      const allowedParentId = await assertGeneratedDriveFileInAllowedFolder(file, googleContext);
+      const cloudinary = getCloudinaryConfigDetails({ requireCredentials: !dry_run });
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          source_drive_file: {
+            id: file.id,
+            name: file.name,
+            mime_type: validated.mimeType,
+            bytes: validated.size,
+            allowed_parent_id: allowedParentId,
+            provider: validated.provider,
+            model: file.appProperties?.model || null,
+            content_sha256: file.appProperties?.content_sha256 || null,
+            web_view_link: file.webViewLink || null
+          },
+          cloudinary: cloudinary.summary,
+          project_key: normalizedProjectKey,
+          asset_key,
+          index,
+          public_readback_required: true,
+          note:
+            "Dry-Run: Drive-Datei und Gemini-Herkunft sind verifiziert; es wurden keine Bytes geladen und kein Cloudinary-Asset erstellt."
+        });
+      }
+
+      const authorizationReceipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "gemini_image_publish_to_cloudinary"
+      });
+      const bytes = await downloadDriveFileBuffer(drive_file_id, max_image_bytes, googleContext);
+      const verifiedBytes = verifyGeneratedImageBytes(bytes, validated.mimeType);
+      const expectedSha256 = file.appProperties?.content_sha256 || null;
+      if (expectedSha256 && expectedSha256 !== verifiedBytes.sha256) {
+        throw new Error("Gemini-Drive-Datei stimmt nicht mit ihrem gespeicherten content_sha256 ueberein.");
+      }
+      const cloudinaryAsset = await uploadGeneratedImageToCloudinary({
+        projectKey: normalizedProjectKey,
+        assetKey: asset_key,
+        fileName: file.name,
+        bytes,
+        contentType: validated.mimeType,
+        index
+      });
+
+      return out({
+        agent_id,
+        dry_run: false,
+        authorization: authorizationReceipt,
+        ok: true,
+        source_drive_file: {
+          id: file.id,
+          name: file.name,
+          mime_type: validated.mimeType,
+          bytes: verifiedBytes.bytes,
+          sha256: verifiedBytes.sha256,
+          allowed_parent_id: allowedParentId,
+          provider: validated.provider,
+          model: file.appProperties?.model || null,
+          web_view_link: file.webViewLink || null
+        },
+        cloudinary_asset: cloudinaryAsset,
+        templated_media_url: cloudinaryAsset.secure_url,
+        lifecycle_note:
+          "Drive-Quelldatei blieb unveraendert. Cloudinary-Asset kann nach dem bestehenden projektbezogenen 30-Tage-Cleanup ueber cleanup_prefix entfernt werden."
+      });
     }
   );
 

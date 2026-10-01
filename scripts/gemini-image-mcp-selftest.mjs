@@ -47,6 +47,7 @@ try {
   const toolNames = new Set((listed.tools || []).map((tool) => tool.name));
   assert.ok(toolNames.has("gemini_image_check_config"));
   assert.ok(toolNames.has("gemini_image_generate"));
+  assert.ok(toolNames.has("gemini_image_publish_to_cloudinary"));
 
   const config = parseTextResult(
     await client.callTool({
@@ -63,6 +64,9 @@ try {
       arguments: {
         agent_id: "vip-ai-design",
         prompt: "A photorealistic alpine hotel at sunrise",
+        upload_to_cloudinary: true,
+        cloudinary_project_key: "reise-stories",
+        cloudinary_asset_key: "2026-10-02-slide-1",
         dry_run: true
       }
     })
@@ -72,6 +76,9 @@ try {
   assert.equal(dryRun.payload.store, false);
   assert.equal(dryRun.payload.response_format.aspect_ratio, "16:9");
   assert.equal(dryRun.payload.response_format.image_size, "2K");
+  assert.equal(dryRun.payload_summary.upload_to_cloudinary, true);
+  assert.equal(dryRun.payload_summary.cloudinary_project_key, "reise-stories");
+  assert.equal(dryRun.payload_summary.cloudinary_asset_key, "2026-10-02-slide-1");
 
   console.log("Gemini image MCP self-test passed.");
 } finally {
