@@ -127,7 +127,7 @@ import {
 import {
   GEMINI_IMAGE_BATCH_MAX_REQUESTS,
   buildGeminiImageBatchPayload,
-  extractGeminiBatchImages,
+  iterateGeminiBatchImages,
   normalizeGeminiBatchName,
   summarizeGeminiBatchJob
 } from "./lib/gemini-image-batch.js";
@@ -19330,17 +19330,14 @@ function createServer() {
         );
       }
       const selectedKeys = request_keys ? new Set(request_keys.map((key) => String(key).toLowerCase())) : null;
-      const extracted = extractGeminiBatchImages(response.data).filter(
-        (entry) => !selectedKeys || selectedKeys.has(entry.requestKey.toLowerCase())
-      );
-      if (!extracted.length) throw new Error("Der abgeschlossene Gemini-Batch enthaelt keine ausgewaehlten Inline-Ergebnisse.");
-      if (selectedKeys) {
-        const returned = new Set(extracted.map((entry) => entry.requestKey.toLowerCase()));
-        const missing = [...selectedKeys].filter((key) => !returned.has(key));
-        if (missing.length) throw new Error(`Gemini-Batch enthaelt die angeforderten request_keys nicht: ${missing.join(", ")}`);
-      }
-
-      const prepared = extracted.map((entry) => {
+      const prepared = [];
+      const seenResultKeys = new Set();
+      for (const entry of iterateGeminiBatchImages(response.data, { requestKeys: request_keys })) {
+        const resultKey = entry.requestKey.toLowerCase();
+        if (seenResultKeys.has(resultKey)) {
+          throw new Error(`Gemini-Batch enthaelt einen doppelten request_key: ${entry.requestKey}`);
+        }
+        seenResultKeys.add(resultKey);
         if (entry.metadata?.project_key !== normalizedProjectKey) {
           throw new Error(`Projekt-Metadaten stimmen fuer ${entry.requestKey} nicht ueberein.`);
         }
@@ -19348,7 +19345,8 @@ function createServer() {
           throw new Error(`Zieldatum-Metadaten stimmen fuer ${entry.requestKey} nicht ueberein.`);
         }
         if (entry.error || !entry.image) {
-          return { ...entry, verified: null, fileName: null };
+          prepared.push({ ...entry, image: null, verified: null, fileName: null });
+          continue;
         }
         if (entry.image.bytes.length > max_image_bytes) {
           throw new Error(
@@ -19361,8 +19359,14 @@ function createServer() {
           entry.requestKey,
           verified.detectedMimeType
         );
-        return { ...entry, verified, fileName };
-      });
+        prepared.push({ ...entry, image: null, verified, fileName });
+      }
+      if (!prepared.length) throw new Error("Der abgeschlossene Gemini-Batch enthaelt keine ausgewaehlten Inline-Ergebnisse.");
+      if (selectedKeys) {
+        const returned = new Set(prepared.map((entry) => entry.requestKey.toLowerCase()));
+        const missing = [...selectedKeys].filter((key) => !returned.has(key));
+        if (missing.length) throw new Error(`Gemini-Batch enthaelt die angeforderten request_keys nicht: ${missing.join(", ")}`);
+      }
       const preview = prepared.map((entry) => ({
         request_key: entry.requestKey,
         status: entry.error ? "failed" : "ready",
@@ -19400,17 +19404,22 @@ function createServer() {
       const googleContext = { agent_id };
       await assertAllowedGoogleFolder(target_folder_id, googleContext);
       const driveFiles = [];
-      for (const entry of prepared) {
-        if (entry.error || !entry.image || !entry.verified) {
+      const preparedByKey = new Map(prepared.map((entry) => [entry.requestKey.toLowerCase(), entry]));
+      for (const entry of iterateGeminiBatchImages(response.data, { requestKeys: request_keys })) {
+        const checked = preparedByKey.get(entry.requestKey.toLowerCase());
+        if (entry.error || !entry.image || !checked?.verified) {
           driveFiles.push({ request_key: entry.requestKey, status: "failed", error: entry.error });
           continue;
+        }
+        if (entry.image.sha256 !== checked.verified.sha256) {
+          throw new Error(`Batch-Bild ${entry.requestKey} hat sich seit dem Preflight veraendert.`);
         }
         const duplicate = await findGeneratedBatchDriveDuplicate(
           {
             targetFolderId: target_folder_id,
             batchName: normalizedBatchName,
             requestKey: entry.requestKey,
-            contentSha256: entry.verified.sha256
+            contentSha256: checked.verified.sha256
           },
           googleContext
         );
@@ -19420,13 +19429,13 @@ function createServer() {
             status: "reused",
             reused: true,
             drive_file: duplicate,
-            sha256: entry.verified.sha256
+            sha256: checked.verified.sha256
           });
           continue;
         }
         const uploaded = await uploadBufferToDrive({
-          name: entry.fileName,
-          mimeType: entry.verified.detectedMimeType,
+          name: checked.fileName,
+          mimeType: checked.verified.detectedMimeType,
           targetFolderId: target_folder_id,
           bytes: entry.image.bytes,
           appProperties: {
@@ -19438,7 +19447,7 @@ function createServer() {
             project_key: compactDriveAppProperty(normalizedProjectKey),
             target_date: compactDriveAppProperty(target_publish_date),
             prompt_sha256: compactDriveAppProperty(entry.metadata?.prompt_sha256 || "not-returned"),
-            content_sha256: entry.verified.sha256,
+            content_sha256: checked.verified.sha256,
             slide: compactDriveAppProperty(entry.metadata?.slide || "unknown")
           },
           googleContext
@@ -19449,7 +19458,7 @@ function createServer() {
           googleContext
         );
         const metadataValidation = validateGeneratedDriveImageMetadata(readback, max_image_bytes);
-        if (readback.appProperties?.content_sha256 !== entry.verified.sha256) {
+        if (readback.appProperties?.content_sha256 !== checked.verified.sha256) {
           throw new Error(`Drive-Readback fuer ${entry.requestKey} hat einen abweichenden SHA-256-Marker.`);
         }
         driveFiles.push({
@@ -19458,7 +19467,7 @@ function createServer() {
           reused: false,
           drive_file: readback,
           validated: metadataValidation,
-          sha256: entry.verified.sha256
+          sha256: checked.verified.sha256
         });
       }
 
