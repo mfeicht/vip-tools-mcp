@@ -4,10 +4,12 @@ import axios from "axios";
 import net from "net";
 import tls from "tls";
 import path from "path";
+import os from "os";
 import { Readable } from "stream";
 import { execFile } from "child_process";
 import { createHash, createHmac, createSign, randomUUID, timingSafeEqual } from "crypto";
 import { existsSync, readdirSync, readFileSync } from "fs";
+import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
@@ -129,8 +131,10 @@ import {
   buildGeminiImageBatchPayload,
   iterateGeminiBatchImages,
   normalizeGeminiBatchName,
+  normalizeGeminiBatchRequestKey,
   summarizeGeminiBatchJob
 } from "./lib/gemini-image-batch.js";
+import { readGeminiBatchStream } from "./lib/gemini-batch-stream.js";
 import {
   buildGeneratedCloudinaryLocation,
   validateGeneratedDriveImageMetadata,
@@ -11966,6 +11970,44 @@ async function getGeminiBatchJob(agentId, batchName) {
   return { response, summary: summarizeGeminiBatchJob(response.data) };
 }
 
+async function streamGeminiBatchJob(agentId, batchName, onEntry) {
+  const normalizedBatchName = normalizeGeminiBatchName(batchName);
+  const { config } = getGeminiImageConfigDetails(agentId, { requireCredentials: true });
+  const response = await axios.request({
+    method: "GET",
+    url: `${GEMINI_API_BASE}/${normalizedBatchName}`,
+    responseType: "stream",
+    timeout: Math.min(GEMINI_IMAGE_TIMEOUT_MS, 120_000),
+    maxContentLength: Infinity,
+    validateStatus: () => true,
+    headers: {
+      "x-goog-api-key": config.apiKey,
+      Accept: "application/json",
+      "User-Agent": WEB_FETCH_USER_AGENT
+    }
+  });
+  if (response.status < 200 || response.status >= 300) {
+    const parts = [];
+    let size = 0;
+    for await (const chunk of response.data) {
+      size += chunk.length;
+      if (size > 64 * 1024) throw new Error(`Gemini-Batch-Read fehlgeschlagen (HTTP ${response.status}); Fehlerantwort zu groß.`);
+      parts.push(chunk);
+    }
+    const providerError = summarizeGeminiApiError(JSON.parse(Buffer.concat(parts).toString("utf8")));
+    throw new Error(`Gemini-Batch-Read fehlgeschlagen (HTTP ${response.status}): ${providerError.message}`);
+  }
+  try {
+    const parsed = await readGeminiBatchStream(response.data, onEntry);
+    const summary = summarizeGeminiBatchJob(parsed.document);
+    summary.inline_response_count = parsed.entryCount;
+    return { summary, providerStatus: response.status, responseBytes: parsed.totalBytes };
+  } catch (error) {
+    response.data.destroy();
+    throw error;
+  }
+}
+
 function normalizeCollectedGeminiFileName(metadata, requestKey, actualMimeType) {
   const extension = actualMimeType === "image/jpeg" ? ".jpg" : ".png";
   const requested = String(metadata?.file_name || requestKey || "gemini-batch-image")
@@ -11977,6 +12019,23 @@ function normalizeCollectedGeminiFileName(metadata, requestKey, actualMimeType) 
     .slice(0, 170)
     .replace(/[. -]+$/g, "") || "gemini-batch-image";
   return normalizeGeminiImageFileName(`${safeStem}${extension}`, actualMimeType);
+}
+
+function validateCollectedGeminiDimensions(dimensions, metadata, requestKey) {
+  if (!dimensions) throw new Error(`Batch-Bild ${requestKey} hat keine lesbaren Abmessungen.`);
+  const ratioParts = String(metadata?.aspect_ratio || "").split(":").map(Number);
+  if (ratioParts.length !== 2 || ratioParts.some((value) => !Number.isFinite(value) || value <= 0)) {
+    throw new Error(`Batch-Bild ${requestKey} hat kein gueltiges Ziel-Seitenverhaeltnis.`);
+  }
+  const actualRatio = dimensions.width / dimensions.height;
+  const expectedRatio = ratioParts[0] / ratioParts[1];
+  if (Math.abs(actualRatio / expectedRatio - 1) > 0.05) {
+    throw new Error(`Batch-Bild ${requestKey} weicht vom angeforderten Seitenverhaeltnis ab.`);
+  }
+  if (metadata?.image_size === "2K" && Math.max(dimensions.width, dimensions.height) < 1900) {
+    throw new Error(`Batch-Bild ${requestKey} unterschreitet die angeforderte 2K-Groesse.`);
+  }
+  return dimensions;
 }
 
 async function findGeneratedBatchDriveDuplicate(
@@ -19323,21 +19382,22 @@ function createServer() {
     }) => {
       const normalizedBatchName = normalizeGeminiBatchName(batch_name);
       const normalizedProjectKey = normalizeBufferProjectKey(project_key);
-      const { summary, response } = await getGeminiBatchJob(agent_id, normalizedBatchName);
-      if (!summary.succeeded) {
-        throw new Error(
-          `Gemini-Batch ${normalizedBatchName} kann im Zustand ${summary.state} nicht eingesammelt werden.`
-        );
-      }
-      const selectedKeys = request_keys ? new Set(request_keys.map((key) => String(key).toLowerCase())) : null;
+      const selectedKeys = request_keys ? new Set(request_keys.map(normalizeGeminiBatchRequestKey)) : null;
       const prepared = [];
       const seenResultKeys = new Set();
-      for (const entry of iterateGeminiBatchImages(response.data, { requestKeys: request_keys })) {
-        const resultKey = entry.requestKey.toLowerCase();
+      const tempDir = await mkdtemp(path.join(os.tmpdir(), "vip-gemini-batch-"));
+      try {
+      const streamed = await streamGeminiBatchJob(agent_id, normalizedBatchName, async (rawEntry, index) => {
+        if (index >= GEMINI_IMAGE_BATCH_MAX_REQUESTS) {
+          throw new Error("Gemini-Batch enthaelt mehr Einzelantworten als erlaubt.");
+        }
+        const resultKey = normalizeGeminiBatchRequestKey(rawEntry?.metadata?.key);
         if (seenResultKeys.has(resultKey)) {
-          throw new Error(`Gemini-Batch enthaelt einen doppelten request_key: ${entry.requestKey}`);
+          throw new Error(`Gemini-Batch enthaelt einen doppelten request_key: ${resultKey}`);
         }
         seenResultKeys.add(resultKey);
+        if (selectedKeys && !selectedKeys.has(resultKey)) return;
+        const [entry] = iterateGeminiBatchImages({ dest: { inlinedResponses: [rawEntry] } });
         if (entry.metadata?.project_key !== normalizedProjectKey) {
           throw new Error(`Projekt-Metadaten stimmen fuer ${entry.requestKey} nicht ueberein.`);
         }
@@ -19345,8 +19405,8 @@ function createServer() {
           throw new Error(`Zieldatum-Metadaten stimmen fuer ${entry.requestKey} nicht ueberein.`);
         }
         if (entry.error || !entry.image) {
-          prepared.push({ ...entry, image: null, verified: null, fileName: null });
-          continue;
+          prepared.push({ ...entry, image: null, verified: null, fileName: null, filePath: null });
+          return;
         }
         if (entry.image.bytes.length > max_image_bytes) {
           throw new Error(
@@ -19354,12 +19414,21 @@ function createServer() {
           );
         }
         const verified = verifyGeneratedImageBytes(entry.image.bytes, entry.image.mimeType);
+        validateCollectedGeminiDimensions(verified.dimensions, entry.metadata, entry.requestKey);
         const fileName = normalizeCollectedGeminiFileName(
           entry.metadata,
           entry.requestKey,
           verified.detectedMimeType
         );
-        prepared.push({ ...entry, image: null, verified, fileName });
+        const filePath = dry_run ? null : path.join(tempDir, `${index}.image`);
+        if (filePath) await writeFile(filePath, entry.image.bytes, { flag: "wx", mode: 0o600 });
+        prepared.push({ ...entry, image: null, verified, fileName, filePath });
+      });
+      const summary = streamed.summary;
+      if (!summary.succeeded) {
+        throw new Error(
+          `Gemini-Batch ${normalizedBatchName} kann im Zustand ${summary.state} nicht eingesammelt werden.`
+        );
       }
       if (!prepared.length) throw new Error("Der abgeschlossene Gemini-Batch enthaelt keine ausgewaehlten Inline-Ergebnisse.");
       if (selectedKeys) {
@@ -19375,6 +19444,7 @@ function createServer() {
         mime_type: entry.verified?.detectedMimeType || null,
         bytes: entry.verified?.bytes || null,
         sha256: entry.verified?.sha256 || null,
+        dimensions: entry.verified?.dimensions || null,
         slide: entry.metadata?.slide || null
       }));
 
@@ -19404,51 +19474,51 @@ function createServer() {
       const googleContext = { agent_id };
       await assertAllowedGoogleFolder(target_folder_id, googleContext);
       const driveFiles = [];
-      const preparedByKey = new Map(prepared.map((entry) => [entry.requestKey.toLowerCase(), entry]));
-      for (const entry of iterateGeminiBatchImages(response.data, { requestKeys: request_keys })) {
-        const checked = preparedByKey.get(entry.requestKey.toLowerCase());
-        if (entry.error || !entry.image || !checked?.verified) {
-          driveFiles.push({ request_key: entry.requestKey, status: "failed", error: entry.error });
+      for (const checked of prepared) {
+        if (checked.error || !checked.verified) {
+          driveFiles.push({ request_key: checked.requestKey, status: "failed", error: checked.error });
           continue;
-        }
-        if (entry.image.sha256 !== checked.verified.sha256) {
-          throw new Error(`Batch-Bild ${entry.requestKey} hat sich seit dem Preflight veraendert.`);
         }
         const duplicate = await findGeneratedBatchDriveDuplicate(
           {
             targetFolderId: target_folder_id,
             batchName: normalizedBatchName,
-            requestKey: entry.requestKey,
+            requestKey: checked.requestKey,
             contentSha256: checked.verified.sha256
           },
           googleContext
         );
         if (duplicate) {
           driveFiles.push({
-            request_key: entry.requestKey,
+            request_key: checked.requestKey,
             status: "reused",
             reused: true,
             drive_file: duplicate,
-            sha256: checked.verified.sha256
+            sha256: checked.verified.sha256,
+            dimensions: checked.verified.dimensions
           });
           continue;
+        }
+        const imageBytes = await readFile(checked.filePath);
+        if (verifyGeneratedImageBytes(imageBytes, checked.verified.detectedMimeType).sha256 !== checked.verified.sha256) {
+          throw new Error(`Batch-Bild ${checked.requestKey} hat sich seit dem Preflight veraendert.`);
         }
         const uploaded = await uploadBufferToDrive({
           name: checked.fileName,
           mimeType: checked.verified.detectedMimeType,
           targetFolderId: target_folder_id,
-          bytes: entry.image.bytes,
+          bytes: imageBytes,
           appProperties: {
             provider: "google-gemini",
             pipeline: "gemini-batch-v1",
             model: compactDriveAppProperty(summary?.model || "gemini-image-batch"),
             batch_name: compactDriveAppProperty(normalizedBatchName),
-            request_key: compactDriveAppProperty(entry.requestKey),
+            request_key: compactDriveAppProperty(checked.requestKey),
             project_key: compactDriveAppProperty(normalizedProjectKey),
             target_date: compactDriveAppProperty(target_publish_date),
-            prompt_sha256: compactDriveAppProperty(entry.metadata?.prompt_sha256 || "not-returned"),
+            prompt_sha256: compactDriveAppProperty(checked.metadata?.prompt_sha256 || "not-returned"),
             content_sha256: checked.verified.sha256,
-            slide: compactDriveAppProperty(entry.metadata?.slide || "unknown")
+            slide: compactDriveAppProperty(checked.metadata?.slide || "unknown")
           },
           googleContext
         });
@@ -19459,15 +19529,16 @@ function createServer() {
         );
         const metadataValidation = validateGeneratedDriveImageMetadata(readback, max_image_bytes);
         if (readback.appProperties?.content_sha256 !== checked.verified.sha256) {
-          throw new Error(`Drive-Readback fuer ${entry.requestKey} hat einen abweichenden SHA-256-Marker.`);
+          throw new Error(`Drive-Readback fuer ${checked.requestKey} hat einen abweichenden SHA-256-Marker.`);
         }
         driveFiles.push({
-          request_key: entry.requestKey,
+          request_key: checked.requestKey,
           status: "uploaded",
           reused: false,
           drive_file: readback,
           validated: metadataValidation,
-          sha256: checked.verified.sha256
+          sha256: checked.verified.sha256,
+          dimensions: checked.verified.dimensions
         });
       }
 
@@ -19487,6 +19558,9 @@ function createServer() {
         lifecycle_note:
           "Die Drive-Dateien bleiben privat. Nach Buffer-Status sent greift gemini_image_cleanup_generated_assets mit 7 Tagen Korrekturfenster und 30 Tagen Papierkorb-Aufbewahrung."
       });
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
     }
   );
 
