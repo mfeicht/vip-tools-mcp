@@ -31,7 +31,8 @@ const providerBody = JSON.stringify({
   name: "batches/streamcollecttest",
   state: "JOB_STATE_SUCCEEDED",
   batchStats: { successfulRequestCount: 6, failedRequestCount: 0 },
-  dest: { inlinedResponses: results }
+  dest: { inlinedResponses: results },
+  output: { inlinedResponses: [{ metadata: { key: "duplicate-output" } }] }
 });
 const provider = http.createServer((req, res) => {
   if (req.url !== "/v1beta/batches/streamcollecttest") {
