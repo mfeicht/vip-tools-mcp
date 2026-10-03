@@ -16,7 +16,7 @@
     "test:asana-observer-comment-guard": "node scripts/asana-observer-comment-guard-selftest.mjs",
     "test:asana-comment-readability": "node scripts/asana-comment-readability-selftest.mjs",
     "test:completion-handoff-guard": "node scripts/completion-handoff-guard-selftest.mjs",
-    "test:material-comment-distributed": "node scripts/material-comment-distributed-selftest.mjs",
+    "test:material-comment-distributed": "node scripts/material-comment-distributed-selftest.mjs && node --test lib/asana-material-comment-http-store.test.mjs",
     "test:imap-window": "node scripts/imap-window-selftest.mjs",
     "test:imap-transport-security": "node scripts/imap-transport-security-selftest.mjs",
     "test:imap-response-reader": "node scripts/imap-response-reader-selftest.mjs",
