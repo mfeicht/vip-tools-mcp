@@ -29,10 +29,12 @@ const results = Array.from({ length: 6 }, (_, i) => ({
 }));
 const providerBody = JSON.stringify({
   name: "batches/streamcollecttest",
-  state: "JOB_STATE_SUCCEEDED",
-  batchStats: { successfulRequestCount: 6, failedRequestCount: 0 },
-  dest: { inlinedResponses: { inlinedResponses: results } },
-  output: { inlinedResponses: [{ metadata: { key: "duplicate-output" } }] }
+  metadata: {
+    state: "JOB_STATE_SUCCEEDED",
+    batchStats: { successfulRequestCount: 6, failedRequestCount: 0 },
+    output: { inlinedResponses: { inlinedResponses: results } }
+  },
+  response: { inlinedResponses: [{ metadata: { key: "duplicate-output" } }] }
 });
 const provider = http.createServer((req, res) => {
   if (req.url !== "/v1beta/batches/streamcollecttest") {
