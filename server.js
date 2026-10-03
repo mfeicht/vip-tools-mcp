@@ -80,6 +80,7 @@ import {
   isRoutineMaterialComment
 } from "./lib/asana-material-comment-coordinator.js";
 import { createRedisMaterialCommentStore } from "./lib/asana-material-comment-store.js";
+import { createHttpMaterialCommentStore } from "./lib/asana-material-comment-http-store.js";
 import {
   classifyAsanaCommentAuthority,
   validateAsanaObserverCommentIntent
@@ -160,13 +161,21 @@ const ASANA_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ASANA_RETRY_BAS
 const ASANA_MATERIAL_COMMENT_REDIS_URL = String(
   process.env.ASANA_MATERIAL_COMMENT_REDIS_URL || ""
 ).trim();
+const ASANA_MATERIAL_COMMENT_D1_TOKEN = String(
+  process.env.VIP_DASHBOARD_FEED_TOKEN || ""
+).trim();
 const ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED = parseBooleanEnv(
   process.env.ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED,
-  Boolean(ASANA_MATERIAL_COMMENT_REDIS_URL)
+  Boolean(ASANA_MATERIAL_COMMENT_REDIS_URL || ASANA_MATERIAL_COMMENT_D1_TOKEN)
 );
 const ASANA_MATERIAL_COMMENT_STORE = ASANA_MATERIAL_COMMENT_REDIS_URL
   ? createRedisMaterialCommentStore({ url: ASANA_MATERIAL_COMMENT_REDIS_URL })
-  : null;
+  : ASANA_MATERIAL_COMMENT_D1_TOKEN
+    ? createHttpMaterialCommentStore({ token: ASANA_MATERIAL_COMMENT_D1_TOKEN })
+    : null;
+const ASANA_MATERIAL_COMMENT_STORE_BACKEND = ASANA_MATERIAL_COMMENT_REDIS_URL
+  ? "redis"
+  : ASANA_MATERIAL_COMMENT_D1_TOKEN ? "dashboard_d1" : "none";
 const ASANA_MATERIAL_COMMENT_COORDINATOR = createAsanaMaterialCommentCoordinator({
   distributedStore: ASANA_MATERIAL_COMMENT_STORE,
   distributedRequired: ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED
@@ -27109,6 +27118,7 @@ app.get(["/", "/health"], (req, res) => {
     deployment_commit:
       process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown",
     material_comment_coordination: {
+      backend: ASANA_MATERIAL_COMMENT_STORE_BACKEND,
       distributed_required: ASANA_MATERIAL_COMMENT_DISTRIBUTED_REQUIRED,
       distributed_configured: ASANA_MATERIAL_COMMENT_COORDINATOR.distributedConfigured()
     },
@@ -27123,6 +27133,26 @@ app.get(["/", "/health"], (req, res) => {
     uptime_seconds: Math.floor(process.uptime()),
     checked_at: new Date().toISOString()
   });
+});
+
+app.get("/material-comment-store/health", async (req, res) => {
+  res.set("cache-control", "no-store");
+  if (!ASANA_MATERIAL_COMMENT_STORE) {
+    return res.status(503).json({ ok: false, backend: "none", ready: false });
+  }
+  try {
+    if (typeof ASANA_MATERIAL_COMMENT_STORE.health === "function") {
+      await ASANA_MATERIAL_COMMENT_STORE.health();
+    } else {
+      await ASANA_MATERIAL_COMMENT_STORE.readReceipt({
+        key: "__health__",
+        payloadHash: "0".repeat(64)
+      });
+    }
+    return res.json({ ok: true, backend: ASANA_MATERIAL_COMMENT_STORE_BACKEND, ready: true });
+  } catch {
+    return res.status(503).json({ ok: false, backend: ASANA_MATERIAL_COMMENT_STORE_BACKEND, ready: false });
+  }
 });
 
 app.use(express.json());
