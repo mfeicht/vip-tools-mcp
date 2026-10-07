@@ -14,7 +14,7 @@ import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 import { assertLinkedGoogleDocScope, linkedGoogleDocReadback } from "./lib/google-docs-linked-reader.js";
-import { assertInstructionReferencesDriveIds, assertRecoverableTrashTarget, resolveCopyDestination } from "./lib/google-drive-write-policy.mjs";
+import { asanaDriveInstructionText, assertInstructionReferencesDriveIds, assertRecoverableTrashTarget, resolveCopyDestination } from "./lib/google-drive-write-policy.mjs";
 import { selectBoundedEmailText } from "./lib/email-uid-text.js";
 import { assertBufferEditDueAtReadback, bufferEditScheduleFields } from "./lib/buffer-edit-schedule.js";
 import {
@@ -10882,7 +10882,7 @@ async function assertActionAuthorized({
   }
   if (requiredDriveResourceIds.length) {
     assertInstructionReferencesDriveIds(
-      [task.name, task.notes, task.html_notes, authorizationStory?.text, authorizationStory?.html_text].join("\n"),
+      asanaDriveInstructionText(task, authorizationStory),
       requiredDriveResourceIds
     );
   }
