@@ -3191,11 +3191,15 @@ async function googleAdsRequest({ method = "GET", path, data, params, login_cust
 async function resolveGoogleAdsKeywordTargeting({
   customerId,
   loginCustomerId,
+  allLocations = false,
   geoTargetConstantIds,
   countryCodes,
   languageConstantId,
   languageCode
 }) {
+  if (allLocations && (geoTargetConstantIds?.length || countryCodes?.length)) {
+    throw new Error("Bei all_locations=true keine country_codes oder geo_target_constant_ids angeben.");
+  }
   if (geoTargetConstantIds?.length && countryCodes?.length) {
     throw new Error("Nur geo_target_constant_ids oder country_codes verwenden, nicht beides.");
   }
@@ -3209,7 +3213,9 @@ async function resolveGoogleAdsKeywordTargeting({
     normalizeGoogleAdsCustomerId(id, "geo_target_constant_id")
   );
 
-  if (!resolvedGeoTargetConstantIds?.length) {
+  if (allLocations) {
+    resolvedGeoTargetConstantIds = [];
+  } else if (!resolvedGeoTargetConstantIds?.length) {
     const normalizedCountryCodes = normalizeGoogleAdsCountryCodes(countryCodes?.length ? countryCodes : ["DE"]);
     const missingCountryCodes = normalizedCountryCodes.filter((code) => !googleAdsKeywordCountryCache.has(code));
     if (missingCountryCodes.length) {
@@ -3270,6 +3276,7 @@ async function resolveGoogleAdsKeywordTargeting({
   }
 
   return {
+    allLocations: Boolean(allLocations),
     geoTargetConstantIds: resolvedGeoTargetConstantIds,
     languageConstantId: resolvedLanguageConstantId,
     resolvedCountries,
@@ -20990,11 +20997,12 @@ function createServer() {
 
   server.tool(
     "google_ads_keyword_historical_metrics",
-    "Ruft historische Keyword-Planer-Daten aus der Google Ads API read-only ab. Laender und Sprache koennen bequem als Codes wie DE/AT/CH und de/en oder alternativ als Google-Konstanten-IDs angegeben werden.",
+    "Ruft historische Keyword-Planer-Daten aus der Google Ads API read-only ab. Laender und Sprache koennen bequem als Codes wie DE/AT/CH und de/en oder alternativ als Google-Konstanten-IDs angegeben werden. Mit all_locations=true werden alle geografischen Zielgebiete zusammengefasst.",
     {
       customer_id: z.string(),
       keywords: z.array(z.string().min(1).max(80)).min(1).max(1000),
       login_customer_id: z.string().optional(),
+      all_locations: z.boolean().optional().default(false),
       country_codes: z.array(z.string().regex(/^[A-Za-z]{2}$/)).min(1).max(10).optional(),
       geo_target_constant_ids: z.array(z.string().regex(/^\d+$/)).min(1).max(10).optional(),
       language_code: z.string().regex(/^[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?$/).optional(),
@@ -21013,6 +21021,7 @@ function createServer() {
       customer_id,
       keywords,
       login_customer_id,
+      all_locations,
       country_codes,
       geo_target_constant_ids,
       language_code,
@@ -21029,6 +21038,7 @@ function createServer() {
         resolvedTargeting = await resolveGoogleAdsKeywordTargeting({
           customerId: normalizedCustomerId,
           loginCustomerId: login_customer_id,
+          allLocations: all_locations,
           geoTargetConstantIds: geo_target_constant_ids,
           countryCodes: country_codes,
           languageConstantId: language_constant_id,
@@ -21070,6 +21080,7 @@ function createServer() {
           login_customer_id: getGoogleAdsLoginCustomerId(login_customer_id),
           ok: false,
           targeting: {
+            all_locations,
             country_codes: country_codes || null,
             language_code: language_code || null,
             resolved_countries: resolvedTargeting.resolvedCountries,
@@ -21098,6 +21109,7 @@ function createServer() {
         currency_lookup_error: currency.lookupError,
         currency_cache_hit: currency.cacheHit,
         targeting: {
+          all_locations,
           country_codes: country_codes || null,
           language_code: language_code || null,
           resolved_countries: resolvedTargeting.resolvedCountries,
@@ -21116,12 +21128,13 @@ function createServer() {
 
   server.tool(
     "google_ads_keyword_ideas",
-    "Ermittelt neue Keyword-Ideen und historische Keyword-Planer-Metriken read-only aus Seed-Begriffen, einer Landingpage oder beidem. Laender und Sprache sind als Codes flexibel waehbar.",
+    "Ermittelt neue Keyword-Ideen und historische Keyword-Planer-Metriken read-only aus Seed-Begriffen, einer Landingpage oder beidem. Laender und Sprache sind als Codes flexibel waehbar. Mit all_locations=true werden alle geografischen Zielgebiete zusammengefasst.",
     {
       customer_id: z.string(),
       seed_keywords: z.array(z.string().min(1).max(80)).max(20).optional().default([]),
       page_url: z.string().url().optional(),
       login_customer_id: z.string().optional(),
+      all_locations: z.boolean().optional().default(false),
       country_codes: z.array(z.string().regex(/^[A-Za-z]{2}$/)).min(1).max(10).optional(),
       geo_target_constant_ids: z.array(z.string().regex(/^\d+$/)).min(1).max(10).optional(),
       language_code: z.string().regex(/^[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?$/).optional(),
@@ -21144,6 +21157,7 @@ function createServer() {
       seed_keywords,
       page_url,
       login_customer_id,
+      all_locations,
       country_codes,
       geo_target_constant_ids,
       language_code,
@@ -21163,6 +21177,7 @@ function createServer() {
         resolvedTargeting = await resolveGoogleAdsKeywordTargeting({
           customerId: normalizedCustomerId,
           loginCustomerId: login_customer_id,
+          allLocations: all_locations,
           geoTargetConstantIds: geo_target_constant_ids,
           countryCodes: country_codes,
           languageConstantId: language_constant_id,
@@ -21242,6 +21257,7 @@ function createServer() {
         currency_lookup_error: currency.lookupError,
         currency_cache_hit: currency.cacheHit,
         targeting: {
+          all_locations,
           country_codes: country_codes || null,
           language_code: language_code || null,
           resolved_countries: resolvedTargeting.resolvedCountries,

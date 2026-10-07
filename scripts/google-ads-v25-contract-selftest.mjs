@@ -25,6 +25,7 @@ assert.match(adsTools, /path: `\/customers\/\$\{normalizedCustomerId\}\/googleAd
 assert.match(adsTools, /"google_ads_keyword_historical_metrics"/);
 assert.match(adsTools, /path: `\/customers\/\$\{normalizedCustomerId\}:generateKeywordHistoricalMetrics`/);
 assert.match(adsTools, /country_codes:/);
+assert.match(adsTools, /all_locations:/);
 assert.match(adsTools, /language_code:/);
 assert.match(adsTools, /includeAverageCpc: include_average_cpc/);
 assert.match(adsTools, /"google_ads_keyword_ideas"/);
