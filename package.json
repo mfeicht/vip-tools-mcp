@@ -36,6 +36,7 @@
     "test:asana-events": "node scripts/asana-events-selftest.mjs",
     "test:dashboard-health": "node scripts/dashboard-health-selftest.mjs",
     "test:google-drive-upload-contract": "node scripts/google-drive-upload-contract-selftest.mjs",
+    "test:google-drive-write-policy": "node --test lib/google-drive-write-policy.test.mjs",
     "test:google-docs-linked-reader": "node scripts/google-docs-linked-reader-selftest.mjs",
     "test:google-ads-v25": "node scripts/google-ads-v25-contract-selftest.mjs",
     "test:google-ads-keyword-metrics": "node --test lib/google-ads-keyword-metrics.test.mjs",

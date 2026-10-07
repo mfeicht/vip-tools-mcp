@@ -14,6 +14,7 @@ import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 import { assertLinkedGoogleDocScope, linkedGoogleDocReadback } from "./lib/google-docs-linked-reader.js";
+import { assertInstructionReferencesDriveIds, assertRecoverableTrashTarget, resolveCopyDestination } from "./lib/google-drive-write-policy.mjs";
 import { selectBoundedEmailText } from "./lib/email-uid-text.js";
 import { assertBufferEditDueAtReadback, bufferEditScheduleFields } from "./lib/buffer-edit-schedule.js";
 import {
@@ -667,6 +668,12 @@ const TOOL_EXTERNAL_WRITE = Object.freeze({
   destructiveHint: false,
   idempotentHint: false,
   openWorldHint: true
+});
+const TOOL_DESTRUCTIVE_WRITE = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false
 });
 const TOOL_DESTRUCTIVE_IDEMPOTENT_WRITE = Object.freeze({
   readOnlyHint: false,
@@ -3358,8 +3365,8 @@ async function getDriveFile(fileId, fields = "id,name,mimeType,parents,webViewLi
   return res.data;
 }
 
-async function assertAllowedGoogleFolder(folderId, googleContext = {}) {
-  if (GOOGLE_ALLOWED_FOLDER_IDS.has(folderId)) return;
+async function isAllowedGoogleFolder(folderId, googleContext = {}) {
+  if (GOOGLE_ALLOWED_FOLDER_IDS.has(folderId)) return true;
 
   let currentId = folderId;
   for (let depth = 0; depth < 10; depth += 1) {
@@ -3369,14 +3376,17 @@ async function assertAllowedGoogleFolder(folderId, googleContext = {}) {
     }
 
     const parents = folder.parents || [];
-    if (parents.some((parent) => GOOGLE_ALLOWED_FOLDER_IDS.has(parent))) return;
+    if (parents.some((parent) => GOOGLE_ALLOWED_FOLDER_IDS.has(parent))) return true;
     if (!parents.length) break;
     currentId = parents[0];
   }
 
-  throw new Error(
-    `Google-Ordner ${folderId} liegt nicht im erlaubten Agenten-Drive-Bereich. Erlaubter Root: ${GOOGLE_AGENT_FOLDER_ID}`
-  );
+  return false;
+}
+
+async function assertAllowedGoogleFolder(folderId, googleContext = {}) {
+  if (await isAllowedGoogleFolder(folderId, googleContext)) return;
+  throw new Error(`Google-Ordner ${folderId} liegt nicht im erlaubten Agenten-Drive-Bereich. Erlaubter Root: ${GOOGLE_AGENT_FOLDER_ID}`);
 }
 
 async function uploadBufferToDrive({
@@ -10758,7 +10768,8 @@ async function assertActionAuthorized({
   asanaTaskGid,
   approvedBy,
   actionName,
-  requireMoritz = false
+  requireMoritz = false,
+  requiredDriveResourceIds = []
 }) {
   const source = authorization?.source || "asana";
 
@@ -10803,7 +10814,8 @@ async function assertActionAuthorized({
       url: `/tasks/${asanaTaskGid}`,
       params: {
         opt_fields:
-          "gid,name,permalink_url,created_by.gid,created_by.name,assignee.gid,assignee.name,followers.gid,followers.name"
+          "gid,name,permalink_url,created_by.gid,created_by.name,assignee.gid,assignee.name,followers.gid,followers.name" +
+          (requiredDriveResourceIds.length ? ",notes,html_notes" : "")
       }
     }),
     asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" })
@@ -10867,6 +10879,12 @@ async function assertActionAuthorized({
   }
   if (requireMoritz && approvedBy && !isMoritzIdentityLabel(approvedBy)) {
     throw new Error(`${actionName}: approved_by widerspricht dem verifizierten Moritz-Autor.`);
+  }
+  if (requiredDriveResourceIds.length) {
+    assertInstructionReferencesDriveIds(
+      [task.name, task.notes, task.html_notes, authorizationStory?.text, authorizationStory?.html_text].join("\n"),
+      requiredDriveResourceIds
+    );
   }
 
   const authorizationStoryHtml = String(authorizationStory?.html_text || "");
@@ -21943,7 +21961,7 @@ function createServer() {
 
   server.tool(
     "google_drive_copy_file_to_agent_folder",
-    "Kopiert eine bestehende Google-Drive-Datei als echte Drive-Dateikopie in den erlaubten Agenten-Drive-Ordner. Nutze dies fuer Vorlagen, wenn Formatierung, Tabs, Formeln, Filter, Validierungen oder Layout erhalten bleiben sollen.",
+    "Kopiert eine bestehende Drive-Datei in einen erlaubten Agenten-Ordner. Ein anderes geteiltes Ziel ist nur mit aktueller Moritz-Anweisung und nachgewiesenem Google-Schreibrecht zulässig.",
     {
       agent_id: agentIdSchema,
       source_file_id: z.string(),
@@ -21968,17 +21986,40 @@ function createServer() {
       verify_after
     }) => {
       const googleContext = { agent_id };
-      await assertAllowedGoogleFolder(target_folder_id, googleContext);
+      const destination = await resolveCopyDestination({
+        targetFolderId: target_folder_id,
+        isAllowlisted: (folderId) => isAllowedGoogleFolder(folderId, googleContext),
+        authorizeMoritz: () => assertActionAuthorized({
+          agentId: agent_id,
+          authorization,
+          confirmedByAsana: confirmed_by_asana,
+          asanaTaskGid: asana_task_gid,
+          actionName: "google_drive_copy_file_to_agent_folder:shared_target",
+          requireMoritz: true,
+          requiredDriveResourceIds: [source_file_id, target_folder_id]
+        }),
+        readFolder: (folderId) => getDriveFile(
+          folderId, "id,name,mimeType,trashed,capabilities(canAddChildren)", googleContext
+        )
+      });
 
-      const sourceFile = await getDriveFile(source_file_id, "id,name,mimeType,parents,webViewLink", googleContext);
+      const sourceFile = await getDriveFile(
+        source_file_id,
+        "id,name,mimeType,parents,webViewLink,trashed,capabilities(canCopy)",
+        googleContext
+      );
       if (sourceFile.mimeType === "application/vnd.google-apps.folder") {
         throw new Error("Google-Ordner koennen nicht per files.copy kopiert werden. Fuer Ordner braucht es einen separaten rekursiven Kopierprozess.");
+      }
+      if (sourceFile.trashed || sourceFile.capabilities?.canCopy === false) {
+        throw new Error("Die Quelldatei ist gelöscht oder das aktive Google-Konto darf sie nicht kopieren.");
       }
 
       const copyTitle = title?.trim() || `${sourceFile.name} - Kopie`;
       const plannedCopy = {
         source_file: sourceFile,
         target_folder_id,
+        target_scope: destination.scope,
         title: copyTitle,
         preserves_native_google_formatting: true
       };
@@ -21988,14 +22029,17 @@ function createServer() {
           agent_id,
           dry_run: true,
           ...plannedCopy,
+          authorization: destination.authorization,
           requires_for_live: [
             "dry_run=false",
-            "verifizierter Asana-Auftrag oder authorization.source=direct_codex aus aktuellem Moritz-Auftrag"
+            destination.scope === "agent_folder"
+              ? "verifizierter Asana-Auftrag oder authorization.source=direct_codex aus aktuellem Moritz-Auftrag"
+              : "aktuelle Moritz-Anweisung und Google-Schreibrecht für den geteilten Zielordner"
           ]
         });
       }
 
-      const authorization_receipt = await assertActionAuthorized({
+      const authorization_receipt = destination.authorization || await assertActionAuthorized({
         agentId: agent_id,
         authorization,
         confirmedByAsana: confirmed_by_asana,
@@ -22033,6 +22077,65 @@ function createServer() {
         verification_status: verificationStatus,
         preserves_native_google_formatting: true
       });
+    }
+  );
+
+  server.tool(
+    "google_drive_trash_file",
+    "Verschiebt genau eine verifizierte Drive-Datei nach aktueller Moritz-Anweisung in den wiederherstellbaren Papierkorb. Ordner und endgültiges Löschen sind ausgeschlossen.",
+    {
+      agent_id: agentIdSchema,
+      file_id: z.string().min(20).max(200),
+      expected_name: z.string().min(1).max(500),
+      expected_parent_id: z.string().min(1).max(200),
+      expected_modified_time: z.string().optional(),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_DESTRUCTIVE_WRITE,
+    async ({ agent_id, file_id, expected_name, expected_parent_id, expected_modified_time, dry_run, confirmed_by_asana, asana_task_gid, authorization }) => {
+      const googleContext = { agent_id };
+      const fields = "id,name,mimeType,parents,modifiedTime,trashed,capabilities(canTrash),webViewLink";
+      const file = await getDriveFile(file_id, fields, googleContext);
+      assertRecoverableTrashTarget(file, {
+        fileId: file_id,
+        expectedName: expected_name,
+        expectedParentId: expected_parent_id,
+        expectedModifiedTime: expected_modified_time
+      });
+
+      if (dry_run) {
+        return out({
+          agent_id,
+          dry_run: true,
+          file,
+          requires_for_live: ["dry_run=false", "expected_modified_time aus dieser Vorschau", "aktuelle Moritz-Anweisung"]
+        });
+      }
+      if (!expected_modified_time) throw new Error("Live-Papierkorbaktion braucht expected_modified_time aus der Vorschau.");
+
+      const authorization_receipt = await assertActionAuthorized({
+        agentId: agent_id,
+        authorization,
+        confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid,
+        actionName: "google_drive_trash_file",
+        requireMoritz: true,
+        requiredDriveResourceIds: [file_id]
+      });
+      await googleRequest({
+        method: "PATCH",
+        url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file_id)}`,
+        params: { fields: "id,name,trashed", supportsAllDrives: true },
+        data: { trashed: true }
+      }, googleContext);
+      const verifiedFile = await getDriveFile(file_id, "id,name,trashed", googleContext);
+      if (verifiedFile.id !== file_id || verifiedFile.trashed !== true) {
+        throw new Error("Papierkorbaktion nicht per Drive-Readback verifiziert.");
+      }
+      return out({ agent_id, dry_run: false, authorization: authorization_receipt, file_before: file, verified_file: verifiedFile });
     }
   );
 

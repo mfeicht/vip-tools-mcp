@@ -57,6 +57,7 @@ try {
     "dataforseo_google_keyword_research",
     "google_drive_upload_csv_to_agent_folder",
     "google_drive_copy_file_to_agent_folder",
+    "google_drive_trash_file",
     "google_sheets_update_range",
     "rs_redaktionsplan_update_row",
     "google_sheets_delete_duplicates",
@@ -105,6 +106,7 @@ try {
       missingAuthorizationSchema.length === 0 &&
       Boolean(toolsByName.get("action_authorization_preflight")) &&
       Boolean(toolsByName.get("google_ads_mutate")?.inputSchema?.properties?.extra_authorization),
+    drive_trash_marked_destructive: toolsByName.get("google_drive_trash_file")?.annotations?.destructiveHint === true,
     valid_direct_moritz_passed:
       !validDirect.isError &&
       /"authorization_status"\s*:\s*"verified"/.test(validText) &&
