@@ -19840,6 +19840,58 @@ function createServer() {
   );
 
   server.tool(
+    "gemini_image_drive_preview",
+    "Liest ein privates, als Google-Gemini-Ausgabe markiertes JPEG-/PNG-Bild aus dem erlaubten Agenten-Drive authentifiziert und gibt es für die visuelle Prüfung als MCP-Bild zurück. Es werden weder Drive noch Cloudinary verändert.",
+    {
+      agent_id: agentIdSchema,
+      drive_file_id: z.string().min(10).max(200),
+      max_image_bytes: z.number().int().min(1024 * 1024).max(12 * 1024 * 1024).optional().default(12 * 1024 * 1024)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, drive_file_id, max_image_bytes }) => {
+      const googleContext = { agent_id };
+      const file = await getDriveFile(
+        drive_file_id,
+        "id,name,mimeType,size,parents,webViewLink,appProperties,trashed",
+        googleContext
+      );
+      if (file.trashed) throw new Error("Gemini-Drive-Datei liegt im Papierkorb.");
+      const validated = validateGeneratedDriveImageMetadata(file, max_image_bytes);
+      const allowedParentId = await assertGeneratedDriveFileInAllowedFolder(file, googleContext);
+      const bytes = await downloadDriveFileBuffer(drive_file_id, max_image_bytes, googleContext);
+      const verified = verifyGeneratedImageBytes(bytes, validated.mimeType);
+      if (verified.bytes !== validated.size) {
+        throw new Error("Gemini-Drive-Datei hat eine abweichende Dateigroesse im Byte-Readback.");
+      }
+      const expectedSha256 = file.appProperties?.content_sha256 || null;
+      if (expectedSha256 && expectedSha256 !== verified.sha256) {
+        throw new Error("Gemini-Drive-Datei stimmt nicht mit ihrem gespeicherten content_sha256 ueberein.");
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              agent_id,
+              drive_file_id: file.id,
+              file_name: file.name,
+              mime_type: verified.detectedMimeType,
+              bytes: verified.bytes,
+              sha256: verified.sha256,
+              dimensions: verified.dimensions,
+              allowed_parent_id: allowedParentId,
+              project_key: file.appProperties?.project_key || null,
+              request_key: file.appProperties?.request_key || null,
+              visual_review_required: true
+            }, null, 2)
+          },
+          { type: "image", data: bytes.toString("base64"), mimeType: verified.detectedMimeType }
+        ]
+      };
+    }
+  );
+
+  server.tool(
     "gemini_image_publish_to_cloudinary",
     "Uebergibt eine im erlaubten Agenten-Drive gespeicherte, eindeutig als Google-Gemini-Ausgabe markierte JPEG-/PNG-Datei an einen engen projektbezogenen Cloudinary-Prefix. Liefert die URL erst nach oeffentlichem Bild-Readback fuer Templated. Standard ist dry_run=true; der Drive-Ursprung bleibt privat und unveraendert.",
     {

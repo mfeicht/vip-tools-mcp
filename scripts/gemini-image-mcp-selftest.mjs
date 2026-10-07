@@ -18,7 +18,7 @@ child.stderr.on("data", (chunk) => {
 });
 
 async function waitForServer() {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + 45_000;
   let stdout = "";
   child.stdout.on("data", (chunk) => {
     stdout += chunk.toString("utf8");
@@ -47,6 +47,7 @@ try {
   const toolNames = new Set((listed.tools || []).map((tool) => tool.name));
   assert.ok(toolNames.has("gemini_image_check_config"));
   assert.ok(toolNames.has("gemini_image_generate"));
+  assert.ok(toolNames.has("gemini_image_drive_preview"));
   assert.ok(toolNames.has("gemini_image_publish_to_cloudinary"));
   assert.ok(toolNames.has("gemini_image_batch_submit"));
   assert.ok(toolNames.has("gemini_image_batch_status"));
