@@ -507,6 +507,55 @@ assert.equal(financeNoFollowUpSignal.no_follow_up_claim, true);
 assert.equal(financeNoFollowUpSignal.has_existing_task_coverage_claim, false);
 assert.equal(financeNoFollowUpSignal.blocked_without_follow_up_task, false);
 
+// Finance stories 1219419450503023 and 1219437923406716: a closed
+// instance decision and source-task metadata are not future-work coverage.
+const financeInstanceScopeStory = {
+  text: "Abschluss des Routine-Scopes\nKeine weitere Folgeaufgabe oder Nacharbeit für diesen Instanz-Scope erforderlich.\n" +
+    "Evidenz / Verifikation\nDer read-only Pflicht-Wrapper, die task-spezifische Evidenz und die Ergebnisstory " +
+    "sind für den engen Routine-Scope vorhanden und geprüft."
+};
+const financeInstanceScopeSignals = detectRoutineFollowUpSignals({
+  finalComment: financeInstanceScopeStory,
+  completionBasis: "Instanz-Scope laut Abschlussstory erfüllt.",
+  followUpNotRequiredBasis: "Kein separater unerledigter Arbeitsauftrag aus dieser Instanz."
+});
+assert.equal(financeInstanceScopeSignals.no_follow_up_claim, true);
+assert.equal(financeInstanceScopeSignals.has_existing_task_coverage_claim, false);
+assert.equal(financeInstanceScopeSignals.blocked_without_follow_up_task, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: financeInstanceScopeStory, hasFollowUpTask: false
+}).ok, true);
+assert.equal(hasRoutineNoFollowUpDecision(financeInstanceScopeStory.text), true);
+
+const financeTaskMetadataStory = {
+  text: "Follow-up\nKeine zusätzliche Folgeaufgabe erforderlich: Der beauftragte Desk-Output ist als " +
+    "datierter Research-Handoff gespeichert.\nEvidenz / Verifikation\n" +
+    "Verifiziert: Task ist offen, VIP AI-Finance zugewiesen, Routine-Tag vorhanden und seit 06.10.2026 fällig."
+};
+const financeTaskMetadataSignals = detectRoutineFollowUpSignals({ finalComment: financeTaskMetadataStory });
+assert.equal(financeTaskMetadataSignals.no_follow_up_claim, true);
+assert.equal(financeTaskMetadataSignals.has_existing_task_coverage_claim, false);
+assert.equal(financeTaskMetadataSignals.blocked_without_follow_up_task, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: financeTaskMetadataStory, hasFollowUpTask: false
+}).ok, true);
+for (const text of [
+  "Keine weitere Folgeaufgabe oder Nacharbeit für diesen Instanz-Scope möglicherweise erforderlich.",
+  "Keine weitere Folgeaufgabe oder Nacharbeit für diesen Instanz-Scope erforderlich, aber die Nacharbeit ist noch offen."
+]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({
+    finalComment: { text }, hasFollowUpTask: false
+  }).ok, false);
+}
+for (const text of [
+  `${financeInstanceScopeStory.text}\nDie nächste Routine übernimmt die weitere Bearbeitung.`,
+  `${financeTaskMetadataStory.text} Die nächste Routine übernimmt die Nacharbeit.`
+]) {
+  assert.equal(detectRoutineFollowUpSignals({
+    finalComment: { text }
+  }).blocked_without_follow_up_task, true);
+}
+
 // Exact Finance result/status stories 1218927790360342, 1218928148082902
 // and 1218935557506000. Reuse the existing decision; do not prompt for a
 // second result/status story or a dummy follow-up task.
