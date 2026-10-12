@@ -409,7 +409,8 @@ for (const text of ["Follow-up\nKeines nachgewiesen.", "Keine weitere Recherche 
 for (const text of [
   "Für diese Routineinstanz ist keine zusätzliche Folgeaufgabe oder Nacharbeit erforderlich; die reguläre Asana-Folgeinstanz bleibt der nächste operative Lauf.",
   "Für die vollständig bearbeitete Instanz ist keine zusätzliche Folgeaufgabe, Übergabe oder Nacharbeit erforderlich.",
-  "Für diese abgeschlossene Routineinstanz ist keine separate Folgeaufgabe nötig: Der belegte Lead ist vollständig verarbeitet."
+  "Für diese abgeschlossene Routineinstanz ist keine separate Folgeaufgabe nötig: Der belegte Lead ist vollständig verarbeitet.",
+  "Für den abgearbeiteten Instanz-Scope ist keine zusätzliche Asana-Folgeaufgabe erforderlich. Keine neue Watchlist-, Score-, Order- oder Gate-Änderung."
 ]) {
   const finalComment = { text: `${text}\nEvidenz / Verifikation\nDer Instanz-Scope wurde zurückgelesen.` };
   const signals = detectRoutineFollowUpSignals({ finalComment });
@@ -417,6 +418,41 @@ for (const text of [
   assert.equal(signals.blocked_without_follow_up_task, false);
   assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment, hasFollowUpTask: false }).ok, true);
 }
+const financeAfterActionFinalComment = {
+  text: "Für den abgearbeiteten Instanz-Scope ist keine zusätzliche Asana-Folgeaufgabe erforderlich.\nEvidenz / Verifikation\nDer begrenzte Routine-Scope ist erfüllt."
+};
+const financeAfterActionSignals = detectRoutineFollowUpSignals({
+  finalComment: financeAfterActionFinalComment,
+  completionBasis: "Der begrenzte Review ist vollständig veröffentlicht; die Follow-up-Entscheidung ist dokumentiert.",
+  followUpNotRequiredBasis: "Keine zusätzliche Asana-Folgeaufgabe erforderlich."
+});
+assert.equal(financeAfterActionSignals.no_follow_up_claim, true);
+assert.equal(financeAfterActionSignals.blocked_without_follow_up_task, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: financeAfterActionFinalComment, hasFollowUpTask: false
+}).ok, true);
+const contradictoryAsanaNoFollowUp = {
+  text: "Keine zusätzliche Asana-Folgeaufgabe erforderlich, aber die technische Nacharbeit ist noch offen."
+};
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: contradictoryAsanaNoFollowUp
+}).no_follow_up_claim, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: contradictoryAsanaNoFollowUp, hasFollowUpTask: false
+}).ok, false);
+const activeAsanaFollowUp = {
+  text: "Die zusätzliche Asana-Folgeaufgabe wurde angelegt und muss weiterbearbeitet werden."
+};
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: activeAsanaFollowUp
+}).blocked_without_follow_up_task, true);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: activeAsanaFollowUp, hasFollowUpTask: false
+}).ok, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { text: "Der begrenzte Routine-Scope ist erfüllt." },
+  hasFollowUpTask: false
+}).ok, false);
 assert.equal(validateRoutineVisibleFollowUpStatus({
   finalComment: { text: "Keine separate Folgeaufgabe nötig, aber die technische Nacharbeit ist noch offen." },
   hasFollowUpTask: false
