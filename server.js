@@ -92,6 +92,7 @@ import {
   sameAsanaDateTimeInstant
 } from "./lib/asana-schedule-guards.js";
 import { assertRoutineCatchupOnCadence, assertRoutineDueCanBeCleared, routineFutureRescheduleRequiresCadence } from "./lib/asana-routine-cadence.js";
+import { MAILPOET_SEGMENT24_GRANT, inspectMailpoetSegment24StandingGrant } from "./lib/mailpoet-segment24-standing-grant.js";
 import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
 import { buildAsanaTaskSearchPlan, executeAsanaInvolvedSearch } from "./lib/asana-search-params.js";
 import { readAsanaResourceEvents } from "./lib/asana-events.js";
@@ -13453,6 +13454,56 @@ function createServer() {
         requireMoritz: require_moritz
       });
       return out({ agent_id, action_name, authorization: receipt });
+    }
+  );
+
+  server.tool(
+    "asana_mailpoet_segment24_grant_preflight",
+    "Prüft read-only Moritz' eng begrenzte Dauerfreigabe für die Developer-Routine App.Goklever.de/MailPoet-Segment 24. Vor Fälligkeit nur shadow_only; Asana-Text oder Agentenkommentare allein erteilen keine Freigabe. Dieser Preflight ersetzt keine frischen MailPoet-/WordPress-Datenprüfungen.",
+    {
+      agent_id: agentIdSchema,
+      task_gid: z.string(),
+      shadow_only: z.boolean().optional().default(false)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, task_gid, shadow_only }) => {
+      validateAsanaGid(task_gid, "task_gid");
+      if (agent_id !== "vip-ai-developer") {
+        throw new Error("Diese Dauerfreigabe ist ausschließlich VIP AI-Developer zugeordnet.");
+      }
+      const asana = getAsana(agent_id);
+      const fields = "gid,name,notes,completed,due_on,due_at,assignee.gid,projects.gid,tags.name";
+      const [taskRes, rootRes] = await Promise.all([
+        asanaRequestWithRetry(asana, { method: "GET", url: `/tasks/${task_gid}`,
+          params: { opt_fields: fields } }),
+        asanaRequestWithRetry(asana, { method: "GET",
+          url: `/tasks/${MAILPOET_SEGMENT24_GRANT.root_task_gid}`,
+          params: { opt_fields: fields } })
+      ]);
+      const task = taskRes.data.data;
+      const sameSlotTaskGids = [];
+      let offset = null;
+      let complete = false;
+      for (let page = 0; page < 20; page += 1) {
+        const res = await asanaRequestWithRetry(asana, {
+          method: "GET",
+          url: `/projects/${MAILPOET_SEGMENT24_GRANT.project_gid}/tasks`,
+          params: { completed_since: "now", limit: 100, opt_fields: "gid,name,completed,due_on",
+            ...(offset ? { offset } : {}) }
+        });
+        for (const candidate of res.data.data || []) {
+          if (!candidate.completed && candidate.name === MAILPOET_SEGMENT24_GRANT.task_name &&
+              candidate.due_on === task.due_on) sameSlotTaskGids.push(candidate.gid);
+        }
+        offset = res.data.next_page?.offset || null;
+        if (!offset) { complete = true; break; }
+      }
+      if (!complete) throw new Error("Asana-Projektliste nicht vollständig paginiert; keine Dauerfreigabe.");
+      const grant = inspectMailpoetSegment24StandingGrant({ agent_id, task,
+        root_task: rootRes.data.data, same_slot_task_gids: sameSlotTaskGids,
+        shadow_only, now: new Date() });
+      return out({ agent_id, ...grant, source: "operations_verified_direct_codex_standing_grant",
+        limitation: "Nur dieser Task-Slot und MailPoet-Segment 24; vor jeder Löschung frische Identitäts-, Membership- und Daten-Readbacks erforderlich." });
     }
   );
 

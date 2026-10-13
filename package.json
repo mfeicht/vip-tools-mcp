@@ -11,6 +11,7 @@
     "test": "node scripts/asana-watcher.mjs --self-test",
     "test:evidence-gate": "node scripts/evidence-gate-selftest.mjs",
     "test:authorization-origin": "node scripts/authorization-origin-selftest.mjs",
+    "test:mailpoet-segment24-standing-grant": "node scripts/mailpoet-segment24-standing-grant-selftest.mjs",
     "test:asana-governance-gates": "node scripts/asana-governance-gate-selftest.mjs",
     "test:asana-routine-intent": "node scripts/asana-routine-intent-selftest.mjs",
     "test:asana-observer-comment-guard": "node scripts/asana-observer-comment-guard-selftest.mjs",
