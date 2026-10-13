@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { assertRoutineCatchupOnCadence, nextRoutineCadenceSlot,
+import { assertRoutineCatchupOnCadence, assertRoutineDueCanBeCleared, isOpenRoutineTask, nextRoutineCadenceSlot,
   routineFutureRescheduleRequiresCadence } from "../lib/asana-routine-cadence.js";
 
 const salesRule = { unit: "day", interval: 2, anchor_due_on: "2026-10-03" };
@@ -7,6 +7,16 @@ const salesSource = { due_on: "2026-10-03", due_at: "2026-10-03T07:00:00.000Z" }
 const salesNow = new Date("2026-10-13T18:00:00.000Z");
 const overdueNext = { name: "R: Lead-Adressen hinzufügen (Badumbau für App.Goklever)",
   completed: false, due_on: "2026-10-05", due_at: "2026-10-05T07:00:00.000Z" };
+assert.equal(isOpenRoutineTask(overdueNext), true);
+assert.equal(isOpenRoutineTask({ ...overdueNext, completed: true }), false);
+assert.equal(isOpenRoutineTask({ name: "Andere Routine", tags: [{ name: "Wiederkehrend" }], completed: false }), true);
+assert.throws(() => assertRoutineDueCanBeCleared(overdueNext), /offene Routine darf ihre Fälligkeit nicht verlieren/);
+assert.throws(() => assertRoutineDueCanBeCleared({ name: "Andere Routine", tags: [{ name: "Routine" }], completed: false }),
+  /offene Routine darf ihre Fälligkeit nicht verlieren/);
+assert.doesNotThrow(() => assertRoutineDueCanBeCleared({ ...overdueNext, completed: true }));
+assert.doesNotThrow(() => assertRoutineDueCanBeCleared({ name: "Einmalige Aufgabe", completed: false }));
+assert.equal(routineFutureRescheduleRequiresCadence({ ...overdueNext, due_on: null, due_at: null },
+  { expected_due_at: "2026-10-14T07:00:00.000Z" }, salesNow), true);
 assert.equal(routineFutureRescheduleRequiresCadence(overdueNext,
   { expected_due_at: "2026-10-14T07:00:00.000Z" }, salesNow), true);
 assert.equal(routineFutureRescheduleRequiresCadence(overdueNext,

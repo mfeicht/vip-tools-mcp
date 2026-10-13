@@ -91,7 +91,7 @@ import {
   isRoutineInstanceMissingAlarmIntent,
   sameAsanaDateTimeInstant
 } from "./lib/asana-schedule-guards.js";
-import { assertRoutineCatchupOnCadence, routineFutureRescheduleRequiresCadence } from "./lib/asana-routine-cadence.js";
+import { assertRoutineCatchupOnCadence, assertRoutineDueCanBeCleared, routineFutureRescheduleRequiresCadence } from "./lib/asana-routine-cadence.js";
 import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
 import { buildAsanaTaskSearchPlan, executeAsanaInvolvedSearch } from "./lib/asana-search-params.js";
 import { readAsanaResourceEvents } from "./lib/asana-events.js";
@@ -15102,7 +15102,7 @@ function createServer() {
 
   server.tool(
     "asana_update_task_schedule",
-    "Ändert Fälligkeitsdatum/-uhrzeit einer Asana-Aufgabe über einen engen Pfad. due_at ist verbindlich und muss als ISO-Zeitpunkt mit Zeitzone übergeben werden; due_on und due_at sind gegenseitig exklusiv. Jede neue künftige Fälligkeit einer offenen Routine erfordert eine belegte schedule_rule und den nächsten Rastertermin.",
+    "Ändert Fälligkeitsdatum/-uhrzeit einer Asana-Aufgabe über einen engen Pfad. due_at ist verbindlich und muss als ISO-Zeitpunkt mit Zeitzone übergeben werden; due_on und due_at sind gegenseitig exklusiv. Jede neue künftige Fälligkeit einer offenen Routine erfordert eine belegte schedule_rule und den nächsten Rastertermin; clear_due ist für offene Routinen gesperrt.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -15132,6 +15132,7 @@ function createServer() {
         params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
       });
       const before_task = beforeRes.data.data;
+      if (clear_due) assertRoutineDueCanBeCleared(before_task);
       const unchangedDue = due_at
         ? Boolean(before_task.due_at && sameAsanaDateTimeInstant(before_task.due_at, due_at))
         : Boolean(due_on && !before_task.due_at && before_task.due_on === due_on);
@@ -15499,7 +15500,7 @@ function createServer() {
 
   server.tool(
     "asana_repair_routine_catchup_due",
-    "Korrigiert nach Routine-Abschluss eine erzeugte Folgeinstanz auf den naechsten Termin ihres belegten Tages-, Wochen- oder Monatsrhythmus. Ein bloss kuenftiger Termin reicht nicht: Off-Cadence-Termine werden ebenfalls korrigiert.",
+    "Korrigiert nach Routine-Abschluss eine erzeugte Folgeinstanz auf den nächsten Termin ihres belegten Tages-, Wochen- oder Monatsrhythmus. Ein bloß künftiger Termin reicht nicht: Auch rasterfremde oder fehlende Fälligkeiten werden korrigiert.",
     {
       agent_id: agentIdSchema,
       source_task_gid: z.string(),
@@ -15597,9 +15598,6 @@ function createServer() {
       }
 
       const due_position = getAsanaTaskDuePosition(next_task, now);
-      if (due_position.mode === "none") {
-        throw new Error("next_task hat keine Faelligkeit; Catch-up-Reparatur braucht einen vorhandenen Due-Stand.");
-      }
       if (due_position.relation === "invalid") {
         throw new Error("next_task hat eine ungueltige Faelligkeit; manuelle Klaerung noetig.");
       }
