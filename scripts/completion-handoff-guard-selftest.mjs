@@ -543,6 +543,37 @@ assert.equal(financeNoFollowUpSignal.no_follow_up_claim, true);
 assert.equal(financeNoFollowUpSignal.has_existing_task_coverage_claim, false);
 assert.equal(financeNoFollowUpSignal.blocked_without_follow_up_task, false);
 
+// Existing Finance stories 1219437967637422 and 1218954092494207 already
+// state that their bounded instance scopes need no separate work.
+for (const text of [
+  "Keine aktive Nacharbeit oder separate Folgeaufgabe ist für diesen begrenzten strukturellen Wochen-Desk erforderlich; spätere Kapitalentscheidungen haben eigene Prüfungsgates.",
+  "Keine weitere Folgeaufgabe oder Nacharbeit für diesen Lauf nötig. Die eigenständigen Finance-Routinen bleiben für ihre regulären Prüftermine zuständig."
+]) {
+  const finalComment = { text: `Follow-up-Status\n${text}\nEvidenz / Verifikation\nDer Instanz-Scope wurde geprüft.` };
+  const signals = detectRoutineFollowUpSignals({ finalComment });
+  assert.equal(hasRoutineNoFollowUpDecision(text), true);
+  assert.equal(signals.no_follow_up_claim, true);
+  assert.equal(signals.blocked_without_follow_up_task, false);
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment, hasFollowUpTask: false }).ok, true);
+}
+for (const text of [
+  "Keine weitere Folgeaufgabe oder Nacharbeit für diesen Lauf möglicherweise nötig.",
+  "Keine aktive Nacharbeit oder separate Folgeaufgabe ist für diesen begrenzten strukturellen Wochen-Desk erforderlich, aber die technische Nacharbeit bleibt offen."
+]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: { text }, hasFollowUpTask: false }).ok, false);
+}
+for (const text of [
+  "Keine weitere Folgeaufgabe oder Nacharbeit für diesen Lauf nötig. Bitte eine neue Folgeaufgabe anlegen.",
+  "Keine weitere Folgeaufgabe oder Nacharbeit für diesen Lauf nötig. Die technische Nacharbeit bleibt offen."
+]) {
+  const signals = detectRoutineFollowUpSignals({ finalComment: { text } });
+  assert.equal(signals.has_explicit_active_follow_up, true);
+  assert.equal(signals.blocked_without_follow_up_task, true);
+}
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: { text: "Keine weitere Folgeaufgabe oder Nacharbeit für diesen Lauf nötig. Die nächste Routine übernimmt die offene Nacharbeit." }
+}).blocked_without_follow_up_task, true);
+
 // Finance stories 1219419450503023 and 1219437923406716: a closed
 // instance decision and source-task metadata are not future-work coverage.
 const financeInstanceScopeStory = {
