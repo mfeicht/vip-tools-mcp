@@ -71,6 +71,49 @@ assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
   proposedText: "Neuer sachlicher Readback ohne Follow-up-Entscheidung."
 }).status, "not_applicable");
 
+// Exact Sales decision wording from the existing 02/07 Oct stories: the
+// comment dedupe and completion gate must agree, without a new status post.
+const salesNoFollowUpStories = [
+  {
+    gid: "1219108233997512",
+    text: "Abschlussbasis\nFür diese abgeschlossene Instanz ist keine separate Follow-up-Aufgabe erforderlich. Es besteht kein unerledigter Arbeitsschritt außerhalb der dokumentierten fünf importierten Leads.\nEvidenz / Verifikation\nErgebnisstory 1219106619553405."
+  },
+  {
+    gid: "1219012035235893",
+    text: "Abschlussstatus\nKeine zusätzliche Follow-up-Aufgabe und keine weitere Nacharbeit für diese Instanz erforderlich. Die reguläre Wiederholung wird durch Asana erzeugt und ist nicht Teil dieses abgeschlossenen Fachlaufs.\nEvidenz / Verifikation\nErgebnisstory 1219010335722185."
+  },
+  {
+    gid: "1219249110196263",
+    text: "Follow-up-Entscheid\nFür diese bereits vollständig belegte Routine-Instanz ist keine zusätzliche operative Folgearbeit erforderlich; die reguläre Routine-Folgeinstanz deckt den nächsten Lauf ab.\nEvidenz / Verifikation\nErgebnisstory 1219106619553405."
+  },
+  {
+    gid: "1219368833899226",
+    text: "Follow-up-Entscheidung\nFür diese bereits vollständig belegte Routine-Instanz besteht keine zusätzliche operative Folgearbeit. Die reguläre Routine-Folgeinstanz deckt den nächsten Lauf ab.\nEvidenz / Verifikation\nErgebnisstory 1219106619553405."
+  }
+].map((story) => ({ ...story, created_by: { gid: "1214338261069890" } }));
+for (const story of salesNoFollowUpStories) {
+  const signals = detectRoutineFollowUpSignals({ finalComment: story });
+  assert.equal(hasRoutineNoFollowUpDecision(story.text), true, story.gid);
+  assert.equal(signals.no_follow_up_claim, true, story.gid);
+  assert.equal(signals.has_existing_task_coverage_claim, false, story.gid);
+  assert.equal(signals.blocked_without_follow_up_task, false, story.gid);
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: story, hasFollowUpTask: false }).ok, true, story.gid);
+  assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+    stories: [story],
+    agentUserGid: "1214338261069890",
+    proposedText: "Keine weitere Folgeaufgabe erforderlich."
+  }).status, "blocked_duplicate_no_follow_up_status", story.gid);
+}
+for (const text of [
+  "Keine separate Follow-up-Aufgabe erforderlich, aber die Nacharbeit ist noch offen.",
+  "Keine zusätzliche Follow-up-Aufgabe und keine weitere Nacharbeit für diese Instanz erforderlich. Die technische Nacharbeit bleibt offen.",
+  "Keine zusätzliche operative Folgearbeit erforderlich. Die bestehende Routine übernimmt die offene Nacharbeit."
+]) {
+  const signals = detectRoutineFollowUpSignals({ finalComment: { text } });
+  assert.equal(signals.blocked_without_follow_up_task, true, text);
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: { text }, hasFollowUpTask: false }).ok, false, text);
+}
+
 const duplicateCommunicationStory = {
   gid: "1218428058256536",
   text: "Vier BCC-Asana-Mails, 0 menschliche Stilbelege. Keine separate Follow-up-Aufgabe nötig. Evidenz / Verifikation. Quelle/Readback: BCC Readback UID 53-56"
@@ -209,6 +252,25 @@ assert.equal(
   }).status,
   "first_material_comment"
 );
+
+const salesScheduleOnlyStory = {
+  gid: "1218937843766464",
+  created_by: { gid: "1214338261069890" },
+  text: "Terminbereinigung\nDie Folgeroutine wurde auf den nächsten freien regulären Slot verschoben. Es wurde kein weiterer Routine-Erfolg behauptet.\nEvidenz / Verifikation\nAsana-Readback bestätigt den neuen Termin."
+};
+assert.equal(inspectRoutineMaterialCommentIdempotency({
+  stories: [salesScheduleOnlyStory],
+  agentUserGid: "1214338261069890"
+}).status, "first_material_comment");
+assert.equal(inspectRoutineMaterialCommentIdempotency({
+  stories: [salesScheduleOnlyStory],
+  agentUserGid: "1214338261069890",
+  supersedesStoryGid: salesScheduleOnlyStory.gid
+}).status, "invalid_supersedes_story");
+assert.equal(inspectRoutineMaterialCommentIdempotency({
+  stories: [{ ...salesScheduleOnlyStory, text: salesScheduleOnlyStory.text.replace("Evidenz / Verifikation", "Fünf Leads importiert.\nEvidenz / Verifikation") }],
+  agentUserGid: "1214338261069890"
+}).status, "blocked_duplicate_material_comment");
 
 const coordinator = createAsanaMaterialCommentCoordinator();
 let releaseFirst;
