@@ -636,6 +636,35 @@ assert.equal(financeNoFollowUpSignal.no_follow_up_claim, true);
 assert.equal(financeNoFollowUpSignal.has_existing_task_coverage_claim, false);
 assert.equal(financeNoFollowUpSignal.blocked_without_follow_up_task, false);
 
+for (const [gid, decision] of [
+  ["1218967492157090", "Kein zusätzlicher Follow-up-Task nötig: Der heutige begrenzte Scanner-Scope ist abgearbeitet; unvalidierte Seeds sind im Bericht als Watch mit Trigger dokumentiert."],
+  ["1218962587450871", "Follow-up: kein aktives Follow-up nötig, weil diese fünf Punkte Watch-/Qualitätskontext für den nächsten regulären Research-/Portfolio-Lauf sind."],
+  ["1219029829828450", "Keine neue aktive Folgeaufgabe erforderlich; der Task benötigt weder Import, Trade noch menschliche Entscheidung."]
+]) {
+  const finalComment = { gid, text: `${decision}\nEvidenz / Verifikation\nDer begrenzte Scope ist belegt.` };
+  assert.equal(hasRoutineNoFollowUpDecision(decision), true, gid);
+  assert.equal(detectRoutineFollowUpSignals({ finalComment }).blocked_without_follow_up_task, false, gid);
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment, hasFollowUpTask: false }).ok, true, gid);
+  assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+    stories: [{ ...finalComment, created_by: { gid: "1215003777954631" } }],
+    agentUserGid: "1215003777954631", proposedText: decision
+  }).status, "blocked_duplicate_no_follow_up_status", gid);
+}
+for (const decision of [
+  "Kein zusätzlicher Follow-up-Task angelegt.",
+  "Follow-up: kein aktives Follow-up nachgewiesen.",
+  "Keine neue aktive Folgeaufgabe angelegt.",
+  "Kein zusätzlicher Follow-up-Task nötig, aber eine Folgeaufgabe ist offen.",
+  "Keine neue aktive Folgeaufgabe erforderlich, jedoch ist eine Freigabe offen."
+]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({
+    finalComment: { text: decision }, hasFollowUpTask: false
+  }).ok, false, decision);
+}
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: { text: "Follow-up: kein aktives Follow-up nötig, aber die bestehende Routine übernimmt weitere Nacharbeit." }
+}).blocked_without_follow_up_task, true);
+
 // Existing Finance stories 1219437967637422 and 1218954092494207 already
 // state that their bounded instance scopes need no separate work.
 for (const text of [
