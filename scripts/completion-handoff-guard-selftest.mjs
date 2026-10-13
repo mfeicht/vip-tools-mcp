@@ -118,6 +118,27 @@ const duplicateCommunicationStory = {
   gid: "1218428058256536",
   text: "Vier BCC-Asana-Mails, 0 menschliche Stilbelege. Keine separate Follow-up-Aufgabe nötig. Evidenz / Verifikation. Quelle/Readback: BCC Readback UID 53-56"
 };
+const communicationCurrentStory = {
+  gid: "1219111944529643",
+  created_by: { gid: "1214979008900132" },
+  text: "Fortsetzung\nEs ist keine fachliche Folgeaufgabe nötig; die nächste tägliche Routineinstanz übernimmt den nächsten Inbox-Zuwachs.\nEvidenz / Verifikation\nCursor und Profil zurückgelesen."
+};
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: communicationCurrentStory, hasFollowUpTask: false
+}).ok, true);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [communicationCurrentStory], agentUserGid: "1214979008900132",
+  proposedText: "Keine weitere Folgeaufgabe nötig.\nEvidenz / Verifikation\nCursor zurückgelesen."
+}).allowed, false);
+for (const text of [
+  "Keine fachliche Folgeaufgabe nötig, aber die technische Nacharbeit ist offen.",
+  "Keine fachliche Folgeaufgabe möglicherweise nötig.",
+  "Eine fachliche Folgeaufgabe ist nötig."
+]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({
+    finalComment: { text }, hasFollowUpTask: false
+  }).ok, false, text);
+}
 assert.equal(validateRoutineMaterialCorrection({
   priorStory: duplicateCommunicationStory,
   proposedText: "Vier BCC-Asana-Mails, 0 menschliche Stilbelege. Keine weitere Folgeaufgabe nötig."
