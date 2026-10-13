@@ -138,6 +138,16 @@ const bccNoFollowUpRestatement = validateRoutineMaterialCorrection({
 assert.equal(bccNoFollowUpRestatement.allowed, false);
 assert.equal(bccNoFollowUpRestatement.issues.includes("correction_restates_no_follow_up"), true);
 assert.equal(validateRoutineMaterialCorrection({
+  priorStory: { gid: "1219249110196263", text: "Keine zusätzliche operative Folgearbeit erforderlich. Evidenz / Verifikation" },
+  correction: {
+    reason: "Die vorhandene Follow-up-Entscheidung soll ohne neue Sachlage umformuliert werden.",
+    before: "Keine zusätzliche operative Folgearbeit erforderlich",
+    after: "Besteht keine zusätzliche operative Folgearbeit",
+    source: "Unveränderter Sales-Abschlussreadback"
+  },
+  proposedText: "Besteht keine zusätzliche operative Folgearbeit."
+}).issues.includes("correction_restates_no_follow_up"), true);
+assert.equal(validateRoutineMaterialCorrection({
   priorStory: { gid: "1217000000000011", text: "Follow-up: keines erforderlich. Evidenz / Verifikation" },
   correction: {
     reason: "Ein weiterer Readback bestätigte denselben Abschlusszustand erneut.",
