@@ -42,6 +42,15 @@ assert.equal(
   sameAsanaDateTimeInstant("2026-10-01T00:00:01.000Z", "2026-10-01T02:00:00+02:00"),
   false
 );
+assert.equal(
+  sameAsanaDateTimeInstant("2026-10-16T08:00:00.000Z", "2026-10-16T08:00:00Z"),
+  true
+);
+assert.equal(
+  sameAsanaDateTimeInstant("2026-10-16T09:00:00.000Z", "2026-10-16T07:00:00Z"),
+  false
+);
+assert.equal(sameAsanaDateTimeInstant("invalid", "2026-10-16T08:00:00Z"), false);
 assert.equal(sameAsanaDateTimeInstant(null, "2026-10-01T02:00:00+02:00"), false);
 
 console.log("asana schedule guard self-test passed");

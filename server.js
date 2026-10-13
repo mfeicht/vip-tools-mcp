@@ -2009,7 +2009,7 @@ function buildAsanaScheduleVerification({
   if (resolvedExpectedDueAt) {
     addCheck({
       name: "due_at_exact",
-      ok: task?.due_at === resolvedExpectedDueAt,
+      ok: sameAsanaDateTimeInstant(task?.due_at, resolvedExpectedDueAt),
       expected: resolvedExpectedDueAt,
       actual: task?.due_at || null,
       note: hasBerlinLocalExpectation
