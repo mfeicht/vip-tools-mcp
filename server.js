@@ -91,6 +91,7 @@ import {
   isRoutineInstanceMissingAlarmIntent,
   sameAsanaDateTimeInstant
 } from "./lib/asana-schedule-guards.js";
+import { assertRoutineCatchupOnCadence } from "./lib/asana-routine-cadence.js";
 import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
 import { buildAsanaTaskSearchPlan, executeAsanaInvolvedSearch } from "./lib/asana-search-params.js";
 import { readAsanaResourceEvents } from "./lib/asana-events.js";
@@ -15475,7 +15476,7 @@ function createServer() {
 
   server.tool(
     "asana_repair_routine_catchup_due",
-    "Korrigiert nach verspaetetem Routine-Abschluss eine erzeugte Folgeinstanz, deren Faelligkeit noch in der Vergangenheit/heute liegt, auf den naechsten vorgesehenen Zeitpunkt nach jetzt. Verhindert Catch-up-Backlogs bei kurz getakteten Asana-Wiederholungen.",
+    "Korrigiert nach Routine-Abschluss eine erzeugte Folgeinstanz auf den naechsten Termin ihres belegten Tages-, Wochen- oder Monatsrhythmus. Ein bloss kuenftiger Termin reicht nicht: Off-Cadence-Termine werden ebenfalls korrigiert.",
     {
       agent_id: agentIdSchema,
       source_task_gid: z.string(),
@@ -15484,6 +15485,12 @@ function createServer() {
       next_future_due_at: z.string().optional(),
       next_future_due_date_berlin: z.string().optional(),
       next_future_due_time_berlin: z.string().optional(),
+      schedule_rule: z.object({
+        unit: z.enum(["day", "week", "month"]),
+        interval: z.number().int().min(1).max(366),
+        anchor_due_on: z.string(),
+        short_month: z.enum(["skip", "last_day"]).optional()
+      }),
       repair_basis: z.string().min(20),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
@@ -15497,6 +15504,7 @@ function createServer() {
       next_future_due_at,
       next_future_due_date_berlin,
       next_future_due_time_berlin,
+      schedule_rule,
       repair_basis,
       dry_run,
       verify_after
@@ -15556,6 +15564,20 @@ function createServer() {
         throw new Error("source_task und next_task teilen kein Projekt; falsche Folgeinstanz vermutet.");
       }
 
+      const expected_cadence_slot = assertRoutineCatchupOnCadence(
+        schedule_rule, source_task, scheduleInput, now
+      );
+      let nextTaskOnCadence = false;
+      try {
+        assertRoutineCatchupOnCadence(schedule_rule, source_task, {
+          expected_due_on: next_task.due_at ? null : next_task.due_on,
+          expected_due_at: next_task.due_at || null
+        }, now);
+        nextTaskOnCadence = true;
+      } catch {
+        nextTaskOnCadence = false;
+      }
+
       const due_position = getAsanaTaskDuePosition(next_task, now);
       if (due_position.mode === "none") {
         throw new Error("next_task hat keine Faelligkeit; Catch-up-Reparatur braucht einen vorhandenen Due-Stand.");
@@ -15563,7 +15585,7 @@ function createServer() {
       if (due_position.relation === "invalid") {
         throw new Error("next_task hat eine ungueltige Faelligkeit; manuelle Klaerung noetig.");
       }
-      const repairNeeded = due_position.relation !== "future";
+      const repairNeeded = !nextTaskOnCadence;
       const repair_basis_sha256 = createHash("sha256").update(repair_basis, "utf8").digest("hex");
 
       if (!repairNeeded || dry_run) {
@@ -15571,11 +15593,13 @@ function createServer() {
           agent_id,
           dry_run,
           repair_needed: repairNeeded,
-          no_action_reason: repairNeeded ? null : "next_task_due_is_already_after_now",
+          no_action_reason: repairNeeded ? null : "next_task_due_matches_documented_cadence",
           source_task,
           next_task,
           due_position,
           proposed_schedule: scheduleInput,
+          expected_cadence_slot,
+          schedule_rule,
           shared_project_gids: sharedProjectGids,
           repair_basis,
           repair_basis_sha256
@@ -15628,6 +15652,8 @@ function createServer() {
         verification_status,
         previous_due_position: due_position,
         applied_schedule: scheduleInput,
+        expected_cadence_slot,
+        schedule_rule,
         shared_project_gids: sharedProjectGids,
         repair_basis,
         repair_basis_sha256
