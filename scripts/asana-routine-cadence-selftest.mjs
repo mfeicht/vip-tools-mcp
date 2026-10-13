@@ -1,26 +1,29 @@
 import assert from "node:assert/strict";
 import { assertRoutineCatchupOnCadence, nextRoutineCadenceSlot,
-  routineCatchupRequiresCadence } from "../lib/asana-routine-cadence.js";
+  routineFutureRescheduleRequiresCadence } from "../lib/asana-routine-cadence.js";
 
 const salesRule = { unit: "day", interval: 2, anchor_due_on: "2026-10-03" };
 const salesSource = { due_on: "2026-10-03", due_at: "2026-10-03T07:00:00.000Z" };
 const salesNow = new Date("2026-10-13T18:00:00.000Z");
 const overdueNext = { name: "R: Lead-Adressen hinzufügen (Badumbau für App.Goklever)",
   completed: false, due_on: "2026-10-05", due_at: "2026-10-05T07:00:00.000Z" };
-assert.equal(routineCatchupRequiresCadence(overdueNext,
+assert.equal(routineFutureRescheduleRequiresCadence(overdueNext,
   { expected_due_at: "2026-10-14T07:00:00.000Z" }, salesNow), true);
-assert.equal(routineCatchupRequiresCadence(overdueNext,
+assert.equal(routineFutureRescheduleRequiresCadence(overdueNext,
   { expected_due_at: "2026-10-15T07:00:00.000Z" }, salesNow), true);
-assert.equal(routineCatchupRequiresCadence({ ...overdueNext, name: "Einmalige Aufgabe" },
+assert.equal(routineFutureRescheduleRequiresCadence({ ...overdueNext, name: "Einmalige Aufgabe" },
   { expected_due_at: "2026-10-14T07:00:00.000Z" }, salesNow), false);
-assert.equal(routineCatchupRequiresCadence({ ...overdueNext, completed: true },
+assert.equal(routineFutureRescheduleRequiresCadence({ ...overdueNext, completed: true },
   { expected_due_at: "2026-10-14T07:00:00.000Z" }, salesNow), false);
-assert.equal(routineCatchupRequiresCadence({ ...overdueNext, due_on: "2026-10-15",
+assert.equal(routineFutureRescheduleRequiresCadence({ ...overdueNext, due_on: "2026-10-15",
   due_at: "2026-10-15T07:00:00.000Z" },
-{ expected_due_at: "2026-10-17T07:00:00.000Z" }, salesNow), false);
-assert.equal(routineCatchupRequiresCadence({ name: "Andere Routine", tags: [{ name: "Routine" }],
+  { expected_due_at: "2026-10-14T07:00:00.000Z" }, salesNow), true);
+assert.equal(routineFutureRescheduleRequiresCadence({ ...overdueNext, due_on: "2026-10-15",
+  due_at: "2026-10-15T07:00:00.000Z" },
+  { expected_due_at: "2026-10-17T07:00:00.000Z" }, salesNow), true);
+assert.equal(routineFutureRescheduleRequiresCadence({ name: "Andere Routine", tags: [{ name: "Routine" }],
   due_on: "2026-10-05", completed: false },
-{ expected_due_on: "2026-10-14" }, salesNow), true);
+  { expected_due_on: "2026-10-14" }, salesNow), true);
 assert.deepEqual(nextRoutineCadenceSlot(salesRule, salesSource, salesNow), {
   due_on: "2026-10-15", due_time_berlin: "09:00:00"
 });
@@ -36,6 +39,9 @@ assert.throws(() => nextRoutineCadenceSlot(salesRule,
   { due_on: "2026-10-04", due_at: "2026-10-04T07:00:00.000Z" }, salesNow),
   /source due date is not on/);
 assert.throws(() => assertRoutineCatchupOnCadence(salesRule, overdueNext,
+  { expected_due_at: "2026-10-14T07:00:00.000Z" }, salesNow), /expected 2026-10-15/);
+assert.throws(() => assertRoutineCatchupOnCadence(salesRule,
+  { due_on: "2026-10-15", due_at: "2026-10-15T07:00:00.000Z" },
   { expected_due_at: "2026-10-14T07:00:00.000Z" }, salesNow), /expected 2026-10-15/);
 
 assert.deepEqual(nextRoutineCadenceSlot(

@@ -91,7 +91,7 @@ import {
   isRoutineInstanceMissingAlarmIntent,
   sameAsanaDateTimeInstant
 } from "./lib/asana-schedule-guards.js";
-import { assertRoutineCatchupOnCadence, routineCatchupRequiresCadence } from "./lib/asana-routine-cadence.js";
+import { assertRoutineCatchupOnCadence, routineFutureRescheduleRequiresCadence } from "./lib/asana-routine-cadence.js";
 import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
 import { buildAsanaTaskSearchPlan, executeAsanaInvolvedSearch } from "./lib/asana-search-params.js";
 import { readAsanaResourceEvents } from "./lib/asana-events.js";
@@ -15102,7 +15102,7 @@ function createServer() {
 
   server.tool(
     "asana_update_task_schedule",
-    "Ändert Fälligkeitsdatum/-uhrzeit einer Asana-Aufgabe über einen engen Pfad. due_at ist verbindlich und muss als ISO-Zeitpunkt mit Zeitzone übergeben werden; due_on und due_at sind gegenseitig exklusiv. Bei überfälligen Routinen erfordert die Verschiebung in die Zukunft eine belegte schedule_rule und den nächsten Rastertermin.",
+    "Ändert Fälligkeitsdatum/-uhrzeit einer Asana-Aufgabe über einen engen Pfad. due_at ist verbindlich und muss als ISO-Zeitpunkt mit Zeitzone übergeben werden; due_on und due_at sind gegenseitig exklusiv. Jede neue künftige Fälligkeit einer offenen Routine erfordert eine belegte schedule_rule und den nächsten Rastertermin.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
@@ -15132,13 +15132,16 @@ function createServer() {
         params: { opt_fields: ASANA_TASK_SCHEDULE_OPT_FIELDS }
       });
       const before_task = beforeRes.data.data;
+      const unchangedDue = due_at
+        ? Boolean(before_task.due_at && sameAsanaDateTimeInstant(before_task.due_at, due_at))
+        : Boolean(due_on && !before_task.due_at && before_task.due_on === due_on);
 
       let expected_cadence_slot = null;
-      if (!clear_due && routineCatchupRequiresCadence(before_task, {
+      if (!clear_due && !unchangedDue && routineFutureRescheduleRequiresCadence(before_task, {
         expected_due_on: due_on, expected_due_at: due_at
       })) {
         if (!schedule_rule) {
-          throw new Error("Überfällige Routine darf nicht pauschal auf einen künftigen Termin verschoben werden. Dokumentierte schedule_rule angeben oder asana_repair_routine_catchup_due mit der abgeschlossenen Quellinstanz nutzen.");
+          throw new Error("Routine darf nicht pauschal auf einen künftigen Termin verschoben werden. Dokumentierte schedule_rule angeben oder asana_repair_routine_catchup_due mit der abgeschlossenen Quellinstanz nutzen.");
         }
         expected_cadence_slot = assertRoutineCatchupOnCadence(schedule_rule,
           before_task, { expected_due_on: due_on, expected_due_at: due_at });
