@@ -91,7 +91,7 @@ import {
   isRoutineInstanceMissingAlarmIntent,
   sameAsanaDateTimeInstant
 } from "./lib/asana-schedule-guards.js";
-import { assertRoutineCatchupOnCadence } from "./lib/asana-routine-cadence.js";
+import { assertRoutineCatchupOnCadence, routineCatchupRequiresCadence } from "./lib/asana-routine-cadence.js";
 import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
 import { buildAsanaTaskSearchPlan, executeAsanaInvolvedSearch } from "./lib/asana-search-params.js";
 import { readAsanaResourceEvents } from "./lib/asana-events.js";
@@ -624,7 +624,13 @@ const ACCOUNTING_ARCHIVE_MAILBOX_CANDIDATES = [
   "INBOX.Archiv"
 ];
 const ASANA_TASK_SCHEDULE_OPT_FIELDS =
-  "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url";
+  "gid,name,completed,due_on,due_at,start_on,start_at,permalink_url,tags.name";
+const ASANA_ROUTINE_CADENCE_RULE_SCHEMA = z.object({
+  unit: z.enum(["day", "week", "month"]),
+  interval: z.number().int().min(1).max(366),
+  anchor_due_on: z.string(),
+  short_month: z.enum(["skip", "last_day"]).optional()
+});
 const ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS =
   "gid,name,completed,completed_at,assignee.gid,assignee.name,due_on,due_at,start_on,start_at,permalink_url,tags.gid,tags.name,followers.gid,followers.name,workspace.gid,memberships.project.gid,memberships.project.name,modified_at";
 const ASANA_TASK_TAG_OPT_FIELDS = "gid,name,completed,tags.gid,tags.name,permalink_url";
@@ -15096,18 +15102,19 @@ function createServer() {
 
   server.tool(
     "asana_update_task_schedule",
-    "Aendert Faelligkeitsdatum/-uhrzeit einer Asana-Aufgabe ueber einen engen Pfad. due_at ist verbindlich und muss als ISO-Zeitpunkt mit Zeitzone uebergeben werden; due_on und due_at sind gegenseitig exklusiv.",
+    "Ändert Fälligkeitsdatum/-uhrzeit einer Asana-Aufgabe über einen engen Pfad. due_at ist verbindlich und muss als ISO-Zeitpunkt mit Zeitzone übergeben werden; due_on und due_at sind gegenseitig exklusiv. Bei überfälligen Routinen erfordert die Verschiebung in die Zukunft eine belegte schedule_rule und den nächsten Rastertermin.",
     {
       agent_id: agentIdSchema,
       task_gid: z.string(),
       due_on: z.string().optional(),
       due_at: z.string().optional(),
+      schedule_rule: ASANA_ROUTINE_CADENCE_RULE_SCHEMA.optional(),
       clear_due: z.boolean().optional().default(false),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
     },
     TOOL_IDEMPOTENT_SAFE_WRITE,
-    async ({ agent_id, task_gid, due_on, due_at, clear_due, dry_run, verify_after }) => {
+    async ({ agent_id, task_gid, due_on, due_at, schedule_rule, clear_due, dry_run, verify_after }) => {
       validateAsanaGid(task_gid, "task_gid");
       validateAsanaDate(due_on, "due_on");
       validateAsanaDateTime(due_at, "due_at");
@@ -15126,8 +15133,20 @@ function createServer() {
       });
       const before_task = beforeRes.data.data;
 
+      let expected_cadence_slot = null;
+      if (!clear_due && routineCatchupRequiresCadence(before_task, {
+        expected_due_on: due_on, expected_due_at: due_at
+      })) {
+        if (!schedule_rule) {
+          throw new Error("Überfällige Routine darf nicht pauschal auf einen künftigen Termin verschoben werden. Dokumentierte schedule_rule angeben oder asana_repair_routine_catchup_due mit der abgeschlossenen Quellinstanz nutzen.");
+        }
+        expected_cadence_slot = assertRoutineCatchupOnCadence(schedule_rule,
+          before_task, { expected_due_on: due_on, expected_due_at: due_at });
+      }
+
       if (dry_run) {
-        return out({ agent_id, dry_run: true, task_gid, data, before_task });
+        return out({ agent_id, dry_run: true, task_gid, data, before_task,
+          expected_cadence_slot });
       }
 
       const res = await asanaRequestWithRetry(asana, {
@@ -15168,6 +15187,7 @@ function createServer() {
         task_gid,
         data,
         before_task,
+        expected_cadence_slot,
         task: res.data.data,
         verified_task,
         verification_status
@@ -15485,12 +15505,7 @@ function createServer() {
       next_future_due_at: z.string().optional(),
       next_future_due_date_berlin: z.string().optional(),
       next_future_due_time_berlin: z.string().optional(),
-      schedule_rule: z.object({
-        unit: z.enum(["day", "week", "month"]),
-        interval: z.number().int().min(1).max(366),
-        anchor_due_on: z.string(),
-        short_month: z.enum(["skip", "last_day"]).optional()
-      }),
+      schedule_rule: ASANA_ROUTINE_CADENCE_RULE_SCHEMA,
       repair_basis: z.string().min(20),
       dry_run: z.boolean().optional().default(false),
       verify_after: z.boolean().optional().default(true)
