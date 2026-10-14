@@ -172,6 +172,43 @@ try {
   } catch (error) {
     missingReviewSignatureBlocked = error.message.includes("registrierte Signaturkomposition");
   }
+  const disabledReviewSend = await client.callTool({
+    name: "email_action_send_review_proposal",
+    arguments: {
+      agent_id: "vip-ai-communication",
+      action_id: "nonexistent-review-fixture",
+      message_uid: "1",
+      proposal_body: "Test",
+      uncertainty_reason: "Lokaler Regressionstest ohne externe Wirkung.",
+      mode: "live",
+      confirm_internal_proposal_send: true
+    }
+  });
+  const learningMailbox = "communication-agent@vip-studios.de";
+  const learningBase = {
+    uid: "701",
+    from: "Moritz <moritz@vip-studios.de>",
+    from_email: "moritz@vip-studios.de",
+    subject: "Re: Test",
+    text_parts: [{ content_type: "text/plain", text: "Antwort" }]
+  };
+  const ccLearning = serverModule.publicBccLearningMessage({
+    ...learningBase, to: "Partner <partner@example.com>",
+    cc: `VIP AI-Communication <${learningMailbox}>`
+  }, learningMailbox, 100);
+  const toLearning = serverModule.publicBccLearningMessage({
+    ...learningBase, to: learningMailbox, cc: "someone@example.com"
+  }, learningMailbox, 100);
+  const bccLearning = serverModule.publicBccLearningMessage({
+    ...learningBase, to: "partner@example.com", bcc: learningMailbox
+  }, learningMailbox, 100);
+  const selfBccLearning = serverModule.publicBccLearningMessage({
+    ...learningBase, from: learningMailbox, from_email: learningMailbox,
+    to: "partner@example.com", bcc: learningMailbox
+  }, learningMailbox, 100);
+  const foreignCcLearning = serverModule.publicBccLearningMessage({
+    ...learningBase, to: "partner@example.com", cc: "other@vip-studios.de"
+  }, learningMailbox, 100);
   const report = {
     review_original_history_follows_signature_in_html_and_text: reviewPlans.every((plan) =>
       plan.quoted_original?.body_chars > 0 &&
@@ -308,6 +345,18 @@ try {
       source.includes("plan.envelope_recipients.includes(plan.external_recipient)") &&
       source.includes("sendEmailActionReviewProposalViaResend") &&
       source.includes("proposal_sent_and_source_trashed"),
+    internal_review_live_send_is_disabled_before_action_lookup:
+      disabledReviewSend.isError === true &&
+      disabledReviewSend.content?.some((item) =>
+        item.type === "text" && item.text.includes("Interner E-Mail-Entwurfsversand ist deaktiviert")
+      ),
+    cc_learning_visibility_is_separate_from_bcc_classification:
+      source.includes("mailbox_visible_in_cc: extractEmailAddresses(message.cc).includes(extractEmailAddress(mailboxAddress))"),
+    cc_learning_positive_and_to_bcc_self_bcc_foreign_cc_negative:
+      ccLearning.mailbox_visible_in_cc === true && ccLearning.bcc_classification === "not_bcc" &&
+      [toLearning, bccLearning, selfBccLearning, foreignCcLearning].every((item) =>
+        item.mailbox_visible_in_cc === false
+      ),
     every_template_marker_is_excluded_from_inbound:
       source.includes("function isTemplateActionSubjectMarked") &&
       source.includes("function isEmailActionInboundMessage") &&
@@ -403,9 +452,13 @@ try {
       standardInfoPlan.to === "ayesha@example.com" &&
       standardInfoPlan.bcc === "contact@reise-stories.de" &&
       standardInfoPlan.in_reply_to === "<guest-post-501@example.com>" &&
-      standardInfoPlain.includes("Before we can confirm a specific placement") &&
+      standardInfoPlain.includes("Specific placements are subject to editorial review") &&
       standardInfoPlain.indexOf("editorial review") < standardInfoPlain.indexOf("Best regards") &&
+      !standardInfoPlain.includes("please send us") &&
       standardInfoPlain.includes("SIGNATURE-FIXTURE"),
+    adaptive_clarification_only_is_blocked:
+      source.includes('if (offerStrategy === "clarification_only")') &&
+      source.includes("externe Rückfragen sind deaktiviert"),
     adaptive_reply_html_uses_semantic_lists:
       adaptiveListHtml.includes("<ul>") &&
       adaptiveListHtml.includes("<li>Preis: 365 EUR</li>") &&

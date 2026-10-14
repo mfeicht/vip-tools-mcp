@@ -27,13 +27,15 @@ test("ordinary unknown-industry pricing inquiry can receive conditional informat
   assert.equal(validateGeneralInformationReply({ ...standard, requestType: "link_purchase" }), true);
   assert.equal(validateGeneralInformationReply({ ...standard, inboundBody: "Can you quote your price in USD?" }), true);
   const body = appendGeneralInformationQualification(standard.replyBody, "en");
-  assert.match(body, /editorial review\.\n\nBest regards$/u);
+  assert.match(body, /making any commitment\.\n\nBest regards$/u);
   assert.ok(body.indexOf("editorial review") < body.indexOf("Best regards"));
-  assert.match(appendGeneralInformationQualification("Hallo\n\nViele Grüße", "de"), /redaktionellen Prüfung\.\n\nViele Grüße$/u);
+  assert.doesNotMatch(body, /please send|\?/iu);
+  assert.match(appendGeneralInformationQualification("Hallo\n\nViele Grüße", "de"), /vor einer Zusage\.\n\nViele Grüße$/u);
   assert.match(
     appendGeneralInformationQualification("Hallo\n\nMit besten Grüßen\nReise-Stories", "de"),
-    /redaktionellen Prüfung\.\n\nMit besten Grüßen\nReise-Stories$/u
+    /vor einer Zusage\.\n\nMit besten Grüßen\nReise-Stories$/u
   );
+  assert.doesNotMatch(appendGeneralInformationQualification("Hallo", "de"), /benötigen|bitte|\?/iu);
 });
 
 test("explicit prohibited or concrete foreign targets do not use the general-information lane", () => {
