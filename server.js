@@ -14,7 +14,8 @@ import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
 import { assertLinkedGoogleDocScope, linkedGoogleDocReadback } from "./lib/google-docs-linked-reader.js";
-import { asanaDriveInstructionText, assertInstructionReferencesDriveIds, assertRecoverableTrashTarget, resolveCopyDestination } from "./lib/google-drive-write-policy.mjs";
+import { asanaDriveInstructionText, assertInstructionReferencesDriveIds, assertRecoverableTrashTarget, assertWritableSharedFolder, resolveCopyDestination } from "./lib/google-drive-write-policy.mjs";
+import { XLSX_MAX_BYTES, XLSX_MIME, copyXlsxWithValues, inspectXlsxValueTemplate, sha256 as xlsxSha256, verifyXlsxValueCopy } from "./lib/xlsx-value-copy.js";
 import { selectBoundedEmailText } from "./lib/email-uid-text.js";
 import { assertBufferEditDueAtReadback, bufferEditScheduleFields } from "./lib/buffer-edit-schedule.js";
 import { findTemplatedTemplateByInternalId } from "./lib/templated-internal-id.js";
@@ -3385,6 +3386,72 @@ async function getDriveFile(fileId, fields = "id,name,mimeType,parents,webViewLi
   return res.data;
 }
 
+async function readDriveXlsx(fileId, googleContext = {}) {
+  const fields = "id,name,mimeType,size,md5Checksum,modifiedTime,parents,trashed,capabilities(canCopy),webViewLink,appProperties";
+  const before = await getDriveFile(fileId, fields, googleContext);
+  if (before.id !== fileId || before.trashed || before.mimeType !== XLSX_MIME ||
+      !before.md5Checksum || !Number.isSafeInteger(Number(before.size)) ||
+      Number(before.size) < 100 || Number(before.size) > XLSX_MAX_BYTES) {
+    throw new Error("Drive-Quelle ist keine aktive, begrenzte XLSX-Datei mit MD5-Readback.");
+  }
+  const res = await googleRequest({
+    method: "GET",
+    url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+    params: { alt: "media", supportsAllDrives: true },
+    responseType: "arraybuffer",
+    maxContentLength: XLSX_MAX_BYTES,
+    timeout: 60000
+  }, googleContext);
+  const bytes = Buffer.from(res.data);
+  const md5 = createHash("md5").update(bytes).digest("hex");
+  const after = await getDriveFile(fileId, fields, googleContext);
+  if (bytes.length !== Number(before.size) || md5 !== before.md5Checksum ||
+      after.md5Checksum !== before.md5Checksum || after.modifiedTime !== before.modifiedTime ||
+      after.trashed || after.mimeType !== XLSX_MIME) {
+    throw new Error("XLSX-Quelldatei hat sich während des Reads geändert oder Bytes und Metadaten widersprechen sich.");
+  }
+  return { file: after, bytes, md5, sha256: xlsxSha256(bytes) };
+}
+
+async function findDriveFilesByExactName(folderId, fileName, googleContext = {}) {
+  const q = `'${escapeGoogleDriveQueryString(folderId)}' in parents and trashed = false and ` +
+    `name = '${escapeGoogleDriveQueryString(fileName)}'`;
+  const files = [];
+  let pageToken;
+  for (let page = 0; page < 3; page += 1) {
+    const res = await googleRequest({
+      method: "GET",
+      url: "https://www.googleapis.com/drive/v3/files",
+      params: {
+        q, pageSize: 100, pageToken,
+        fields: "nextPageToken,files(id,name,mimeType,size,md5Checksum,parents,webViewLink,appProperties,modifiedTime)",
+        supportsAllDrives: true, includeItemsFromAllDrives: true
+      }
+    }, googleContext);
+    files.push(...(res.data.files || []));
+    pageToken = res.data.nextPageToken;
+    if (!pageToken) return files;
+  }
+  throw new Error("XLSX-Zielname hat zu viele Treffer; Duplikatprüfung unvollständig.");
+}
+
+async function generateDriveFileId(googleContext = {}) {
+  const response = await googleRequest({
+    method: "GET",
+    url: "https://www.googleapis.com/drive/v3/files/generateIds",
+    params: { count: 1, space: "drive", type: "files" }
+  }, googleContext);
+  const fileId = response.data?.ids?.[0];
+  if (!fileId || typeof fileId !== "string" || fileId.length > 200) {
+    throw new Error("XLSX-Upload-ID konnte nicht eindeutig vorab erzeugt werden.");
+  }
+  return fileId;
+}
+
+// Prevent overlapping uploads to the same name within this server process. Drive
+// permits duplicate names, so the live tool remains classified as non-idempotent.
+const XLSX_ACTIVE_TARGETS = new Set();
+
 async function isAllowedGoogleFolder(folderId, googleContext = {}) {
   if (GOOGLE_ALLOWED_FOLDER_IDS.has(folderId)) return true;
 
@@ -3413,6 +3480,7 @@ async function uploadBufferToDrive({
   name,
   mimeType,
   targetFolderId,
+  fileId,
   bytes,
   appProperties,
   assertFolder = assertAllowedGoogleFolder,
@@ -3421,6 +3489,7 @@ async function uploadBufferToDrive({
   await assertFolder(targetFolderId, googleContext);
   const boundary = `vip-tools-${randomUUID()}`;
   const metadata = JSON.stringify({
+    ...(fileId ? { id: fileId } : {}),
     name,
     mimeType,
     parents: [targetFolderId],
@@ -22276,6 +22345,190 @@ function createServer() {
         verification_status: verificationStatus,
         preserves_native_google_formatting: true
       });
+    }
+  );
+
+  server.tool(
+    "google_drive_xlsx_inspect_file",
+    "Liest eine echte Office-XLSX-Datei aus Drive begrenzt und read-only: MD5/SHA-256, Blattnamen, ZIP-Parts und vorhandene Zellen im Blatt Keywordsammlung. Keine Konvertierung und kein Datei-Write.",
+    {
+      agent_id: agentIdSchema,
+      file_id: z.string().min(20).max(200)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, file_id }) => {
+      const source = await readDriveXlsx(file_id, { agent_id });
+      const structure = await inspectXlsxValueTemplate(source.bytes);
+      return out({
+        agent_id,
+        file: source.file,
+        source_md5: source.md5,
+        ...structure,
+        verification_status: "verified_read_only"
+      });
+    }
+  );
+
+  server.tool(
+    "google_drive_xlsx_copy_edit_cells",
+    "Erstellt eine neue XLSX-Kopie der Drive-Vorlage mit ausschließlich neuen Werten in vorhandenen leeren Zellen A2:J999 von Keywordsammlung. Alle anderen ZIP-Parts und die Blattstruktur werden bytegleich geprüft; Dry-Run liefert Output-Hash und vorab erzeugte Drive-Datei-ID für einen sicheren Retry desselben Plans. Ein geteiltes Ziel erfordert einen verifizierbaren Moritz-Kommentar samt beiden Drive-IDs.",
+    {
+      agent_id: agentIdSchema,
+      source_file_id: z.string().min(20).max(200),
+      expected_source_md5: z.string().regex(/^[a-f0-9]{32}$/i),
+      target_folder_id: z.string().optional().default(GOOGLE_AGENT_FOLDER_ID),
+      title: z.string().min(6).max(240),
+      cells: z.array(z.object({
+        address: z.string().regex(/^[A-Ja-j][1-9][0-9]{0,2}$/),
+        value: z.union([z.string().min(1).max(1000), z.number().finite()])
+      }).strict()).min(1).max(500),
+      expected_output_sha256: z.string().regex(/^[a-f0-9]{64}$/i).optional(),
+      planned_file_id: z.string().min(10).max(200).optional(),
+      dry_run: z.boolean().optional().default(true),
+      confirmed_by_asana: z.boolean().optional().default(false),
+      asana_task_gid: z.string().optional(),
+      authorization: actionAuthorizationSchema.optional()
+    },
+    TOOL_EXTERNAL_WRITE,
+    async ({ agent_id, source_file_id, expected_source_md5, target_folder_id, title, cells,
+      expected_output_sha256, planned_file_id, dry_run, confirmed_by_asana, asana_task_gid, authorization }) => {
+      const fileName = title.trim();
+      if (path.basename(fileName) !== fileName || /[\\/\0\r\n]/.test(fileName) || !/\.xlsx$/i.test(fileName)) {
+        throw new Error("XLSX-Titel muss ein einfacher .xlsx-Dateiname ohne Pfad oder Steuerzeichen sein.");
+      }
+      const googleContext = { agent_id };
+      const destination = await resolveCopyDestination({
+        targetFolderId: target_folder_id,
+        isAllowlisted: (folderId) => isAllowedGoogleFolder(folderId, googleContext),
+        authorizeMoritz: () => assertActionAuthorized({
+          agentId: agent_id, authorization, confirmedByAsana: confirmed_by_asana,
+          asanaTaskGid: asana_task_gid,
+          actionName: "google_drive_xlsx_copy_edit_cells:shared_target",
+          requireMoritz: true,
+          requiredDriveResourceIds: [source_file_id, target_folder_id]
+        }),
+        readFolder: (folderId) => getDriveFile(folderId,
+          "id,name,mimeType,trashed,capabilities(canAddChildren)", googleContext)
+      });
+      if (destination.scope !== "agent_folder") {
+        if (authorization?.source === "direct_codex") {
+          assertInstructionReferencesDriveIds(authorization.direct_instruction,
+            [source_file_id, target_folder_id]);
+        } else if (!authorization?.asana_authorization_story_gid) {
+          throw new Error("Geteiltes XLSX-Ziel braucht einen verifizierbaren Moritz-Asana-Kommentar mit beiden Drive-IDs.");
+        }
+      }
+      const source = await readDriveXlsx(source_file_id, googleContext);
+      if (source.file.capabilities?.canCopy === false || source.md5 !== expected_source_md5.toLowerCase()) {
+        throw new Error("XLSX-Quelle ist nicht kopierbar oder entspricht nicht dem gepinnten MD5.");
+      }
+      const structure = await inspectXlsxValueTemplate(source.bytes);
+      const copy = await copyXlsxWithValues(source.bytes, cells);
+      const outputMd5 = createHash("md5").update(copy.bytes).digest("hex");
+      const plan = {
+        source_file_id, source_md5: source.md5, source_sha256: source.sha256,
+        target_folder_id, target_scope: destination.scope, title: fileName,
+        cell_addresses: cells.map((cell) => cell.address.toUpperCase()),
+        cell_count: cells.length, source_structure: structure,
+        output_sha256: copy.output_sha256, output_md5: outputMd5,
+        output_bytes: copy.bytes.length,
+        unchanged_part_count: copy.unchanged_part_count,
+        target_sheet_structure_preserved: copy.target_sheet_structure_preserved,
+        value_readback_count: copy.value_readback_count
+      };
+      if (dry_run) {
+        const generatedFileId = await generateDriveFileId(googleContext);
+        return out({ agent_id, dry_run: true, ...plan, authorization: destination.authorization,
+          planned_file_id: generatedFileId,
+          requires_for_live: ["dry_run=false", "expected_output_sha256 und planned_file_id aus diesem Dry-Run",
+            destination.scope === "agent_folder"
+              ? "verifizierter eigener Asana-Auftrag"
+              : "aktuelle Moritz-Anweisung mit beiden Drive-IDs und Schreibrecht im geteilten Zielordner"] });
+      }
+      if (expected_output_sha256?.toLowerCase() !== copy.output_sha256 || !planned_file_id) {
+        throw new Error("XLSX-Live-Output oder vorab erzeugte Drive-Datei-ID fehlt gegenüber dem Dry-Run.");
+      }
+      const authorizationReceipt = destination.authorization || await assertActionAuthorized({
+        agentId: agent_id, authorization, confirmedByAsana: confirmed_by_asana,
+        asanaTaskGid: asana_task_gid, actionName: "google_drive_xlsx_copy_edit_cells"
+      });
+      const activeTargetKey = `${target_folder_id}\u0000${fileName}`;
+      if (XLSX_ACTIVE_TARGETS.has(activeTargetKey)) {
+        throw new Error("XLSX-Zielname wird bereits in diesem Serverprozess bearbeitet; nach Readback erneut prüfen.");
+      }
+      XLSX_ACTIVE_TARGETS.add(activeTargetKey);
+      try {
+        const existing = await findDriveFilesByExactName(target_folder_id, fileName, googleContext);
+        if (existing.length > 1) throw new Error("Mehrere XLSX-Dateien mit demselben Zielnamen; kein sicherer Upload.");
+        const matching = existing[0];
+        if (matching) {
+          if (matching.mimeType !== XLSX_MIME || matching.md5Checksum !== outputMd5 ||
+              matching.appProperties?.vip_sha256 !== copy.output_sha256 ||
+              !matching.parents?.includes(target_folder_id)) {
+            throw new Error("Zielname bereits mit abweichendem Inhalt belegt; keine neue Kopie erzeugt.");
+          }
+          const downloaded = await readDriveXlsx(matching.id, googleContext);
+          if (downloaded.sha256 !== copy.output_sha256) throw new Error("Vorhandene XLSX-Kopie widerspricht dem Output-Hash.");
+          const verification = await verifyXlsxValueCopy(source.bytes, downloaded.bytes, cells);
+          return out({ agent_id, dry_run: false, upload_status: "deduplicated_existing",
+            authorization: authorizationReceipt, ...plan, copied_file: downloaded.file,
+            ...verification, verification_status: "verified" });
+        }
+        const assertTarget = async (folderId, context) => {
+          if (folderId !== target_folder_id) throw new Error("XLSX-Zielordner nach Freigabe geändert.");
+          if (destination.scope === "agent_folder") return assertAllowedGoogleFolder(folderId, context);
+          const folder = await getDriveFile(folderId,
+            "id,name,mimeType,trashed,capabilities(canAddChildren)", context);
+          assertWritableSharedFolder(folder, folderId);
+        };
+        let uploaded;
+        try {
+          uploaded = await uploadBufferToDrive({
+            name: fileName, mimeType: XLSX_MIME, targetFolderId: target_folder_id,
+            fileId: planned_file_id, bytes: copy.bytes, googleContext, assertFolder: assertTarget,
+            appProperties: {
+              vip_sha256: copy.output_sha256,
+              vip_source_file_id: source_file_id,
+              vip_source_md5: source.md5,
+              vip_agent_id: agent_id,
+              ...(asana_task_gid ? { vip_asana_task_gid: asana_task_gid } : {})
+            }
+          });
+        } catch (uploadError) {
+          // A concurrent or timed-out create may already have committed. Re-read
+          // the exact pre-generated ID; never POST again under a different ID.
+          try {
+            const recovery = await readDriveXlsx(planned_file_id, googleContext);
+            if (recovery.file.name === fileName && recovery.file.parents?.includes(target_folder_id) &&
+                recovery.sha256 === copy.output_sha256 &&
+                recovery.file.appProperties?.vip_sha256 === copy.output_sha256) {
+              const verification = await verifyXlsxValueCopy(source.bytes, recovery.bytes, cells);
+              return out({ agent_id, dry_run: false, upload_status: "recovered_existing_id",
+                authorization: authorizationReceipt, ...plan, planned_file_id,
+                copied_file: recovery.file, ...verification, verification_status: "verified" });
+            }
+          } catch {
+            // The original upload error remains the evidence for an uncertain write.
+          }
+          throw new Error(`XLSX-Upload-ID ${planned_file_id} unklar: ${uploadError.message}; keinen neuen Dry-Run oder zweite ID ohne Drive-Readback verwenden.`);
+        }
+        if (uploaded.id !== planned_file_id) {
+          throw new Error("Drive-Upload verwendete nicht die gepinnte Datei-ID; keinen Retry ohne Prüfung.");
+        }
+        const downloaded = await readDriveXlsx(planned_file_id, googleContext);
+        if (downloaded.file.name !== fileName || !downloaded.file.parents?.includes(target_folder_id) ||
+            downloaded.sha256 !== copy.output_sha256 || downloaded.md5 !== outputMd5 ||
+            downloaded.file.appProperties?.vip_sha256 !== copy.output_sha256) {
+          throw new Error(`XLSX-Upload ${uploaded.id} hat einen abweichenden Drive-Readback; keinen Retry ohne Prüfung.`);
+        }
+        const verification = await verifyXlsxValueCopy(source.bytes, downloaded.bytes, cells);
+        return out({ agent_id, dry_run: false, upload_status: "uploaded",
+          authorization: authorizationReceipt, ...plan, planned_file_id,
+          copied_file: downloaded.file,
+          ...verification, verification_status: "verified" });
+      } finally {
+        XLSX_ACTIVE_TARGETS.delete(activeTargetKey);
+      }
     }
   );
 
