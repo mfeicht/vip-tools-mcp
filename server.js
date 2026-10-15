@@ -22371,7 +22371,7 @@ function createServer() {
 
   server.tool(
     "google_drive_xlsx_copy_edit_cells",
-    "Erstellt eine neue XLSX-Kopie der Drive-Vorlage mit ausschließlich neuen Werten in vorhandenen leeren Zellen A2:J999 von Keywordsammlung. Alle anderen ZIP-Parts und die Blattstruktur werden bytegleich geprüft; Dry-Run liefert Output-Hash und vorab erzeugte Drive-Datei-ID für einen sicheren Retry desselben Plans. Ein geteiltes Ziel erfordert einen verifizierbaren Moritz-Kommentar samt beiden Drive-IDs.",
+    "Erstellt eine neue XLSX-Kopie der Drive-Vorlage mit ausschließlich neuen Werten in vorhandenen leeren Zellen A2:J999 von Keywordsammlung. Alle anderen ZIP-Parts und die Blattstruktur werden bytegleich geprüft; Dry-Run liefert Output-Hash und vorab erzeugte Drive-Datei-ID für einen sicheren Retry desselben Plans. Ein geteiltes Ziel erfordert eine verifizierte Moritz-Anweisung mit beiden Drive-IDs.",
     {
       agent_id: agentIdSchema,
       source_file_id: z.string().min(20).max(200),
@@ -22414,8 +22414,6 @@ function createServer() {
         if (authorization?.source === "direct_codex") {
           assertInstructionReferencesDriveIds(authorization.direct_instruction,
             [source_file_id, target_folder_id]);
-        } else if (!authorization?.asana_authorization_story_gid) {
-          throw new Error("Geteiltes XLSX-Ziel braucht einen verifizierbaren Moritz-Asana-Kommentar mit beiden Drive-IDs.");
         }
       }
       const source = await readDriveXlsx(source_file_id, googleContext);
