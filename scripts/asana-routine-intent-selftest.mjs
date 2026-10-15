@@ -46,6 +46,36 @@ assert.equal(
   "Ein expliziter Nicht-Routine-Auftrag darf auch einen irrefuehrenden Titel korrigieren."
 );
 
+assert.equal(
+  isRoutineTaskCreationIntent({
+    name: "Follower-Fachblatt an Live-Gate angleichen",
+    description: "Diese Nicht-Routine-Aufgabe erklärt, wie Folgeaufgaben und wiederkehrende Aufgaben geprüft werden.",
+    creation_basis: "Einzelauftrag aus dem Review; keine Routine-Aufgabe anlegen."
+  }),
+  false,
+  "Fachtext über Routinen und negierte Aufgabenart darf keinen Routine-Tag auslösen."
+);
+
+assert.equal(
+  isRoutineTaskCreationIntent({
+    name: "Systemcheck einrichten",
+    description: "Die bestehende wöchentliche Aufgabe im Prozess beschreiben.",
+    creation_basis: "Einmalige Dokumentationskorrektur."
+  }),
+  false,
+  "Die Erwähnung einer bestehenden Routine ist kein Auftrag zu ihrer Neuanlage."
+);
+
+assert.equal(
+  isRoutineTaskCreationIntent({
+    name: "Systemcheck einrichten",
+    description: "Bitte keine wöchentliche Aufgabe anlegen.",
+    creation_basis: "Einmaliger Auftrag."
+  }),
+  false,
+  "Eine ausdrücklich negierte Wiederholung darf nicht als positive Anlage gelten."
+);
+
 console.log(
   JSON.stringify({
     explicit_false_authoritative: true,
