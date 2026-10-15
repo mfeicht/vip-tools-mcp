@@ -17,6 +17,7 @@ import { assertLinkedGoogleDocScope, linkedGoogleDocReadback } from "./lib/googl
 import { asanaDriveInstructionText, assertInstructionReferencesDriveIds, assertRecoverableTrashTarget, resolveCopyDestination } from "./lib/google-drive-write-policy.mjs";
 import { selectBoundedEmailText } from "./lib/email-uid-text.js";
 import { assertBufferEditDueAtReadback, bufferEditScheduleFields } from "./lib/buffer-edit-schedule.js";
+import { findTemplatedTemplateByInternalId } from "./lib/templated-internal-id.js";
 import {
   appendGeneralInformationQualification,
   validateGeneralInformationReply
@@ -19084,7 +19085,7 @@ function createServer() {
 
   server.tool(
     "templated_list_templates",
-    "Listet Templated.io-Vorlagen read-only, optional gefiltert nach Name, Dimensionen, Tags oder externer ID.",
+    "Listet Templated.io-Vorlagen read-only, optional gefiltert nach Name, Dimensionen, Tags oder externer ID. external_id ist die vom Anbieter gesetzte externe ID, nicht die interne Vorlagen-ID; dafür templated_find_template_by_id verwenden.",
     {
       agent_id: agentIdSchema,
       query: z.string().max(120).optional(),
@@ -19128,6 +19129,35 @@ function createServer() {
           response.data && typeof response.data === "object" && !Array.isArray(response.data)
             ? Object.fromEntries(Object.entries(response.data).filter(([key]) => !["data", "templates", "items", "results"].includes(key)))
             : null
+      });
+    }
+  );
+
+  server.tool(
+    "templated_find_template_by_id",
+    "Sucht eine Templated.io-Vorlage read-only anhand ihrer internen UUID. Prüft die ungefilterte Liste vollständig und liefert Seiten und Layer für die anschließende fachliche Prüfung.",
+    {
+      agent_id: agentIdSchema,
+      template_id: z.string().uuid()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, template_id }) => {
+      const result = await findTemplatedTemplateByInternalId({
+        templateId: template_id,
+        fetchPage: async ({ page, limit, includeLayers, includePages }) => {
+          const response = await templatedRequest(agent_id, {
+            path: "/v1/templates",
+            params: { page, limit, includeLayers, includePages }
+          });
+          if (!response.ok) throw new Error(`templated_template_page_request_failed:${response.status}`);
+          return getTemplatedItems(response.data);
+        }
+      });
+      return out({
+        agent_id,
+        template_id,
+        lookup_mode: "unfiltered_internal_id",
+        ...result
       });
     }
   );
