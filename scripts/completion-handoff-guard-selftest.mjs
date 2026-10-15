@@ -444,6 +444,30 @@ assert.equal(contradictoryCoverageSignal.no_follow_up_claim, true);
 assert.equal(contradictoryCoverageSignal.has_existing_task_coverage_claim, true);
 assert.equal(contradictoryCoverageSignal.blocked_without_follow_up_task, true);
 
+// Communication result story 1219529981250412: only the next native inbox
+// run continues from the verified UID cursor; this run has no separate work.
+const bccNativeContinuation = "Keine separate Folgeaufgabe erforderlich: Die tägliche native Routine übernimmt neue Nachrichten ab UID 120; die Folgeinstanz wird nach Abschluss geprüft.";
+const bccNativeSignals = detectRoutineFollowUpSignals({
+  finalComment: { text: bccNativeContinuation,
+    html_text: `<body><strong>Fortsetzung</strong>\n${bccNativeContinuation}</body>` },
+  completionBasis: "Vier Asana-Systemmails geprüft; kein menschlicher CC-Lernbeleg.",
+  followUpNotRequiredBasis: "Keine separate Folgeaufgabe erforderlich."
+});
+assert.equal(bccNativeSignals.no_follow_up_claim, true);
+assert.equal(bccNativeSignals.has_existing_task_coverage_claim, false);
+assert.equal(bccNativeSignals.blocked_without_follow_up_task, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { text: bccNativeContinuation }, hasFollowUpTask: false
+}).ok, true);
+for (const text of [
+  "Die tägliche native Routine übernimmt neue Nachrichten ab UID 120.",
+  `${bccNativeContinuation} Die bestehende Routine übernimmt die Nacharbeit.`,
+  "Keine separate Folgeaufgabe erforderlich: Die tägliche native Routine übernimmt die Nacharbeit ab UID 120."
+]) {
+  assert.equal(detectRoutineFollowUpSignals({ finalComment: { text } })
+    .blocked_without_follow_up_task, true);
+}
+
 const noFollowUpSignal = detectRoutineFollowUpSignals({
   finalComment: { text: "Keine weitere Folgeaufgabe erforderlich.", html_text: "" },
   completionBasis: "Die Aufgabe ist vollstaendig abgeschlossen.",
