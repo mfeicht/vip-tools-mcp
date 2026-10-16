@@ -207,6 +207,25 @@ await test("API errors stop sequential branch execution without retries", async 
   await assert.rejects(() => executeAsanaInvolvedSearch(plan(), async () => { calls++; throw new Error("429"); }), /429/);
   assert.equal(calls, 1);
 });
+await test("fetch telemetry covers every read page without changing partial-search safety", async () => {
+  const rows = Array.from({ length: 5 }, (_, index) => task(index + 1, "assignee", index));
+  const fetch = mockSearch(rows);
+  const result = await executeAsanaInvolvedSearch(plan(), async (params) => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return fetch(params);
+  }, { pageSize: 3, maxPagesPerBranch: 1 });
+  assert.equal(result.search_status, "partial");
+  assert.equal(result.delta_cursor_advance_allowed, false);
+  assert.equal(result.total_pages, 3);
+  assert.equal(result.branches.length, 3);
+  for (const branch of result.branches) {
+    assert.equal(branch.fetch_ms_per_page.length, branch.pages);
+    assert.equal(branch.fetch_ms_total, branch.fetch_ms_per_page.reduce((sum, ms) => sum + ms, 0));
+    assert(branch.fetch_ms_per_page.every((ms) => Number.isInteger(ms) && ms >= 0));
+  }
+  assert(result.branches[0].fetch_ms_total >= 5);
+  assert.equal(result.fetch_ms_total, result.branches.reduce((sum, branch) => sum + branch.fetch_ms_total, 0));
+});
 await test("creation ascending and numeric GID tie-break order", async () => {
   const result = await executeAsanaInvolvedSearch(plan({ sortBy: "created_at", sortAscending: true }), mockSearch([task(10), task(2)]));
   assert.deepEqual(result.tasks.map((row) => row.gid), ["2", "10"]);
