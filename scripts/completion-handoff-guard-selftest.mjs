@@ -34,6 +34,21 @@ const socialNoFollowUpStatus = {
   created_by: { gid: "1214979008788664" },
   text: "Follow-up-Status\nKeine weitere Folgeaufgabe oder Nacharbeit ist für diesen abgeschlossenen Routineumfang nötig. Die nächste reguläre Prüfung erfolgt über die native Routinefolgeinstanz.\nEvidenz / Verifikation\nDer Follow-up-Status ergibt sich aus dem vollständig verifizierten Ergebnis dieses Routine-Tasks."
 };
+const businesspulseResultDecision = {
+  gid: "1219568791357696",
+  text: "Kein separates Follow-up innerhalb dieser Aufgabe erforderlich: Das geplante Posting ist vollständig nachgewiesen; die reguläre Wiederholung läuft über ihren bestehenden Rhythmus weiter.\nEvidenz / Verifikation\nBuffer-Post und Redaktionsplan wurden zurückgelesen."
+};
+assert.equal(hasRoutineNoFollowUpDecision(businesspulseResultDecision.text), true);
+assert.equal(detectRoutineFollowUpSignals({ finalComment: businesspulseResultDecision }).no_follow_up_claim, true);
+assert.equal(detectRoutineFollowUpSignals({ finalComment: businesspulseResultDecision }).blocked_without_follow_up_task, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: businesspulseResultDecision, hasFollowUpTask: false }).ok, true);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { text: "Kein separates Follow-up innerhalb dieser Aufgabe erforderlich, aber die technische Nacharbeit bleibt offen.\nEvidenz / Verifikation\nDer Rest ist benannt." },
+  hasFollowUpTask: false
+}).ok, false);
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: { text: "Keine Folgeaufgabe erforderlich: Die nächste Routineinstanz übernimmt nach dem Zieltermin den Sent-Readback und die fristgebundene Asset-Nachkontrolle." }
+}).blocked_without_follow_up_task, true);
 assert.equal(hasRoutineNoFollowUpDecision(socialNoFollowUpStatus.text), true);
 assert.equal(detectRoutineFollowUpSignals({ finalComment: socialNoFollowUpStatus }).no_follow_up_claim, true);
 assert.equal(detectRoutineFollowUpSignals({ finalComment: socialNoFollowUpStatus }).blocked_without_follow_up_task, false);
