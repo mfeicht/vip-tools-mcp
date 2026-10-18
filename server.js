@@ -14210,6 +14210,92 @@ function createServer() {
   );
 
   server.tool(
+    "asana_reconcile_onpage_9161_posting_claim",
+    "Einmaliger Operations-Reparaturpfad für den belegten Content-Onpage-Posting-Claim. Prüft Moritz-Freigabe, vollständige Asana-Stories, Claim, Receipt und Fence vor dem engen D1-Release; Dry-Run zuerst ausführen.",
+    {
+      agent_id: z.literal("vip-ai-operations"),
+      dry_run: z.boolean().optional().default(true)
+    },
+    TOOL_SAFE_WRITE,
+    async ({ agent_id, dry_run }) => {
+      const operationsTaskGid = "1219607452726754";
+      const sourceTaskGid = "1219442371707872";
+      const authorizationStoryGid = "1219613662064797";
+      const moritzGid = "1108801330389276";
+      const operationsGid = "1214979008788676";
+      const contentGid = "1214338261069896";
+      const key = `${contentGid}:${sourceTaskGid}`;
+      const payloadHash = "0c7e0eba566f9eabfb213a8065321544bfe7ce69d2b9c6c416b3e78310459bf1";
+      if (ASANA_MATERIAL_COMMENT_STORE_BACKEND !== "http" ||
+          !ASANA_MATERIAL_COMMENT_STORE?.readClaim ||
+          !ASANA_MATERIAL_COMMENT_STORE?.repairOnpagePostingWithoutStory) {
+        throw new Error("Der freigegebene Reparaturpfad benötigt den privaten HTTP/D1-Store.");
+      }
+      const asana = getAsana(agent_id);
+      const [me, operationsTask, sourceTask, authorizationStory] = await Promise.all([
+        asanaRequestWithRetry(asana, { method: "GET", url: "/users/me" }),
+        asanaRequestWithRetry(asana, { method: "GET", url: `/tasks/${operationsTaskGid}`,
+          params: { opt_fields: "gid,completed,assignee.gid" } }),
+        asanaRequestWithRetry(asana, { method: "GET", url: `/tasks/${sourceTaskGid}`,
+          params: { opt_fields: "gid,completed,assignee.gid,modified_at" } }),
+        asanaRequestWithRetry(asana, { method: "GET", url: `/stories/${authorizationStoryGid}`,
+          params: { opt_fields: "gid,text,created_by.gid,target.gid,resource_subtype" } })
+      ]);
+      if (String(me.data.data?.gid) !== operationsGid ||
+          operationsTask.data.data?.completed ||
+          String(operationsTask.data.data?.assignee?.gid) !== operationsGid ||
+          sourceTask.data.data?.completed ||
+          String(sourceTask.data.data?.assignee?.gid) !== contentGid ||
+          String(authorizationStory.data.data?.created_by?.gid) !== moritzGid ||
+          String(authorizationStory.data.data?.target?.gid) !== operationsTaskGid ||
+          authorizationStory.data.data?.resource_subtype !== "comment_added" ||
+          !/Freigabe zum beheben/i.test(String(authorizationStory.data.data?.text || ""))) {
+        throw new Error("Agenten-, Task- oder Moritz-Freigabebindung nicht verifiziert.");
+      }
+      const assertNoTargetComment = async () => {
+        const stories = await readAllAsanaTaskStories(asana, sourceTaskGid);
+        if (stories.some((story) => story.resource_subtype === "comment_added")) {
+          throw new Error("Im Content-Quelltask besteht bereits ein Kommentar; kein Posting-Release.");
+        }
+        return stories.length;
+      };
+      const storyCount = await assertNoTargetComment();
+      const claim = await ASANA_MATERIAL_COMMENT_STORE.readClaim({ key, payloadHash });
+      const receipt = await ASANA_MATERIAL_COMMENT_STORE.readReceipt({ key, payloadHash });
+      if (!claim || claim.state !== "posting" || claim.fence !== 1 ||
+          claim.payload_hash !== payloadHash ||
+          !String(claim.payload_probe || "").startsWith("Technischer Blocker vor der Onpage-Optimierung") ||
+          !claim.token || !claim.posting_at ||
+          Date.now() - Date.parse(claim.posting_at) < 24 * 60 * 60 * 1000 || receipt) {
+        throw new Error("Alter Posting-Claim, Payload-Probe, Wartezeit oder fehlendes Receipt nicht verifiziert.");
+      }
+      if (dry_run) {
+        return out({ agent_id, dry_run: true, task_gid: operationsTaskGid,
+          source_task_gid: sourceTaskGid, authorization_story_gid: authorizationStoryGid,
+          source_story_count: storyCount, claim_state: claim.state, fence: claim.fence,
+          posting_at: claim.posting_at, receipt_present: false, release_allowed: true });
+      }
+      await assertNoTargetComment();
+      const released = await ASANA_MATERIAL_COMMENT_STORE.repairOnpagePostingWithoutStory({
+        key, payloadHash, payloadProbe: claim.payload_probe, token: claim.token, fence: claim.fence
+      });
+      if (!released.ok) throw new Error(`D1-Release verweigert (${released.status}); Zustand erneut lesen.`);
+      const [afterClaim, afterReceipt, afterStoryCount] = await Promise.all([
+        ASANA_MATERIAL_COMMENT_STORE.readClaim({ key, payloadHash }),
+        ASANA_MATERIAL_COMMENT_STORE.readReceipt({ key, payloadHash }),
+        assertNoTargetComment()
+      ]);
+      if (afterClaim?.state !== "released" || afterClaim.fence !== 1 || afterReceipt) {
+        throw new Error("D1-Nachlesung weicht vom freigegebenen Release ab.");
+      }
+      return out({ agent_id, dry_run: false, task_gid: operationsTaskGid,
+        source_task_gid: sourceTaskGid, authorization_story_gid: authorizationStoryGid,
+        source_story_count: afterStoryCount, claim_state: afterClaim.state,
+        fence: afterClaim.fence, receipt_present: false, verification_status: "ok" });
+    }
+  );
+
+  server.tool(
     "asana_comment",
     "Postet einen Asana-Kommentar ueber ein enges Rich-Text-Schema. Beginne mit konkretem Ergebnis, benoetigter Entscheidung oder Frage; Hintergrund und Evidenz danach. Kein rohes HTML: Das Tool baut valides Asana-Rich-Text-Markup, echte GID-Mentions, nummerierte oder ungeordnete Listen, Absatz-Runs mit strong/em/u und bei Bedarf Code-Bloecke selbst und prueft den Readback. Status-, Ergebnis-, Handoff- und Abschlusskommentare brauchen einen strukturierten Evidenzblock. Der Readability-Check meldet verdaechtige sichtbare Wort-/Zahlverklebungen derzeit als report_only-Diagnose; URLs, E-Mail-Adressen, bekannte technische Tokens und code_blocks werden bewusst ausgenommen. Reiner Follower-/Beteiligtenstatus ist OBSERVER und erlaubt keinen Kommentar; noetig sind eigene Assignee-/Creator-Rolle, eine verifizierte aktuelle GID-Mention, direkte Moritz-Anweisung, belegte kritische Anomalie oder enger Governance-Scope. In Routinen ist der erste geschlossene materielle Ergebnis-/Handoff-/Abschlusskommentar kanonisch; typische Ergebnis- oder Erfolgssprache bleibt auch bei comment_kind=status materiell. Eine echte Korrektur braucht supersedes_story_gid und correction mit konkretem Vorher-/Nachher-Claim, Grund und Quelle; das Tool macht den Story-Verweis sichtbar. Reine Umformulierungen duerfen nicht als Korrektur gepostet werden. In Routine-Aufgaben darf Moritz nur bei Blocker, konkreter Frage, kritischer Auffaelligkeit oder benoetigter Entscheidung erwaehnt werden; normale Erfolgs-/Abschlusskommentare werden technisch blockiert.",
     {
