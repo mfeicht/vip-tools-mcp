@@ -459,6 +459,28 @@ assert.equal(contradictoryCoverageSignal.no_follow_up_claim, true);
 assert.equal(contradictoryCoverageSignal.has_existing_task_coverage_claim, true);
 assert.equal(contradictoryCoverageSignal.blocked_without_follow_up_task, true);
 
+// Content result story 1219570654486832 already contains this final decision.
+const contentNoFollowUpStory = {
+  gid: "1219570654486832",
+  created_by: { gid: "1214338261069896" },
+  text: "Ergebnis\nRedaktionsplan!E9209 enthält den Research-Hinweis.\nReadback\nKeine gesonderte Folgeaufgabe erforderlich.\nEvidenz / Verifikation\nE9209 wurde zurückgelesen."
+};
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: contentNoFollowUpStory, hasFollowUpTask: false
+}).ok, true);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [contentNoFollowUpStory], agentUserGid: "1214338261069896",
+  proposedText: "Keine gesonderte Folgeaufgabe erforderlich."
+}).status, "blocked_duplicate_no_follow_up_status");
+for (const text of [
+  "Keine gesonderte Folgeaufgabe erforderlich, aber die Nacharbeit ist offen.",
+  "Keine gesonderte Folgeaufgabe angelegt."
+]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({
+    finalComment: { text }, hasFollowUpTask: false
+  }).ok, false);
+}
+
 // Communication result story 1219529981250412: only the next native inbox
 // run continues from the verified UID cursor; this run has no separate work.
 const bccNativeContinuation = "Keine separate Folgeaufgabe erforderlich: Die tägliche native Routine übernimmt neue Nachrichten ab UID 120; die Folgeinstanz wird nach Abschluss geprüft.";
