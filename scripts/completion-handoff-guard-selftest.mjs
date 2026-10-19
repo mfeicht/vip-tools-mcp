@@ -195,6 +195,30 @@ const communicationCurrentStory = {
   created_by: { gid: "1214979008900132" },
   text: "Fortsetzung\nEs ist keine fachliche Folgeaufgabe nötig; die nächste tägliche Routineinstanz übernimmt den nächsten Inbox-Zuwachs.\nEvidenz / Verifikation\nCursor und Profil zurückgelesen."
 };
+const communicationNoFollowUpStory = {
+  gid: "1219111944529644",
+  created_by: { gid: "1214979008900132" },
+  text: "Keine separate fachliche Folgeaufgabe oder Nacharbeit ist nötig.\nEvidenz / Verifikation\nBCC-Cursor und Profil zurückgelesen."
+};
+assert.equal(hasRoutineNoFollowUpDecision(communicationNoFollowUpStory.text), true);
+assert.equal(detectRoutineFollowUpSignals({ finalComment: communicationNoFollowUpStory }).no_follow_up_claim, true);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: communicationNoFollowUpStory, hasFollowUpTask: false
+}).ok, true);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { html_text: `<body><p>${communicationNoFollowUpStory.text}</p></body>` },
+  hasFollowUpTask: false
+}).ok, true);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [communicationNoFollowUpStory], agentUserGid: "1214979008900132",
+  proposedText: "Keine fachliche Folgeaufgabe nötig.\nEvidenz / Verifikation\nCursor zurückgelesen."
+}).allowed, false);
+for (const text of [
+  "Keine separate fachliche Folgeaufgabe oder Nacharbeit ist nötig, aber technische Nacharbeit ist offen.",
+  "Keine separate fachliche Folgeaufgabe oder Nacharbeit ist nötig. Die bestehende Routine übernimmt die offene Nacharbeit."
+]) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment: { text }, hasFollowUpTask: false }).ok, false, text);
+}
 assert.equal(validateRoutineVisibleFollowUpStatus({
   finalComment: communicationCurrentStory, hasFollowUpTask: false
 }).ok, true);
@@ -230,6 +254,26 @@ const bccNoFollowUpRestatement = validateRoutineMaterialCorrection({
 });
 assert.equal(bccNoFollowUpRestatement.allowed, false);
 assert.equal(bccNoFollowUpRestatement.issues.includes("correction_restates_no_follow_up"), true);
+const bccCursorCorrectionStory = {
+  gid: "1219111944529645",
+  created_by: { gid: "1214979008900132" },
+  text: "Der Cursor steht dedupliziert auf UID 114. Es ist keine fachliche Folgeaufgabe nötig. Evidenz / Verifikation: Cursor-State zurückgelesen."
+};
+const bccCursorCorrection = validateRoutineMaterialCorrection({
+  priorStory: bccCursorCorrectionStory,
+  correction: {
+    before: "Der Cursor steht dedupliziert auf UID 114",
+    after: "Der Cursor steht dedupliziert auf UID 115",
+    reason: "Ein neuer BCC-Eingang wurde nach dem früheren Ergebnis nachweislich geprüft.",
+    source: "BCC-Readback vom 13.10.2026 mit UID 115"
+  },
+  proposedText: "Der Cursor steht dedupliziert auf UID 115. Es ist keine fachliche Folgeaufgabe nötig. Evidenz / Verifikation: Neuer BCC-Readback."
+});
+assert.equal(bccCursorCorrection.allowed, true);
+assert.equal(inspectRoutineMaterialCommentIdempotency({
+  stories: [bccCursorCorrectionStory], agentUserGid: "1214979008900132",
+  supersedesStoryGid: bccCursorCorrectionStory.gid
+}).status, "allowed_explicit_correction");
 assert.equal(validateRoutineMaterialCorrection({
   priorStory: { gid: "1219249110196263", text: "Keine zusätzliche operative Folgearbeit erforderlich. Evidenz / Verifikation" },
   correction: {
