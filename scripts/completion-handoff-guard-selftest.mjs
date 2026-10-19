@@ -119,6 +119,63 @@ for (const story of salesNoFollowUpStories) {
     proposedText: "Keine weitere Folgeaufgabe erforderlich."
   }).status, "blocked_duplicate_no_follow_up_status", story.gid);
 }
+
+// Sales source story 1219635385389958: a new regional search belongs to the
+// next native run; the six leads from this run have already been imported.
+const salesNewScopeDecision = "Kein Follow-up erforderlich. Die sechs Leads sind vollständig verarbeitet und importiert. Es ist keine aktive Nacharbeit durch eine andere Person erforderlich; die nächste Routine-Instanz übernimmt nur eine neue, regional rotierte Recherche.";
+const contentNativeCheckDecision = "Keine separate Nacharbeit nötig; die nächste reguläre TOP-10-Instanz wird nach Abschluss nativ in Asana geprüft.";
+for (const text of [
+  salesNewScopeDecision,
+  `${salesNewScopeDecision.slice(0, -1)} für Hamburg.`,
+  contentNativeCheckDecision,
+  "Keine separate Nacharbeit nötig. Niemand muss noch prüfen.",
+  "Keine separate Nacharbeit nötig. Moritz muss noch nicht prüfen."
+]) {
+  for (const finalComment of [
+    { text },
+    { html_text: `<body><p>${text}</p></body>` },
+    { text, html_text: `<body><p>${text}</p></body>` }
+  ]) {
+    const signals = detectRoutineFollowUpSignals({ finalComment });
+    assert.equal(hasRoutineNoFollowUpDecision(text), true, text);
+    assert.equal(signals.no_follow_up_claim, true, text);
+    assert.equal(signals.has_existing_task_coverage_claim, false, text);
+    assert.equal(signals.blocked_without_follow_up_task, false, text);
+    assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment, hasFollowUpTask: false }).ok, true, text);
+  }
+}
+for (const text of [
+  "Keine separate Nacharbeit nötig. Die bestehende Routine übernimmt die Nacharbeit.",
+  "Keine separate Nacharbeit nötig. Die nächste Routine übernimmt die weitere Bearbeitung.",
+  "Kein Follow-up erforderlich. Die nächste Routine-Instanz übernimmt offene Leads aus diesem Lauf.",
+  "Keine separate Nacharbeit nötig; die nächste reguläre TOP-10-Instanz übernimmt die noch offenen Punkte aus diesem Lauf.",
+  "Keine separate Nacharbeit nötig; die nächste reguläre TOP-10-Instanz übernimmt noch offene Nacharbeit aus diesem Lauf.",
+  "Keine separate Nacharbeit nötig; jedoch ist die Freigabe offen.",
+  "Keine separate Nacharbeit nötig; die Freigabe steht noch aus.",
+  "Keine separate Nacharbeit nötig; Moritz muss die Freigabe noch erteilen.",
+  "Keine separate Nacharbeit nötig. Moritz muss noch freigeben."
+]) {
+  for (const finalComment of [{ text }, { html_text: `<body><p>${text}</p></body>` }]) {
+    const signals = detectRoutineFollowUpSignals({ finalComment });
+    assert.equal(signals.blocked_without_follow_up_task, true, text);
+    assert.equal(validateRoutineVisibleFollowUpStatus({ finalComment, hasFollowUpTask: false }).ok, false, text);
+  }
+}
+for (const text of [
+  "Keine separate Nacharbeit nötig; jedoch ist die Freigabe offen.",
+  "Keine separate Nacharbeit nötig; die Freigabe steht noch aus.",
+  "Keine separate Nacharbeit nötig; Moritz muss die Freigabe noch erteilen.",
+  "Keine separate Nacharbeit nötig; die nächste reguläre TOP-10-Instanz übernimmt die noch offenen Punkte aus diesem Lauf.",
+  "Keine separate Nacharbeit nötig. Moritz muss noch freigeben."
+]) {
+  assert.equal(hasRoutineNoFollowUpDecision(text), false, text);
+}
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: {
+    text: contentNativeCheckDecision,
+    html_text: `<body><p>${contentNativeCheckDecision}</p><a data-asana-gid="1215000000000000"/></body>`
+  }
+}).blocked_without_follow_up_task, true);
 for (const text of [
   "Keine separate Follow-up-Aufgabe erforderlich, aber die Nacharbeit ist noch offen.",
   "Keine zusätzliche Follow-up-Aufgabe und keine weitere Nacharbeit für diese Instanz erforderlich. Die technische Nacharbeit bleibt offen.",
@@ -315,6 +372,23 @@ assert.equal(inspectRoutineMaterialCommentIdempotency({
 }).status, "invalid_supersedes_story");
 assert.equal(inspectRoutineMaterialCommentIdempotency({
   stories: [{ ...salesScheduleOnlyStory, text: salesScheduleOnlyStory.text.replace("Evidenz / Verifikation", "Fünf Leads importiert.\nEvidenz / Verifikation") }],
+  agentUserGid: "1214338261069890"
+}).status, "blocked_duplicate_material_comment");
+
+const catchUpScheduleStory = {
+  gid: "1218937843766465",
+  created_by: { gid: "1214338261069890" },
+  text: "Terminbereinigung\nDie aus der verspätet abgeschlossenen Vorinstanz erzeugte Folgeroutine wurde im Catch-up-Pfad auf den nächsten freien Slot verschoben.\nVerifikation\nEvidenz / Verifikation\nAsana-Readback der Terminbereinigung; kein weiterer Routine-Erfolg behauptet."
+};
+assert.equal(inspectRoutineMaterialCommentIdempotency({
+  stories: [catchUpScheduleStory], agentUserGid: "1214338261069890"
+}).status, "first_material_comment");
+assert.equal(inspectRoutineMaterialCommentIdempotency({
+  stories: [{ ...catchUpScheduleStory, text: `${catchUpScheduleStory.text}\n1 Lead importiert.` }],
+  agentUserGid: "1214338261069890"
+}).status, "blocked_duplicate_material_comment");
+assert.equal(inspectRoutineMaterialCommentIdempotency({
+  stories: [catchUpScheduleStory, { ...closedEvidenceStory, created_by: { gid: "1214338261069890" } }],
   agentUserGid: "1214338261069890"
 }).status, "blocked_duplicate_material_comment");
 
