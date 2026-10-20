@@ -39,8 +39,8 @@ test("active process or advancing Codex activity keeps every lease", () => {
 });
 
 test("open task needs the exact own result story after task acquisition", () => {
-  const stories = [{ gid: "story-1", subtype: "comment_added", created_at: new Date(2_000_000).toISOString(),
-    created_by: { gid: "user-1" }, target: { gid: "123" } }];
+  const stories = [{ gid: "story-1", resource_subtype: "comment_added",
+    created_at: new Date(2_000_000).toISOString(), created_by: { gid: "user-1" } }];
   const taskReadbacks = [{ task_gid: "123", evidence_story_gid: "story-1",
     readbacks: completedTask.map((row) => ({ ...row, task: { ...row.task,
       completed: false, assignee: { gid: "user-1" } }, stories })) }];

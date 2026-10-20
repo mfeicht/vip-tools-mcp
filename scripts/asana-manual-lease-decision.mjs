@@ -87,8 +87,8 @@ export function decideManualLeaseReconciliation({ run, nativeReadbacks, processR
     } else if (nativeReadbacks[1].turn_status === "completed" &&
         task.assignee?.gid === agentUserGid &&
         pair.evidence_story_gid && stories.some((story) =>
-          story.gid === pair.evidence_story_gid && story.subtype === "comment_added" &&
-          story.target?.gid === binding.task_gid &&
+          story.gid === pair.evidence_story_gid &&
+          story.resource_subtype === "comment_added" &&
           story.created_by?.gid === agentUserGid &&
           Date.parse(story.created_at || "") > binding.acquired_at_ms)) {
       releaseTasks.push(binding.task_gid);
