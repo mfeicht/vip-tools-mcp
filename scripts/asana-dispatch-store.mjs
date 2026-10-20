@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { collectWorkerProcessReadback } from "./asana-worker-process-readback.mjs";
+import { decideManualLeaseReconciliation } from "./asana-manual-lease-decision.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
 export const DEFAULT_DB_PATH = path.join(
@@ -604,7 +606,7 @@ export class AsanaDispatchStore {
         a.fence AS agent_lease_fence, a.updated_at_ms AS agent_lease_updated_at_ms
       FROM manual_runs r
       LEFT JOIN leases a ON a.key='agent:' || r.agent_id AND a.run_id=r.run_id
-      WHERE r.state='active' AND r.created_at_ms <= ?
+      WHERE r.state='active' AND a.run_id=r.run_id AND r.created_at_ms <= ?
         AND COALESCE((SELECT MAX(l.updated_at_ms) FROM leases l
           WHERE l.run_id=r.run_id),r.created_at_ms) <= ?
         AND (r.last_checked_at_ms IS NULL OR r.last_checked_at_ms <= ?)
@@ -618,6 +620,71 @@ export class AsanaDispatchStore {
       LEFT JOIN leases l ON l.key='task:' || t.task_gid AND l.run_id=t.run_id
       WHERE t.run_id=? ORDER BY t.task_gid`);
     return runs.map((run) => ({ ...run, tasks: tasks.all(run.run_id) }));
+  }
+
+  // The caller supplies two independent Codex/Asana readbacks. A fixed local
+  // process scan and every persisted fence are checked again immediately before
+  // the single database transition. Unverified tasks remain quarantined.
+  reconcileManualRun(run, evidence, now = Date.now()) {
+    // Production entry point: no caller-supplied process proof is accepted.
+    const processReadback = collectWorkerProcessReadback(run);
+    return this._reconcileManualRunWithProcessReadback(run, evidence, processReadback, now);
+  }
+
+  _reconcileManualRunWithProcessReadback(run, evidence, processReadback, now = Date.now()) {
+    assertTime(now, "now");
+    if (!run?.run_id || !evidence?.nativeReadbacks || !evidence?.taskReadbacks) {
+      throw new Error("Manual reconciliation evidence required");
+    }
+    return this.transaction(() => {
+      const current = this.db.prepare(`SELECT r.*, r.created_at_ms AS acquired_at_ms,
+          a.token AS agent_lease_token, a.fence AS agent_lease_fence
+        FROM manual_runs r LEFT JOIN leases a
+          ON a.key='agent:' || r.agent_id AND a.run_id=r.run_id
+        WHERE r.run_id=?`).get(run.run_id);
+      const tasks = this.db.prepare(`SELECT t.task_gid,
+          t.first_acquired_at_ms AS acquired_at_ms,
+          t.lease_fence AS bound_lease_fence,
+          l.token AS lease_token,l.fence AS lease_fence
+        FROM manual_run_tasks t LEFT JOIN leases l
+          ON l.key='task:' || t.task_gid AND l.run_id=t.run_id
+        WHERE t.run_id=? ORDER BY t.task_gid`).all(run.run_id);
+      const keys = ["run_id", "agent_id", "thread_id", "state", "acquired_at_ms",
+        "agent_fence", "agent_lease_token", "agent_lease_fence"];
+      const taskKeys = ["task_gid", "acquired_at_ms", "bound_lease_fence", "lease_token", "lease_fence"];
+      if (!current || keys.some((key) => current[key] !== run[key]) ||
+          tasks.length !== run.tasks?.length || tasks.some((task, index) =>
+            taskKeys.some((key) => task[key] !== run.tasks[index][key]))) {
+        return { applied: false, reason: "manual_fence_changed" };
+      }
+      const decision = decideManualLeaseReconciliation({ run: { ...current, tasks },
+        nativeReadbacks: evidence.nativeReadbacks, taskReadbacks: evidence.taskReadbacks,
+        agentUserGid: evidence.agentUserGid, processReadback, now: Date.now() });
+      if (!decision.release_agent || decision.action === "hold") {
+        return { applied: false, reason: decision.reason };
+      }
+      const taskSet = new Set(tasks.map((task) => task.task_gid));
+      if (decision.release_tasks.length + decision.quarantine_tasks.length !== taskSet.size ||
+          decision.release_tasks.some((gid) => !taskSet.has(gid))) {
+        throw new Error("Manual reconciliation task partition invalid");
+      }
+      for (const gid of decision.release_tasks) {
+        const task = tasks.find((row) => row.task_gid === gid);
+        if (!this.releaseLease({ key: `task:${gid}`, run_id: run.run_id,
+          token: task.lease_token, fence: task.lease_fence })) {
+          throw new Error("Manual task lease fence changed");
+        }
+      }
+      if (!this.releaseLease({ key: `agent:${run.agent_id}`, run_id: run.run_id,
+        token: current.agent_lease_token, fence: current.agent_lease_fence })) {
+        throw new Error("Manual agent lease fence changed");
+      }
+      const complete = decision.quarantine_tasks.length === 0;
+      this.db.prepare(`UPDATE manual_runs SET state=?,updated_at_ms=?,
+          released_at_ms=?,last_checked_at_ms=? WHERE run_id=?`)
+        .run(complete ? "released" : "active", now, complete ? now : null, now, run.run_id);
+      return { applied: true, decision };
+    });
   }
 
   acquireLeaseInTransaction(key, runId, ttlMs, now) {
