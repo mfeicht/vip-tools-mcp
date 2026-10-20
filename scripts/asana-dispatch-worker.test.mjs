@@ -5,8 +5,19 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
-import { assertCodexOutputSchema, cleanNoWriteDueTask, documentedDependencyNoWrite,
+import { assertCodexOutputSchema, cleanNoWriteDueTask, documentedDependencyNoWrite, promptFor,
   noStorySignalsDeferredByDue, noWriteDisposition } from "./asana-dispatch-worker.mjs";
+
+test("all agent dispatch prompts bind the same no-Render and safe-retry contract", () => {
+  for (const agent of ["vip-ai-social-media", "vip-ai-finance", "vip-ai-communication", "vip-ai-operations"]) {
+    const prompt = promptFor({ run_id: "test", signals: [{ agent_id: agent, kind: "due_task" }] },
+      { gid: "1", name: "Routine" }, { tier: "standard" });
+    assert.match(prompt, /VIP-MCP-NO-RENDER-FALLBACK-V1/);
+    assert.match(prompt, /auch nicht read-only/);
+    assert.match(prompt, /Kein Retry einer unklaren Mutation ohne Readback\/Dedupe/);
+    assert.ok(prompt.includes(`agent_id=${agent}`));
+  }
+});
 
 test("Codex output schema requires every property and permits null dependency fields", () => {
   const schema = JSON.parse(fs.readFileSync(path.join(import.meta.dirname,

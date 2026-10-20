@@ -37,6 +37,15 @@ const providerBody = JSON.stringify({
   response: { inlinedResponses: [{ metadata: { key: "duplicate-output" } }] }
 });
 const provider = http.createServer((req, res) => {
+  if (req.url === "/v1beta/batches/providererror") {
+    res.writeHead(503, { "content-type": "text/html" }).end("<html>temporarily unavailable</html>");
+    return;
+  }
+  if (req.url === "/v1beta/batches/statuspending") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ name: "batches/statuspending", metadata: { state: "JOB_STATE_RUNNING" } }));
+    return;
+  }
   if (req.url !== "/v1beta/batches/streamcollecttest") {
     res.writeHead(404).end();
     return;
@@ -72,6 +81,26 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${mcpPort}/mcp`)));
+  assert.match(client.getInstructions(), /VIP-MCP-NO-RENDER-FALLBACK-V1/);
+  assert.match(client.getInstructions(), /including read-only attempts/);
+  for (const [batch_name, count, ready] of [
+    ["batches/streamcollecttest", 6, true], ["batches/statuspending", 0, false]
+  ]) {
+    const status = await client.callTool({ name: "gemini_image_batch_status",
+      arguments: { agent_id: "vip-ai-social-media", batch_name } });
+    assert.equal(status.isError, undefined);
+    const value = JSON.parse(status.content.find((item) => item.type === "text").text);
+    assert.equal(value.batch.inline_response_count, count);
+    assert.equal(value.ready_to_collect, ready);
+    assert.equal(value.readback.mode, "bounded_stream");
+    assert.equal(value.readback.max_entry_bytes, 16 * 1024 * 1024);
+    assert.equal(JSON.stringify(value).includes(base64.slice(0, 100)), false);
+  }
+  const failure = await client.callTool({ name: "gemini_image_batch_status",
+    arguments: { agent_id: "vip-ai-social-media", batch_name: "batches/providererror" } });
+  assert.equal(failure.isError, true);
+  assert.match(JSON.stringify(failure.content), /HTTP 503/);
+  assert.doesNotMatch(JSON.stringify(failure.content), /Unexpected token/);
   const response = await client.callTool({
     name: "gemini_image_batch_collect",
     arguments: {

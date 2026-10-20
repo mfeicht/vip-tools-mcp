@@ -133,6 +133,9 @@ export function promptFor(claim, task, route) {
     `Zusaetzliche bestehende Remote-/Task-Lock-Regeln und die Asana-Schreibvertraege bleiben gueltig.\n\n` +
     `Lies zuerst AGENTS.md und VIP-AI-Memory/10-Agenten/${agentFolder}/Start-hier.md sowie die dort verwiesenen Pflichtvertraege. ` +
     `Nutze fuer Asana ausschliesslich vip-tools-remote mit agent_id=${agentId}. Beginne mit einem schmalen Task-Readback ueber opt_fields; lade Beschreibung, Stories und Anhaenge nur im fuer diesen Task noetigen Umfang. ` +
+    `VIP-MCP-NO-RENDER-FALLBACK-V1: Kein Render-Connector, keine Render-CLI und keine Render-Admin-API als Diagnose oder Fallback, auch nicht read-only. ` +
+    `Bei HTTP 502/503/504 nur den kanonischen begrenzten Verbindungszyklus nutzen; bei 429/Cloudflare Cooldown beachten. Keine parallelen MCP-Bootstraps. ` +
+    `Kein Retry einer unklaren Mutation ohne Readback/Dedupe. Lies dazu VIP-AI-Memory/01-Prozesse/MCP-und-Automationen/MCP-Setup-Health-und-Sandbox.md. ` +
     `Bearbeite hoechstens diesen einen Task und alle aktuell offenen Kommentare darin, soweit Kapazitaet und Kontext reichen. ` +
     `Wenn der Task bereits erledigt, nicht mehr dir zugewiesen oder das Signal fachlich nicht mehr aktuell ist, tue nichts. ` +
     `Bei bewaehrten Aufgaben vergleiche vor blocked/no_action den letzten belegten Erfolgsweg dieses Aufgabentyps mit aktuellem Scope, aktiven Regeln und Readbacks; dokumentiere ein relevantes Delta statt den bekannten Pfad still zu verwerfen. ` +

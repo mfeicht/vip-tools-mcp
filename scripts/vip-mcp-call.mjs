@@ -3,6 +3,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -38,14 +39,14 @@ This script always uses ${MCP_URL}. It does not accept endpoint overrides.`);
 }
 
 function parsePositiveInt(value, label) {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
+  const parsed = Number(value);
+  if (!/^[0-9]+$/.test(String(value)) || !Number.isSafeInteger(parsed) || parsed <= 0) {
     throw new Error(`${label} muss eine positive Ganzzahl sein.`);
   }
   return parsed;
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const opts = {
     tool: null,
     argsJson: null,
@@ -97,6 +98,8 @@ function parseArgs(argv) {
   if (opts.tool && !/^[a-z][a-z0-9_]*$/i.test(opts.tool)) {
     throw new Error("Ungueltiger MCP-Toolname.");
   }
+  if (opts.attempts > DEFAULT_ATTEMPTS) throw new Error("attempts darf höchstens 3 sein.");
+  if (opts.delayMs > MAX_RETRY_DELAY_MS) throw new Error("delay-ms darf höchstens 60000 sein.");
   return opts;
 }
 
@@ -109,9 +112,16 @@ function processAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return error?.code !== "ESRCH";
   }
+}
+
+export function connectLockReclaimable(lock, ageMs, alive = processAlive) {
+  // A live holder may be sleeping through a shared cooldown. Age is not proof
+  // that its connect transaction ended. Give a newly created empty file time.
+  if (Number.isInteger(lock?.pid) && lock.pid > 1) return !alive(lock.pid);
+  return Number.isFinite(ageMs) && ageMs > CONNECT_LOCK_STALE_MS;
 }
 
 async function readJson(pathname, fallback = {}) {
@@ -149,11 +159,8 @@ async function acquireConnectLock() {
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       const lock = await readJson(CONNECT_LOCK_PATH, {});
-      const acquiredAt = Date.parse(lock.acquiredAt || "");
-      const stale =
-        !Number.isFinite(acquiredAt) ||
-        Date.now() - acquiredAt > CONNECT_LOCK_STALE_MS ||
-        !processAlive(Number(lock.pid));
+      const stat = await fs.stat(CONNECT_LOCK_PATH).catch(() => null);
+      const stale = connectLockReclaimable(lock, stat ? Date.now() - stat.mtimeMs : 0);
       if (stale) {
         await fs.unlink(CONNECT_LOCK_PATH).catch(() => {});
         continue;
@@ -220,7 +227,7 @@ function safeErrorText(error) {
   return message.replace(/\s+/g, " ").slice(0, MAX_ERROR_OUTPUT_CHARS);
 }
 
-function classifyConnectionError(error) {
+export function classifyConnectionError(error) {
   const message = errorText(error);
   if (error?.code === "VIP_MCP_COORDINATION_TIMEOUT") return "mcp_coordination_timeout";
   if (/Just a moment|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
@@ -228,14 +235,15 @@ function classifyConnectionError(error) {
   }
   if (/\b429\b|too many requests|rate.?limit/i.test(message)) return "remote_rate_limited";
   if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(message)) return "dns_resolution_error";
-  if (/\b(502|503|504)\b|Streamable HTTP error/i.test(message)) return "remote_mcp_transient_error";
+  if (/\b(401|403)\b/.test(message)) return "remote_auth_or_permission_error";
+  if (/\b(502|503|504)\b/.test(message)) return "remote_mcp_transient_error";
   if (/ECONNRESET|ECONNREFUSED|ETIMEDOUT|fetch failed|timeout after/i.test(message)) {
     return "network_transport_error";
   }
   return "mcp_connection_error";
 }
 
-function isTransientConnectionError(error) {
+export function isTransientConnectionError(error) {
   return [
     "dns_resolution_error",
     "remote_mcp_transient_error",
@@ -369,6 +377,35 @@ function normalizeContent(content) {
   });
 }
 
+async function recordToolTransportFailure(error, tool) {
+  const lock = await acquireConnectLock();
+  try {
+    const current = await readJson(TRANSPORT_STATE_PATH, {});
+    const cooldown = isCooldownConnectionError(error);
+    const until = Math.max(Date.parse(current.cooldownUntil || "") || 0,
+      cooldown ? Date.now() + RATE_LIMIT_COOLDOWN_MS : 0);
+    await recordTransportState({
+      lastToolFailureAt: new Date().toISOString(),
+      lastTool: tool,
+      lastToolErrorClass: classifyConnectionError(error),
+      lastToolError: safeErrorText(error),
+      ...(cooldown ? { cooldownUntil: new Date(until).toISOString() } : {})
+    });
+  } finally {
+    await releaseConnectLock(lock);
+  }
+}
+
+export async function callToolOnce(client, tool, args, timeoutMs, recordFailure = recordToolTransportFailure) {
+  try {
+    return await withTimeout(client.callTool({ name: tool, arguments: args }), timeoutMs, `MCP tool ${tool}`);
+  } catch (error) {
+    // Record post-connect throttling too, but never replay a possible mutation.
+    await recordFailure(error, tool).catch(() => {});
+    throw error;
+  }
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.selfTest) {
@@ -399,11 +436,7 @@ async function main() {
 
     // Tool calls are intentionally not auto-retried. A transport error after a
     // mutating request is ambiguous and retrying could duplicate side effects.
-    const result = await withTimeout(
-      client.callTool({ name: opts.tool, arguments: toolArgs }),
-      opts.toolTimeoutMs,
-      `MCP tool ${opts.tool}`
-    );
+    const result = await callToolOnce(client, opts.tool, toolArgs, opts.toolTimeoutMs);
     console.log(
       JSON.stringify({
         ok: !result.isError,
@@ -422,7 +455,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main().catch((error) => {
   console.error(
     JSON.stringify({
       ok: false,

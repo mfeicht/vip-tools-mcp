@@ -12088,19 +12088,18 @@ async function findGeminiBatchByDisplayName(agentId, displayName) {
 }
 
 async function getGeminiBatchJob(agentId, batchName) {
-  const normalizedBatchName = normalizeGeminiBatchName(batchName);
-  const response = await geminiImageRequest(agentId, {
-    path: `/${normalizedBatchName}`,
-    timeout: Math.min(GEMINI_IMAGE_TIMEOUT_MS, 60_000)
+  // Status/cancel preflights must not buffer every base64 image in a completed job.
+  // Retain at most one bounded entry; pending/failed jobs may have no inline list.
+  const streamed = await streamGeminiBatchJob(agentId, batchName, () => {}, {
+    maxEntryBytes: 16 * 1024 * 1024,
+    allowMissingInline: true
   });
-  if (!response.ok) {
-    const providerError = summarizeGeminiApiError(response.data);
-    throw new Error(`Gemini-Batch-Read fehlgeschlagen (HTTP ${response.status}): ${providerError.message}`);
-  }
-  return { response, summary: summarizeGeminiBatchJob(response.data) };
+  return { response: { status: streamed.providerStatus }, summary: streamed.summary,
+    readback: { mode: "bounded_stream", response_bytes: streamed.responseBytes,
+      max_entry_bytes: 16 * 1024 * 1024 } };
 }
 
-async function streamGeminiBatchJob(agentId, batchName, onEntry) {
+async function streamGeminiBatchJob(agentId, batchName, onEntry, streamOptions = {}) {
   const normalizedBatchName = normalizeGeminiBatchName(batchName);
   const { config } = getGeminiImageConfigDetails(agentId, { requireCredentials: true });
   const response = await axios.request({
@@ -12124,11 +12123,17 @@ async function streamGeminiBatchJob(agentId, batchName, onEntry) {
       if (size > 64 * 1024) throw new Error(`Gemini-Batch-Read fehlgeschlagen (HTTP ${response.status}); Fehlerantwort zu groß.`);
       parts.push(chunk);
     }
-    const providerError = summarizeGeminiApiError(JSON.parse(Buffer.concat(parts).toString("utf8")));
+    let errorData;
+    try {
+      errorData = JSON.parse(Buffer.concat(parts).toString("utf8"));
+    } catch {
+      errorData = { error: { message: "Provider lieferte eine Nicht-JSON-Fehlerantwort." } };
+    }
+    const providerError = summarizeGeminiApiError(errorData);
     throw new Error(`Gemini-Batch-Read fehlgeschlagen (HTTP ${response.status}): ${providerError.message}`);
   }
   try {
-    const parsed = await readGeminiBatchStream(response.data, onEntry);
+    const parsed = await readGeminiBatchStream(response.data, onEntry, streamOptions);
     const summary = summarizeGeminiBatchJob(parsed.document);
     summary.inline_response_count = parsed.entryCount;
     return { summary, providerStatus: response.status, responseBytes: parsed.totalBytes };
@@ -13311,7 +13316,7 @@ function summarizeUnsplashPhoto(photo) {
 /* ---------------- MCP SERVER FACTORY ---------------- */
 
 const MCP_SERVER_INSTRUCTIONS =
-  "VIP Tools Remote is the canonical VIP integration. For Asana, always use this server's asana_* tools with the explicit agent_id of the active agent; every agent_id maps to a separate Asana identity. Never suggest, install, connect, or use the public Asana plugin as a fallback. If this server or a required tool is unavailable, follow only the documented bounded retry path and report remote_mcp_tool_context_unavailable. Never fall back to another agent_id or a shared Asana account.";
+  "VIP Tools Remote is the canonical VIP integration. For Asana, always use this server's asana_* tools with the explicit agent_id of the active agent; every agent_id maps to a separate Asana identity. Never suggest, install, connect, or use the public Asana plugin as a fallback. If this server or a required tool is unavailable, follow only the documented bounded retry path and report remote_mcp_tool_context_unavailable. Never fall back to another agent_id or a shared Asana account. VIP-MCP-NO-RENDER-FALLBACK-V1: Never use or connect a Render connector, Render CLI or Render admin API to diagnose, health-check, retry or bypass this MCP, including read-only attempts. Hosting management requires a separate explicit human request. HTTP 502/503/504 do not prove a hosting outage; use only the bounded canonical retry path. On 429 or Cloudflare challenge honor the shared cooldown. Never replay a mutation with an unknown outcome before readback/deduplication.";
 
 function createServer() {
   const server = new McpServer({
@@ -19666,12 +19671,13 @@ function createServer() {
     },
     TOOL_EXTERNAL_READ,
     async ({ agent_id, batch_name }) => {
-      const { response, summary } = await getGeminiBatchJob(agent_id, batch_name);
+      const { response, summary, readback } = await getGeminiBatchJob(agent_id, batch_name);
       return out({
         agent_id,
         ok: true,
         provider_status: response.status,
         batch: summary,
+        readback,
         ready_to_collect: summary.succeeded,
         retry_recommended: !summary.terminal,
         terminal_failure: summary.terminal && !summary.succeeded
