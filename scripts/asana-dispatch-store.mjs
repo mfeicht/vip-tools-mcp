@@ -529,6 +529,33 @@ export class AsanaDispatchStore {
     });
   }
 
+  manualRunsForReconciliation({ now = Date.now(), limit = 2 } = {}) {
+    assertTime(now, "now");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 2) {
+      throw new Error("manual reconciliation limit must be one or two");
+    }
+    const idleBefore = now - 10 * 60_000;
+    const recheckBefore = now - 60 * 60_000;
+    if (idleBefore < 0) return [];
+    const runs = this.db.prepare(`SELECT r.*, a.token AS agent_lease_token,
+        a.fence AS agent_lease_fence, a.updated_at_ms AS agent_lease_updated_at_ms
+      FROM manual_lease_runs r
+      LEFT JOIN leases a ON a.key='agent:' || r.agent_id AND a.run_id=r.run_id
+      WHERE r.state='active' AND r.acquired_at_ms <= ?
+        AND COALESCE((SELECT MAX(l.updated_at_ms) FROM leases l
+          WHERE l.run_id=r.run_id),r.acquired_at_ms) <= ?
+        AND (r.last_checked_at_ms IS NULL OR r.last_checked_at_ms <= ?)
+      ORDER BY COALESCE(r.last_checked_at_ms,r.acquired_at_ms),r.run_id
+      LIMIT ?`).all(idleBefore, idleBefore, recheckBefore, limit);
+    const tasks = this.db.prepare(`SELECT t.task_gid,t.acquired_at_ms,
+        l.token AS lease_token,l.fence AS lease_fence,
+        l.updated_at_ms AS lease_updated_at_ms
+      FROM manual_lease_tasks t
+      LEFT JOIN leases l ON l.key='task:' || t.task_gid AND l.run_id=t.run_id
+      WHERE t.run_id=? ORDER BY t.task_gid`);
+    return runs.map((run) => ({ ...run, tasks: tasks.all(run.run_id) }));
+  }
+
   acquireLeaseInTransaction(key, runId, ttlMs, now) {
     const current = this.db.prepare("SELECT * FROM leases WHERE key = ?").get(key);
     // Expiry alone is not proof that a Codex turn stopped. Stale leases fail closed.

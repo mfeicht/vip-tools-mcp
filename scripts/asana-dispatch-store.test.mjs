@@ -210,6 +210,51 @@ test("manual lease acquisition fails closed without a Codex chat identity", (t) 
   assert.equal(first.db.prepare("SELECT COUNT(*) n FROM manual_lease_runs").get().n, 0);
 });
 
+test("manual reconciliation selector is bounded, read-only and retains task history", (t) => {
+  const { first, second } = fixture(t);
+  const now = 10_000_000;
+  for (const [agent, run, age] of [
+    ["vip-ai-alpha", "manual-alpha", 90],
+    ["vip-ai-beta", "manual-beta", 80],
+    ["vip-ai-gamma", "manual-gamma", 5]
+  ]) {
+    first.acquireManualAgent(agent, run, `thread-${run}`, now - age * 60_000);
+  }
+  first.acquireManualTask("manual-alpha", "123", "thread-manual-alpha", now - 89 * 60_000);
+  first.acquireManualTask("manual-alpha", "456", "thread-manual-alpha", now - 88 * 60_000);
+  first.db.prepare("DELETE FROM leases WHERE key='task:456'").run();
+  const before = second.db.prepare("SELECT total_changes() AS n").get().n;
+  const candidates = second.manualRunsForReconciliation({ now });
+  assert.deepEqual(candidates.map((run) => run.run_id), ["manual-alpha", "manual-beta"]);
+  assert.equal(candidates[0].thread_id, "thread-manual-alpha");
+  assert.equal(typeof candidates[0].agent_lease_token, "string");
+  assert.deepEqual(candidates[0].tasks.map((task) => task.task_gid), ["123", "456"]);
+  assert.equal(candidates[0].tasks[1].lease_token, null);
+  assert.equal(second.db.prepare("SELECT total_changes() AS n").get().n, before);
+  assert.equal(second.manualRunsForReconciliation({ now, limit: 1 }).length, 1);
+  assert.throws(() => second.manualRunsForReconciliation({ now, limit: 3 }), /limit/);
+});
+
+test("manual reconciliation selector waits for inactivity and one-hour recheck", (t) => {
+  const { first, second } = fixture(t);
+  const now = 10_000_000;
+  first.acquireManualAgent("vip-ai-alpha", "manual-alpha", "thread-alpha", now - 90 * 60_000);
+  first.acquireManualTask("manual-alpha", "123", "thread-alpha", now - 89 * 60_000);
+  first.acquireManualAgent("vip-ai-alpha", "manual-alpha", "thread-alpha", now - 5 * 60_000);
+  assert.deepEqual(second.manualRunsForReconciliation({ now }), []);
+  first.db.prepare("UPDATE leases SET updated_at_ms=? WHERE run_id=?")
+    .run(now - 11 * 60_000, "manual-alpha");
+  first.db.prepare("UPDATE manual_lease_runs SET last_checked_at_ms=? WHERE run_id=?")
+    .run(now - 30 * 60_000, "manual-alpha");
+  assert.deepEqual(second.manualRunsForReconciliation({ now }), []);
+  first.db.prepare("UPDATE manual_lease_runs SET last_checked_at_ms=? WHERE run_id=?")
+    .run(now - 61 * 60_000, "manual-alpha");
+  assert.equal(second.manualRunsForReconciliation({ now })[0].run_id, "manual-alpha");
+  first.db.prepare("UPDATE manual_lease_runs SET state='needs_review' WHERE run_id=?")
+    .run("manual-alpha");
+  assert.deepEqual(second.manualRunsForReconciliation({ now }), []);
+});
+
 test("observations and cursors persist atomically", (t) => {
   const { first, second } = fixture(t);
   first.transaction(() => {
