@@ -859,6 +859,45 @@ assert.equal(detectRoutineFollowUpSignals({
   finalComment: { text: "Follow-up: kein aktives Follow-up nötig, aber die bestehende Routine übernimmt weitere Nacharbeit." }
 }).blocked_without_follow_up_task, true);
 
+// Finance Radar 1219052898397684: the result already states the closed
+// decision. Completion and status idempotency must use the same reading;
+// a portfolio context handoff is not a new Asana follow-up by itself.
+const financeRadarResult = {
+  gid: "1219106662877805",
+  created_by: { gid: "1215003777954631" },
+  text: "Kein High-Alert. Handoff an Portfolio: Watchlist-/Risikokontext, ohne Order- oder Sizing-Freigabe. " +
+    "Für jede spätere Handlung wären frische Primärquellen und reguläre QA-Gates nötig. " +
+    "Follow-up: keine eigene Folgeaufgabe nötig, weil kein High-Alert und keine konkrete externe Handlung aus diesem Radar folgt.\n" +
+    "Evidenz / Verifikation\nDer Radar-Readback wurde geprüft."
+};
+const financeRadarSignals = detectRoutineFollowUpSignals({
+  finalComment: financeRadarResult,
+  completionBasis: "Radar vom 02.10. abgeschlossen; keine aktive Nacharbeit.",
+  followUpNotRequiredBasis: "Kein High-Alert und keine konkrete Portfolio-Aktion aus diesem Radar."
+});
+assert.equal(financeRadarSignals.no_follow_up_claim, true);
+assert.equal(financeRadarSignals.blocked_without_follow_up_task, false);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: financeRadarResult, hasFollowUpTask: false
+}).ok, true);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [financeRadarResult],
+  agentUserGid: "1215003777954631",
+  proposedText: "Keine weitere Folgeaufgabe nötig."
+}).status, "blocked_duplicate_no_follow_up_status");
+for (const remainingWork of [
+  "Die technische Nacharbeit bleibt offen.",
+  "Bitte eine neue Folgeaufgabe anlegen."
+]) {
+  assert.equal(detectRoutineFollowUpSignals({
+    finalComment: { text: `${financeRadarResult.text}\n${remainingWork}` }
+  }).blocked_without_follow_up_task, true);
+}
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { text: "Follow-up: keine eigene Folgeaufgabe möglicherweise nötig." },
+  hasFollowUpTask: false
+}).ok, false);
+
 // Existing Finance stories 1219437967637422 and 1218954092494207 already
 // state that their bounded instance scopes need no separate work.
 for (const text of [
