@@ -52,6 +52,7 @@
     "test:gemini-image": "node --test lib/gemini-image.test.mjs",
     "test:gemini-image-batch": "node --test lib/gemini-image-batch.test.mjs lib/generated-image-retention.test.mjs",
     "test:gemini-image-handoff": "node --test lib/generated-image-handoff.test.mjs",
+    "test:templated-preview": "node --test lib/templated-render-preview.test.mjs lib/templated-internal-id.test.mjs lib/generated-image-handoff.test.mjs",
     "test:gemini-image-mcp": "node scripts/gemini-image-mcp-selftest.mjs",
     "test:mcp-lifecycle": "node scripts/mcp-request-lifecycle-selftest.mjs",
     "mcp:call": "node scripts/vip-mcp-call.mjs"
