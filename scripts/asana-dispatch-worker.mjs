@@ -243,7 +243,6 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
   const runId = randomUUID().replaceAll("-", "");
   const claim = store.claimNext(runId, { agentId: selectedAgentId });
   if (!claim) { store.close(); return { status: "idle" }; }
-  store.recordRun(claim);
   const agentId = claim.signals[0].agent_id;
   const taskGid = claim.signals[0].task_gid;
   const client = new Client({ name: "vip-asana-dispatch-worker", version: "1.0.0" });
@@ -273,6 +272,12 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
     }
     claim.resume_context = resumeContextForClaim(store, claim);
     const route = await selectModel(agentId, before);
+    // This transaction must commit before spawn. An expired or changed fence
+    // leaves the claim for reconciliation; it must never launch the model.
+    if (!store.beginCodexLaunch(claim)) {
+      return { status: "prestart_claim_expired", run_id: runId,
+        agent_id: agentId, task_gid: taskGid };
+    }
     const startedAt = Date.now() - 2000;
     codexStarted = true;
     codex = await runCodex(claim, before, route, store, db, codexBinary);

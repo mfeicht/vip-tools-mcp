@@ -86,9 +86,29 @@ export function resolveDeadLetters(store, { signalIds, agentId, taskGid, outcome
 export async function reconcileCompletedRuns(store, { readTask = null,
   archive = archiveCompletedThread, limit = 5 } = {}) {
   const runs = store.runsNeedingReconciliation()
-    .filter((run) => run.state === "needs_reconciliation").slice(0, limit);
-  const result = { checked: 0, acknowledged: 0, still_open: 0, archived: 0, errors: [] };
+    .filter((run) => run.state === "needs_reconciliation" ||
+      (run.state === "claimed" && run.launch_phase === "preflight")).slice(0, limit);
+  const result = { checked: 0, acknowledged: 0, still_open: 0,
+    preflight_retried: 0, preflight_unverified: 0, archived: 0, errors: [] };
   if (!runs.length) return result;
+
+  // Preflight recovery is purely local. Never require an MCP connection to
+  // release a provably never-launched claim, and never infer that from NULL.
+  const pending = [];
+  for (const run of runs) {
+    if (run.state !== "claimed") { pending.push(run); continue; }
+    result.checked += 1;
+    try {
+      if (run.launch_phase === "preflight" &&
+          store.recoverNeverLaunchedRun(run.run_id)) result.preflight_retried += 1;
+      else result.preflight_unverified += 1;
+    } catch (error) {
+      result.preflight_unverified += 1;
+      result.errors.push({ run_id: run.run_id, stage: "preflight",
+        error: String(error).slice(0, 500) });
+    }
+  }
+  if (!pending.length) return result;
 
   let client = null;
   try {
@@ -102,7 +122,7 @@ export async function reconcileCompletedRuns(store, { readTask = null,
         return response.response?.data;
       };
     }
-    for (const run of runs) {
+    for (const run of pending) {
       result.checked += 1;
       try {
         const task = await readTask(run);

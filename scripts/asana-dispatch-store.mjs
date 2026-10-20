@@ -75,6 +75,7 @@ export class AsanaDispatchStore {
         thread_id TEXT,
         turn_id TEXT,
         state TEXT NOT NULL CHECK (state IN ('claimed','started','completed','needs_reconciliation')),
+        launch_phase TEXT,
         started_at_ms INTEGER NOT NULL,
         updated_at_ms INTEGER NOT NULL,
         last_error TEXT
@@ -133,6 +134,11 @@ export class AsanaDispatchStore {
       );
       CREATE INDEX IF NOT EXISTS poll_run_errors_started ON poll_run_errors(started_at_ms);
     `);
+    // Historical runs remain NULL: an old claimed row is not proof of no launch.
+    if (!this.db.prepare("PRAGMA table_info(runs)").all()
+      .some((column) => column.name === "launch_phase")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN launch_phase TEXT");
+    }
   }
 
   close() {
@@ -334,6 +340,67 @@ export class AsanaDispatchStore {
         threadId, turnId, state, now, now, error ? String(error).slice(0, 500) : null);
   }
 
+  beginCodexLaunch(claim, now = Date.now()) {
+    assertTime(now, "now");
+    return this.transaction(() => {
+      const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(assertId(claim.run_id, "run_id"));
+      const agent = this.db.prepare("SELECT * FROM leases WHERE key=?").get(claim.agent_lease.key);
+      const task = this.db.prepare("SELECT * FROM leases WHERE key=?").get(claim.task_lease.key);
+      const signals = this.db.prepare("SELECT * FROM signals WHERE run_id=? ORDER BY id").all(claim.run_id);
+      if (run?.state !== "claimed" || run.launch_phase !== "preflight" ||
+          run.thread_id || run.turn_id ||
+          agent?.key !== `agent:${run.agent_id}` || task?.key !== `task:${run.task_gid}` ||
+          agent?.run_id !== claim.run_id || task?.run_id !== claim.run_id ||
+          agent.token !== claim.agent_lease.token || agent.fence !== claim.agent_lease.fence ||
+          task.token !== claim.task_lease.token || task.fence !== claim.task_lease.fence ||
+          agent.expires_at_ms <= now || task.expires_at_ms <= now ||
+          signals.length !== claim.signals.length || !signals.length ||
+          signals.some((signal) => signal.status !== "leased" ||
+            signal.agent_id !== run.agent_id || signal.task_gid !== run.task_gid ||
+            signal.lease_token !== task.token || signal.lease_fence !== task.fence ||
+            !claim.signals.some((expected) => expected.id === signal.id))) return false;
+      this.db.prepare("UPDATE runs SET launch_phase='launching',updated_at_ms=? WHERE run_id=?")
+        .run(now, claim.run_id);
+      this.acquireLeaseInTransaction(agent.key, claim.run_id, 2 * 60 * 60_000, now);
+      this.acquireLeaseInTransaction(task.key, claim.run_id, 2 * 60 * 60_000, now);
+      return true;
+    });
+  }
+
+  recoverNeverLaunchedRun(runId, now = Date.now()) {
+    assertId(runId, "run_id");
+    assertTime(now, "now");
+    return this.transaction(() => {
+      const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(runId);
+      if (run?.state !== "claimed" || run.launch_phase !== "preflight" ||
+          run.thread_id || run.turn_id) return false;
+      const leases = this.leasesForRun(runId);
+      const agent = leases.find((lease) => lease.key === `agent:${run.agent_id}`);
+      const task = leases.find((lease) => lease.key === `task:${run.task_gid}`);
+      const signals = this.db.prepare("SELECT * FROM signals WHERE run_id=? ORDER BY id").all(runId);
+      if (leases.length !== 2 || !agent || !task ||
+          agent.expires_at_ms >= now || task.expires_at_ms >= now || !signals.length ||
+          signals.some((signal) => signal.status !== "leased" ||
+            signal.agent_id !== run.agent_id || signal.task_gid !== run.task_gid ||
+            signal.lease_token !== task.token || signal.lease_fence !== task.fence)) return false;
+      const note = "Dispatcher stopped in fenced preflight before Codex launch";
+      for (const signal of signals) {
+        const changed = this.db.prepare(`UPDATE signals SET status='retry_after',
+          available_at_ms=?, attempts=MAX(0,attempts-1), run_id=NULL,
+          lease_token=NULL, lease_fence=NULL, updated_at_ms=?, last_error=?
+          WHERE id=? AND status='leased' AND run_id=? AND lease_token=? AND lease_fence=?`)
+          .run(now + 5 * 60_000, now, note, signal.id, runId, task.token, task.fence).changes;
+        if (changed !== 1) throw new Error("Preflight signal fence changed");
+      }
+      if (!this.releaseLease(task) || !this.releaseLease(agent)) {
+        throw new Error("Preflight lease fence changed");
+      }
+      this.db.prepare("UPDATE runs SET state='completed',updated_at_ms=?,last_error=? WHERE run_id=?")
+        .run(now, note, runId);
+      return true;
+    });
+  }
+
   touchRun(runId, now = Date.now()) {
     this.db.prepare("UPDATE runs SET updated_at_ms=? WHERE run_id=? AND state='started'")
       .run(now, assertId(runId, "run_id"));
@@ -428,7 +495,7 @@ export class AsanaDispatchStore {
       .run(lease.key, lease.run_id, lease.token, lease.fence).changes === 1;
   }
 
-  claimNext(runId, { now = Date.now(), ttlMs = 2 * 60 * 60_000, agentId = null } = {}) {
+  claimNext(runId, { now = Date.now(), ttlMs = 20 * 60_000, agentId = null } = {}) {
     assertId(runId, "run_id");
     if (agentId) assertId(agentId, "agent_id");
     return this.transaction(() => {
@@ -457,7 +524,12 @@ export class AsanaDispatchStore {
             run_id=?, lease_token=?, lease_fence=?, updated_at_ms=? WHERE id=?`)
             .run(runId, taskLease.token, taskLease.fence, now, signal.id);
         }
-        return { run_id: runId, agent_lease: agentLease, task_lease: taskLease, signals: siblings };
+        const claim = { run_id: runId, agent_lease: agentLease, task_lease: taskLease, signals: siblings };
+        this.db.prepare(`INSERT INTO runs
+          (run_id,agent_id,task_gid,state,launch_phase,started_at_ms,updated_at_ms)
+          VALUES (?,?,?,'claimed','preflight',?,?)`)
+          .run(runId, candidate.agent_id, candidate.task_gid, now, now);
+        return claim;
       }
       return null;
     });

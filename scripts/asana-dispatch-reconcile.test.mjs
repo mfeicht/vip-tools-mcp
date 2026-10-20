@@ -27,11 +27,30 @@ test("completed task readback releases ambiguous run and archives its thread", a
     readTask: async () => ({ gid: "123456", completed: true }),
     archive: async (id) => { archived.push(id); return true; }
   });
-  assert.deepEqual(result, { checked: 1, acknowledged: 1, still_open: 0, archived: 1, errors: [] });
+  assert.deepEqual(result, { checked: 1, acknowledged: 1, still_open: 0,
+    preflight_retried: 0, preflight_unverified: 0, archived: 1, errors: [] });
   assert.deepEqual(archived, ["thread-1"]);
   assert.deepEqual(store.activeLeases(), []);
   assert.deepEqual(store.counts(), { acknowledged: 1 });
   assert.equal(store.db.prepare("SELECT state FROM runs WHERE run_id='run-1'").get().state, "completed");
+});
+
+test("expired preflight is retried locally without an Asana or Codex read", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dispatch-preflight-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new AsanaDispatchStore(path.join(dir, "store.sqlite"));
+  t.after(() => store.close());
+  store.enqueue({ id: "signal-1", agent_id: "vip-ai-test", task_gid: "123456",
+    source_version: "signal-1", kind: "due_task", priority: 50, available_at_ms: 1000 }, 1000);
+  store.claimNext("run-preflight", { now: 1000, ttlMs: 60_000 });
+  const result = await reconcileCompletedRuns(store, {
+    readTask: async () => { throw new Error("must not read Asana"); },
+    archive: async () => { throw new Error("must not archive"); }
+  });
+  assert.equal(result.preflight_retried, 1);
+  assert.equal(result.acknowledged, 0);
+  assert.deepEqual(store.counts(), { retry_after: 1 });
+  assert.deepEqual(store.activeLeases(), []);
 });
 
 test("open task stays fenced after ambiguous worker outcome", async (t) => {
@@ -90,7 +109,8 @@ test("read-only reconciliation inspection reports post-run stories without relea
     stories: [{ gid: "story-1", created_at: "1970-01-01T00:00:03Z",
       created_by: { gid: "user-1" } }], ownGid: "user-1"
   } });
-  assert.equal(result.task_modified_after_start, false);
+  // The atomically persisted claim starts at 1000 ms, before this readback.
+  assert.equal(result.task_modified_after_start, true);
   assert.equal(result.own_stories_after_start, 1);
   assert.equal(result.stories_after_start[0].gid, "story-1");
   assert.equal(store.activeLeases().length, 2);
