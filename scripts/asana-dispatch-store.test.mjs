@@ -183,14 +183,31 @@ test("fencing tokens reject stale acknowledgements and retries dead-letter", (t)
 
 test("scheduled agent leases share the same gate as dispatch", (t) => {
   const { first, second } = fixture(t);
-  const acquired = executeLeaseCommand(first, { command: "acquire-agent", agent: "vip-ai-research" });
+  const thread = "thread-123";
+  const acquired = executeLeaseCommand(first, { command: "acquire-agent", agent: "vip-ai-research", thread });
   assert.equal(acquired.acquired, true);
-  assert.equal(executeLeaseCommand(second, { command: "acquire-agent", agent: "vip-ai-research" }).acquired, false);
-  assert.equal(executeLeaseCommand(first, { command: "acquire-task", run: acquired.run_id, task: "123" }).acquired, true);
+  assert.equal(executeLeaseCommand(second, { command: "acquire-agent", agent: "vip-ai-research", thread }).acquired, false);
+  assert.equal(executeLeaseCommand(first, { command: "acquire-task", run: acquired.run_id, task: "123", thread }).acquired, true);
+  assert.deepEqual({ ...second.db.prepare("SELECT agent_id,thread_id FROM manual_lease_runs WHERE run_id=?")
+    .get(acquired.run_id) }, { agent_id: "vip-ai-research", thread_id: thread });
+  assert.deepEqual(second.db.prepare("SELECT task_gid FROM manual_lease_tasks WHERE run_id=?")
+    .all(acquired.run_id).map((row) => row.task_gid), ["123"]);
   first.enqueue(signal("story-1", "123", "vip-ai-research"));
   assert.equal(second.claimNext("run-dispatch"), null);
-  assert.equal(executeLeaseCommand(first, { command: "release", run: acquired.run_id }).released, 2);
+  assert.throws(() => executeLeaseCommand(second,
+    { command: "release", run: acquired.run_id, thread: "foreign-thread" }), /binding required/);
+  assert.equal(executeLeaseCommand(first, { command: "release", run: acquired.run_id, thread }).released, 2);
+  assert.equal(second.db.prepare("SELECT state FROM manual_lease_runs WHERE run_id=?")
+    .get(acquired.run_id).state, "released");
   assert.equal(second.claimNext("run-dispatch")?.signals[0].id, "story-1");
+});
+
+test("manual lease acquisition fails closed without a Codex chat identity", (t) => {
+  const { first } = fixture(t);
+  assert.throws(() => executeLeaseCommand(first,
+    { command: "acquire-agent", agent: "vip-ai-research" }), /CODEX_THREAD_ID/);
+  assert.deepEqual(first.activeLeases(), []);
+  assert.equal(first.db.prepare("SELECT COUNT(*) n FROM manual_lease_runs").get().n, 0);
 });
 
 test("observations and cursors persist atomically", (t) => {

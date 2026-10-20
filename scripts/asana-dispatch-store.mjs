@@ -59,6 +59,22 @@ export class AsanaDispatchStore {
         key TEXT PRIMARY KEY,
         last_fence INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS manual_lease_runs (
+        run_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        acquired_at_ms INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active','released','needs_review')),
+        last_checked_at_ms INTEGER,
+        last_error TEXT,
+        reconciliation_evidence TEXT
+      );
+      CREATE TABLE IF NOT EXISTS manual_lease_tasks (
+        run_id TEXT NOT NULL,
+        task_gid TEXT NOT NULL,
+        acquired_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(run_id,task_gid)
+      );
       CREATE TABLE IF NOT EXISTS task_observations (
         agent_id TEXT NOT NULL,
         task_gid TEXT NOT NULL,
@@ -470,6 +486,49 @@ export class AsanaDispatchStore {
     return this.transaction(() => this.acquireLeaseInTransaction(key, runId, ttlMs, now));
   }
 
+  acquireManualAgent(agentId, runId, threadId, now = Date.now()) {
+    assertId(agentId, "agent_id");
+    assertId(runId, "run_id");
+    assertId(threadId, "thread_id");
+    assertTime(now, "now");
+    return this.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM manual_lease_runs WHERE run_id=?").get(runId);
+      if (existing && (existing.agent_id !== agentId || existing.thread_id !== threadId ||
+          existing.state !== "active")) throw new Error("Manual run binding changed");
+      const lease = this.acquireLeaseInTransaction(`agent:${agentId}`, runId, 2 * 60 * 60_000, now);
+      if (!lease) return null;
+      if (!existing) this.db.prepare(`INSERT INTO manual_lease_runs
+        (run_id,agent_id,thread_id,acquired_at_ms,state) VALUES (?,?,?,?,'active')`)
+        .run(runId, agentId, threadId, now);
+      return lease;
+    });
+  }
+
+  assertManualRunThread(runId, threadId) {
+    assertId(runId, "run_id");
+    assertId(threadId, "thread_id");
+    const run = this.db.prepare("SELECT * FROM manual_lease_runs WHERE run_id=?").get(runId);
+    if (!run || run.thread_id !== threadId || run.state !== "active") {
+      throw new Error("Active manual run/thread binding required");
+    }
+    return run;
+  }
+
+  acquireManualTask(runId, taskGid, threadId, now = Date.now()) {
+    assertId(taskGid, "task_gid");
+    assertTime(now, "now");
+    return this.transaction(() => {
+      const run = this.assertManualRunThread(runId, threadId);
+      const agent = this.db.prepare("SELECT * FROM leases WHERE key=?").get(`agent:${run.agent_id}`);
+      if (!agent || agent.run_id !== runId) throw new Error("Acquire the agent lease first");
+      const lease = this.acquireLeaseInTransaction(`task:${taskGid}`, runId, 2 * 60 * 60_000, now);
+      if (!lease) return null;
+      this.db.prepare(`INSERT OR IGNORE INTO manual_lease_tasks
+        (run_id,task_gid,acquired_at_ms) VALUES (?,?,?)`).run(runId, taskGid, now);
+      return lease;
+    });
+  }
+
   acquireLeaseInTransaction(key, runId, ttlMs, now) {
     const current = this.db.prepare("SELECT * FROM leases WHERE key = ?").get(key);
     // Expiry alone is not proof that a Codex turn stopped. Stale leases fail closed.
@@ -771,11 +830,14 @@ export class AsanaDispatchStore {
     return { run_id: runId, agent_lease: agentLease, task_lease: taskLease, signals };
   }
 
-  releaseRun(runId) {
+  releaseRun(runId, threadId = null) {
     assertId(runId, "run_id");
     return this.transaction(() => {
+      if (threadId !== null) this.assertManualRunThread(runId, threadId);
       const leases = this.leasesForRun(runId);
       for (const lease of leases) this.releaseLease(lease);
+      if (threadId !== null) this.db.prepare(`UPDATE manual_lease_runs SET state='released'
+        WHERE run_id=? AND state='active'`).run(runId);
       return leases.length;
     });
   }

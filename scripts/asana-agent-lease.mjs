@@ -11,23 +11,23 @@ function parse(argv) {
   return { command, ...options };
 }
 
-export function executeLeaseCommand(store, { command, agent, task, run }) {
+export function executeLeaseCommand(store, { command, agent, task, run, thread }) {
   if (command === "status") return { leases: store.activeLeases(), counts: store.counts() };
+  if (!thread) throw new Error("CODEX_THREAD_ID or CODEX_SESSION_ID required for manual lease");
   if (command === "acquire-agent") {
     if (!/^vip-ai-[a-z-]+$/.test(agent || "")) throw new Error("Valid --agent required");
     const runId = run || randomUUID().replaceAll("-", "");
-    const lease = store.acquireLease(`agent:${agent}`, runId, 2 * 60 * 60_000);
+    const lease = store.acquireManualAgent(agent, runId, thread);
     return { acquired: Boolean(lease), run_id: runId, lease: lease || null };
   }
   if (command === "acquire-task") {
     if (!run || !/^\d+$/.test(task || "")) throw new Error("--run and numeric --task required");
-    const agentLease = store.leasesForRun(run).find((lease) => lease.key.startsWith("agent:"));
-    if (!agentLease) throw new Error("Acquire the agent lease first");
-    const lease = store.acquireLease(`task:${task}`, run, 2 * 60 * 60_000);
+    const lease = store.acquireManualTask(run, task, thread);
     return { acquired: Boolean(lease), run_id: run, lease: lease || null };
   }
   if (command === "renew") {
     if (!run) throw new Error("--run required");
+    store.assertManualRunThread(run, thread);
     const leases = store.leasesForRun(run);
     if (!leases.length) throw new Error("No active leases for run");
     for (const lease of leases) store.acquireLease(lease.key, run, 2 * 60 * 60_000);
@@ -35,7 +35,7 @@ export function executeLeaseCommand(store, { command, agent, task, run }) {
   }
   if (command === "release") {
     if (!run) throw new Error("--run required");
-    return { released: store.releaseRun(run), run_id: run };
+    return { released: store.releaseRun(run, thread), run_id: run };
   }
   throw new Error("Usage: acquire-agent --agent=vip-ai-X | acquire-task --run=ID --task=GID | renew --run=ID | release --run=ID | status");
 }
@@ -43,7 +43,8 @@ export function executeLeaseCommand(store, { command, agent, task, run }) {
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
   const store = new AsanaDispatchStore();
   try {
-    const result = executeLeaseCommand(store, parse(process.argv.slice(2)));
+    const result = executeLeaseCommand(store, { ...parse(process.argv.slice(2)),
+      thread: process.env.CODEX_THREAD_ID || process.env.CODEX_SESSION_ID });
     console.log(JSON.stringify(result));
     if (result.acquired === false) process.exitCode = 3;
   } catch (error) {
