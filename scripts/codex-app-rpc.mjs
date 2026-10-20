@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-
-const CODEX = process.env.VIP_DASHBOARD_CODEX_BIN || "/Applications/ChatGPT.app/Contents/Resources/codex";
+import { resolveCodexBinary } from "./codex-binary.mjs";
 
 export class CodexAppRpc {
   constructor() {
@@ -11,7 +10,7 @@ export class CodexAppRpc {
   }
 
   async start() {
-    this.child = spawn(CODEX, ["app-server", "--listen", "stdio://"],
+    this.child = spawn(resolveCodexBinary(), ["app-server", "--listen", "stdio://"],
       { stdio: ["pipe", "pipe", "pipe"] });
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", (chunk) => { this.stderr = `${this.stderr}${chunk}`.slice(-2000); });

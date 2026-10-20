@@ -345,11 +345,52 @@ export class AsanaDispatchStore {
   }
 
   runsNeedingReconciliation(now = Date.now()) {
-    return this.db.prepare(`SELECT r.*, l.expires_at_ms FROM runs r JOIN leases l
-      ON l.key='agent:'||r.agent_id AND l.run_id=r.run_id
-      WHERE (l.expires_at_ms < ? AND r.state IN ('claimed','started'))
+    return this.db.prepare(`SELECT r.*, a.expires_at_ms,
+        CASE WHEN a.key IS NULL THEN 1 ELSE 0 END AS task_only_quarantine
+      FROM runs r JOIN leases t ON t.key='task:'||r.task_gid AND t.run_id=r.run_id
+      LEFT JOIN leases a ON a.key='agent:'||r.agent_id AND a.run_id=r.run_id
+      WHERE (a.expires_at_ms < ? AND r.state IN ('claimed','started'))
          OR r.state='needs_reconciliation'`)
       .all(now);
+  }
+
+  quarantineTerminalRun(expectedRun, expectedLeases, expectedSignals, turnId,
+    evidenceDigest, now = Date.now(), { dryRun = false } = {}) {
+    assertTime(now, "now");
+    assertId(turnId, "turn_id");
+    if (!/^[a-f0-9]{64}$/.test(evidenceDigest || "")) throw new Error("Evidence digest required");
+    return this.transaction(() => {
+      const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(expectedRun?.run_id);
+      const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+      if (!run || !same({ ...run }, expectedRun) ||
+          !["started", "needs_reconciliation"].includes(run.state) ||
+          !run.thread_id || (run.turn_id && run.turn_id !== turnId)) {
+        throw new Error("Run changed before quarantine");
+      }
+      const leases = this.leasesForRun(run.run_id).map((row) => ({ ...row }));
+      const signals = this.db.prepare("SELECT * FROM signals WHERE run_id=? ORDER BY id")
+        .all(run.run_id).map((row) => ({ ...row }));
+      if (!same(leases, expectedLeases) || !same(signals, expectedSignals) ||
+          leases.length !== 2 || !signals.length ||
+          signals.some((row) => row.status !== "leased" ||
+            row.agent_id !== run.agent_id || row.task_gid !== run.task_gid)) {
+        throw new Error("Lease or signal changed before quarantine");
+      }
+      const agent = leases.find((row) => row.key === `agent:${run.agent_id}`);
+      const task = leases.find((row) => row.key === `task:${run.task_gid}`);
+      if (!agent || !task || signals.some((row) =>
+        row.lease_token !== task.token || row.lease_fence !== task.fence)) {
+        throw new Error("Incomplete fenced claim");
+      }
+      if (dryRun) return { status: "review_ready", run_id: run.run_id,
+        agent_release_only: true, task_and_signals_preserved: true };
+      this.recordRun({ run_id: run.run_id, agent_lease: agent, task_lease: task, signals },
+        { threadId: run.thread_id, turnId, state: "needs_reconciliation",
+          error: `Task quarantined after native terminal double-read; evidence sha256=${evidenceDigest}`, now });
+      if (!this.releaseLease(agent)) throw new Error("Agent release fence changed");
+      return { run_id: run.run_id, agent_id: run.agent_id, task_gid: run.task_gid,
+        agent_released: true, task_quarantined: true, signals_preserved: signals.length };
+    });
   }
 
   acquireLease(key, runId, ttlMs, now = Date.now()) {

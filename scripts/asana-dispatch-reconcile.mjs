@@ -108,6 +108,12 @@ export async function reconcileCompletedRuns(store, { readTask = null,
         const task = await readTask(run);
         if (String(task?.gid || "") !== run.task_gid) throw new Error("Task readback GID mismatch");
         if (task.completed !== true) { result.still_open += 1; continue; }
+        // Operator quarantine deliberately removed only the agent lease.
+        // A later Asana completion alone must not release that protected task.
+        if (run.task_only_quarantine) {
+          result.task_quarantined = (result.task_quarantined || 0) + 1;
+          continue;
+        }
         const claim = store.claimForRun(run.run_id);
         store.settle(claim, { outcome: "acknowledged" });
         store.recordRun(claim, { threadId: run.thread_id, turnId: run.turn_id, state: "completed" });

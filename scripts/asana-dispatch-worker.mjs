@@ -9,9 +9,9 @@ import { AsanaDispatchStore, DEFAULT_DB_PATH } from "./asana-dispatch-store.mjs"
 import { storiesForTask, tool } from "./asana-dispatch-poller.mjs";
 import { dueIsReady, signalId, storyMentionsUser } from "./asana-dispatch-signals.mjs";
 import { archiveCompletedThread } from "./codex-app-rpc.mjs";
+import { resolveCodexBinary } from "./codex-binary.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
-const CODEX = process.env.VIP_DASHBOARD_CODEX_BIN || "/Applications/ChatGPT.app/Contents/Resources/codex";
 const MCP_URL = process.env.WATCHER_MCP_URL || "https://vip-tools-mcp.onrender.com/mcp";
 const RESULT_SCHEMA = path.join(import.meta.dirname, "asana-dispatch-result.schema.json");
 const TASK_FIELDS = "gid,name,completed,assignee.gid,created_by.gid,due_on,due_at,modified_at,permalink_url";
@@ -144,7 +144,7 @@ function promptFor(claim, task, route) {
     `blocked bei echtem externem Hindernis, no_action nur wenn keine Handlung mehr noetig ist.\n`;
 }
 
-async function runCodex(claim, task, route, store, dbPath) {
+async function runCodex(claim, task, route, store, dbPath, codexBinary) {
   const outputPath = path.join(path.dirname(dbPath), `asana-dispatch-${claim.run_id}.json`);
   const outputHandle = await fs.open(outputPath, "wx", 0o600);
   await outputHandle.close();
@@ -162,7 +162,7 @@ async function runCodex(claim, task, route, store, dbPath) {
   const previousUmask = process.umask(0o077);
   let child;
   try {
-    child = spawn(CODEX, args, {
+    child = spawn(codexBinary, args, {
       cwd: ROOT,
       env: { ...process.env, VIP_ASANA_DISPATCH_RUN_ID: claim.run_id,
         VIP_ASANA_DISPATCH_AGENT_ID: claim.signals[0].agent_id,
@@ -228,7 +228,12 @@ async function runCodex(claim, task, route, store, dbPath) {
   }
 }
 
-export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null } = {}) {
+export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
+  resolveBinary = resolveCodexBinary } = {}) {
+  // A missing application bundle must not claim a task or create a stale lease.
+  let codexBinary;
+  try { codexBinary = resolveBinary(); }
+  catch (error) { return { status: "preflight_blocked", reason: String(error.message || error) }; }
   const store = new AsanaDispatchStore(db);
   const runId = randomUUID().replaceAll("-", "");
   const claim = store.claimNext(runId, { agentId: selectedAgentId });
@@ -264,7 +269,7 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null } 
     const route = await selectModel(agentId, before);
     const startedAt = Date.now() - 2000;
     codexStarted = true;
-    codex = await runCodex(claim, before, route, store, db);
+    codex = await runCodex(claim, before, route, store, db, codexBinary);
     const after = await readTask(client, agentId, taskGid);
     const afterStories = await storiesForTask(client, agentId, taskGid);
     const verifiedProgress = after.completed || laterOwnStory(afterStories, ownGid, startedAt);
