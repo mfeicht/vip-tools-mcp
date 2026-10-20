@@ -94,4 +94,44 @@ assert.deepEqual(assertRoutineCatchupOnCadence(dstRule, dstSource,
   due_on: "2026-10-25", due_time_berlin: "09:00:00"
 });
 
-console.log("asana routine cadence self-test passed");
+const workweek = { unit: "day", interval: 1, anchor_due_on: "2026-10-15", weekdays: [1, 2, 3, 4, 5] };
+const ledgerSource = { due_on: "2026-10-15", due_at: "2026-10-15T19:35:00.000Z" };
+assert.deepEqual(nextRoutineCadenceSlot(workweek, ledgerSource, new Date("2026-10-16T19:34:59Z")),
+  { due_on: "2026-10-16", due_time_berlin: "21:35:00" });
+for (const now of ["2026-10-16T19:35:00Z", "2026-10-17T10:00:00Z", "2026-10-18T10:00:00Z"]) {
+  assert.deepEqual(nextRoutineCadenceSlot(workweek, ledgerSource, new Date(now)),
+    { due_on: "2026-10-19", due_time_berlin: "21:35:00" });
+}
+assert.deepEqual(nextRoutineCadenceSlot(workweek, { due_on: "2026-10-15" },
+  new Date("2026-10-16T08:00:00Z")), { due_on: "2026-10-19", due_time_berlin: null });
+assert.deepEqual(assertRoutineCatchupOnCadence(workweek, ledgerSource,
+  { expected_due_at: "2026-10-26T20:35:00Z" }, new Date("2026-10-23T19:35:00Z")),
+  { due_on: "2026-10-26", due_time_berlin: "21:35:00" });
+assert.throws(() => assertRoutineCatchupOnCadence(workweek, ledgerSource,
+  { expected_due_at: "2026-10-24T19:35:00Z" }, new Date("2026-10-23T19:35:00Z")),
+  /expected 2026-10-26/);
+// Weekdays must not relax the separate source-time safeguard.
+assert.throws(() => assertRoutineCatchupOnCadence(workweek,
+  { due_on: "2026-10-15", due_at: "2026-10-15T10:45:00Z" },
+  { expected_due_at: "2026-10-20T19:35:00Z" }, new Date("2026-10-20T17:00:00Z")),
+  /expected 2026-10-21 12:45:00/);
+for (const weekdays of [[], [1, 1], [0], [8], [1.5], ["1"], null, "1,2,3,4,5"]) {
+  assert.throws(() => nextRoutineCadenceSlot({ ...workweek, weekdays }, ledgerSource, salesNow),
+    /unique ISO weekdays/);
+}
+for (const delta of [{ unit: "week" }, { unit: "month" }, { interval: 2 }]) {
+  assert.throws(() => nextRoutineCadenceSlot({ ...workweek, ...delta }, ledgerSource, salesNow),
+    /unique ISO weekdays/);
+}
+assert.throws(() => nextRoutineCadenceSlot(workweek, { due_on: "2026-10-17" }, salesNow),
+  /documented weekdays/);
+assert.throws(() => nextRoutineCadenceSlot({ ...workweek, anchor_due_on: "2026-10-11" },
+  ledgerSource, salesNow), /documented weekdays/);
+assert.deepEqual(nextRoutineCadenceSlot({ ...workweek, weekdays: [4] }, ledgerSource,
+  new Date("2026-10-15T19:35:00Z")), { due_on: "2026-10-22", due_time_berlin: "21:35:00" });
+assert.deepEqual(nextRoutineCadenceSlot(
+  { ...workweek, anchor_due_on: "2026-10-18", weekdays: [7] },
+  { due_on: "2026-10-18", due_at: "2026-10-18T19:35:00Z" },
+  new Date("2026-10-19T10:00:00Z")), { due_on: "2026-10-25", due_time_berlin: "21:35:00" });
+
+console.log("asana routine cadence self-test passed (including ISO weekdays and DST)");

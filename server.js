@@ -633,6 +633,8 @@ const ASANA_ROUTINE_CADENCE_RULE_SCHEMA = z.object({
   unit: z.enum(["day", "week", "month"]),
   interval: z.number().int().min(1).max(366),
   anchor_due_on: z.string(),
+  weekdays: z.array(z.number().int().min(1).max(7)).min(1).max(7).optional()
+    .describe("Optional ISO weekdays (1=Monday, 7=Sunday), only with unit=day and interval=1. Must come from the documented schedule contract."),
   short_month: z.enum(["skip", "last_day"]).optional()
 });
 const ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS =

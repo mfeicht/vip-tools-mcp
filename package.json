@@ -33,6 +33,7 @@
     "test:accounting-invoice-parser": "node scripts/accounting-invoice-parser-selftest.mjs",
     "test:recurrence-settle": "node scripts/recurrence-settle-selftest.mjs",
     "test:asana-schedule-guard": "node scripts/asana-schedule-guard-selftest.mjs",
+    "test:asana-routine-cadence": "node scripts/asana-routine-cadence-selftest.mjs",
     "test:asana-search-params": "node scripts/asana-search-params-selftest.mjs",
     "test:asana-events": "node scripts/asana-events-selftest.mjs",
     "test:dashboard-health": "node scripts/dashboard-health-selftest.mjs",
