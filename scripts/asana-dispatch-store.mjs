@@ -611,6 +611,7 @@ export class AsanaDispatchStore {
       ORDER BY COALESCE(r.last_checked_at_ms,r.created_at_ms),r.run_id
       LIMIT ?`).all(idleBefore, idleBefore, recheckBefore, limit);
     const tasks = this.db.prepare(`SELECT t.task_gid,t.first_acquired_at_ms AS acquired_at_ms,
+        t.lease_fence AS bound_lease_fence,
         l.token AS lease_token,l.fence AS lease_fence,
         l.updated_at_ms AS lease_updated_at_ms
       FROM manual_run_tasks t

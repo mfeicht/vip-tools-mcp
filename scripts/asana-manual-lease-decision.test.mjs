@@ -1,19 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { decideManualLeaseReconciliation as decide } from "./asana-manual-lease-decision.mjs";
+import { processScanBinding } from "./asana-worker-process-readback.mjs";
 
 const now = 10_000_000;
 const run = { run_id: "manual-run", agent_id: "vip-ai-test", thread_id: "thread-1",
   state: "active", acquired_at_ms: 1_000_000, agent_lease_token: "agent-token",
-  agent_lease_fence: 1, tasks: [{ task_gid: "123", acquired_at_ms: 1_001_000,
-    lease_token: "task-token", lease_fence: 1 }] };
+  agent_lease_fence: 1, agent_fence: 1,
+  tasks: [{ task_gid: "123", acquired_at_ms: 1_001_000,
+    lease_token: "task-token", lease_fence: 1, bound_lease_fence: 1 }] };
 const native = [0, 1].map((index) => ({ observed_at_ms: now - 3_000 + 1_500 * index,
   source: "codex_app.read_thread", host_id: "local", thread_id: "thread-1",
   runtime_status: "idle", turn_id: "turn-1", turn_status: "completed",
   started_at_ms: 900_000, completed_at_ms: 9_000_000,
   activity_digest: "a".repeat(64) }));
-const processReadback = { observed_at_ms: now - 1_000, run_id: "manual-run",
-  thread_id: "thread-1", scan_succeeded: true, matching_processes: [] };
+const processReadback = { ...processScanBinding(run), observed_at_ms: now - 1_000,
+  raw_sha256: "b".repeat(64), scan_succeeded: true, matching_processes: [] };
 const completedTask = [0, 1].map((index) => ({ observed_at_ms: now - 3_000 + 1_500 * index,
   agent_id: "vip-ai-test", task: { gid: "123", completed: true,
     modified_at: "2026-10-20T15:00:00Z" }, stories: [], next_page: null }));
@@ -36,6 +38,14 @@ test("active process or advancing Codex activity keeps every lease", () => {
     { ...native[1], completed_at_ms: null, turn_status: "interrupted" }] }).action, "hold");
   assert.equal(decide({ ...args, nativeReadbacks: native.map((row) =>
     ({ ...row, started_at_ms: run.acquired_at_ms + 60_000 })) }).action, "hold");
+});
+
+test("stored manual fences must match the current leases", () => {
+  assert.equal(decide({ ...args, run: { ...run, agent_fence: 2 } }).reason,
+    "lease_binding_incomplete");
+  const changedTask = { ...run, tasks: [{ ...run.tasks[0], bound_lease_fence: 2 }] };
+  assert.deepEqual(decide({ ...args, run: changedTask }).quarantine_tasks,
+    [{ task_gid: "123", reason: "task_lease_missing" }]);
 });
 
 test("open task needs the exact own result story after task acquisition", () => {
@@ -63,7 +73,7 @@ test("changed or incomplete Asana pages quarantine only the affected task", () =
     [{ task_gid: "123", reason: "task_readback_unverified" }]);
   assert.equal(decide({ ...args, taskReadbacks: unstable }).release_agent, true);
   const secondTask = { task_gid: "456", acquired_at_ms: 1_002_000,
-    lease_token: "second-token", lease_fence: 2 };
+    lease_token: "second-token", lease_fence: 2, bound_lease_fence: 2 };
   const partial = decide({ ...args, run: { ...run, tasks: [...run.tasks, secondTask] },
     taskReadbacks: [{ task_gid: "123", readbacks: completedTask },
       { task_gid: "456", readbacks: unstable[0].readbacks.map((row) =>

@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readManualNative, readManualLeaseDecision } from "./asana-manual-lease-readback.mjs";
+import { processScanBinding } from "./asana-worker-process-readback.mjs";
 
 const now = Date.now();
 const run = { run_id: "manual-test", agent_id: "vip-ai-operations",
   thread_id: "thread-1", state: "active", acquired_at_ms: now - 30_000,
-  agent_lease_token: "agent-token", agent_lease_fence: 1,
+  agent_lease_token: "agent-token", agent_lease_fence: 1, agent_fence: 1,
   tasks: [{ task_gid: "123", acquired_at_ms: now - 29_000,
-    lease_token: "task-token", lease_fence: 1 }] };
+    lease_token: "task-token", lease_fence: 1, bound_lease_fence: 1 }] };
 
 function rpc(overrides = {}) {
   return { async call(method) {
@@ -53,8 +54,8 @@ test("read-only driver takes two native and scoped Asana reads before deciding",
       agent_id: run.agent_id, task: { gid: "123", completed: true,
         modified_at: new Date(now - 20_000).toISOString() },
       stories: [], next_page: null }; },
-    scan: () => ({ observed_at_ms: now - 100, run_id: run.run_id,
-      thread_id: run.thread_id, scan_succeeded: true, matching_processes: [] }),
+    scan: () => ({ ...processScanBinding(run), observed_at_ms: now - 100,
+      raw_sha256: "b".repeat(64), scan_succeeded: true, matching_processes: [] }),
     wait: async () => {}, now: () => now });
   assert.equal(result.decision.action, "release");
   assert.equal(nativeCount, 2);

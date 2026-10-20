@@ -208,6 +208,8 @@ test("manual reconciliation selector uses the current chat binding and preserves
   assert.equal(candidates[0].thread_id, context.threadId);
   assert.equal(candidates[0].acquired_at_ms, now - 90 * 60_000);
   assert.deepEqual(candidates[0].tasks.map((task) => task.task_gid), ["123", "456"]);
+  assert.equal(candidates[0].tasks[0].bound_lease_fence,
+    candidates[0].tasks[0].lease_fence);
   assert.equal(candidates[0].tasks[1].lease_token, null);
   assert.equal(second.db.prepare("SELECT total_changes() AS n").get().n, before);
 });

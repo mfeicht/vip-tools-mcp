@@ -1,3 +1,5 @@
+import { processScanBinding } from "./asana-worker-process-readback.mjs";
+
 const TERMINAL = new Set(["completed", "failed", "interrupted"]);
 const MAX_READBACK_AGE_MS = 5 * 60_000;
 
@@ -20,7 +22,8 @@ export function decideManualLeaseReconciliation({ run, nativeReadbacks, processR
     return hold("manual_binding_incomplete");
   }
   if (!run.agent_lease_token || !Number.isSafeInteger(run.agent_lease_fence) ||
-      run.agent_lease_fence < 1 || run.tasks.some((task) =>
+      run.agent_lease_fence < 1 || run.agent_fence !== run.agent_lease_fence ||
+      run.tasks.some((task) =>
         !task.task_gid || !Number.isSafeInteger(task.acquired_at_ms)) ||
       new Set(run.tasks.map((task) => task.task_gid)).size !== run.tasks.length) {
     return hold("lease_binding_incomplete");
@@ -44,9 +47,13 @@ export function decideManualLeaseReconciliation({ run, nativeReadbacks, processR
         { ...nativeReadbacks[1], observed_at_ms: null })) {
     return hold("native_terminal_unverified");
   }
+  const scanBinding = processScanBinding(run);
   if (!fresh(processReadback, now) || processReadback.scan_succeeded !== true ||
       processReadback.run_id !== run.run_id ||
       processReadback.thread_id !== run.thread_id ||
+      Object.entries(scanBinding).some(([key, value]) =>
+        !same(processReadback[key], value)) ||
+      !/^[a-f0-9]{64}$/.test(processReadback.raw_sha256 || "") ||
       !Array.isArray(processReadback.matching_processes) ||
       processReadback.matching_processes.length) {
     return hold("worker_inactivity_unverified");
@@ -80,7 +87,7 @@ export function decideManualLeaseReconciliation({ run, nativeReadbacks, processR
     }
     const { task, stories } = pair.readbacks[1];
     if (!binding.lease_token || !Number.isSafeInteger(binding.lease_fence) ||
-        binding.lease_fence < 1) {
+        binding.lease_fence < 1 || binding.bound_lease_fence !== binding.lease_fence) {
       quarantineTasks.push({ task_gid: binding.task_gid, reason: "task_lease_missing" });
     } else if (task.completed === true) {
       releaseTasks.push(binding.task_gid);
