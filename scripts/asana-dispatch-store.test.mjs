@@ -87,13 +87,14 @@ test("fencing tokens reject stale acknowledgements and retries dead-letter", (t)
 
 test("scheduled agent leases share the same gate as dispatch", (t) => {
   const { first, second } = fixture(t);
-  const acquired = executeLeaseCommand(first, { command: "acquire-agent", agent: "vip-ai-research" });
+  const env = { CODEX_THREAD_ID: "01a13d34-b615-7451-b51d-e5d75b31dbcf" };
+  const acquired = executeLeaseCommand(first, { command: "acquire-agent", agent: "vip-ai-research" }, env);
   assert.equal(acquired.acquired, true);
-  assert.equal(executeLeaseCommand(second, { command: "acquire-agent", agent: "vip-ai-research" }).acquired, false);
-  assert.equal(executeLeaseCommand(first, { command: "acquire-task", run: acquired.run_id, task: "123" }).acquired, true);
+  assert.equal(executeLeaseCommand(second, { command: "acquire-agent", agent: "vip-ai-research" }, env).acquired, false);
+  assert.equal(executeLeaseCommand(first, { command: "acquire-task", run: acquired.run_id, task: "123" }, env).acquired, true);
   first.enqueue(signal("story-1", "123", "vip-ai-research"));
   assert.equal(second.claimNext("run-dispatch"), null);
-  assert.equal(executeLeaseCommand(first, { command: "release", run: acquired.run_id }).released, 2);
+  assert.equal(executeLeaseCommand(first, { command: "release", run: acquired.run_id }, env).released, 2);
   assert.equal(second.claimNext("run-dispatch")?.signals[0].id, "story-1");
 });
 
