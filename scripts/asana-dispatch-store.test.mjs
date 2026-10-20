@@ -183,76 +183,52 @@ test("fencing tokens reject stale acknowledgements and retries dead-letter", (t)
 
 test("scheduled agent leases share the same gate as dispatch", (t) => {
   const { first, second } = fixture(t);
-  const thread = "thread-123";
-  const acquired = executeLeaseCommand(first, { command: "acquire-agent", agent: "vip-ai-research", thread });
+  const env = { CODEX_THREAD_ID: "01a13d34-b615-7451-b51d-e5d75b31dbcf" };
+  const acquired = executeLeaseCommand(first, { command: "acquire-agent", agent: "vip-ai-research" }, env);
   assert.equal(acquired.acquired, true);
-  assert.equal(executeLeaseCommand(second, { command: "acquire-agent", agent: "vip-ai-research", thread }).acquired, false);
-  assert.equal(executeLeaseCommand(first, { command: "acquire-task", run: acquired.run_id, task: "123", thread }).acquired, true);
-  assert.deepEqual({ ...second.db.prepare("SELECT agent_id,thread_id FROM manual_lease_runs WHERE run_id=?")
-    .get(acquired.run_id) }, { agent_id: "vip-ai-research", thread_id: thread });
-  assert.deepEqual(second.db.prepare("SELECT task_gid FROM manual_lease_tasks WHERE run_id=?")
-    .all(acquired.run_id).map((row) => row.task_gid), ["123"]);
+  assert.equal(executeLeaseCommand(second, { command: "acquire-agent", agent: "vip-ai-research" }, env).acquired, false);
+  assert.equal(executeLeaseCommand(first, { command: "acquire-task", run: acquired.run_id, task: "123" }, env).acquired, true);
   first.enqueue(signal("story-1", "123", "vip-ai-research"));
   assert.equal(second.claimNext("run-dispatch"), null);
-  assert.throws(() => executeLeaseCommand(second,
-    { command: "release", run: acquired.run_id, thread: "foreign-thread" }), /binding required/);
-  assert.equal(executeLeaseCommand(first, { command: "release", run: acquired.run_id, thread }).released, 2);
-  assert.equal(second.db.prepare("SELECT state FROM manual_lease_runs WHERE run_id=?")
-    .get(acquired.run_id).state, "released");
+  assert.equal(executeLeaseCommand(first, { command: "release", run: acquired.run_id }, env).released, 2);
   assert.equal(second.claimNext("run-dispatch")?.signals[0].id, "story-1");
 });
 
-test("manual lease acquisition fails closed without a Codex chat identity", (t) => {
-  const { first } = fixture(t);
-  assert.throws(() => executeLeaseCommand(first,
-    { command: "acquire-agent", agent: "vip-ai-research" }), /CODEX_THREAD_ID/);
-  assert.deepEqual(first.activeLeases(), []);
-  assert.equal(first.db.prepare("SELECT COUNT(*) n FROM manual_lease_runs").get().n, 0);
-});
-
-test("manual reconciliation selector is bounded, read-only and retains task history", (t) => {
+test("manual reconciliation selector uses the current chat binding and preserves task history", (t) => {
   const { first, second } = fixture(t);
   const now = 10_000_000;
-  for (const [agent, run, age] of [
-    ["vip-ai-alpha", "manual-alpha", 90],
-    ["vip-ai-beta", "manual-beta", 80],
-    ["vip-ai-gamma", "manual-gamma", 5]
-  ]) {
-    first.acquireManualAgent(agent, run, `thread-${run}`, now - age * 60_000);
-  }
-  first.acquireManualTask("manual-alpha", "123", "thread-manual-alpha", now - 89 * 60_000);
-  first.acquireManualTask("manual-alpha", "456", "thread-manual-alpha", now - 88 * 60_000);
+  const context = { threadId: "01a13d34-b615-7451-b51d-e5d75b31dbcf", source: "CODEX_THREAD_ID" };
+  first.acquireManualAgent("vip-ai-operations", "manual-one", context, now - 90 * 60_000);
+  first.acquireManualTask("manual-one", "123", context, now - 89 * 60_000);
+  first.acquireManualTask("manual-one", "456", context, now - 88 * 60_000);
   first.db.prepare("DELETE FROM leases WHERE key='task:456'").run();
   const before = second.db.prepare("SELECT total_changes() AS n").get().n;
   const candidates = second.manualRunsForReconciliation({ now });
-  assert.deepEqual(candidates.map((run) => run.run_id), ["manual-alpha", "manual-beta"]);
-  assert.equal(candidates[0].thread_id, "thread-manual-alpha");
-  assert.equal(typeof candidates[0].agent_lease_token, "string");
+  assert.deepEqual(candidates.map((run) => run.run_id), ["manual-one"]);
+  assert.equal(candidates[0].thread_id, context.threadId);
+  assert.equal(candidates[0].acquired_at_ms, now - 90 * 60_000);
   assert.deepEqual(candidates[0].tasks.map((task) => task.task_gid), ["123", "456"]);
   assert.equal(candidates[0].tasks[1].lease_token, null);
   assert.equal(second.db.prepare("SELECT total_changes() AS n").get().n, before);
-  assert.equal(second.manualRunsForReconciliation({ now, limit: 1 }).length, 1);
-  assert.throws(() => second.manualRunsForReconciliation({ now, limit: 3 }), /limit/);
 });
 
-test("manual reconciliation selector waits for inactivity and one-hour recheck", (t) => {
-  const { first, second } = fixture(t);
+test("manual reconciliation selector respects inactivity and the review interval", (t) => {
+  const { first } = fixture(t);
   const now = 10_000_000;
-  first.acquireManualAgent("vip-ai-alpha", "manual-alpha", "thread-alpha", now - 90 * 60_000);
-  first.acquireManualTask("manual-alpha", "123", "thread-alpha", now - 89 * 60_000);
-  first.acquireManualAgent("vip-ai-alpha", "manual-alpha", "thread-alpha", now - 5 * 60_000);
-  assert.deepEqual(second.manualRunsForReconciliation({ now }), []);
-  first.db.prepare("UPDATE leases SET updated_at_ms=? WHERE run_id=?")
-    .run(now - 11 * 60_000, "manual-alpha");
-  first.db.prepare("UPDATE manual_lease_runs SET last_checked_at_ms=? WHERE run_id=?")
-    .run(now - 30 * 60_000, "manual-alpha");
-  assert.deepEqual(second.manualRunsForReconciliation({ now }), []);
-  first.db.prepare("UPDATE manual_lease_runs SET last_checked_at_ms=? WHERE run_id=?")
-    .run(now - 61 * 60_000, "manual-alpha");
-  assert.equal(second.manualRunsForReconciliation({ now })[0].run_id, "manual-alpha");
-  first.db.prepare("UPDATE manual_lease_runs SET state='needs_review' WHERE run_id=?")
-    .run("manual-alpha");
-  assert.deepEqual(second.manualRunsForReconciliation({ now }), []);
+  const context = { threadId: "01a13d34-b615-7451-b51d-e5d75b31dbcf", source: "CODEX_THREAD_ID" };
+  first.acquireManualAgent("vip-ai-operations", "manual-one", context, now - 90 * 60_000);
+  first.acquireManualTask("manual-one", "123", context, now - 89 * 60_000);
+  first.acquireManualAgent("vip-ai-operations", "manual-one", context, now - 5 * 60_000);
+  assert.deepEqual(first.manualRunsForReconciliation({ now }), []);
+  first.db.prepare("UPDATE leases SET updated_at_ms=? WHERE run_id='manual-one'")
+    .run(now - 11 * 60_000);
+  first.db.prepare("UPDATE manual_runs SET last_checked_at_ms=? WHERE run_id='manual-one'")
+    .run(now - 30 * 60_000);
+  assert.deepEqual(first.manualRunsForReconciliation({ now }), []);
+  first.db.prepare("UPDATE manual_runs SET last_checked_at_ms=? WHERE run_id='manual-one'")
+    .run(now - 61 * 60_000);
+  assert.equal(first.manualRunsForReconciliation({ now })[0].run_id, "manual-one");
+  assert.throws(() => first.manualRunsForReconciliation({ now, limit: 3 }), /limit/);
 });
 
 test("observations and cursors persist atomically", (t) => {

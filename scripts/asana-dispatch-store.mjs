@@ -59,22 +59,6 @@ export class AsanaDispatchStore {
         key TEXT PRIMARY KEY,
         last_fence INTEGER NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS manual_lease_runs (
-        run_id TEXT PRIMARY KEY,
-        agent_id TEXT NOT NULL,
-        thread_id TEXT NOT NULL,
-        acquired_at_ms INTEGER NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('active','released','needs_review')),
-        last_checked_at_ms INTEGER,
-        last_error TEXT,
-        reconciliation_evidence TEXT
-      );
-      CREATE TABLE IF NOT EXISTS manual_lease_tasks (
-        run_id TEXT NOT NULL,
-        task_gid TEXT NOT NULL,
-        acquired_at_ms INTEGER NOT NULL,
-        PRIMARY KEY(run_id,task_gid)
-      );
       CREATE TABLE IF NOT EXISTS task_observations (
         agent_id TEXT NOT NULL,
         task_gid TEXT NOT NULL,
@@ -149,11 +133,34 @@ export class AsanaDispatchStore {
         PRIMARY KEY(started_at_ms, ordinal)
       );
       CREATE INDEX IF NOT EXISTS poll_run_errors_started ON poll_run_errors(started_at_ms);
+      CREATE TABLE IF NOT EXISTS manual_runs (
+        run_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        thread_id_source TEXT NOT NULL,
+        agent_fence INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active','released')),
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        released_at_ms INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS manual_run_tasks (
+        run_id TEXT NOT NULL,
+        task_gid TEXT NOT NULL,
+        lease_fence INTEGER NOT NULL,
+        first_acquired_at_ms INTEGER NOT NULL,
+        last_acquired_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(run_id, task_gid)
+      );
     `);
-    // Historical runs remain NULL: an old claimed row is not proof of no launch.
+    // Historical rows remain unclassified; never infer that Codex was not launched.
     if (!this.db.prepare("PRAGMA table_info(runs)").all()
       .some((column) => column.name === "launch_phase")) {
       this.db.exec("ALTER TABLE runs ADD COLUMN launch_phase TEXT");
+    }
+    if (!this.db.prepare("PRAGMA table_info(manual_runs)").all()
+      .some((column) => column.name === "last_checked_at_ms")) {
+      this.db.exec("ALTER TABLE manual_runs ADD COLUMN last_checked_at_ms INTEGER");
     }
   }
 
@@ -486,46 +493,102 @@ export class AsanaDispatchStore {
     return this.transaction(() => this.acquireLeaseInTransaction(key, runId, ttlMs, now));
   }
 
-  acquireManualAgent(agentId, runId, threadId, now = Date.now()) {
-    assertId(agentId, "agent_id");
+  manualRun(runId) {
+    return this.db.prepare("SELECT * FROM manual_runs WHERE run_id=?")
+      .get(assertId(runId, "run_id")) || null;
+  }
+
+  assertManualContext(context) {
+    if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(context?.threadId || "") ||
+        !["CODEX_THREAD_ID", "CODEX_SESSION_ID"].includes(context?.source)) {
+      throw new Error("Real CODEX_THREAD_ID or CODEX_SESSION_ID required");
+    }
+  }
+
+  assertManualOwner(run, context) {
+    this.assertManualContext(context);
+    if (run.thread_id !== context.threadId || run.state !== "active") {
+      throw new Error("Manual run belongs to another thread or is already released");
+    }
+    const agent = this.db.prepare("SELECT * FROM leases WHERE key=? AND run_id=?")
+      .get(`agent:${run.agent_id}`, run.run_id);
+    if (!agent || agent.fence !== run.agent_fence) throw new Error("Manual agent lease fence changed");
+    return agent;
+  }
+
+  acquireManualAgent(agentId, runId, context, now = Date.now()) {
+    if (!/^vip-ai-[a-z-]+$/.test(agentId || "")) throw new Error("Valid agent required");
     assertId(runId, "run_id");
-    assertId(threadId, "thread_id");
     assertTime(now, "now");
+    this.assertManualContext(context);
     return this.transaction(() => {
-      const existing = this.db.prepare("SELECT * FROM manual_lease_runs WHERE run_id=?").get(runId);
-      if (existing && (existing.agent_id !== agentId || existing.thread_id !== threadId ||
-          existing.state !== "active")) throw new Error("Manual run binding changed");
+      const prior = this.manualRun(runId);
+      if (prior) {
+        if (prior.agent_id !== agentId) throw new Error("Manual agent identity changed");
+        this.assertManualOwner(prior, context);
+      } else if (this.leasesForRun(runId).length ||
+          this.db.prepare("SELECT 1 FROM runs WHERE run_id=?").get(runId) ||
+          this.db.prepare("SELECT 1 FROM signals WHERE run_id=?").get(runId)) {
+        throw new Error("Existing unbound or dispatcher run cannot be adopted");
+      }
       const lease = this.acquireLeaseInTransaction(`agent:${agentId}`, runId, 2 * 60 * 60_000, now);
       if (!lease) return null;
-      if (!existing) this.db.prepare(`INSERT INTO manual_lease_runs
-        (run_id,agent_id,thread_id,acquired_at_ms,state) VALUES (?,?,?,?,'active')`)
-        .run(runId, agentId, threadId, now);
+      if (!prior) {
+        this.db.prepare(`INSERT INTO manual_runs
+          (run_id,agent_id,thread_id,thread_id_source,agent_fence,state,created_at_ms,updated_at_ms)
+          VALUES (?,?,?,?,?,'active',?,?)`)
+          .run(runId, agentId, context.threadId, context.source, lease.fence, now, now);
+      } else {
+        this.db.prepare("UPDATE manual_runs SET updated_at_ms=? WHERE run_id=?").run(now, runId);
+      }
       return lease;
     });
   }
 
-  assertManualRunThread(runId, threadId) {
+  acquireManualTask(runId, taskGid, context, now = Date.now()) {
     assertId(runId, "run_id");
-    assertId(threadId, "thread_id");
-    const run = this.db.prepare("SELECT * FROM manual_lease_runs WHERE run_id=?").get(runId);
-    if (!run || run.thread_id !== threadId || run.state !== "active") {
-      throw new Error("Active manual run/thread binding required");
-    }
-    return run;
-  }
-
-  acquireManualTask(runId, taskGid, threadId, now = Date.now()) {
-    assertId(taskGid, "task_gid");
+    if (!/^\d+$/.test(taskGid || "")) throw new Error("Numeric task required");
     assertTime(now, "now");
     return this.transaction(() => {
-      const run = this.assertManualRunThread(runId, threadId);
-      const agent = this.db.prepare("SELECT * FROM leases WHERE key=?").get(`agent:${run.agent_id}`);
-      if (!agent || agent.run_id !== runId) throw new Error("Acquire the agent lease first");
+      const run = this.manualRun(runId);
+      if (!run) throw new Error("Bound manual run required");
+      this.assertManualOwner(run, context);
       const lease = this.acquireLeaseInTransaction(`task:${taskGid}`, runId, 2 * 60 * 60_000, now);
       if (!lease) return null;
-      this.db.prepare(`INSERT OR IGNORE INTO manual_lease_tasks
-        (run_id,task_gid,acquired_at_ms) VALUES (?,?,?)`).run(runId, taskGid, now);
+      this.db.prepare(`INSERT INTO manual_run_tasks
+        (run_id,task_gid,lease_fence,first_acquired_at_ms,last_acquired_at_ms)
+        VALUES (?,?,?,?,?) ON CONFLICT(run_id,task_gid) DO UPDATE SET
+        lease_fence=excluded.lease_fence,last_acquired_at_ms=excluded.last_acquired_at_ms`)
+        .run(runId, taskGid, lease.fence, now, now);
+      this.db.prepare("UPDATE manual_runs SET updated_at_ms=? WHERE run_id=?").run(now, runId);
       return lease;
+    });
+  }
+
+  finishManualLeaseCommand(runId, command, context, now = Date.now()) {
+    assertId(runId, "run_id");
+    assertTime(now, "now");
+    if (!["renew", "release"].includes(command)) throw new Error("Invalid manual lease command");
+    return this.transaction(() => {
+      const run = this.manualRun(runId);
+      if (!run) throw new Error("Bound manual run required");
+      this.assertManualContext(context);
+      if (run.thread_id !== context.threadId) throw new Error("Manual run belongs to another thread");
+      if (command === "release" && run.state === "released") {
+        if (this.leasesForRun(runId).length) throw new Error("Released run unexpectedly owns leases");
+        return 0;
+      }
+      this.assertManualOwner(run, context);
+      const leases = this.leasesForRun(runId);
+      for (const lease of leases) {
+        if (command === "release") {
+          if (!this.releaseLease(lease)) throw new Error("Lease release fence changed");
+        } else this.acquireLeaseInTransaction(lease.key, runId, 2 * 60 * 60_000, now);
+      }
+      this.db.prepare(`UPDATE manual_runs SET updated_at_ms=?,state=?,released_at_ms=?
+        WHERE run_id=?`).run(now, command === "release" ? "released" : "active",
+        command === "release" ? now : null, runId);
+      return leases.length;
     });
   }
 
@@ -537,20 +600,20 @@ export class AsanaDispatchStore {
     const idleBefore = now - 10 * 60_000;
     const recheckBefore = now - 60 * 60_000;
     if (idleBefore < 0) return [];
-    const runs = this.db.prepare(`SELECT r.*, a.token AS agent_lease_token,
+    const runs = this.db.prepare(`SELECT r.*, r.created_at_ms AS acquired_at_ms, a.token AS agent_lease_token,
         a.fence AS agent_lease_fence, a.updated_at_ms AS agent_lease_updated_at_ms
-      FROM manual_lease_runs r
+      FROM manual_runs r
       LEFT JOIN leases a ON a.key='agent:' || r.agent_id AND a.run_id=r.run_id
-      WHERE r.state='active' AND r.acquired_at_ms <= ?
+      WHERE r.state='active' AND r.created_at_ms <= ?
         AND COALESCE((SELECT MAX(l.updated_at_ms) FROM leases l
-          WHERE l.run_id=r.run_id),r.acquired_at_ms) <= ?
+          WHERE l.run_id=r.run_id),r.created_at_ms) <= ?
         AND (r.last_checked_at_ms IS NULL OR r.last_checked_at_ms <= ?)
-      ORDER BY COALESCE(r.last_checked_at_ms,r.acquired_at_ms),r.run_id
+      ORDER BY COALESCE(r.last_checked_at_ms,r.created_at_ms),r.run_id
       LIMIT ?`).all(idleBefore, idleBefore, recheckBefore, limit);
-    const tasks = this.db.prepare(`SELECT t.task_gid,t.acquired_at_ms,
+    const tasks = this.db.prepare(`SELECT t.task_gid,t.first_acquired_at_ms AS acquired_at_ms,
         l.token AS lease_token,l.fence AS lease_fence,
         l.updated_at_ms AS lease_updated_at_ms
-      FROM manual_lease_tasks t
+      FROM manual_run_tasks t
       LEFT JOIN leases l ON l.key='task:' || t.task_gid AND l.run_id=t.run_id
       WHERE t.run_id=? ORDER BY t.task_gid`);
     return runs.map((run) => ({ ...run, tasks: tasks.all(run.run_id) }));
@@ -857,14 +920,11 @@ export class AsanaDispatchStore {
     return { run_id: runId, agent_lease: agentLease, task_lease: taskLease, signals };
   }
 
-  releaseRun(runId, threadId = null) {
+  releaseRun(runId) {
     assertId(runId, "run_id");
     return this.transaction(() => {
-      if (threadId !== null) this.assertManualRunThread(runId, threadId);
       const leases = this.leasesForRun(runId);
       for (const lease of leases) this.releaseLease(lease);
-      if (threadId !== null) this.db.prepare(`UPDATE manual_lease_runs SET state='released'
-        WHERE run_id=? AND state='active'`).run(runId);
       return leases.length;
     });
   }
