@@ -9,7 +9,7 @@ const MAX_AGE_MS = 5 * 60_000;
 
 // Operator evidence comes from native Codex tools and canonical Operations MCP.
 // A timestamp in the old history projection is not a substitute for native state.
-export function validateQuarantineEvidence(evidence, now = Date.now()) {
+export function validateQuarantineEvidence(evidence, now = Date.now(), { allowNativeActivityWithoutEventTime = false } = {}) {
   if (evidence?.schema !== "asana-native-terminal-quarantine-v1") throw new Error("Invalid evidence schema");
   const run = evidence.expected_run;
   if (!run?.thread_id || !run.task_gid || !run.agent_id) throw new Error("Run identity missing");
@@ -23,6 +23,11 @@ export function validateQuarantineEvidence(evidence, now = Date.now()) {
   if (!Array.isArray(native) || native.length !== 2) throw new Error("Two native readbacks required");
   for (const row of native) {
     fresh(row);
+    const nativeActivityFallback = allowNativeActivityWithoutEventTime &&
+      row.source === "codex_app.read_thread" && row.last_event_at_ms === null &&
+      row.event_time_availability === "not_exposed_by_native_read_thread" &&
+      Number.isSafeInteger(row.activity_item_count) && row.activity_item_count > 0 &&
+      typeof row.activity_last_item_id === "string" && row.activity_last_item_id.length > 0;
     if (!["codex_app.read_thread", "codex_app.wait_threads"].includes(row.source) ||
         row.host_id !== "local" || row.thread_id !== run.thread_id ||
         !["notLoaded", "idle"].includes(row.runtime_status) ||
@@ -31,9 +36,9 @@ export function validateQuarantineEvidence(evidence, now = Date.now()) {
         !Number.isFinite(row.started_at_ms) || row.started_at_ms < run.started_at_ms - 2_000 ||
         row.started_at_ms > row.observed_at_ms ||
         !/^[a-f0-9]{64}$/.test(row.activity_digest || "") ||
-        !Number.isSafeInteger(row.last_event_at_ms) ||
-        row.last_event_at_ms < row.started_at_ms ||
-        row.last_event_at_ms > row.observed_at_ms ||
+        (!nativeActivityFallback && (!Number.isSafeInteger(row.last_event_at_ms) ||
+          row.last_event_at_ms < row.started_at_ms ||
+          row.last_event_at_ms > row.observed_at_ms)) ||
         (row.completed_at_ms != null &&
           (!Number.isFinite(row.completed_at_ms) || row.completed_at_ms < row.started_at_ms ||
             row.completed_at_ms > row.observed_at_ms + 1_000)) ||
@@ -46,6 +51,9 @@ export function validateQuarantineEvidence(evidence, now = Date.now()) {
       native[0].turn_status !== native[1].turn_status ||
       native[0].activity_digest !== native[1].activity_digest ||
       native[0].last_event_at_ms !== native[1].last_event_at_ms ||
+      native[0].activity_item_count !== native[1].activity_item_count ||
+      native[0].activity_last_item_id !== native[1].activity_last_item_id ||
+      native[0].event_time_availability !== native[1].event_time_availability ||
       native[0].started_at_ms !== native[1].started_at_ms ||
       native[0].completed_at_ms !== native[1].completed_at_ms) {
     throw new Error("Native terminal readbacks changed");
