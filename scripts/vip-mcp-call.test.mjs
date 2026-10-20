@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { parseArgs, classifyConnectionError, isTransientConnectionError,
   connectLockReclaimable, callToolOnce } from "./vip-mcp-call.mjs";
 
@@ -25,6 +26,19 @@ test("authorization failures are not transient while 503 and challenges remain d
   assert.equal(isTransientConnectionError(new Error("Streamable HTTP error: HTTP 503")), true);
   assert.equal(classifyConnectionError(new Error("HTTP 403 <title>Just a moment</title>")),
     "cloudflare_managed_challenge");
+});
+
+test("real SDK status codes with empty response bodies retain retry and cooldown semantics", () => {
+  for (const code of [502, 503, 504]) {
+    assert.equal(isTransientConnectionError(new StreamableHTTPError(code, "Error POSTing to endpoint: ")), true);
+  }
+  for (const code of [401, 403]) {
+    assert.equal(classifyConnectionError(new StreamableHTTPError(code, "")), "remote_auth_or_permission_error");
+  }
+  assert.equal(classifyConnectionError(new StreamableHTTPError(429, "")), "remote_rate_limited");
+  assert.equal(classifyConnectionError(new StreamableHTTPError(403, "Just a moment")),
+    "cloudflare_managed_challenge");
+  assert.equal(isTransientConnectionError(new StreamableHTTPError(404, "")), false);
 });
 
 test("a living or newly initializing connect holder is never reclaimed by age alone", () => {

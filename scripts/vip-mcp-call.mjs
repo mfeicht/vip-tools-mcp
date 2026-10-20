@@ -219,12 +219,20 @@ function errorText(error) {
   return String(error?.message || error || "unknown error");
 }
 
+function httpStatus(error) {
+  // StreamableHTTPError keeps status in .code, not necessarily in its message.
+  const value = error?.status ?? error?.response?.status ?? error?.code;
+  const code = Number(value);
+  return Number.isInteger(code) && code >= 100 && code <= 599 ? code : null;
+}
+
 function safeErrorText(error) {
   const message = errorText(error);
   if (/Just a moment|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
     return "Cloudflare managed challenge on the canonical MCP endpoint";
   }
-  return message.replace(/\s+/g, " ").slice(0, MAX_ERROR_OUTPUT_CHARS);
+  const status = httpStatus(error);
+  return `${status ? `HTTP ${status}: ` : ""}${message}`.replace(/\s+/g, " ").slice(0, MAX_ERROR_OUTPUT_CHARS);
 }
 
 export function classifyConnectionError(error) {
@@ -233,6 +241,10 @@ export function classifyConnectionError(error) {
   if (/Just a moment|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
     return "cloudflare_managed_challenge";
   }
+  const status = httpStatus(error);
+  if (status === 429) return "remote_rate_limited";
+  if (status === 401 || status === 403) return "remote_auth_or_permission_error";
+  if ([502, 503, 504].includes(status)) return "remote_mcp_transient_error";
   if (/\b429\b|too many requests|rate.?limit/i.test(message)) return "remote_rate_limited";
   if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(message)) return "dns_resolution_error";
   if (/\b(401|403)\b/.test(message)) return "remote_auth_or_permission_error";
