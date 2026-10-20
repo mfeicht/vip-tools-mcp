@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   detectRoutineFollowUpSignals,
+  hasPendingRoutineDueGateClaim,
   hasRoutineNoFollowUpDecision,
   isDuplicateNativeRoutineTask,
   inspectRoutineMaterialCommentIdempotency,
@@ -28,6 +29,20 @@ const openEvidenceStory = {
   text:
     "Status\nEvidenz / Verifikation\nDer Zwischenstand ist belegt.\nOffene Evidenzluecken\nDeployment fehlt."
 };
+
+// Original Wiki story 1219567343270925 was posted before the due date and
+// remained the final story when the routine was completed on 19 October.
+const wikiPendingDueStory = {
+  text: "Die Routine bleibt wegen der Fälligkeit am 19.10.2026 offen; der Abschluss folgt erst ab diesem Datum nach frischem Readback.\nEvidenz / Verifikation\nRoutine wartet auf Due-Gate."
+};
+assert.equal(hasPendingRoutineDueGateClaim(wikiPendingDueStory), true);
+assert.equal(hasPendingRoutineDueGateClaim({ html_text: `<p>${wikiPendingDueStory.text}</p>` }), true);
+assert.equal(hasPendingRoutineDueGateClaim({
+  text: "Due-Gate erreicht. Task und Michael-Folgeaufgabe heute frisch zurückgelesen; Routine wird abgeschlossen, Importaufgabe bleibt offen.\nEvidenz / Verifikation\nTask und Follow-up verifiziert."
+}), false);
+assert.equal(hasPendingRoutineDueGateClaim({
+  text: "Die Routine blieb bis zur Fälligkeit offen. Heute ist das Due-Gate erreicht; aktueller Readback bestätigt den Abschluss.\nEvidenz / Verifikation\nReadback verifiziert."
+}), false);
 
 const socialNoFollowUpStatus = {
   gid: "1218967490328212",

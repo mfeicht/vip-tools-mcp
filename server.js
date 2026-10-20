@@ -69,6 +69,7 @@ import {
 } from "./lib/google-ads-keyword-metrics.js";
 import {
   detectRoutineFollowUpSignals,
+  hasPendingRoutineDueGateClaim,
   hasRoutineNoFollowUpDecision,
   isDuplicateNativeRoutineTask,
   inspectRoutineMaterialCommentIdempotency,
@@ -15126,6 +15127,11 @@ function createServer() {
         if (require_evidence_gate && hasOpenEvidenceGaps) {
           throw new Error(
             "Abschluss blockiert: Der finale Asana-Kommentar enthaelt offene Evidenzluecken. Erst klaeren/reparieren oder Aufgabe offen lassen."
+          );
+        }
+        if (routine_like_task && hasPendingRoutineDueGateClaim(final_comment)) {
+          throw new Error(
+            "Routine-Abschluss blockiert: Der gewählte finale Kommentar beschreibt die Routine noch als wegen des Due-Gates offen oder wartend. Nach Fälligkeit zuerst Task und Follow-up frisch zurücklesen und einen kurzen Evidenz-Status mit aktuellem Abschlussentscheid posten; keinen zweiten Ergebnistext schreiben. Dessen Story-GID als final_comment_story_gid verwenden."
           );
         }
       }
