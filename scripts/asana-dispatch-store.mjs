@@ -154,6 +154,19 @@ export class AsanaDispatchStore {
         last_acquired_at_ms INTEGER NOT NULL,
         PRIMARY KEY(run_id, task_gid)
       );
+      CREATE TABLE IF NOT EXISTS recovery_events (
+        id INTEGER PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        observed_at_ms INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        evidence_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS continuation_starts (
+        run_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        task_gid TEXT NOT NULL,
+        started_at_ms INTEGER NOT NULL
+      );
     `);
     // Historical rows remain unclassified; never infer that Codex was not launched.
     if (!this.db.prepare("PRAGMA table_info(runs)").all()
@@ -164,6 +177,12 @@ export class AsanaDispatchStore {
       .some((column) => column.name === "last_checked_at_ms")) {
       this.db.exec("ALTER TABLE manual_runs ADD COLUMN last_checked_at_ms INTEGER");
     }
+    for (const [table, column] of [["runs", "last_reconcile_check_at_ms"], ["manual_runs", "agent_released_at_ms"],
+      ["manual_run_tasks", "resolved_at_ms"]]) {
+      if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === column))
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} INTEGER`);
+    }
+
   }
 
   close() {
@@ -386,6 +405,10 @@ export class AsanaDispatchStore {
             !claim.signals.some((expected) => expected.id === signal.id))) return false;
       this.db.prepare("UPDATE runs SET launch_phase='launching',updated_at_ms=? WHERE run_id=?")
         .run(now, claim.run_id);
+      if (signals.every(signal => signal.kind === "continuation")) {
+        this.db.prepare("INSERT INTO continuation_starts VALUES (?,?,?,?)")
+          .run(claim.run_id,run.agent_id,run.task_gid,now);
+      }
       this.acquireLeaseInTransaction(agent.key, claim.run_id, 2 * 60 * 60_000, now);
       this.acquireLeaseInTransaction(task.key, claim.run_id, 2 * 60 * 60_000, now);
       return true;
@@ -606,7 +629,7 @@ export class AsanaDispatchStore {
         a.fence AS agent_lease_fence, a.updated_at_ms AS agent_lease_updated_at_ms
       FROM manual_runs r
       LEFT JOIN leases a ON a.key='agent:' || r.agent_id AND a.run_id=r.run_id
-      WHERE r.state='active' AND a.run_id=r.run_id AND r.created_at_ms <= ?
+      WHERE r.state='active' AND (a.run_id=r.run_id OR r.agent_released_at_ms IS NOT NULL) AND r.created_at_ms <= ?
         AND COALESCE((SELECT MAX(l.updated_at_ms) FROM leases l
           WHERE l.run_id=r.run_id),r.created_at_ms) <= ?
         AND (r.last_checked_at_ms IS NULL OR r.last_checked_at_ms <= ?)
@@ -618,8 +641,16 @@ export class AsanaDispatchStore {
         l.updated_at_ms AS lease_updated_at_ms
       FROM manual_run_tasks t
       LEFT JOIN leases l ON l.key='task:' || t.task_gid AND l.run_id=t.run_id
-      WHERE t.run_id=? ORDER BY t.task_gid`);
+      WHERE t.run_id=? AND t.resolved_at_ms IS NULL ORDER BY t.task_gid`);
     return runs.map((run) => ({ ...run, tasks: tasks.all(run.run_id) }));
+  }
+
+  markManualRunChecked(run, now = Date.now()) {
+    assertTime(now, "now");
+    return this.db.prepare(`UPDATE manual_runs SET last_checked_at_ms=?
+      WHERE run_id=? AND state=? AND updated_at_ms=?
+        AND last_checked_at_ms IS ?`).run(now, run.run_id, run.state,
+          run.updated_at_ms, run.last_checked_at_ms).changes === 1;
   }
 
   // The caller supplies two independent Codex/Asana readbacks. A fixed local
@@ -638,29 +669,37 @@ export class AsanaDispatchStore {
     }
     return this.transaction(() => {
       const current = this.db.prepare(`SELECT r.*, r.created_at_ms AS acquired_at_ms,
-          a.token AS agent_lease_token, a.fence AS agent_lease_fence
+          a.token AS agent_lease_token, a.fence AS agent_lease_fence, a.updated_at_ms AS agent_lease_updated_at_ms
         FROM manual_runs r LEFT JOIN leases a
           ON a.key='agent:' || r.agent_id AND a.run_id=r.run_id
         WHERE r.run_id=?`).get(run.run_id);
       const tasks = this.db.prepare(`SELECT t.task_gid,
           t.first_acquired_at_ms AS acquired_at_ms,
           t.lease_fence AS bound_lease_fence,
-          l.token AS lease_token,l.fence AS lease_fence
+          l.token AS lease_token,l.fence AS lease_fence, l.updated_at_ms AS lease_updated_at_ms
         FROM manual_run_tasks t LEFT JOIN leases l
           ON l.key='task:' || t.task_gid AND l.run_id=t.run_id
-        WHERE t.run_id=? ORDER BY t.task_gid`).all(run.run_id);
+        WHERE t.run_id=? AND t.resolved_at_ms IS NULL ORDER BY t.task_gid`).all(run.run_id);
       const keys = ["run_id", "agent_id", "thread_id", "state", "acquired_at_ms",
-        "agent_fence", "agent_lease_token", "agent_lease_fence"];
-      const taskKeys = ["task_gid", "acquired_at_ms", "bound_lease_fence", "lease_token", "lease_fence"];
+        "agent_fence", "agent_lease_token", "agent_lease_fence", "agent_lease_updated_at_ms",
+        "agent_released_at_ms", "updated_at_ms", "last_checked_at_ms"];
+      const taskKeys = ["task_gid", "acquired_at_ms", "bound_lease_fence", "lease_token", "lease_fence", "lease_updated_at_ms"];
       if (!current || keys.some((key) => current[key] !== run[key]) ||
           tasks.length !== run.tasks?.length || tasks.some((task, index) =>
             taskKeys.some((key) => task[key] !== run.tasks[index][key]))) {
         return { applied: false, reason: "manual_fence_changed" };
       }
+      const expectedKeys = new Set(tasks.filter(task => task.lease_token)
+        .map(task => `task:${task.task_gid}`));
+      if (current.agent_lease_token) expectedKeys.add(`agent:${run.agent_id}`);
+      const held = this.leasesForRun(run.run_id);
+      if (held.length !== expectedKeys.size || held.some(lease => !expectedKeys.has(lease.key))) {
+        return { applied: false, reason: "unbound_manual_lease" };
+      }
       const decision = decideManualLeaseReconciliation({ run: { ...current, tasks },
         nativeReadbacks: evidence.nativeReadbacks, taskReadbacks: evidence.taskReadbacks,
-        agentUserGid: evidence.agentUserGid, processReadback, now: Date.now() });
-      if (!decision.release_agent || decision.action === "hold") {
+        agentUserGid: evidence.agentUserGid, processReadback, now });
+      if (decision.action === "hold") {
         return { applied: false, reason: decision.reason };
       }
       const taskSet = new Set(tasks.map((task) => task.task_gid));
@@ -674,15 +713,19 @@ export class AsanaDispatchStore {
           token: task.lease_token, fence: task.lease_fence })) {
           throw new Error("Manual task lease fence changed");
         }
+        this.db.prepare("UPDATE manual_run_tasks SET resolved_at_ms=? WHERE run_id=? AND task_gid=?")
+          .run(now, run.run_id, gid);
       }
-      if (!this.releaseLease({ key: `agent:${run.agent_id}`, run_id: run.run_id,
+      if (decision.release_agent && !this.releaseLease({ key: `agent:${run.agent_id}`, run_id: run.run_id,
         token: current.agent_lease_token, fence: current.agent_lease_fence })) {
         throw new Error("Manual agent lease fence changed");
       }
       const complete = decision.quarantine_tasks.length === 0;
       this.db.prepare(`UPDATE manual_runs SET state=?,updated_at_ms=?,
-          released_at_ms=?,last_checked_at_ms=? WHERE run_id=?`)
-        .run(complete ? "released" : "active", now, complete ? now : null, now, run.run_id);
+          released_at_ms=?,last_checked_at_ms=?,agent_released_at_ms=COALESCE(agent_released_at_ms,?) WHERE run_id=?`)
+        .run(complete ? "released" : "active", now, complete ? now : null, now, now, run.run_id);
+      this.db.prepare("INSERT INTO recovery_events(run_id,observed_at_ms,kind,evidence_json) VALUES (?,?,?,?)")
+        .run(run.run_id,now,"manual",JSON.stringify({run,evidence,processReadback,decision}));
       return { applied: true, decision };
     });
   }
@@ -712,10 +755,15 @@ export class AsanaDispatchStore {
       .run(lease.key, lease.run_id, lease.token, lease.fence).changes === 1;
   }
 
-  claimNext(runId, { now = Date.now(), ttlMs = 20 * 60_000, agentId = null } = {}) {
+  claimNext(runId, { now = Date.now(), ttlMs = 20 * 60_000, agentId = null, maxActiveAgents = null } = {}) {
     assertId(runId, "run_id");
     if (agentId) assertId(agentId, "agent_id");
+    if(maxActiveAgents !== null && (!Number.isSafeInteger(maxActiveAgents) || maxActiveAgents<1 || maxActiveAgents>2))
+      throw new Error("Invalid worker capacity");
     return this.transaction(() => {
+      if(maxActiveAgents !== null && this.db.prepare("SELECT COUNT(*) AS n FROM leases WHERE key LIKE 'agent:%'").get().n>=maxActiveAgents)
+        return null;
+      this.normalizeContinuations(now);
       const candidates = this.db.prepare(`
         SELECT * FROM signals WHERE status IN ('pending','retry_after') AND available_at_ms <= ?
           AND (? IS NULL OR agent_id = ?)
@@ -753,13 +801,18 @@ export class AsanaDispatchStore {
   }
 
   settle(claim, { outcome, error = null, now = Date.now(), maxAttempts = 5,
-    dependencyWatch = null } = {}) {
+    dependencyWatch = null, continuation = null } = {}) {
     if (!claim?.signals?.length || !["acknowledged", "retry_after", "dead_letter"].includes(outcome)) {
       throw new Error("invalid settlement");
     }
     return this.transaction(() => {
       const agentLease = this.db.prepare("SELECT * FROM leases WHERE key=?").get(claim.agent_lease.key);
       const taskLease = this.db.prepare("SELECT * FROM leases WHERE key=?").get(claim.task_lease.key);
+      const held=this.leasesForRun(claim.run_id);
+      if(held.length!==2 || held.some(lease=>
+        ![claim.agent_lease.key,claim.task_lease.key].includes(lease.key))) {
+        throw new Error("Extra run leases require per-task reconciliation before settlement");
+      }
       if (agentLease?.token !== claim.agent_lease.token || agentLease?.fence !== claim.agent_lease.fence ||
           taskLease?.token !== claim.task_lease.token || taskLease?.fence !== claim.task_lease.fence) {
         throw new Error("stale fencing token");
@@ -796,8 +849,19 @@ export class AsanaDispatchStore {
             assertId(dependencyWatch.linked_task_gid, "linked_task_gid"),
             assertId(dependencyWatch.evidence_story_gid, "evidence_story_gid"), now, now);
       }
+      if (outcome !== "retry_after") this.db.prepare(`UPDATE signals SET status='acknowledged',
+        updated_at_ms=?,last_error='Superseded continuation after verified run outcome'
+        WHERE agent_id=? AND task_gid=? AND kind='continuation' AND status IN ('pending','retry_after')`)
+        .run(now,claim.signals[0].agent_id,claim.signals[0].task_gid);
       this.releaseLease(claim.task_lease);
       this.releaseLease(claim.agent_lease);
+      if (continuation) {
+        if(outcome!=="acknowledged" || continuation.signal.agent_id!==claim.signals[0].agent_id ||
+          continuation.signal.task_gid!==claim.signals[0].task_gid) throw new Error("Invalid continuation scope");
+        this.scheduleContinuation(continuation.signal,continuation.nextStep,now);
+      }
+      this.db.prepare("UPDATE runs SET state='completed',updated_at_ms=? WHERE run_id=?")
+        .run(now,claim.run_id);
       return claim.signals.length;
     });
   }
@@ -970,6 +1034,49 @@ export class AsanaDispatchStore {
   leasesForRun(runId) {
     return this.db.prepare("SELECT * FROM leases WHERE run_id=? ORDER BY key")
       .all(assertId(runId, "run_id"));
+  }
+
+  continuationReadyAt(agentId, taskGid, now = Date.now()) {
+    const last=this.db.prepare("SELECT MAX(updated_at_ms) AS at FROM runs WHERE agent_id=? AND task_gid=?")
+      .get(agentId,taskGid).at;
+    const starts=this.db.prepare(`SELECT started_at_ms FROM continuation_starts
+      WHERE agent_id=? AND task_gid=? AND started_at_ms>? ORDER BY started_at_ms DESC`)
+      .all(agentId,taskGid,now-86400000);
+    return Math.max(last == null ? 0 : last+3600000,
+      starts.length>=4 ? starts[3].started_at_ms+86400000 : 0);
+  }
+
+  normalizeContinuations(now = Date.now()) {
+    const rows=this.db.prepare(`SELECT * FROM signals WHERE kind='continuation'
+      AND status IN ('pending','retry_after') ORDER BY created_at_ms,id`).all();
+    const seen=new Set();
+    for (const row of rows) {
+      const key=`${row.agent_id}:${row.task_gid}`;
+      if (seen.has(key)) this.db.prepare(`UPDATE signals SET status='acknowledged',updated_at_ms=?,
+        last_error='Superseded duplicate continuation' WHERE id=?`).run(now,row.id);
+      else {
+        seen.add(key);
+        const at=Math.max(row.available_at_ms,this.continuationReadyAt(row.agent_id,row.task_gid,now));
+        if(at!==row.available_at_ms) this.db.prepare("UPDATE signals SET available_at_ms=?,updated_at_ms=? WHERE id=?")
+          .run(at,now,row.id);
+      }
+    }
+  }
+
+  scheduleContinuation(signal, nextStep, now = Date.now()) {
+    const delay=typeof nextStep === "string" && nextStep.trim() ? 3600000 : 86400000;
+    this.enqueue({...signal,kind:"continuation",available_at_ms:Math.max(now+delay,
+      this.continuationReadyAt(signal.agent_id,signal.task_gid,now))},now);
+    this.normalizeContinuations(now);
+  }
+
+  readyAgentIds(now = Date.now(), limit = 2) {
+    if(!Number.isSafeInteger(limit)||limit<0||limit>2) throw new Error("Worker limit must be zero to two");
+    return this.db.prepare(`SELECT agent_id,MAX(priority) AS priority,MIN(created_at_ms) AS created
+      FROM signals WHERE status IN ('pending','retry_after') AND available_at_ms<=?
+      AND NOT EXISTS(SELECT 1 FROM leases WHERE key='agent:'||signals.agent_id)
+      AND NOT EXISTS(SELECT 1 FROM leases WHERE key='task:'||signals.task_gid)
+      GROUP BY agent_id ORDER BY priority DESC,created,agent_id LIMIT ?`).all(now,limit).map(row=>row.agent_id);
   }
 
   claimForRun(runId) {

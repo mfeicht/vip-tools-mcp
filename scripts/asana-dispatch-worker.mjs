@@ -4,16 +4,13 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { AsanaDispatchStore, DEFAULT_DB_PATH } from "./asana-dispatch-store.mjs";
-import { storiesForTask, tool } from "./asana-dispatch-poller.mjs";
+import { connectMcpClient, storiesForTask, tool } from "./asana-dispatch-poller.mjs";
 import { dueIsReady, signalId, storyMentionsUser } from "./asana-dispatch-signals.mjs";
 import { archiveCompletedThread } from "./codex-app-rpc.mjs";
 import { resolveCodexBinary } from "./codex-binary.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
-const MCP_URL = process.env.WATCHER_MCP_URL || "https://vip-tools-mcp.onrender.com/mcp";
 const RESULT_SCHEMA = path.join(import.meta.dirname, "asana-dispatch-result.schema.json");
 const TASK_FIELDS = "gid,name,completed,assignee.gid,created_by.gid,due_on,due_at,modified_at,permalink_url";
 const RUN_LIMIT_MS = 45 * 60_000;
@@ -145,7 +142,7 @@ export function promptFor(claim, task, route) {
     `Bei einem reinen Due-Signal, dessen einziger offener Schritt bereits in einer bestehenden Asana-Story als Abhaengigkeit von einem anderen offenen Task belegt ist, vermeide einen doppelten Kommentar. Melde blocked/no_action und setze linked_task_gid und evidence_story_gid auf die direkt nachgelesenen GIDs. Ohne diesen Beleg dokumentiere den Blocker im aktuellen Task; ein stiller No-Write-Ausgang wird zur Operations-Pruefung eskaliert. ` +
     `Plane diesen Lauf auf hoechstens etwa 25 Minuten fachliche Arbeit; bei mehr Umfang dokumentiere einen verifizierbaren Zwischenstand und setze spaeter fort. ` +
     `Kein Subagent, keine weitere Aufgabe ausser notwendigem, vertraglich erlaubtem Handoff. ` +
-    `Antworte am Ende ausschliesslich im vorgegebenen JSON-Schema. Setze linked_task_gid und evidence_story_gid ausserhalb eines belegten Abhaengigkeitsfalls auf null. outcome=progress nur bei nachpruefbarem Fortschritt, ` +
+    `Antworte am Ende ausschliesslich im vorgegebenen JSON-Schema. Setze linked_task_gid und evidence_story_gid ausserhalb eines belegten Abhaengigkeitsfalls auf null. Setze next_step bei progress auf den konkreten nächsten Schritt, sonst null. outcome=progress nur bei nachprüfbarem Fortschritt, ` +
     `blocked bei echtem externem Hindernis, no_action nur wenn keine Handlung mehr noetig ist.\n`;
 }
 
@@ -234,23 +231,23 @@ async function runCodex(claim, task, route, store, dbPath, codexBinary) {
 }
 
 export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
-  resolveBinary = resolveCodexBinary } = {}) {
+  resolveBinary = resolveCodexBinary, connect = connectMcpClient } = {}) {
   // A missing application bundle must not claim a task or create a stale lease.
   let codexBinary;
   try { codexBinary = resolveBinary(); }
   catch (error) { return { status: "preflight_blocked", reason: String(error.message || error) }; }
   const store = new AsanaDispatchStore(db);
   const runId = randomUUID().replaceAll("-", "");
-  const claim = store.claimNext(runId, { agentId: selectedAgentId });
+  const claim = store.claimNext(runId, { agentId: selectedAgentId, maxActiveAgents: 2 });
   if (!claim) { store.close(); return { status: "idle" }; }
   const agentId = claim.signals[0].agent_id;
   const taskGid = claim.signals[0].task_gid;
-  const client = new Client({ name: "vip-asana-dispatch-worker", version: "1.0.0" });
+  let client = null;
   let codex = null;
   let codexStarted = false;
   try {
     await assertCodexOutputSchema();
-    await client.connect(new StreamableHTTPClientTransport(new URL(MCP_URL)));
+    client = await connect();
     const before = await readTask(client, agentId, taskGid);
     const ownGid = await userGid(client, agentId);
     const beforeStories = await storiesForTask(client, agentId, taskGid);
@@ -329,14 +326,14 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
     if (!after.completed && ["completed", "failed"].includes(codex.answer.outcome)) {
       throw new Error(`Codex reported ${codex.answer.outcome} but the task remains open`);
     }
-    store.settle(claim, { outcome: "acknowledged" });
-    store.recordRun(claim, { threadId: codex.threadId, turnId: codex.turnId, state: "completed" });
+    let continuation=null;
     if (!after.completed && codex.answer.outcome === "progress") {
       const version = signalId(agentId, taskGid, "continuation", runId);
-      store.enqueue({ id: version, agent_id: agentId, task_gid: taskGid,
-        source_version: version, kind: "continuation", priority: 55,
-        available_at_ms: Date.now() + 15 * 60_000 });
+      continuation={signal:{ id: version, agent_id: agentId, task_gid: taskGid,
+        source_version: version, kind: "continuation", priority: 55 }, nextStep:codex.answer.next_step};
     }
+    store.settle(claim, { outcome: "acknowledged", continuation });
+    store.recordRun(claim, { threadId: codex.threadId, turnId: codex.turnId, state: "completed" });
     let archived = false;
     try { archived = await archiveCompletedThread(codex.threadId); } catch { /* Daily native audit is fallback. */ }
     return { status: after.completed ? "completed" : codex.answer.outcome,
@@ -353,7 +350,7 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
     return { status: "needs_reconciliation", run_id: runId, agent_id: agentId,
       task_gid: taskGid, error: String(error?.message || error).slice(0, 500) };
   } finally {
-    await client.close().catch(() => {});
+    if (client) await client.close().catch(() => {});
     store.close();
   }
 }

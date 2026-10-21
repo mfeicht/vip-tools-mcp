@@ -30,7 +30,7 @@ function evidence(run, { open = [], unstable = [], terminal = "completed" } = {}
   const base = { source: "codex_app.read_thread", host_id: "local",
     thread_id: run.thread_id, runtime_status: "idle", turn_id: "turn-1",
     turn_status: terminal, started_at_ms: run.acquired_at_ms - 1000,
-    completed_at_ms: now - 10_000, activity_digest: "a".repeat(64) };
+    completed_at_ms: now - 10_000, activity_item_count: 2, activity_last_item_id: "item-2", activity_digest: "a".repeat(64) };
   const nativeReadbacks = [{ ...base, observed_at_ms: now - 4000 },
     { ...base, observed_at_ms: now - 2000 }];
   const taskReadbacks = run.tasks.map((binding) => {
@@ -74,7 +74,16 @@ test("unverified task stays quarantined while agent and verified task release", 
   assert.equal(result.decision.action, "partial_quarantine");
   assert.deepEqual(db.activeLeases().map((row) => row.key), ["task:456"]);
   assert.equal(db.manualRun(run.run_id).state, "active");
-  assert.deepEqual(db.manualRunsForReconciliation({ now: Date.now() + 61 * 60_000 }), []);
+  const pending = db.manualRunsForReconciliation({ now: Date.now() + 61 * 60_000 });
+  assert.equal(pending.length, 1);
+  assert.deepEqual(pending[0].tasks.map(task => task.task_gid), ["456"]);
+  db.acquireManualAgent(agent, "new-manual-run", context);
+  const newAgent = db.activeLeases().find(row => row.key.startsWith("agent:"));
+  const retried = apply(db, pending[0], evidence(pending[0]));
+  assert.equal(retried.applied, true);
+  assert.equal(retried.decision.release_agent, false);
+  assert.equal(db.manualRun(run.run_id).state, "released");
+  assert.deepEqual(db.activeLeases().map(row => ({...row})), [{...newAgent}]);
 });
 
 test("changed task fence, stale native proof and a live process leave all leases", t => {
@@ -111,4 +120,21 @@ test("database failure rolls back every task and agent release", t => {
   assert.throws(() => apply(db, run, evidence(run)), /simulated crash/);
   assert.equal(db.activeLeases().length, 3);
   assert.equal(db.manualRun(run.run_id).state, "active");
+});
+
+
+test("renewed activity invalidates old evidence", t => {
+  const {db,run}=fixture(t);
+  const proof=evidence(run);
+  const old=db.leasesForRun(run.run_id).find(row=>row.key.startsWith("task:"));
+  db.acquireLease(old.key,run.run_id,120000,Date.now());
+  assert.equal(apply(db,run,proof).reason,"manual_fence_changed");
+});
+
+
+test("unbound extra lease prevents a partial manual transition", t => {
+  const {db,run}=fixture(t);
+  db.acquireLease("task:999",run.run_id,120000);
+  assert.equal(apply(db,run,evidence(run)).reason,"unbound_manual_lease");
+  assert.equal(db.activeLeases().length,3);
 });

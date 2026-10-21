@@ -5,6 +5,7 @@ import path from "node:path";
 import { AsanaDispatchStore, DEFAULT_DB_PATH } from "./asana-dispatch-store.mjs";
 import { poll } from "./asana-dispatch-poller.mjs";
 import { reconcileCompletedRuns } from "./asana-dispatch-reconcile.mjs";
+import { reconcileManualLeases } from "./asana-manual-lease-reconcile.mjs";
 
 const HEALTH_PATH = path.join(path.dirname(DEFAULT_DB_PATH), "Asana-Dispatch-Health.json");
 const LOG_PATH = path.join(path.dirname(DEFAULT_DB_PATH), "Asana-Dispatch-Workers.log");
@@ -17,16 +18,18 @@ async function saveHealth(health) {
 }
 
 async function launchWorkers(store, maximum = 2) {
+  if (!Number.isSafeInteger(maximum) || maximum < 0 || maximum > 2) throw new Error("Invalid worker limit");
   const active = store.activeLeases().filter((lease) =>
-    lease.key.startsWith("agent:") && lease.expires_at_ms > Date.now());
+    lease.key.startsWith("agent:"));
   const slots = Math.max(0, maximum - active.length);
-  const ready = store.readyCount();
-  const count = Math.min(slots, ready);
+  store.transaction(()=>store.normalizeContinuations());
+  const agents = store.readyAgentIds(Date.now(),slots);
+  const count = agents.length;
   if (count === 0) return 0;
   const log = await fs.open(LOG_PATH, "a", 0o600);
   try {
-    for (let i = 0; i < count; i += 1) {
-      const child = spawn(NODE, [path.join(import.meta.dirname, "asana-dispatch-worker.mjs")], {
+    for (const agent of agents) {
+      const child = spawn(NODE, [path.join(import.meta.dirname, "asana-dispatch-worker.mjs"),`--agent=${agent}`], {
         cwd: path.resolve(import.meta.dirname, ".."),
         detached: true, stdio: ["ignore", log.fd, log.fd], env: { ...process.env }
       });
@@ -53,15 +56,23 @@ export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
   }
   const store = new AsanaDispatchStore();
   try {
-    health.reconciliation = await reconcileCompletedRuns(store);
+    health.reconciliation = await reconcileCompletedRuns(store, { remoteEnabled: pollHealthy });
     health.errors.push(...health.reconciliation.errors.map((error) => ({ source: "reconciliation", ...error })));
+    health.manual_reconciliation = pollHealthy && !health.reconciliation.errors.length
+      ? await reconcileManualLeases(store)
+      : { skipped: "upstream_readback_failed", errors: [] };
+    health.errors.push(...health.manual_reconciliation.errors.map(error =>
+      ({ source: "manual_reconciliation", ...error })));
     health.ready = store.readyCount();
     health.counts = store.counts();
     health.active_agents = store.activeLeases().filter((lease) =>
       lease.key.startsWith("agent:") && lease.expires_at_ms > Date.now()).length;
-    health.stale_leases = store.runsNeedingReconciliation().length;
+    health.stale_leases = store.activeLeases().filter(lease => lease.expires_at_ms <= Date.now()).length;
+    health.quarantined_tasks = store.db.prepare(`SELECT COUNT(*) AS n FROM leases t
+      WHERE t.key LIKE 'task:%' AND NOT EXISTS
+        (SELECT 1 FROM leases a WHERE a.run_id=t.run_id AND a.key LIKE 'agent:%')`).get().n;
     health.stalled_runs = store.stalledRuns().length;
-    if (dispatch && pollHealthy) {
+    if (dispatch && pollHealthy && !health.errors.length) {
       health.workers_started = await launchWorkers(store, maxWorkers);
     }
   } catch (error) {

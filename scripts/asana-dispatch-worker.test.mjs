@@ -1,3 +1,4 @@
+import { workOnce } from "./asana-dispatch-worker.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -55,7 +56,7 @@ test("future due gate suppresses mixed non-story continuation signals before a m
   ] }, { due_on: "2026-09-22", due_at: "2026-09-22T08:30:00.000Z" }, now), false);
 });
 
-test("MCP failure before agent start retries and releases both leases", (t) => {
+test("MCP failure before agent start retries and releases both leases", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dispatch-worker-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const db = path.join(dir, "store.sqlite");
@@ -65,12 +66,11 @@ test("MCP failure before agent start retries and releases both leases", (t) => {
     priority: 60, available_at_ms: Date.now() - 1000 });
   store.close();
 
-  const result = spawnSync(process.execPath,
-    [path.join(import.meta.dirname, "asana-dispatch-worker.mjs"), `--db=${db}`],
-    { env: { ...process.env, WATCHER_MCP_URL: "http://127.0.0.1:1/mcp" },
-      encoding: "utf8", timeout: 10_000 });
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).status, "retry_after");
+  let calls = 0;
+  const result = await workOnce({ db, resolveBinary: () => process.execPath,
+    connect: async () => { calls++; throw new Error("HTTP 503 fixture"); } });
+  assert.equal(result.status, "retry_after");
+  assert.equal(calls, 1);
 
   const after = new AsanaDispatchStore(db);
   assert.deepEqual(after.counts(), { retry_after: 1 });

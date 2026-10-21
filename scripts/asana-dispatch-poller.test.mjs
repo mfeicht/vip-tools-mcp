@@ -137,44 +137,18 @@ test("streamable HTTP status codes are retryable even when the response body omi
   assert.match(formatToolError(permanent), /HTTP 400/);
 });
 
-test("MCP connection retries one transient failure with a fresh client", async () => {
-  const waits = [];
-  const clients = [];
-  const createPair = () => {
-    const index = clients.length;
-    const client = {
-      closed: false,
-      async connect() {
-        if (index === 0) {
-          const error = new Error("Streamable HTTP error: Error POSTing to endpoint: ");
-          error.code = 503;
-          throw error;
-        }
-      },
-      async close() { this.closed = true; }
-    };
-    clients.push(client);
-    return { client, transport: {} };
-  };
-  const connected = await connectMcpClient(createPair, async (ms) => waits.push(ms));
-  assert.equal(connected, clients[1]);
-  assert.equal(clients[0].closed, true);
-  assert.equal(clients[1].closed, false);
-  assert.deepEqual(waits, [10_000]);
+test("poller delegates one canonical connect cycle without an extra retry tier", async () => {
+  let calls = 0;
+  await assert.rejects(connectMcpClient(async () => { calls++; throw new Error("HTTP 503"); }), /mcp_connect.*503/);
+  assert.equal(calls, 1);
+  const client = {};assert.equal(await connectMcpClient(async () => client), client);
 });
 
-test("MCP connection does not retry permanent failures", async () => {
-  let attempts = 0;
-  await assert.rejects(connectMcpClient(() => {
-    attempts += 1;
-    return { client: {
-      async connect() {
-        const error = new Error("bad request");
-        error.code = 400;
-        throw error;
-      },
-      async close() {}
-    }, transport: {} };
-  }, async () => { throw new Error("unexpected retry"); }), /mcp_connect: bad request \(HTTP 400\)/);
-  assert.equal(attempts, 1);
+test("tool errors and ambiguous writes are never replayed by the poller", async () => {
+  for (const message of ["HTTP 503", "HTTP 429", "HTTP 403"]) {
+    let calls = 0;
+    await assert.rejects(tool({callTool: async () => {calls++;throw new Error(message);}},
+      "asana_comment", {}), /asana_comment/);
+    assert.equal(calls, 1);
+  }
 });

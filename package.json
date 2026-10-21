@@ -6,7 +6,7 @@
   "scripts": {
     "watcher:asana": "node scripts/asana-watcher.mjs",
     "watcher:asana-dispatch": "node scripts/asana-dispatch-watch.mjs --dispatch",
-    "test:asana-dispatch": "node --test scripts/asana-agent-lease.test.mjs scripts/asana-dispatch-store.test.mjs scripts/asana-dispatch-signals.test.mjs scripts/asana-dispatch-poller.test.mjs scripts/asana-dispatch-worker.test.mjs scripts/asana-dispatch-reconcile.test.mjs scripts/asana-manual-lease-decision.test.mjs scripts/asana-manual-lease-readback.test.mjs scripts/asana-manual-lease-transaction.test.mjs",
+    "test:asana-dispatch": "node --test scripts/asana-agent-lease.test.mjs scripts/asana-dispatch-store.test.mjs scripts/asana-dispatch-signals.test.mjs scripts/asana-dispatch-poller.test.mjs scripts/asana-dispatch-worker.test.mjs scripts/asana-dispatch-reconcile.test.mjs scripts/asana-manual-lease-decision.test.mjs scripts/asana-manual-lease-readback.test.mjs scripts/asana-manual-lease-transaction.test.mjs scripts/asana-dispatch-terminal-recovery.test.mjs scripts/asana-manual-lease-reconcile.test.mjs scripts/asana-continuation-policy.test.mjs",
     "postinstall": "node scripts/install-browser-runtime.mjs",
     "test": "node scripts/asana-watcher.mjs --self-test",
     "test:evidence-gate": "node scripts/evidence-gate-selftest.mjs",

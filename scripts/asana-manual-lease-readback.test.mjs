@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readManualNative, readManualLeaseDecision } from "./asana-manual-lease-readback.mjs";
+import { readManualNative, readManualLeaseDecision, readManualAsanaTask } from "./asana-manual-lease-readback.mjs";
 import { processScanBinding } from "./asana-worker-process-readback.mjs";
 
 const now = Date.now();
@@ -48,7 +48,7 @@ test("read-only driver takes two native and scoped Asana reads before deciding",
       source: "codex_app.read_thread", host_id: "local", thread_id: run.thread_id,
       runtime_status: "idle", turn_id: "turn-1", turn_status: "completed",
       started_at_ms: run.acquired_at_ms - 1000, completed_at_ms: now - 20_000,
-      activity_digest: "a".repeat(64) }; },
+      activity_item_count: 2, activity_last_item_id: "item-2", activity_digest: "a".repeat(64) }; },
     readAsana: async () => { taskCount += 1; return {
       observed_at_ms: now - 2500 + taskCount * 1500,
       agent_id: run.agent_id, task: { gid: "123", completed: true,
@@ -61,4 +61,22 @@ test("read-only driver takes two native and scoped Asana reads before deciding",
   assert.equal(nativeCount, 2);
   assert.equal(taskCount, 2);
   assert.deepEqual(calls, [["asana_request", "/users/me", run.agent_id]]);
+});
+
+
+test("system stories may have no author but comments require attributable authors", async () => {
+  let comment=false;
+  const client={callTool:async({arguments:args})=>({content:[{type:"text",text:JSON.stringify({response:
+    args.path.endsWith("/stories") ? {data:[{gid:"story-1",created_at:"2026-10-21T08:00:00Z",
+      resource_subtype:comment?"comment_added":"task_due_time_approaching_story",created_by:null}],next_page:null} :
+      {data:{gid:"123",completed:false,modified_at:"2026-10-21T08:00:00Z"}}})}]})};
+  assert.equal((await readManualAsanaTask(run,run.tasks[0],client)).stories.length,1);
+  comment=true;
+  await assert.rejects(readManualAsanaTask(run,run.tasks[0],client),/story readback incomplete/);
+});
+
+test("pending native tool items cannot attest a terminal run", async () => {
+  await assert.rejects(readManualNative(run,rpc({call:async(method)=>method==="thread/items/list"?
+    {data:[{item:{id:"unfinished",type:"commandExecution",status:"inProgress"}}],nextCursor:null}:
+    rpc().call(method)})),/activity items incomplete/);
 });

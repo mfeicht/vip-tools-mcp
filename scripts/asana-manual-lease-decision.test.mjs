@@ -13,7 +13,7 @@ const native = [0, 1].map((index) => ({ observed_at_ms: now - 3_000 + 1_500 * in
   source: "codex_app.read_thread", host_id: "local", thread_id: "thread-1",
   runtime_status: "idle", turn_id: "turn-1", turn_status: "completed",
   started_at_ms: 900_000, completed_at_ms: 9_000_000,
-  activity_digest: "a".repeat(64) }));
+  activity_item_count: 2, activity_last_item_id: "item-2", activity_digest: "a".repeat(64) }));
 const processReadback = { ...processScanBinding(run), observed_at_ms: now - 1_000,
   raw_sha256: "b".repeat(64), scan_succeeded: true, matching_processes: [] };
 const completedTask = [0, 1].map((index) => ({ observed_at_ms: now - 3_000 + 1_500 * index,

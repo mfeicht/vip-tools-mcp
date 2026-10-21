@@ -21,8 +21,11 @@ export function decideManualLeaseReconciliation({ run, nativeReadbacks, processR
       !Number.isSafeInteger(run.acquired_at_ms) || !Array.isArray(run.tasks)) {
     return hold("manual_binding_incomplete");
   }
-  if (!run.agent_lease_token || !Number.isSafeInteger(run.agent_lease_fence) ||
-      run.agent_lease_fence < 1 || run.agent_fence !== run.agent_lease_fence ||
+  const agentAlreadyReleased = Number.isSafeInteger(run.agent_released_at_ms) &&
+    run.agent_released_at_ms >= run.acquired_at_ms && run.agent_released_at_ms <= now &&
+    run.agent_lease_token == null && run.agent_lease_fence == null;
+  if ((!agentAlreadyReleased && (!run.agent_lease_token || !Number.isSafeInteger(run.agent_lease_fence) ||
+      run.agent_lease_fence < 1 || run.agent_fence !== run.agent_lease_fence)) ||
       run.tasks.some((task) =>
         !task.task_gid || !Number.isSafeInteger(task.acquired_at_ms)) ||
       new Set(run.tasks.map((task) => task.task_gid)).size !== run.tasks.length) {
@@ -33,7 +36,8 @@ export function decideManualLeaseReconciliation({ run, nativeReadbacks, processR
         !["codex_app.read_thread", "codex_app.wait_threads"].includes(row.source) ||
         row.host_id !== "local" || !["idle", "notLoaded"].includes(row.runtime_status) ||
         row.thread_id !== run.thread_id || !TERMINAL.has(row.turn_status) ||
-        !row.turn_id || !/^[a-f0-9]{64}$/.test(row.activity_digest || "") ||
+        !row.turn_id || !Number.isSafeInteger(row.activity_item_count) || row.activity_item_count < 1 ||
+        !row.activity_last_item_id || !/^[a-f0-9]{64}$/.test(row.activity_digest || "") ||
         !Number.isSafeInteger(row.started_at_ms) ||
         row.started_at_ms > row.observed_at_ms ||
         row.started_at_ms > run.acquired_at_ms + 2_000 ||
@@ -59,7 +63,7 @@ export function decideManualLeaseReconciliation({ run, nativeReadbacks, processR
     return hold("worker_inactivity_unverified");
   }
   if (run.tasks.length === 0) return { action: "release", reason: "terminal_without_tasks",
-    release_agent: true, release_tasks: [], quarantine_tasks: [] };
+    release_agent: !agentAlreadyReleased, release_tasks: [], quarantine_tasks: [] };
 
   const readbacks = new Map();
   if (!Array.isArray(taskReadbacks) || !agentUserGid) {
@@ -106,5 +110,5 @@ export function decideManualLeaseReconciliation({ run, nativeReadbacks, processR
   if (readbacks.size !== run.tasks.length) return hold("task_readbacks_ambiguous");
   return { action: quarantineTasks.length ? "partial_quarantine" : "release",
     reason: quarantineTasks.length ? "terminal_with_unverified_tasks" : "terminal_tasks_verified",
-    release_agent: true, release_tasks: releaseTasks, quarantine_tasks: quarantineTasks };
+    release_agent: !agentAlreadyReleased, release_tasks: releaseTasks, quarantine_tasks: quarantineTasks };
 }

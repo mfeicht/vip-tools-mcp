@@ -2,14 +2,49 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["outcome", "summary", "linked_task_gid", "evidence_story_gid"],
+  "required": [
+    "outcome",
+    "summary",
+    "linked_task_gid",
+    "evidence_story_gid",
+    "next_step"
+  ],
   "properties": {
     "outcome": {
       "type": "string",
-      "enum": ["completed", "progress", "blocked", "no_action", "failed"]
+      "enum": [
+        "completed",
+        "progress",
+        "blocked",
+        "no_action",
+        "failed"
+      ]
     },
-    "summary": { "type": "string", "minLength": 1, "maxLength": 1200 },
-    "linked_task_gid": { "type": ["string", "null"], "pattern": "^[0-9]+$" },
-    "evidence_story_gid": { "type": ["string", "null"], "pattern": "^[0-9]+$" }
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1200
+    },
+    "linked_task_gid": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9]+$"
+    },
+    "evidence_story_gid": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9]+$"
+    },
+    "next_step": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 1200
+    }
   }
 }

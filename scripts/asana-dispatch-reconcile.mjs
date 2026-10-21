@@ -1,10 +1,8 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { AsanaDispatchStore, DEFAULT_DB_PATH } from "./asana-dispatch-store.mjs";
-import { storiesForTask, tool } from "./asana-dispatch-poller.mjs";
-import { archiveCompletedThread } from "./codex-app-rpc.mjs";
+import { connectMcpClient, storiesForTask, tool } from "./asana-dispatch-poller.mjs";
+import { CodexAppRpc } from "./codex-app-rpc.mjs";
+import { dispatchRecoverySnapshot, readDispatchRecovery, applyDispatchRecovery } from "./asana-dispatch-terminal-recovery.mjs";
 
-const MCP_URL = process.env.WATCHER_MCP_URL || "https://vip-tools-mcp.onrender.com/mcp";
 
 export function summarizeReconciliationReadback(run, task, stories, ownGid) {
   if (String(task?.gid || "") !== run.task_gid || !Array.isArray(stories) || !ownGid) {
@@ -32,9 +30,9 @@ export async function inspectReconciliationRun(store, { runId, readback = null }
   }
   if (readback) return summarizeReconciliationReadback(run,
     readback.task, readback.stories, readback.ownGid);
-  const client = new Client({ name: "vip-asana-dispatch-reconciliation-inspector", version: "1.0.0" });
+  let client = null;
   try {
-    await client.connect(new StreamableHTTPClientTransport(new URL(MCP_URL)));
+    client = await connectMcpClient();
     const taskResult = await tool(client, "asana_request", { agent_id: run.agent_id,
       method: "GET", path: `/tasks/${run.task_gid}`,
       params: { opt_fields: "gid,completed,assignee.gid,modified_at" } });
@@ -44,38 +42,12 @@ export async function inspectReconciliationRun(store, { runId, readback = null }
     return summarizeReconciliationReadback(run, taskResult.response?.data,
       stories, userResult.response?.data?.gid);
   } finally {
-    await client.close().catch(() => {});
+    if (client) await client.close().catch(() => {});
   }
 }
 
-export async function resolveReconciliationRun(store, { runId, outcome, evidence,
-  archive = archiveCompletedThread, now = Date.now() } = {}) {
-  if (typeof runId !== "string" || !/^[a-zA-Z0-9_-]{2,180}$/.test(runId)) {
-    throw new Error("A valid reconciliation runId is required");
-  }
-  if (!["acknowledged", "retry_after"].includes(outcome)) {
-    throw new Error("Reconciliation outcome must be acknowledged or retry_after");
-  }
-  if (typeof evidence !== "string" || evidence.trim().length < 20) {
-    throw new Error("Reconciliation requires a concrete evidence note");
-  }
-  const run = store.db.prepare("SELECT * FROM runs WHERE run_id=?").get(runId);
-  if (!run) throw new Error(`Unknown reconciliation run ${runId}`);
-  if (run.state !== "needs_reconciliation") {
-    throw new Error(`Run ${runId} is not awaiting reconciliation`);
-  }
-  const claim = store.claimForRun(runId);
-  store.settle(claim, { outcome, error: outcome === "retry_after" ? evidence.trim() : null, now });
-  store.recordRun(claim, { threadId: run.thread_id, turnId: run.turn_id, state: "completed",
-    error: `Manual reconciliation (${outcome}): ${evidence.trim()}`, now });
-  let archived = false;
-  let archiveError = null;
-  if (outcome === "acknowledged" && run.thread_id) {
-    try { archived = await archive(run.thread_id); }
-    catch (error) { archiveError = String(error).slice(0, 500); }
-  }
-  return { run_id: runId, agent_id: run.agent_id, task_gid: run.task_gid,
-    outcome, signals_resolved: claim.signals.length, archived, archive_error: archiveError };
+export async function resolveReconciliationRun() {
+  throw new Error("A free-text evidence note cannot authorize release; use fenced native/Asana recovery");
 }
 
 export function resolveDeadLetters(store, { signalIds, agentId, taskGid, outcome,
@@ -83,73 +55,59 @@ export function resolveDeadLetters(store, { signalIds, agentId, taskGid, outcome
   return store.reviewDeadLetters({ signalIds, agentId, taskGid, outcome, evidence, now });
 }
 
-export async function reconcileCompletedRuns(store, { readTask = null,
-  archive = archiveCompletedThread, limit = 5 } = {}) {
-  const runs = store.runsNeedingReconciliation()
-    .filter((run) => run.state === "needs_reconciliation" ||
-      (run.state === "claimed" && run.launch_phase === "preflight")).slice(0, limit);
-  const result = { checked: 0, acknowledged: 0, still_open: 0,
-    preflight_retried: 0, preflight_unverified: 0, archived: 0, errors: [] };
-  if (!runs.length) return result;
-
-  // Preflight recovery is purely local. Never require an MCP connection to
-  // release a provably never-launched claim, and never infer that from NULL.
+export async function reconcileCompletedRuns(store, {
+  connect = connectMcpClient, makeRpc = () => new CodexAppRpc(),
+  read = readDispatchRecovery, apply = applyDispatchRecovery, now = () => Date.now(), limit = 2,
+  remoteEnabled = true
+} = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 2) throw new Error("Recovery limit is one or two");
+  const runs = store.runsNeedingReconciliation(now()).filter(run =>
+    run.last_reconcile_check_at_ms == null || run.last_reconcile_check_at_ms <= now() - 3600000)
+    .sort((a,b) => (a.last_reconcile_check_at_ms ?? a.started_at_ms) -
+      (b.last_reconcile_check_at_ms ?? b.started_at_ms)).slice(0,limit);
+  const result = { checked:0, acknowledged:0, still_open:0, held:0,
+    preflight_retried:0, preflight_unverified:0, archived:0, errors:[] };
   const pending = [];
   for (const run of runs) {
     if (run.state !== "claimed") { pending.push(run); continue; }
-    result.checked += 1;
+    result.checked++;
     try {
-      if (run.launch_phase === "preflight" &&
-          store.recoverNeverLaunchedRun(run.run_id)) result.preflight_retried += 1;
-      else result.preflight_unverified += 1;
-    } catch (error) {
-      result.preflight_unverified += 1;
-      result.errors.push({ run_id: run.run_id, stage: "preflight",
-        error: String(error).slice(0, 500) });
+      if (run.launch_phase === "preflight" && store.recoverNeverLaunchedRun(run.run_id, now()))
+        result.preflight_retried++;
+      else result.preflight_unverified++;
+    } catch(error) {
+      result.errors.push({run_id:run.run_id, stage:"preflight", error:String(error).slice(0,500)});
     }
   }
   if (!pending.length) return result;
-
-  let client = null;
+  if (!remoteEnabled) { result.held += pending.length; return result; }
+  let client, rpc;
   try {
-    if (!readTask) {
-      client = new Client({ name: "vip-asana-dispatch-reconciler", version: "1.0.0" });
-      await client.connect(new StreamableHTTPClientTransport(new URL(MCP_URL)));
-      readTask = async (run) => {
-        const response = await tool(client, "asana_request", { agent_id: run.agent_id,
-          method: "GET", path: `/tasks/${run.task_gid}`,
-          params: { opt_fields: "gid,completed,modified_at" } });
-        return response.response?.data;
-      };
-    }
-    for (const run of pending) {
-      result.checked += 1;
+    client = await connect();
+    rpc = makeRpc();
+    await rpc.start();
+    for (const selected of pending) {
+      result.checked++;
+      const snapshot = dispatchRecoverySnapshot(store, selected.run_id);
       try {
-        const task = await readTask(run);
-        if (String(task?.gid || "") !== run.task_gid) throw new Error("Task readback GID mismatch");
-        if (task.completed !== true) { result.still_open += 1; continue; }
-        // Operator quarantine deliberately removed only the agent lease.
-        // A later Asana completion alone must not release that protected task.
-        if (run.task_only_quarantine) {
-          result.task_quarantined = (result.task_quarantined || 0) + 1;
-          continue;
-        }
-        const claim = store.claimForRun(run.run_id);
-        store.settle(claim, { outcome: "acknowledged" });
-        store.recordRun(claim, { threadId: run.thread_id, turnId: run.turn_id, state: "completed" });
-        result.acknowledged += 1;
-        if (run.thread_id) {
-          try { if (await archive(run.thread_id)) result.archived += 1; }
-          catch (error) { result.errors.push({ run_id: run.run_id, stage: "archive", error: String(error) }); }
-        }
-      } catch (error) {
-        result.errors.push({ run_id: run.run_id, stage: "readback", error: String(error).slice(0, 500) });
+        const proof = await read(snapshot, {rpc,client});
+        const decision = apply(store,snapshot,proof,{now:now()});
+        if (decision.action === "acknowledge") result.acknowledged++;
+        else if (decision.action === "quarantine") result.still_open++;
+        else result.held++;
+      } catch(error) {
+        result.errors.push({run_id:selected.run_id, stage:"readback", error:String(error).slice(0,500)});
+      } finally {
+        store.db.prepare(`UPDATE runs SET last_reconcile_check_at_ms=?
+          WHERE run_id=? AND updated_at_ms=? AND last_reconcile_check_at_ms IS ?`)
+          .run(now(),selected.run_id,snapshot.run.updated_at_ms,snapshot.run.last_reconcile_check_at_ms);
       }
     }
-  } catch (error) {
-    result.errors.push({ stage: "connect", error: String(error).slice(0, 500) });
+  } catch(error) {
+    result.errors.push({stage:"connect",error:String(error).slice(0,500)});
   } finally {
-    if (client) await client.close().catch(() => {});
+    await client?.close().catch(()=>{});
+    await rpc?.close().catch(()=>{});
   }
   return result;
 }
