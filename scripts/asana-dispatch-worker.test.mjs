@@ -7,7 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
 import { assertCodexOutputSchema, cleanNoWriteDueTask, documentedDependencyNoWrite, promptFor,
-  noStorySignalsDeferredByDue, noWriteDisposition } from "./asana-dispatch-worker.mjs";
+  noStorySignalsDeferredByDue, noWriteDisposition, verifiedOpenTaskHandoff } from "./asana-dispatch-worker.mjs";
 
 test("all agent dispatch prompts bind the same no-Render and safe-retry contract", () => {
   for (const agent of ["vip-ai-social-media", "vip-ai-finance", "vip-ai-communication", "vip-ai-operations"]) {
@@ -137,4 +137,29 @@ test("unverified clean no-write due task dead-letters without retaining an agent
   assert.deepEqual(store.counts(), { dead_letter: 1 });
   assert.deepEqual(store.activeLeases(), []);
   assert.equal(store.claimNext("run-2", { now: 3000 }), null);
+});
+
+
+test("documented open-task handoff acknowledges worker work, never Asana completion", () => {
+  const startedAt=Date.parse("2026-10-22T15:06:00Z");
+  const input={before:{gid:"123",completed:false,assignee:{gid:"111"}},
+    after:{gid:"123",completed:false,assignee:{gid:"222"},modified_at:"2026-10-22T15:13:00Z"},
+    afterStories:[{gid:"333",resource_subtype:"comment_added",text:"Dokumentation übergeben; menschliche QA bleibt offen.",created_by:{gid:"111"},created_at:"2026-10-22T15:12:00Z"}],
+    answer:{outcome:"handed_off",summary:"Dokumentation ist belegt übergeben; fachliche QA bleibt offen."},
+    codex:{exitCode:0,timedOut:false,threadId:"thread"},ownGid:"111",startedAt};
+  assert.equal(verifiedOpenTaskHandoff(input),true);
+  assert.equal(verifiedOpenTaskHandoff({...input,answer:{...input.answer,outcome:"completed"}}),true);
+  for(const patch of [
+    {after:{...input.after,assignee:{gid:"111"}}},
+    {after:{...input.after,assignee:null}},
+    {after:{...input.after,gid:"999"}},
+    {after:{...input.after,modified_at:"2026-10-21T00:00:00Z"}},
+    {before:{...input.before,assignee:{gid:"222"}}},
+    {afterStories:[]},
+    {afterStories:[{...input.afterStories[0],created_by:{gid:"222"}}]},
+    {afterStories:[{...input.afterStories[0],resource_subtype:"assigned"}]},
+    {codex:{...input.codex,timedOut:true}},
+    {codex:{...input.codex,exitCode:1}},
+    {answer:{...input.answer,outcome:"failed"}}
+  ])assert.equal(verifiedOpenTaskHandoff({...input,...patch}),false,JSON.stringify(patch));
 });

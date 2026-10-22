@@ -53,6 +53,19 @@ function allCommentSignalsAnswered(claim, stories, userId) {
   });
 }
 
+// A completed worker handoff does not imply that the Asana task is completed.
+export function verifiedOpenTaskHandoff({before,after,afterStories,answer,codex,ownGid,startedAt}) {
+  return Boolean(ownGid && before?.completed === false && after?.completed === false &&
+    before.gid === after.gid && before.assignee?.gid === ownGid &&
+    /^\d+$/.test(String(after.assignee?.gid || "")) && after.assignee.gid !== ownGid &&
+    Date.parse(after.modified_at || "") >= startedAt &&
+    codex?.exitCode === 0 && codex.timedOut === false && codex.threadId &&
+    ["handed_off","completed"].includes(answer?.outcome) &&
+    typeof answer.summary === "string" && answer.summary.trim().length >= 20 &&
+    Array.isArray(afterStories) && laterOwnStory(afterStories.filter(s =>
+      s.resource_subtype === "comment_added" && typeof s.text === "string" && s.text.trim().length >= 20),ownGid,startedAt));
+}
+
 export function cleanNoWriteFinishedRun({ claim, before, after, afterStories,
   answer, codex, ownGid, startedAt }) {
   return Boolean(claim.signals.length &&
@@ -143,7 +156,8 @@ export function promptFor(claim, task, route) {
     `Plane diesen Lauf auf hoechstens etwa 25 Minuten fachliche Arbeit; bei mehr Umfang dokumentiere einen verifizierbaren Zwischenstand und setze spaeter fort. ` +
     `Kein Subagent, keine weitere Aufgabe ausser notwendigem, vertraglich erlaubtem Handoff. ` +
     `Antworte am Ende ausschliesslich im vorgegebenen JSON-Schema. Setze linked_task_gid und evidence_story_gid ausserhalb eines belegten Abhaengigkeitsfalls auf null. Setze next_step bei progress auf den konkreten nächsten Schritt, sonst null. outcome=progress nur bei nachprüfbarem Fortschritt, ` +
-    `blocked bei echtem externem Hindernis, no_action nur wenn keine Handlung mehr noetig ist.\n`;
+    `blocked bei echtem externem Hindernis, no_action nur wenn keine Handlung mehr noetig ist. ` +
+    `outcome=completed nur bei per Readback abgeschlossener Asana-Aufgabe. Ist deine Arbeit belegt an einen anderen zuständigen Assignee übergeben und bleibt der Task offen, nutze handed_off; dokumentiere den Handoff im Task und verifiziere die neue Zuweisung.\n`;
 }
 
 async function runCodex(claim, task, route, store, dbPath, codexBinary) {
@@ -323,6 +337,13 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
     if (codex.exitCode !== 0 || !codex.answer?.outcome) {
       throw new Error("Asana changed but Codex run did not finish with a verifiable result");
     }
+    if (verifiedOpenTaskHandoff({before,after,afterStories,answer:codex.answer,codex,ownGid,startedAt})) {
+      store.settle(claim,{outcome:"acknowledged"});
+      store.recordRun(claim,{threadId:codex.threadId,turnId:codex.turnId,state:"completed"});
+      return {status:"handed_off",task_completed:false,new_assignee_gid:after.assignee.gid,
+        run_id:runId,agent_id:agentId,task_gid:taskGid};
+    }
+    if (codex.answer.outcome === "handed_off") throw new Error("Open-task handoff postcondition unverified");
     if (!after.completed && ["completed", "failed"].includes(codex.answer.outcome)) {
       throw new Error(`Codex reported ${codex.answer.outcome} but the task remains open`);
     }
