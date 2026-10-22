@@ -154,6 +154,7 @@ import {
   evaluateGeneratedImageCleanup
 } from "./lib/generated-image-retention.js";
 import { createMcpRequestCleanup } from "./lib/mcp-request-lifecycle.js";
+import { mcpTraceId } from "./lib/mcp-request-correlation.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -27850,6 +27851,8 @@ let activeMcpRequests = 0;
 let totalMcpRequests = 0;
 
 app.post("/mcp", async (req, res) => {
+  const traceId = mcpTraceId(req.get("x-vip-request-id"));
+  res.set("x-vip-request-id", traceId);
   const server = createServer();
 
   const transport = new StreamableHTTPServerTransport({
@@ -27864,6 +27867,7 @@ app.post("/mcp", async (req, res) => {
     server,
     onCleanupError({ resource, error }, reason) {
       console.error("MCP CLEANUP ERROR", {
+        trace_id: traceId,
         request_number: requestNumber,
         resource,
         reason,
@@ -27873,6 +27877,7 @@ app.post("/mcp", async (req, res) => {
     onClosed({ reason, errors }) {
       activeMcpRequests = Math.max(0, activeMcpRequests - 1);
       console.log("MCP REQUEST CLOSED", {
+        trace_id: traceId,
         request_number: requestNumber,
         reason,
         cleanup_errors: errors.length,
@@ -27889,6 +27894,7 @@ app.post("/mcp", async (req, res) => {
       ? req.body.params.name
       : null;
     console.log("MCP REQUEST", req.method, req.body?.method, {
+      trace_id: traceId,
       request_number: requestNumber,
       active_requests: activeMcpRequests,
       tool_name: toolName
@@ -27897,7 +27903,7 @@ app.post("/mcp", async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
-    console.error("MCP ERROR:", err);
+    console.error("MCP ERROR:", { trace_id: traceId, request_number: requestNumber, error: err });
 
     if (!res.headersSent) {
       res.status(500).send(err.message);
