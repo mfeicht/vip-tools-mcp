@@ -10,6 +10,17 @@ import {readManualAsanaTask} from './asana-manual-lease-readback.mjs';
 import {manualThreadContext} from './asana-agent-lease.mjs';
 
 export function parseSpawnResumeArguments(args) {
+  // Keep the historical run ID out of this observer's process command line.
+  // The fixed process scanner must still detect every real run reference.
+  if(args.length===1&&args[0].startsWith('--request=')) {
+    const file=args[0].slice(10);
+    if(!file.startsWith('/')||fs.realpathSync(file)!==file||!fs.lstatSync(file).isFile()||
+      fs.statSync(file).size>8192)throw new Error('Bounded regular request file required');
+    const request=JSON.parse(fs.readFileSync(file,'utf8'));
+    if(!Array.isArray(request)||request.some(v=>typeof v!=='string'||v.startsWith('--request=')))
+      throw new Error('Request must contain only explicit CLI arguments');
+    return parseSpawnResumeArguments(request);
+  }
   const opts={apply:false};
   for(const arg of args) {
     if(arg==='--apply'&&!opts.apply){opts.apply=true;continue;}
