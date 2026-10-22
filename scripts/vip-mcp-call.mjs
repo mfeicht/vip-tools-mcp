@@ -6,6 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { createCorrelatedMcpFetch } from "../lib/mcp-request-correlation.js";
 
 const MCP_URL = "https://vip-tools-mcp.onrender.com/mcp";
 const DEFAULT_ATTEMPTS = 3;
@@ -314,7 +315,10 @@ async function parseToolArgs(opts) {
 
 async function connectOnce(opts, attempt) {
   const client = new Client({ name: "vip-canonical-mcp-fallback", version: "1.0.0" });
-  const transport = new StreamableHTTPClientTransport(new URL(MCP_URL));
+  const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), {
+    fetch: createCorrelatedMcpFetch(fetch, (record) =>
+      console.error(`[vip-mcp] ${JSON.stringify(record)}`))
+  });
   try {
     await withTimeout(client.connect(transport), opts.connectTimeoutMs, "MCP connect");
     return client;
