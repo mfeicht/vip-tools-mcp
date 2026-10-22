@@ -23,11 +23,16 @@ export function manualThreadContext(env = process.env) {
 export function executeLeaseCommand(store, { command, agent, task, run }, env = process.env) {
   if (command === "status") return {
     leases: store.activeLeases(), counts: store.counts(),
+    dispatch_maintenance: store.dispatchMaintenance(),
     manual_runs: store.db.prepare("SELECT * FROM manual_runs WHERE state='active' ORDER BY created_at_ms").all(),
     manual_run_tasks: store.db.prepare(`SELECT t.* FROM manual_run_tasks t
       JOIN manual_runs r ON r.run_id=t.run_id WHERE r.state='active'
       ORDER BY t.run_id,t.task_gid`).all(),
   };
+  if (command === 'maintenance-pause' || command === 'maintenance-resume') {
+    if(!run || env.VIP_ASANA_DISPATCH_RUN_ID) throw new Error('Manual Operations run required');
+    return store.setDispatchMaintenance(run,manualThreadContext(env),{pause:command==='maintenance-pause'});
+  }
   if (command === "acquire-agent") {
     if (!/^vip-ai-[a-z-]+$/.test(agent || "")) throw new Error("Valid --agent required");
     if (env.VIP_ASANA_DISPATCH_RUN_ID) throw new Error("Dispatcher already owns local leases");
