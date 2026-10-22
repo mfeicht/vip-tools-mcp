@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { readDispatchNative, readManualAsanaTask, boundedReadClients } from "./asana-manual-lease-readback.mjs";
 import { collectWorkerProcessReadback, processScanBinding } from "./asana-worker-process-readback.mjs";
+import { tool } from "./asana-dispatch-poller.mjs";
+import { signalId } from "./asana-dispatch-signals.mjs";
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -19,6 +21,10 @@ export async function readDispatchRecovery(snapshot, { rpc, client,
   scan = collectWorkerProcessReadback } = {}) {
   const { run } = snapshot;
   ({rpc,client}=boundedReadClients(rpc,client));
+  const identity = await tool(client,"asana_request",{agent_id:run.agent_id,
+    method:"GET",path:"/users/me",params:{opt_fields:"gid"}});
+  const ownGid=identity.response?.data?.gid;
+  if(!/^\d+$/.test(ownGid || "")) throw new Error("Recovery owner identity unavailable");
   const native = [], asana = [], processes = [];
   for (let pass = 0; pass < 2; pass++) {
     if (pass) await wait(native[0].completed_at_ms === null ? 30000 : 1100);
@@ -26,7 +32,31 @@ export async function readDispatchRecovery(snapshot, { rpc, client,
     processes.push(scan(run));
     asana.push(await readTask(run, { task_gid: run.task_gid }, client));
   }
-  return { native, asana, processes };
+  return { native, asana, processes, ownGid };
+}
+
+export function documentedOpenRecovery(run, proof) {
+  const native = proof.native[1], current = proof.asana[1];
+  const answer = native.answer;
+  if(native.turn_status !== "completed" || native.completed_at_ms === null ||
+      !["blocked","progress"].includes(answer?.outcome) ||
+      !/^\d+$/.test(proof.ownGid || "") || current.task.completed !== false ||
+      current.task.assignee?.gid !== proof.ownGid ||
+      (answer.outcome === "progress" &&
+        (typeof answer.next_step !== "string" || answer.next_step.trim().length < 12))) return null;
+  const eligible = current.stories.filter(story => story.resource_subtype === "comment_added" &&
+    story.created_by?.gid === proof.ownGid && /^\d+$/.test(story.gid || "") &&
+    typeof story.text === "string" && story.text.trim().length >= 20 &&
+    Date.parse(story.created_at) >= run.started_at_ms &&
+    Date.parse(story.created_at) <= native.completed_at_ms &&
+    (answer.evidence_story_gid === story.gid ||
+      new RegExp(`(^|\\D)${story.gid}(\\D|$)`).test(answer.summary)));
+  if(eligible.length !== 1) return null;
+  const story=eligible[0];
+  // A later response requires fresh work rather than settlement of the old run.
+  if(current.stories.some(other => other.resource_subtype === "comment_added" &&
+      other.created_by?.gid !== proof.ownGid && Date.parse(other.created_at) >= Date.parse(story.created_at))) return null;
+  return {outcome:answer.outcome,evidence_story_gid:story.gid,next_step:answer.next_step};
 }
 
 export function decideDispatchRecovery(snapshot, proof, scan, now = Date.now()) {
@@ -88,8 +118,10 @@ export function decideDispatchRecovery(snapshot, proof, scan, now = Date.now()) 
     !same({...asana[0], observed_at_ms:null}, {...asana[1], observed_at_ms:null})) {
     return hold("asana_readback_unverified");
   }
-  return { action: !missingEnd && asana[1].task.completed ? "acknowledge" : "quarantine",
-    reason: missingEnd ? "missing_end_agent_only_quarantine" : "terminal_verified",
+  const open = !missingEnd ? documentedOpenRecovery(run,proof) : null;
+  return { action: !missingEnd && (asana[1].task.completed || open) ? "acknowledge" : "quarantine",
+    reason: open ? "documented_open_task" : missingEnd ? "missing_end_agent_only_quarantine" : "terminal_verified",
+    open,
     release_agent: Boolean(agent), turn_id: native[1].turn_id };
 }
 
@@ -108,8 +140,13 @@ export function applyDispatchRecovery(store, snapshot, proof, {
     if (decision.action === "acknowledge") {
       for (const signal of signals) store.db.prepare(`UPDATE signals SET status='acknowledged',
         run_id=NULL,lease_token=NULL,lease_fence=NULL,updated_at_ms=?,last_error=? WHERE id=?`)
-        .run(now, `Stable native terminal and Asana completion; proof=${digest(proof)}`, signal.id);
+        .run(now, `Stable native terminal and ${decision.open ? "documented open-task result" : "Asana completion"}; proof=${digest(proof)}`, signal.id);
       for (const lease of leases) if (!store.releaseLease(lease)) throw new Error("Recovery lease changed");
+      if(decision.open?.outcome === "progress") {
+        const id=signalId(run.agent_id,run.task_gid,"continuation",run.run_id);
+        store.scheduleContinuation({id,agent_id:run.agent_id,task_gid:run.task_gid,
+          source_version:id,kind:"continuation",priority:55},decision.open.next_step,now);
+      }
     } else {
       const agent = leases.find(lease => lease.key === `agent:${run.agent_id}`);
       if (agent && !store.releaseLease(agent)) throw new Error("Recovery agent changed");

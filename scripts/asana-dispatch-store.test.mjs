@@ -383,3 +383,17 @@ test("poll history keeps compact load and reliability evidence", (t) => {
   assert.equal(stats.first_started_at, new Date(2 * day).toISOString());
   assert.equal(stats.last_finished_at, new Date(3 * day + 60_000).toISOString());
 });
+
+
+test("undated assignment stays queued until a real trigger arrives",()=>{
+  const store=new AsanaDispatchStore(":memory:");
+  try{
+    store.enqueue({id:"new-1",agent_id:"vip-ai-research",task_gid:"123",source_version:"new-1",kind:"new_assigned_task",priority:45},1000);
+    assert.equal(store.claimNext("run-1",{now:2000}),null);
+    assert.equal(store.readyCount(2000),0);assert.deepEqual(store.readyAgentIds(2000),[]);
+    assert.deepEqual(store.counts(),{pending:1});
+    store.enqueue({id:"due-1",agent_id:"vip-ai-research",task_gid:"123",source_version:"due-1",kind:"due_task",priority:60},2000);
+    assert.deepEqual(store.readyAgentIds(3000),["vip-ai-research"]);
+    assert.equal(store.claimNext("run-2",{now:3000}).signals.length,2);
+  }finally{store.close();}
+});

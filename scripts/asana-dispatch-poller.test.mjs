@@ -152,3 +152,52 @@ test("tool errors and ambiguous writes are never replayed by the poller", async 
     assert.equal(calls, 1);
   }
 });
+
+
+test("cyclic audit discovers comments without modified_at changes and backfills once",async()=>{
+  const store=new AsanaDispatchStore(":memory:");
+  try{
+    const now=new Date("2026-10-22T10:00:00Z");
+    const task={gid:"123",name:"Task",completed:false,assignee:{gid:"456"},modified_at:"2026-10-20T10:00:00Z"};
+    store.observeTask({agent_id:"vip-ai-research",task_gid:"123",modified_at:task.modified_at,
+      latest_story_at:"2026-10-21T10:00:00Z",latest_story_gid:"888"},now.getTime()-3600000);
+    const stories=[{gid:"777",resource_subtype:"comment_added",created_by:{gid:"900"},
+      created_at:"2026-10-20T11:00:00Z",text:"Bitte den offenen Punkt bearbeiten."}];
+    const client=fakeClient({stories});
+    const snapshot={agent_id:"vip-ai-research",ok:true,truncated:false,user_gid:"456",workspace_gid:"111",tasks:[task]};
+    const first=await scanAgent(client,store,snapshot,new Set(["456"]),now,true);
+    assert.equal(first.signals_inserted,1);assert.equal(first.stories_read,1);
+    const observation=store.observation("vip-ai-research","123");
+    assert.equal(observation.history_checked_at_ms,now.getTime());
+    assert.equal((await scanAgent(client,store,snapshot,new Set(["456"]),new Date(now.getTime()+300000),true)).stories_read,0);
+    stories.push({...stories[0],gid:"999",created_at:"2026-10-22T10:10:00Z"});
+    const later=await scanAgent(client,store,snapshot,new Set(["456"]),new Date(now.getTime()+900000),true);
+    assert.equal(later.signals_inserted,1);assert.equal(store.counts().pending,2);
+  }finally{store.close();}
+});
+
+test("failed cyclic audit never advances observation or poll cursor",async()=>{
+  const store=new AsanaDispatchStore(":memory:");
+  try{
+    const task={gid:"123",name:"Task",completed:false,assignee:{gid:"456"},modified_at:"2026-10-20T10:00:00Z"};
+    store.observeTask({agent_id:"vip-ai-research",task_gid:"123",modified_at:task.modified_at},1000);
+    const before=store.observation("vip-ai-research","123");
+    const story={gid:"777",created_at:"2026-10-20T11:00:00Z",type:"comment",created_by:{gid:"900"}};
+    const snapshot={agent_id:"vip-ai-research",ok:true,truncated:false,user_gid:"456",workspace_gid:"111",tasks:[task]};
+    await assert.rejects(scanAgent(fakeClient({stories:[story,story]}),store,snapshot,new Set(["456"]),new Date(),true),/duplicate story/);
+    assert.deepEqual(store.observation("vip-ai-research","123"),before);
+    assert.equal(store.pollCursor("vip-ai-research"),null);assert.deepEqual(store.counts(),{});
+  }finally{store.close();}
+});
+
+
+test("one transport failure stops later agent scans while a scoped permission error stays isolated",async()=>{
+  const {scanSnapshots}=await import("./asana-dispatch-poller.mjs");
+  for(const message of ["HTTP 503","HTTP 429","Cloudflare managed challenge on the canonical MCP endpoint","Request timed out","HTTP 403"]){
+    const seen=[];
+    const result=await scanSnapshots(null,null,[{agent_id:"a"},{agent_id:"b"},{agent_id:"c"}],new Set(),new Date(),false,
+      async(_client,_store,snapshot)=>{seen.push(snapshot.agent_id);if(snapshot.agent_id==="b")throw new Error(message);return {agent_id:snapshot.agent_id};});
+    assert.equal(result.errors.length,1);
+    assert.deepEqual(seen,message==="HTTP 403" ? ["a","b","c"] : ["a","b"]);
+  }
+});

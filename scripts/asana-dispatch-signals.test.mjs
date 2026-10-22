@@ -34,3 +34,13 @@ test("only new human comments enqueue; observers need verified mention", () => {
   assert.deepEqual(result.signals.map((signal) => signal.story_gid), ["12"]);
   assert.equal(result.latest.gid, "12");
 });
+
+
+test("same-time comments use numeric GID order and equivalent timezones",()=>{
+  const stories=[{gid:"9",created_at:"2026-10-22T10:00:00Z",type:"comment",created_by:{gid:"456"}},
+    {gid:"10",created_at:"2026-10-22T12:00:00+02:00",type:"comment",created_by:{gid:"900"}}];
+  const options={observation:null,userGid:"456",allAgentUserGids:new Set(["456"]),owned:true,now:new Date("2026-10-22T11:00:00Z")};
+  assert.deepEqual(newCommentSignals("vip-ai-research",{gid:"123"},stories,options).signals.map(s=>s.story_gid),["10"]);
+  assert.equal(newCommentSignals("vip-ai-research",{gid:"123"},stories,{...options,
+    observation:{latest_story_at:"2026-10-22T10:00:00Z",latest_story_gid:"10"}}).signals.length,0);
+});
