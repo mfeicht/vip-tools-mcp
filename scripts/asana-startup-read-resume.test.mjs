@@ -76,6 +76,14 @@ test('audit failure rolls back every signal, lease and attempt change',t=>{
  assert.throws(()=>applyStartupReadResume(f.store,f.snapshot,f.proof,{...f.options,apply:true}),/audit refused/);
  assert.deepEqual(dispatchRecoverySnapshot(f.store,'old'),f.snapshot);
 });
+test('default evaluation clock is sampled after the real process observation',t=>{
+ const f=fixture(t);let clock=f.now;t.mock.method(Date,'now',()=>clock);
+ const {now,...options}=f.options;
+ const result=applyStartupReadResume(f.store,f.snapshot,f.proof,{...options,scan:()=>{
+   clock+=40;return {...f.scan,observed_at_ms:clock};
+ }});
+ assert.equal(result.action,'retry_after');assert.deepEqual(dispatchRecoverySnapshot(f.store,'old'),f.snapshot);
+});
 test('native collector binds complete pagination to digest and original error',async t=>{
  const f=fixture(t),items=f.proof.native[0].items;const turn={id:'turn',status:'failed',startedAt:f.now-900000,completedAt:f.now-800000,error:f.proof.native[0].error};
  const rpc={call:async(method,params)=>{
