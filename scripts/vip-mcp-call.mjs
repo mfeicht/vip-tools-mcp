@@ -410,12 +410,38 @@ async function recordToolTransportFailure(error, tool) {
 
 export async function callToolOnce(client, tool, args, timeoutMs, recordFailure = recordToolTransportFailure) {
   try {
-    return await withTimeout(client.callTool({ name: tool, arguments: args }), timeoutMs, `MCP tool ${tool}`);
+    const result = await withTimeout(client.callTool({ name: tool, arguments: args }, undefined,
+      {timeout:timeoutMs,maxTotalTimeout:timeoutMs}), timeoutMs, `MCP tool ${tool}`);
+    if (result?.isError) {
+      const message = (result.content || []).filter((item) => item.type === "text")
+        .map((item) => item.text).join("\n").slice(0, 2000);
+      const error = new Error(message || "MCP tool failed");
+      if (isCooldownConnectionError(error)) await recordFailure(error, tool).catch(() => {});
+    }
+    return result;
   } catch (error) {
     // Record post-connect throttling too, but never replay a possible mutation.
     await recordFailure(error, tool).catch(() => {});
     throw error;
   }
+}
+
+// Programmatic clients use the same single-flight connection and shared
+// cooldown as the CLI. There is no endpoint override or additional retry tier.
+export async function connectCanonicalMcp() {
+  const { client } = await connectWithRetry({ attempts: DEFAULT_ATTEMPTS,
+    delayMs: DEFAULT_DELAY_MS, connectTimeoutMs: DEFAULT_CONNECT_TIMEOUT_MS });
+  return {
+    async callTool(request, _schema, options = {}) {
+      await waitForSharedTransportWindow();
+      const remaining=options.deadlineAtMs == null ? DEFAULT_TOOL_TIMEOUT_MS : options.deadlineAtMs-Date.now();
+      if(remaining<=0) throw new Error("MCP readback deadline exceeded before tool call");
+      const timeout = Math.min(options.maxTotalTimeout || options.timeout ||
+        DEFAULT_TOOL_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS,remaining);
+      return callToolOnce(client, request.name, request.arguments, timeout);
+    },
+    close: () => client.close()
+  };
 }
 
 async function main() {

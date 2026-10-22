@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
 import { executeLeaseCommand } from "./asana-agent-lease.mjs";
 
@@ -46,6 +47,101 @@ test("agent and task leases fence parallel starts across connections", (t) => {
   first.settle(firstClaim, { outcome: "acknowledged", now: 2000 });
   const resumed = second.claimNext("run-3", { now: 2000 });
   assert.equal(resumed.signals[0].id, "story-2");
+});
+
+test("claim persists preflight with both leases and signals in one transaction", (t) => {
+  const { first, second } = fixture(t);
+  first.enqueue(signal("story-1"), 1000);
+  const claim = first.claimNext("run-1", { now: 1000 });
+  assert.equal(second.db.prepare("SELECT launch_phase FROM runs WHERE run_id=?")
+    .get("run-1").launch_phase, "preflight");
+  assert.equal(second.claimForRun("run-1").signals[0].id, "story-1");
+  assert.equal(claim.agent_lease.expires_at_ms, 1000 + 20 * 60_000);
+  assert.equal(second.claimNext("run-2", { now: 2000 }), null);
+});
+
+test("a duplicate run ID rolls back the entire new claim", (t) => {
+  const { first, second } = fixture(t);
+  first.enqueue(signal("story-1", "123", "vip-ai-first"), 1000);
+  first.claimNext("same-run", { now: 1000 });
+  first.enqueue(signal("story-2", "456", "vip-ai-second"), 1000);
+  assert.throws(() => second.claimNext("same-run", { now: 2000 }), /UNIQUE constraint failed/);
+  assert.equal(first.db.prepare("SELECT status FROM signals WHERE id='story-2'").get().status,
+    "pending");
+  assert.equal(first.db.prepare("SELECT COUNT(*) AS n FROM leases WHERE run_id='same-run'")
+    .get().n, 2);
+});
+
+test("launch fence verifies run, both leases and every signal before spawn", (t) => {
+  const { first, second } = fixture(t);
+  first.enqueue(signal("story-1"), 1000);
+  const claim = first.claimNext("run-1", { now: 1000 });
+  const stale = { ...claim, task_lease: { ...claim.task_lease, fence: claim.task_lease.fence + 1 } };
+  assert.equal(second.beginCodexLaunch(stale, 2000), false);
+  assert.equal(second.db.prepare("SELECT launch_phase FROM runs WHERE run_id=?")
+    .get("run-1").launch_phase, "preflight");
+  second.db.prepare("UPDATE signals SET lease_fence=lease_fence+1 WHERE id='story-1'").run();
+  assert.equal(first.beginCodexLaunch(claim, 2000), false);
+  second.db.prepare("UPDATE signals SET lease_fence=? WHERE id='story-1'")
+    .run(claim.task_lease.fence);
+  assert.equal(first.beginCodexLaunch(claim, 2000), true);
+  assert.equal(second.beginCodexLaunch(claim, 2001), false);
+  assert.equal(second.db.prepare("SELECT launch_phase FROM runs WHERE run_id=?")
+    .get("run-1").launch_phase, "launching");
+  assert.equal(second.db.prepare("SELECT expires_at_ms FROM leases WHERE key=?")
+    .get(claim.task_lease.key).expires_at_ms, 2000 + 2 * 60 * 60_000);
+});
+
+test("only an expired, intact preflight claim can be retried after a crash", (t) => {
+  const { first, second } = fixture(t);
+  first.enqueue(signal("story-1"), 1000);
+  const claim = first.claimNext("run-1", { now: 1000, ttlMs: 60_000 });
+  assert.equal(second.recoverNeverLaunchedRun("run-1", 61_000), false);
+  assert.equal(second.recoverNeverLaunchedRun("run-1", 61_001), true);
+  assert.equal(first.recoverNeverLaunchedRun("run-1", 61_002), false);
+  assert.deepEqual(first.activeLeases(), []);
+  assert.deepEqual(second.counts(), { retry_after: 1 });
+  assert.equal(second.db.prepare("SELECT attempts,available_at_ms FROM signals WHERE id='story-1'")
+    .get().attempts, 0);
+  assert.equal(second.claimNext("run-2", { now: 61_001 + 5 * 60_000 - 1 }), null);
+  assert.equal(second.claimNext("run-2", { now: 61_001 + 5 * 60_000 })?.signals[0].id,
+    "story-1");
+  assert.equal(claim.run_id, "run-1");
+});
+
+test("launching, legacy NULL and changed fences never get preflight recovery", (t) => {
+  const { first, second } = fixture(t);
+  first.enqueue(signal("story-1", "123"), 1000);
+  const launched = first.claimNext("run-launching", { now: 1000, ttlMs: 60_000 });
+  assert.equal(first.beginCodexLaunch(launched, 2000), true);
+  assert.equal(second.recoverNeverLaunchedRun("run-launching", 2 * 60 * 60_000), false);
+  first.enqueue(signal("story-2", "456", "vip-ai-other"), 1000);
+  first.claimNext("run-legacy", { now: 1000, ttlMs: 60_000 });
+  second.db.prepare("UPDATE runs SET launch_phase=NULL WHERE run_id='run-legacy'").run();
+  assert.equal(first.recoverNeverLaunchedRun("run-legacy", 120_000), false);
+  first.enqueue(signal("story-3", "789", "vip-ai-third"), 1000);
+  first.claimNext("run-broken", { now: 1000, ttlMs: 60_000 });
+  second.db.prepare("UPDATE signals SET lease_fence=lease_fence+1 WHERE id='story-3'").run();
+  assert.equal(first.recoverNeverLaunchedRun("run-broken", 120_000), false);
+  assert.equal(second.db.prepare("SELECT status FROM signals WHERE id='story-3'").get().status,
+    "leased");
+});
+
+test("old run schemas migrate without labeling historical runs as preflight", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dispatch-migrate-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const filename = path.join(dir, "store.sqlite");
+  const old = new DatabaseSync(filename);
+  old.exec(`CREATE TABLE runs (run_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+    task_gid TEXT NOT NULL, thread_id TEXT, turn_id TEXT, state TEXT NOT NULL,
+    started_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, last_error TEXT);
+    INSERT INTO runs VALUES ('old-run','vip-ai-test','123',NULL,NULL,'claimed',1000,1000,NULL);`);
+  old.close();
+  const store = new AsanaDispatchStore(filename);
+  t.after(() => store.close());
+  const migrated = store.db.prepare("SELECT launch_phase FROM runs WHERE run_id='old-run'").get();
+  assert.equal(migrated.launch_phase, null);
+  assert.equal(store.recoverNeverLaunchedRun("old-run", 120_000), false);
 });
 
 test("comment arriving during an active task waits for the next run", (t) => {
@@ -96,6 +192,45 @@ test("scheduled agent leases share the same gate as dispatch", (t) => {
   assert.equal(second.claimNext("run-dispatch"), null);
   assert.equal(executeLeaseCommand(first, { command: "release", run: acquired.run_id }, env).released, 2);
   assert.equal(second.claimNext("run-dispatch")?.signals[0].id, "story-1");
+});
+
+test("manual reconciliation selector uses the current chat binding and preserves task history", (t) => {
+  const { first, second } = fixture(t);
+  const now = 10_000_000;
+  const context = { threadId: "01a13d34-b615-7451-b51d-e5d75b31dbcf", source: "CODEX_THREAD_ID" };
+  first.acquireManualAgent("vip-ai-operations", "manual-one", context, now - 90 * 60_000);
+  first.acquireManualTask("manual-one", "123", context, now - 89 * 60_000);
+  first.acquireManualTask("manual-one", "456", context, now - 88 * 60_000);
+  first.db.prepare("DELETE FROM leases WHERE key='task:456'").run();
+  const before = second.db.prepare("SELECT total_changes() AS n").get().n;
+  const candidates = second.manualRunsForReconciliation({ now });
+  assert.deepEqual(candidates.map((run) => run.run_id), ["manual-one"]);
+  assert.equal(candidates[0].thread_id, context.threadId);
+  assert.equal(candidates[0].acquired_at_ms, now - 90 * 60_000);
+  assert.deepEqual(candidates[0].tasks.map((task) => task.task_gid), ["123", "456"]);
+  assert.equal(candidates[0].tasks[0].bound_lease_fence,
+    candidates[0].tasks[0].lease_fence);
+  assert.equal(candidates[0].tasks[1].lease_token, null);
+  assert.equal(second.db.prepare("SELECT total_changes() AS n").get().n, before);
+});
+
+test("manual reconciliation selector respects inactivity and the review interval", (t) => {
+  const { first } = fixture(t);
+  const now = 10_000_000;
+  const context = { threadId: "01a13d34-b615-7451-b51d-e5d75b31dbcf", source: "CODEX_THREAD_ID" };
+  first.acquireManualAgent("vip-ai-operations", "manual-one", context, now - 90 * 60_000);
+  first.acquireManualTask("manual-one", "123", context, now - 89 * 60_000);
+  first.acquireManualAgent("vip-ai-operations", "manual-one", context, now - 5 * 60_000);
+  assert.deepEqual(first.manualRunsForReconciliation({ now }), []);
+  first.db.prepare("UPDATE leases SET updated_at_ms=? WHERE run_id='manual-one'")
+    .run(now - 11 * 60_000);
+  first.db.prepare("UPDATE manual_runs SET last_checked_at_ms=? WHERE run_id='manual-one'")
+    .run(now - 30 * 60_000);
+  assert.deepEqual(first.manualRunsForReconciliation({ now }), []);
+  first.db.prepare("UPDATE manual_runs SET last_checked_at_ms=? WHERE run_id='manual-one'")
+    .run(now - 61 * 60_000);
+  assert.equal(first.manualRunsForReconciliation({ now })[0].run_id, "manual-one");
+  assert.throws(() => first.manualRunsForReconciliation({ now, limit: 3 }), /limit/);
 });
 
 test("observations and cursors persist atomically", (t) => {

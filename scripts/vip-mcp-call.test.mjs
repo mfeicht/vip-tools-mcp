@@ -86,3 +86,13 @@ test("post-connect 429 persists the real shared cooldown without touching host s
   assert.ok(Date.parse(state.cooldownUntil) >= before + 60000);
   assert.equal(fs.existsSync(path.join(directory, "connect.lock")), false);
 });
+
+
+test("isError rate-limit responses persist cooldown without replay", async () => {
+  let calls=0;const recorded=[];
+  const result=await callToolOnce({callTool:async()=>{calls++;return {isError:true,
+    content:[{type:"text",text:"HTTP 429 Too Many Requests"}]};}},"asana_request",{},1000,
+    async(error,name)=>recorded.push([classifyConnectionError(error),name]));
+  assert.equal(result.isError,true);assert.equal(calls,1);
+  assert.deepEqual(recorded,[["remote_rate_limited","asana_request"]]);
+});

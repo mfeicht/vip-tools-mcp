@@ -1,11 +1,9 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { connectCanonicalMcp } from "./vip-mcp-call.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { AsanaDispatchStore, DEFAULT_DB_PATH } from "./asana-dispatch-store.mjs";
 import { dependencyReadySignal, newCommentSignals, taskSignal } from "./asana-dispatch-signals.mjs";
 
-const MCP_URL = process.env.WATCHER_MCP_URL || "https://vip-tools-mcp.onrender.com/mcp";
 const TASK_FIELDS = "gid,name,completed,created_by.gid,assignee.gid,due_on,due_at,modified_at,permalink_url,tags.name,followers.gid";
 const STORY_FIELDS = "gid,created_at,created_by.gid,resource_subtype,type,text,html_text";
 
@@ -38,52 +36,20 @@ export function formatToolError(error) {
   return status ? `${message} (HTTP ${status})` : message;
 }
 
-export async function connectMcpClient(
-  createPair = () => ({
-    client: new Client({ name: "vip-asana-dispatch-sensor", version: "1.0.0" }),
-    transport: new StreamableHTTPClientTransport(new URL(MCP_URL))
-  }),
-  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-) {
-  let lastError;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const { client, transport } = createPair();
-    try {
-      await client.connect(transport);
-      return client;
-    } catch (error) {
-      lastError = error;
-      await Promise.race([
-        client.close().catch(() => {}),
-        new Promise((resolve) => setTimeout(resolve, 5_000))
-      ]);
-      if (attempt === 2 || !retryableToolError(error)) break;
-      const status = toolErrorStatus(error);
-      await wait(status === 429 || /429|cloudflare/i.test(String(error)) ? 60_000 : 10_000);
-    }
-  }
-  throw new Error(`mcp_connect: ${formatToolError(lastError)}`);
+export async function connectMcpClient(connect = connectCanonicalMcp) {
+  try { return await connect(); }
+  catch (error) { throw new Error(`mcp_connect: ${formatToolError(error)}`); }
 }
 
 export async function tool(client, name, args) {
-  let lastError;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      const result = await client.callTool({ name, arguments: args }, undefined,
-        { timeout: 45_000, maxTotalTimeout: 45_000 });
-      if (result?.isError) throw new Error(result.content?.map((item) => item.text).join("\n") || `${name} failed`);
-      const payload = result.content?.find((item) => item.type === "text")?.text;
-      if (!payload) throw new Error(`${name} returned no JSON`);
-      return JSON.parse(payload);
-    } catch (error) {
-      lastError = error;
-      if (attempt === 2 || !retryableToolError(error)) break;
-      const status = toolErrorStatus(error);
-      await new Promise((resolve) => setTimeout(resolve,
-        status === 429 || /429|cloudflare/i.test(String(error)) ? 60_000 : 10_000));
-    }
-  }
-  throw new Error(`${name}: ${formatToolError(lastError)}`);
+  try {
+    const result = await client.callTool({ name, arguments: args }, undefined,
+      { timeout: 45_000, maxTotalTimeout: 45_000 });
+    if (result?.isError) throw new Error(result.content?.map((item) => item.text).join("\n") || `${name} failed`);
+    const payload = result.content?.find((item) => item.type === "text")?.text;
+    if (!payload) throw new Error(`${name} returned no JSON`);
+    return JSON.parse(payload);
+  } catch (error) { throw new Error(`${name}: ${formatToolError(error)}`); }
 }
 
 export async function storiesForTask(client, agentId, taskGid) {
@@ -95,7 +61,11 @@ export async function storiesForTask(client, agentId, taskGid) {
       agent_id: agentId, method: "GET", path: `/tasks/${taskGid}/stories`,
       params: { limit: 100, opt_fields: STORY_FIELDS, ...(offset ? { offset } : {}) }
     });
-    stories.push(...(result.response?.data || []));
+    if (!Array.isArray(result.response?.data) ||
+        !Object.hasOwn(result.response, "next_page") ||
+        (result.response.next_page !== null &&
+          !result.response.next_page?.offset)) throw new Error(`Incomplete story page on ${taskGid}`);
+    stories.push(...result.response.data);
     offset = result.response?.next_page?.offset || null;
     if (!offset) return stories;
     if (seenOffsets.has(offset)) throw new Error(`Repeated story offset on ${taskGid}`);

@@ -32,6 +32,13 @@ export class CodexAppRpc {
       }
       this.pending.clear();
     });
+    this.child.once("error", (error) => {
+      for (const pending of this.pending.values()) {
+        clearTimeout(pending.timeout);
+        pending.reject(error);
+      }
+      this.pending.clear();
+    });
     await this.call("initialize", {
       clientInfo: { name: "vip-asana-dispatch", version: "1.0.0" },
       capabilities: { experimentalApi: true }
