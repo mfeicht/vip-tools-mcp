@@ -2,12 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {AsanaDispatchStore} from './asana-dispatch-store.mjs';
 import {dispatchRecoverySnapshot} from './asana-dispatch-terminal-recovery.mjs';
 import {applyFailedSpawnRecovery} from './asana-failed-spawn-recovery.mjs';
 import {failedSpawnResumeSnapshot,applyFailedSpawnResume,decideFailedSpawnResume} from './asana-failed-spawn-resume.mjs';
 import {PROCESS_SCAN_POLICY} from './asana-worker-process-readback.mjs';
+import {matchingWorkerProcesses} from './asana-worker-process-readback.mjs';
 import {parseSpawnResumeArguments} from './asana-failed-spawn-resume-cli.mjs';
 
 function fixture(t) {
@@ -63,4 +65,18 @@ test('CLI refuses arbitrary DB, identity and incomplete apply arguments',()=>{
  assert.equal(parseSpawnResumeArguments(good).apply,false);
  for(const extra of ['--db=/tmp/other','--agent=vip-ai-developer','--apply','--backup=/tmp/old.sqlite','--output=/tmp/duplicate'])
   assert.throws(()=>parseSpawnResumeArguments([...good,extra]));
+});
+test('bounded request file keeps observer out of exact-run scan without weakening worker detection',t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'spawn-request-'));t.after(()=>fs.rmSync(dir,{recursive:true}));
+ const file=fs.realpathSync(dir)+'/request.json',run='a'.repeat(32);
+ const args=['--run='+run,'--operations-run='+'b'.repeat(32),'--operations-task=456','--output=/tmp/result.json'];
+ fs.writeFileSync(file,JSON.stringify(args));
+ assert.equal(parseSpawnResumeArguments(['--request='+file]).run,run);
+ const processes=`101 node /repo/scripts/asana-failed-spawn-resume-cli.mjs --request=${file}\n102 node /repo/scripts/asana-dispatch-worker.mjs\n103 codex exec --resume ${run}`;
+ assert.deepEqual(matchingWorkerProcesses(processes,{run_id:run,thread_id:null}),
+  [{pid:102,reason:'dispatch-worker'},{pid:103,reason:'exact-run-or-thread'}]);
+ fs.writeFileSync(file,JSON.stringify(['--request='+file]));
+ assert.throws(()=>parseSpawnResumeArguments(['--request='+file]),/explicit CLI arguments/);
+ fs.writeFileSync(file,' '.repeat(8193));
+ assert.throws(()=>parseSpawnResumeArguments(['--request='+file]),/Bounded/);
 });
