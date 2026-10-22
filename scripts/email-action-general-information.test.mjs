@@ -43,6 +43,12 @@ test("explicit prohibited or concrete foreign targets do not use the general-inf
     "We want casino links on your site.",
     "Can we publish crypto content?",
     "Our content excludes casino, but we want CBD placements.",
+    "We do not exclude casino.",
+    "Our content never excludes casino.",
+    "If our content excludes casino.",
+    "Is it true that our content excludes casino?",
+    "Our content excludes casino?",
+    "It is false that our content excludes casino.",
     "Our content excludes casino. We want gambling links.",
     "Our content excludes casino, and promotes CBD content.",
     "Please link https://example.com/travel from an existing article."
