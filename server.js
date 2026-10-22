@@ -19,6 +19,7 @@ import { XLSX_MAX_BYTES, XLSX_MIME, copyXlsxWithValues, inspectXlsxValueTemplate
 import { selectBoundedEmailText } from "./lib/email-uid-text.js";
 import { assertBufferEditDueAtReadback, bufferEditScheduleFields } from "./lib/buffer-edit-schedule.js";
 import { findTemplatedTemplateByInternalId } from "./lib/templated-internal-id.js";
+import { buildTemplatedRenderPreview } from "./lib/templated-render-preview.js";
 import {
   appendGeneralInformationQualification,
   validateGeneralInformationReply
@@ -633,6 +634,8 @@ const ASANA_ROUTINE_CADENCE_RULE_SCHEMA = z.object({
   unit: z.enum(["day", "week", "month"]),
   interval: z.number().int().min(1).max(366),
   anchor_due_on: z.string(),
+  weekdays: z.array(z.number().int().min(1).max(7)).min(1).max(7).optional()
+    .describe("Optional ISO weekdays (1=Monday, 7=Sunday), only with unit=day and interval=1. Must come from the documented schedule contract."),
   short_month: z.enum(["skip", "last_day"]).optional()
 });
 const ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS =
@@ -11970,7 +11973,10 @@ function getTemplatedConfigDetails(agentId, { requireCredentials = true } = {}) 
   };
 }
 
-async function templatedRequest(agentId, { method = "GET", path, params, data, timeout = TEMPLATED_TIMEOUT_MS }) {
+async function templatedRequest(agentId, {
+  method = "GET", path, params, data, timeout = TEMPLATED_TIMEOUT_MS,
+  max_response_bytes, max_redirects
+}) {
   const { config } = getTemplatedConfigDetails(agentId, { requireCredentials: true });
   const res = await axios.request({
     method,
@@ -11978,6 +11984,8 @@ async function templatedRequest(agentId, { method = "GET", path, params, data, t
     params,
     data,
     timeout,
+    ...(max_response_bytes !== undefined ? { maxContentLength: max_response_bytes } : {}),
+    ...(max_redirects !== undefined ? { maxRedirects: max_redirects } : {}),
     validateStatus: () => true,
     headers: {
       Authorization: `Bearer ${config.apiKey}`,
@@ -19348,6 +19356,24 @@ function createServer() {
         render: response.data
       });
     }
+  );
+
+  server.tool(
+    "templated_render_preview",
+    "Liest einen abgeschlossenen Templated-Render über die eigene Agentenidentität und gibt sein JPEG-/PNG-Bild zur visuellen QA zurück. Nur die kanonische Templated-CDN-URL derselben Render-ID; keine beliebigen URLs, Redirects oder Schreibwirkung. Maximal 8 MiB, 4096 Pixel je Seite und 16 Megapixel.",
+    {
+      agent_id: agentIdSchema,
+      render_id: z.string().uuid()
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, render_id }) => buildTemplatedRenderPreview({
+      agentId: agent_id,
+      renderId: render_id,
+      readRender: async (id) => templatedRequest(agent_id, {
+        method: "GET", path: `/v1/render/${encodeURIComponent(id)}`, timeout: 10_000,
+        max_response_bytes: 256 * 1024, max_redirects: 0
+      })
+    })
   );
 
   server.tool(

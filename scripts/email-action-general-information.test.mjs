@@ -42,10 +42,26 @@ test("explicit prohibited or concrete foreign targets do not use the general-inf
   for (const inboundBody of [
     "We want casino links on your site.",
     "Can we publish crypto content?",
+    "Our content excludes casino, but we want CBD placements.",
+    "We do not exclude casino.",
+    "Our content never excludes casino.",
+    "If our content excludes casino.",
+    "Is it true that our content excludes casino?",
+    "Our content excludes casino?",
+    "It is false that our content excludes casino.",
+    "Our content excludes casino. We want gambling links.",
+    "Our content excludes casino, and promotes CBD content.",
     "Please link https://example.com/travel from an existing article."
   ]) {
     assert.throws(() => validateGeneralInformationReply({ ...standard, inboundBody }));
   }
+});
+
+test("an explicit exclusion list does not by itself make the industry prohibited", () => {
+  assert.equal(validateGeneralInformationReply({
+    ...standard,
+    inboundBody: "Our content is original, niche-relevant, and excludes gambling, adult, and loan-related topics. Could you share your guest post pricing and publishing guidelines?"
+  }), true);
 });
 
 test("discounts, payment requests, promises and nonstandard requests remain gated", () => {
