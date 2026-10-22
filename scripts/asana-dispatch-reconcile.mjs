@@ -66,9 +66,17 @@ export async function reconcileCompletedRuns(store, {
     .sort((a,b) => (a.last_reconcile_check_at_ms ?? a.started_at_ms) -
       (b.last_reconcile_check_at_ms ?? b.started_at_ms)).slice(0,limit);
   const result = { checked:0, acknowledged:0, still_open:0, held:0,
-    preflight_retried:0, preflight_unverified:0, archived:0, errors:[] };
+    preflight_retried:0, preflight_unverified:0, archived:0, errors:[], blocked_runs:[] };
   const pending = [];
   for (const run of runs) {
+    if (run.state !== "claimed" && !run.thread_id) {
+      result.checked++;result.held++;
+      result.blocked_runs.push({run_id:run.run_id,reason:"legacy_thread_binding_missing"});
+      store.db.prepare(`UPDATE runs SET last_reconcile_check_at_ms=?
+        WHERE run_id=? AND updated_at_ms=? AND last_reconcile_check_at_ms IS ?`)
+        .run(now(),run.run_id,run.updated_at_ms,run.last_reconcile_check_at_ms);
+      continue;
+    }
     if (run.state !== "claimed") { pending.push(run); continue; }
     result.checked++;
     try {
@@ -94,9 +102,17 @@ export async function reconcileCompletedRuns(store, {
         const decision = apply(store,snapshot,proof,{now:now()});
         if (decision.action === "acknowledge") result.acknowledged++;
         else if (decision.action === "quarantine") result.still_open++;
-        else result.held++;
+        else {result.held++;result.blocked_runs.push({run_id:selected.run_id,reason:decision.reason});}
       } catch(error) {
-        result.errors.push({run_id:selected.run_id, stage:"readback", error:String(error).slice(0,500)});
+        const message=String(error).slice(0,500);
+        // A native read failure affects only this run. A canonical MCP failure
+        // blocks further remote work for the tick; never start a retry cascade.
+        if (/asana_request:|mcp_connect:/.test(message)) {
+          result.errors.push({run_id:selected.run_id, stage:"readback", error:message});
+          break;
+        }
+        result.held++;
+        result.blocked_runs.push({run_id:selected.run_id,reason:"native_or_local_readback_unavailable",error:message});
       } finally {
         store.db.prepare(`UPDATE runs SET last_reconcile_check_at_ms=?
           WHERE run_id=? AND updated_at_ms=? AND last_reconcile_check_at_ms IS ?`)

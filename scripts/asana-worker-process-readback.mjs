@@ -29,7 +29,7 @@ export function matchingWorkerProcesses(raw, run) {
     if (!parsed) throw new Error("Incomplete process scan output");
     const [, pid, command] = parsed;
     let reason;
-    if (command.includes(run.run_id) || command.includes(run.thread_id)) reason = "exact-run-or-thread";
+    if (command.includes(run.run_id) || (run.thread_id && command.includes(run.thread_id))) reason = "exact-run-or-thread";
     else if (/(?:^|[\s/])asana-dispatch-worker\.mjs(?:\s|$)/.test(command)) reason = "dispatch-worker";
     else if (/(?:^|[\s/])codex(?:\s+[^\s]+)*\s+exec(?:\s|$)/.test(command)) reason = "codex-exec";
     if (reason) matches.push({ pid: Number(pid), reason });
@@ -45,4 +45,21 @@ export function collectWorkerProcessReadback(run) {
   });
   return { ...binding, observed_at_ms: Date.now(), scan_succeeded: true,
     raw_sha256: hash(raw), matching_processes: matchingWorkerProcesses(raw, run) };
+}
+
+// Historical spawn ENOENT has no Codex thread. This separate scanner never
+// invents a thread identity and cannot authorize task release or replay.
+export function collectFailedSpawnProcessReadback(run) {
+  if (!/^[a-zA-Z0-9_-]+$/.test(run?.run_id || '') ||
+      !/^[a-zA-Z0-9_-]+$/.test(run?.agent_id || '') || run.thread_id != null || run.turn_id != null ||
+      run.state !== 'needs_reconciliation' ||
+      !/^Error: spawn \/Applications\/(?:ChatGPT|Codex)\.app\/Contents\/Resources\/codex ENOENT$/.test(run.last_error || '')) {
+    throw new Error('Unverified historical spawn failure');
+  }
+  const raw=execFileSync('/bin/ps',PS_ARGS,{encoding:'utf8',timeout:10000,maxBuffer:8*1024*1024});
+  return {source:'asana-failed-spawn-process-readback',host_id:'local',hostname:os.hostname(),
+    run_id:run.run_id,agent_id:run.agent_id,thread_id:null,scan_policy:PROCESS_SCAN_POLICY,
+    scanner_sha256:hash(fs.readFileSync(new URL(import.meta.url))),executable:'/bin/ps',args:PS_ARGS,
+    observed_at_ms:Date.now(),scan_succeeded:true,raw_sha256:hash(raw),
+    matching_processes:matchingWorkerProcesses(raw,run)};
 }
