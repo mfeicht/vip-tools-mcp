@@ -73,9 +73,11 @@ export function decideStartupReadResume(snapshot,proof,scan,now=Date.now(),works
     task_completed:false,preserve_attempts:true};
 }
 
-export function applyStartupReadResume(store,snapshot,proof,{operator,apply=false,now=Date.now(),
+export function applyStartupReadResume(store,snapshot,proof,{operator,apply=false,now=null,
   scan=collectWorkerProcessReadback,workspace=root}={}) {
   const processReadback=scan(snapshot.run);
+  // The observation must precede its evaluation clock, including real ps time.
+  now ??= Date.now();
   return store.transaction(()=>{
     if(!same(dispatchRecoverySnapshot(store,snapshot.run.run_id),snapshot))return {action:'hold',reason:'recovery_fence_changed'};
     const manual=store.manualRun(operator?.run_id),leases=manual?store.leasesForRun(manual.run_id):[];
