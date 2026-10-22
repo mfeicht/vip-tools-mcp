@@ -68,6 +68,26 @@ test("read-only reconciliation inspection reports post-run stories without relea
   assert.deepEqual(store.counts(), { leased: 1 });
 });
 
+test("legacy missing thread never calls native API or blocks unrelated work",async t=>{
+  const store=fixture(t);
+  store.db.prepare('UPDATE runs SET thread_id=NULL').run();
+  const result=await reconcileCompletedRuns(store,{connect:async()=>{throw new Error('must not connect');}});
+  assert.equal(result.held,1);assert.deepEqual(result.errors,[]);
+  assert.equal(result.blocked_runs[0].reason,'legacy_thread_binding_missing');
+  assert.equal(store.activeLeases().length,2);
+});
+
+test("native timeout remains scoped but MCP failure stops the remote cycle",async t=>{
+  const store=fixture(t);
+  const options={connect:async()=>({close:async()=>{}}),makeRpc:()=>({start:async()=>{},close:async()=>{}})};
+  let result=await reconcileCompletedRuns(store,{...options,read:async()=>{throw new Error('thread/items/list timed out');}});
+  assert.equal(result.held,1);assert.deepEqual(result.errors,[]);
+  store.db.prepare('UPDATE runs SET last_reconcile_check_at_ms=NULL').run();
+  result=await reconcileCompletedRuns(store,{...options,read:async()=>{throw new Error('asana_request: HTTP 503');}});
+  assert.equal(result.errors.length,1);
+  assert.equal(store.activeLeases().length,2);
+});
+
 test("operator can acknowledge exact dead letters only after scoped evidence and without active leases", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dead-letter-review-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

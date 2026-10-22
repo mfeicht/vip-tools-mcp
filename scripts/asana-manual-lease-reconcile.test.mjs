@@ -37,3 +37,13 @@ test("applied partial recovery is counted separately and all clients close",asyn
   });
   assert.equal(result.partial_quarantine,1);assert.equal(result.released,0);assert.equal(closed,2);
 });
+
+test("one unreadable native manual run does not block another agent",async()=>{
+  const store={manualRunsForReconciliation:()=>[{run_id:'active',tasks:[]},{run_id:'done',tasks:[]}],
+    reconcileManualRun:()=>({applied:true,decision:{action:'release'}}),markManualRunChecked:()=>{}};
+  const result=await reconcileManualLeases(store,{
+    makeRpc:()=>({start:async()=>{},close:async()=>{}}),
+    read:async run=>{if(run.run_id==='active')throw new Error('Native activity items incomplete');return {};}
+  });
+  assert.deepEqual(result.errors,[]);assert.equal(result.held,1);assert.equal(result.released,1);
+});
