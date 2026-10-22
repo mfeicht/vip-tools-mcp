@@ -1,4 +1,4 @@
-import { connectCanonicalMcp } from "./vip-mcp-call.mjs";
+import { connectCanonicalMcp, classifyConnectionError } from "./vip-mcp-call.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { AsanaDispatchStore, DEFAULT_DB_PATH } from "./asana-dispatch-store.mjs";
@@ -56,6 +56,7 @@ export async function storiesForTask(client, agentId, taskGid) {
   const stories = [];
   let offset = null;
   const seenOffsets = new Set();
+  const seenStories = new Set();
   for (let page = 0; page < 30; page += 1) {
     const result = await tool(client, "asana_request", {
       agent_id: agentId, method: "GET", path: `/tasks/${taskGid}/stories`,
@@ -65,6 +66,11 @@ export async function storiesForTask(client, agentId, taskGid) {
         !Object.hasOwn(result.response, "next_page") ||
         (result.response.next_page !== null &&
           !result.response.next_page?.offset)) throw new Error(`Incomplete story page on ${taskGid}`);
+    for(const story of result.response.data) {
+      if(!/^\d+$/.test(story?.gid || "") || seenStories.has(story.gid) ||
+          !Number.isFinite(Date.parse(story.created_at))) throw new Error(`Invalid or duplicate story on ${taskGid}`);
+      seenStories.add(story.gid);
+    }
     stories.push(...result.response.data);
     offset = result.response?.next_page?.offset || null;
     if (!offset) return stories;
@@ -75,15 +81,15 @@ export async function storiesForTask(client, agentId, taskGid) {
 }
 
 function assertSearchComplete(search, agentId) {
-  if (search.search_status !== "ok" || search.search_complete === false ||
-      search.result_truncated === true || !Array.isArray(search.tasks)) {
+  if (search.search_status !== "ok" || search.search_complete !== true ||
+      search.result_truncated !== false || !Array.isArray(search.tasks)) {
     throw new Error(`Incomplete involved search for ${agentId}: ${search.search_status || "unknown"}`);
   }
 }
 
 export async function scanAgent(client, store, snapshot, agentUserGids, scanStartedAt, write) {
   const agentId = snapshot.agent_id;
-  if (!snapshot.ok || snapshot.truncated || !snapshot.user_gid || !snapshot.workspace_gid) {
+  if (snapshot.ok !== true || snapshot.truncated !== false || !Array.isArray(snapshot.tasks) || !snapshot.user_gid || !snapshot.workspace_gid) {
     throw new Error(`${agentId}: incomplete assigned task snapshot: ${snapshot.error || "truncated"}`);
   }
   const cursor = store.pollCursor(agentId);
@@ -102,6 +108,14 @@ export async function scanAgent(client, store, snapshot, agentUserGids, scanStar
     tasks.set(String(task.gid), { ...tasks.get(String(task.gid)), ...task });
   }
 
+  const openTasks = [...tasks.values()].filter(task => task.completed === false);
+  const auditLimit = Math.min(8, Math.ceil(openTasks.length / 12));
+  const audit = new Set(openTasks.filter(task => {
+    const observation = store.observation(agentId,String(task.gid));
+    return !observation?.stories_checked_at_ms || observation.stories_checked_at_ms <= scanStartedAt.getTime()-15*60000;
+  }).sort((a,b) => (store.observation(agentId,String(a.gid))?.stories_checked_at_ms || 0) -
+    (store.observation(agentId,String(b.gid))?.stories_checked_at_ms || 0) || String(a.gid).localeCompare(String(b.gid)))
+    .slice(0,auditLimit).map(task=>String(task.gid)));
   const newSignals = [];
   const observations = [];
   let storiesRead = 0;
@@ -117,19 +131,22 @@ export async function scanAgent(client, store, snapshot, agentUserGids, scanStar
       if (signal) newSignals.push(signal);
     }
     let latest = null;
-    if (!observation || task.modified_at !== observation.modified_at) {
+    const readStories = !observation || task.modified_at !== observation.modified_at || audit.has(taskGid);
+    if (readStories) {
       const stories = await storiesForTask(client, agentId, taskGid);
       storiesRead += 1;
       const comments = newCommentSignals(agentId, task, stories, {
         observation, userGid: snapshot.user_gid, allAgentUserGids: agentUserGids,
-        owned, now: scanStartedAt
+        owned, historicalBackfill: !observation?.history_checked_at_ms, now: scanStartedAt
       });
       newSignals.push(...comments.signals);
       latest = comments.latest;
     }
     observations.push({ agent_id: agentId, task_gid: taskGid,
       modified_at: task.modified_at || null,
-      latest_story_at: latest?.at || null, latest_story_gid: latest?.gid || null });
+      latest_story_at: latest?.at || null, latest_story_gid: latest?.gid || null,
+      stories_checked_at_ms: readStories ? scanStartedAt.getTime() : null,
+      history_checked_at_ms: readStories ? scanStartedAt.getTime() : null });
   }
 
   const dependencyUpdates = [];
@@ -169,6 +186,22 @@ export async function scanAgent(client, store, snapshot, agentUserGids, scanStar
     dependencies_checked: dependencyUpdates.length };
 }
 
+export async function scanSnapshots(client, store, snapshots, agentUserGids, scanStartedAt, write,
+  scan = scanAgent) {
+  const result={agents:[],errors:[]};
+  for (const snapshot of snapshots) {
+    try { result.agents.push(await scan(client,store,snapshot,agentUserGids,scanStartedAt,write)); }
+    catch(error) {
+      result.errors.push({agent_id:snapshot.agent_id,error:String(error?.message || error).slice(0,500)});
+      // Stop this tick after transport failure. The next scheduled tick owns recovery.
+      if(["remote_rate_limited","cloudflare_managed_challenge","remote_mcp_transient_error",
+          "network_transport_error","dns_resolution_error","mcp_coordination_timeout"]
+          .includes(classifyConnectionError(error))) break;
+    }
+  }
+  return result;
+}
+
 export async function poll({ write = false, agentIds = null, db = DEFAULT_DB_PATH } = {}) {
   if (write && agentIds) throw new Error("Partial write scans cannot establish all agent identities");
   const scanStartedAt = new Date();
@@ -197,13 +230,7 @@ export async function poll({ write = false, agentIds = null, db = DEFAULT_DB_PAT
         ...incomplete.map((item) => item.agent_id), ...missing].join(",")}`);
     }
     const agentUserGids = new Set(snapshots.agents.filter((item) => item.ok).map((item) => String(item.user_gid)));
-    for (const snapshot of snapshots.agents) {
-      try {
-        result.agents.push(await scanAgent(client, store, snapshot, agentUserGids, scanStartedAt, write));
-      } catch (error) {
-        result.errors.push({ agent_id: snapshot.agent_id, error: String(error?.message || error).slice(0, 500) });
-      }
-    }
+    Object.assign(result,await scanSnapshots(client,store,snapshots.agents,agentUserGids,scanStartedAt,write));
     result.counts = store.counts();
     if (result.errors.length) process.exitCode = 2;
     return result;

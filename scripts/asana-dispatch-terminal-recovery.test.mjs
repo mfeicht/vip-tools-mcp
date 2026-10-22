@@ -99,3 +99,50 @@ test("missing end time only frees the agent after 30s stable native and process 
   const later=dispatchRecoverySnapshot(f.store,"run-1");
   assert.equal(decideDispatchRecovery(later,f.proof,f.scan,f.now).action,"hold");
 });
+
+
+function openFixture(t,outcome="progress") {
+  const f=fixture(t);f.proof.ownGid="111";
+  f.proof.native.forEach(row=>{row.turn_status="completed";row.answer={outcome,
+    summary:"Geprüfter Fortschritt mit Ergebnisstory 222.",evidence_story_gid:"222",linked_task_gid:null,
+    next_step:outcome==="progress" ? "Den nächsten geprüften Teil des Auftrags bearbeiten." : null};});
+  f.proof.asana.forEach(row=>{row.task={...row.task,completed:false,assignee:{gid:"111"}};
+    row.stories=[{gid:"222",resource_subtype:"comment_added",created_by:{gid:"111"},
+      created_at:new Date(f.now-20000).toISOString(),text:"Geprüfter Zwischenstand, der Haupttask bleibt offen."}];});
+  return f;
+}
+
+test("documented open progress settles the exact run and preserves throttled continuation",t=>{
+  const f=openFixture(t);
+  const decision=applyDispatchRecovery(f.store,f.snapshot,f.proof,{scan:()=>f.scan,now:f.now});
+  assert.equal(decision.action,"acknowledge");assert.equal(decision.reason,"documented_open_task");
+  assert.equal(decision.open.outcome,"progress");assert.deepEqual(f.store.activeLeases(),[]);
+  assert.deepEqual(f.store.counts(),{acknowledged:1,pending:1});
+  const continuation=f.store.db.prepare("SELECT * FROM signals WHERE kind='continuation'").get();
+  assert.ok(continuation.available_at_ms>=f.now+3600000);
+  assert.equal(f.store.db.prepare("SELECT state FROM runs WHERE run_id='run-1'").get().state,"completed");
+  assert.equal(f.proof.asana[1].task.completed,false);
+});
+
+test("documented blocked run frees its task without falsely completing it",t=>{
+  const f=openFixture(t,"blocked");
+  assert.equal(applyDispatchRecovery(f.store,f.snapshot,f.proof,{scan:()=>f.scan,now:f.now}).action,"acknowledge");
+  assert.deepEqual(f.store.counts(),{acknowledged:1});
+});
+
+test("missing or contradictory open-task evidence never releases the task",t=>{
+  const f=openFixture(t);
+  for(const mutate of [
+    p=>{p.ownGid="333";},
+    p=>{p.native.forEach(row=>row.turn_status="failed");},
+    p=>{p.native.forEach(row=>row.answer.next_step="");},
+    p=>{p.native.forEach(row=>{row.answer.evidence_story_gid=null;row.answer.summary="Keine Story-GID.";});},
+    p=>{p.asana.forEach(row=>row.task.assignee.gid="333");},
+    p=>{p.asana.forEach(row=>row.stories[0].created_at=new Date(f.now-999999).toISOString());},
+    p=>{p.asana.forEach(row=>row.stories[0].created_at=new Date(f.now-5000).toISOString());},
+    p=>{p.asana.forEach(row=>row.stories.push({...row.stories[0],gid:"223",created_by:{gid:"333"}}));}
+  ]) {
+    const proof=structuredClone(f.proof);mutate(proof);
+    assert.equal(decideDispatchRecovery(f.snapshot,proof,f.scan,f.now).action,"quarantine");
+  }
+});

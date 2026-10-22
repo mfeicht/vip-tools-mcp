@@ -74,32 +74,55 @@ export function storyMentionsUser(story, userGid) {
   });
 }
 
+function compareStoryGids(left, right) {
+  const a = String(left || "");
+  const b = String(right || "");
+  if (/^\d+$/.test(a) && /^\d+$/.test(b)) {
+    const first = BigInt(a);
+    const second = BigInt(b);
+    return first < second ? -1 : first > second ? 1 : 0;
+  }
+  return a.localeCompare(b);
+}
+
 export function newCommentSignals(agentId, task, stories, {
-  observation, userGid, allAgentUserGids, owned, now = new Date()
+  observation, userGid, allAgentUserGids, owned, historicalBackfill = false,
+  now = new Date()
 }) {
-  const previous = observation?.latest_story_at || null;
-  const firstScanFloor = new Date(now.getTime() - 24 * 60 * 60_000).toISOString();
-  const floor = previous || firstScanFloor;
+  const previous = historicalBackfill ? null : observation?.latest_story_at || null;
+  const previousTime = previous === null ? null : Date.parse(previous);
+  if (previousTime !== null && !Number.isFinite(previousTime)) {
+    throw new Error(`Invalid observed story timestamp for ${task.gid}`);
+  }
+  const floorTime = previousTime ?? -Infinity;
   const sorted = [...stories].sort((a, b) =>
-    String(a.created_at || "").localeCompare(String(b.created_at || "")) ||
-    String(a.gid || "").localeCompare(String(b.gid || "")));
-  const ownReplyAt = sorted.filter((story) => storyIsComment(story) &&
+    Date.parse(a.created_at) - Date.parse(b.created_at) ||
+    compareStoryGids(a.gid, b.gid));
+  const ownReply = sorted.filter((story) => storyIsComment(story) &&
     String(story.created_by?.gid || "") === String(userGid))
-    .map((story) => String(story.created_at || "")).at(-1) || null;
+    .at(-1) || null;
   const signals = [];
   for (const story of sorted) {
-    if (!storyIsComment(story) || !story.gid || !story.created_at || story.created_at < floor) continue;
-    if (previous && story.created_at === previous && String(story.gid) <= String(observation.latest_story_gid || "")) continue;
-    if (ownReplyAt && story.created_at <= ownReplyAt) continue;
+    if (!storyIsComment(story) || !story.gid || !story.created_at) continue;
+    const storyTime = Date.parse(story.created_at);
+    if (storyTime < floorTime) continue;
+    if (previousTime !== null && storyTime === previousTime &&
+        compareStoryGids(story.gid, observation.latest_story_gid) <= 0) continue;
+    if (ownReply && (storyTime < Date.parse(ownReply.created_at) ||
+        (storyTime === Date.parse(ownReply.created_at) &&
+          compareStoryGids(story.gid, ownReply.gid) <= 0))) continue;
     const author = String(story.created_by?.gid || "");
     if (!author || allAgentUserGids.has(author)) continue;
     if (!owned && !storyMentionsUser(story, userGid)) continue;
     const storyGid = String(story.gid);
+    const historical = storyTime < now.getTime() - 24 * 60 * 60_000;
     signals.push({
       id: signalId(agentId, String(task.gid), "comment", storyGid),
       agent_id: agentId, task_gid: String(task.gid), story_gid: storyGid,
       source_version: signalId(agentId, String(task.gid), "story", storyGid),
-      kind: owned ? "human_comment" : "direct_mention", priority: owned ? 85 : 95
+      kind: historical ? "historical_comment" :
+        (owned ? "human_comment" : "direct_mention"),
+      priority: historical ? 45 : owned ? 85 : 95
     });
   }
   return {

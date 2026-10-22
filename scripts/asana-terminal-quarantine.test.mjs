@@ -134,13 +134,17 @@ test("partial transaction failure rolls back run metadata and agent deletion", (
 test("automatic Asana-only reconciler cannot unlock an operator-quarantined task", async (t) => {
   const { store, evidence } = fixture(t);
   quarantineFromEvidence(store, evidence, { apply: true, now: NOW });
+  let reads=0;
   const result = await reconcileCompletedRuns(store, {
-    readTask: async () => ({ gid: "12345", completed: true }),
-    archive: async () => { throw new Error("must not archive"); }
+    now:()=>NOW+3600001,
+    connect:async()=>({close:async()=>{}}),
+    makeRpc:()=>({start:async()=>{},close:async()=>{}}),
+    read:async()=>{reads++;throw new Error("Native terminal readback unavailable");}
   });
-  assert.equal(result.task_quarantined, 1);
-  assert.equal(result.acknowledged, 0);
-  assert.equal(result.errors.length, 0);
-  assert.equal(store.leasesForRun("old-run").length, 1);
-  assert.deepEqual(store.counts(), { leased: 1 });
+  assert.equal(reads,1);
+  assert.equal(result.held,1);
+  assert.equal(result.acknowledged,0);
+  assert.equal(result.errors.length,0);
+  assert.equal(store.leasesForRun("old-run").length,1);
+  assert.deepEqual(store.counts(),{leased:1});
 });

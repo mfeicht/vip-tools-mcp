@@ -178,7 +178,8 @@ export class AsanaDispatchStore {
       this.db.exec("ALTER TABLE manual_runs ADD COLUMN last_checked_at_ms INTEGER");
     }
     for (const [table, column] of [["runs", "last_reconcile_check_at_ms"], ["manual_runs", "agent_released_at_ms"],
-      ["manual_run_tasks", "resolved_at_ms"]]) {
+      ["manual_run_tasks", "resolved_at_ms"], ["task_observations", "stories_checked_at_ms"],
+      ["task_observations", "history_checked_at_ms"]]) {
       if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === column))
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} INTEGER`);
     }
@@ -354,18 +355,21 @@ export class AsanaDispatchStore {
   }
 
   observeTask({ agent_id: agentId, task_gid: taskGid, modified_at: modifiedAt = null,
-    latest_story_at: latestStoryAt = null, latest_story_gid: latestStoryGid = null }, now = Date.now()) {
+    latest_story_at: latestStoryAt = null, latest_story_gid: latestStoryGid = null,
+    stories_checked_at_ms: storiesChecked = null, history_checked_at_ms: historyChecked = null }, now = Date.now()) {
     assertId(agentId, "agent_id");
     assertId(taskGid, "task_gid");
     assertTime(now, "now");
     this.db.prepare(`INSERT INTO task_observations
-      (agent_id,task_gid,modified_at,latest_story_at,latest_story_gid,observed_at_ms)
-      VALUES (?,?,?,?,?,?) ON CONFLICT(agent_id,task_gid) DO UPDATE SET
+      (agent_id,task_gid,modified_at,latest_story_at,latest_story_gid,observed_at_ms,stories_checked_at_ms,history_checked_at_ms)
+      VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(agent_id,task_gid) DO UPDATE SET
       modified_at=excluded.modified_at,
       latest_story_at=COALESCE(excluded.latest_story_at,task_observations.latest_story_at),
       latest_story_gid=COALESCE(excluded.latest_story_gid,task_observations.latest_story_gid),
-      observed_at_ms=excluded.observed_at_ms`)
-      .run(agentId, taskGid, modifiedAt, latestStoryAt, latestStoryGid, now);
+      observed_at_ms=excluded.observed_at_ms,
+      stories_checked_at_ms=COALESCE(excluded.stories_checked_at_ms,task_observations.stories_checked_at_ms),
+      history_checked_at_ms=COALESCE(excluded.history_checked_at_ms,task_observations.history_checked_at_ms)`)
+      .run(agentId, taskGid, modifiedAt, latestStoryAt, latestStoryGid, now, storiesChecked, historyChecked);
   }
 
   recordRun(claim, { threadId = null, turnId = null, state = "claimed", error = null,
@@ -766,6 +770,7 @@ export class AsanaDispatchStore {
       this.normalizeContinuations(now);
       const candidates = this.db.prepare(`
         SELECT * FROM signals WHERE status IN ('pending','retry_after') AND available_at_ms <= ?
+          AND kind != 'new_assigned_task'
           AND (? IS NULL OR agent_id = ?)
           AND NOT EXISTS (SELECT 1 FROM leases WHERE key='agent:'||signals.agent_id)
           AND NOT EXISTS (SELECT 1 FROM leases WHERE key='task:'||signals.task_gid)
@@ -801,11 +806,18 @@ export class AsanaDispatchStore {
   }
 
   settle(claim, { outcome, error = null, now = Date.now(), maxAttempts = 5,
-    dependencyWatch = null, continuation = null } = {}) {
+    dependencyWatch = null, continuation = null, transientPreflight = false } = {}) {
     if (!claim?.signals?.length || !["acknowledged", "retry_after", "dead_letter"].includes(outcome)) {
       throw new Error("invalid settlement");
     }
     return this.transaction(() => {
+      if (transientPreflight) {
+        const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(claim.run_id);
+        if (outcome !== "retry_after" || run?.state !== "claimed" ||
+            run.launch_phase !== "preflight" || run.thread_id || run.turn_id) {
+          throw new Error("Transport deferral requires an unlaunched preflight claim");
+        }
+      }
       const agentLease = this.db.prepare("SELECT * FROM leases WHERE key=?").get(claim.agent_lease.key);
       const taskLease = this.db.prepare("SELECT * FROM leases WHERE key=?").get(claim.task_lease.key);
       const held=this.leasesForRun(claim.run_id);
@@ -823,12 +835,13 @@ export class AsanaDispatchStore {
             current.lease_token !== claim.task_lease.token || current.lease_fence !== claim.task_lease.fence) {
           throw new Error("signal claim changed");
         }
-        const next = outcome === "retry_after" && current.attempts >= maxAttempts ? "dead_letter" : outcome;
-        const delay = Math.min(60 * 60_000, 60_000 * (2 ** Math.max(0, current.attempts - 1)));
+        const next = outcome === "retry_after" && !transientPreflight && current.attempts >= maxAttempts ? "dead_letter" : outcome;
+        const delay = transientPreflight ? 15 * 60_000 : Math.min(60 * 60_000, 60_000 * (2 ** Math.max(0, current.attempts - 1)));
         const availableAt = next === "retry_after" ? now + delay : now;
         this.db.prepare(`UPDATE signals SET status=?, available_at_ms=?, run_id=NULL,
-          lease_token=NULL, lease_fence=NULL, updated_at_ms=?, last_error=? WHERE id=?`)
-          .run(next, availableAt, now, error ? String(error).slice(0, 500) : null, signal.id);
+          lease_token=NULL, lease_fence=NULL, updated_at_ms=?, last_error=?, attempts=? WHERE id=?`)
+          .run(next, availableAt, now, error ? String(error).slice(0, 500) : null,
+            transientPreflight ? Math.max(0,current.attempts-1) : current.attempts, signal.id);
       }
       if (dependencyWatch) {
         if (outcome !== "acknowledged" ||
@@ -1024,7 +1037,7 @@ export class AsanaDispatchStore {
 
   readyCount(now = Date.now()) {
     return this.db.prepare(`SELECT COUNT(*) AS n FROM signals
-      WHERE status IN ('pending','retry_after') AND available_at_ms <= ?`).get(now).n;
+      WHERE status IN ('pending','retry_after') AND available_at_ms <= ? AND kind != 'new_assigned_task'`).get(now).n;
   }
 
   activeLeases() {
@@ -1074,6 +1087,7 @@ export class AsanaDispatchStore {
     if(!Number.isSafeInteger(limit)||limit<0||limit>2) throw new Error("Worker limit must be zero to two");
     return this.db.prepare(`SELECT agent_id,MAX(priority) AS priority,MIN(created_at_ms) AS created
       FROM signals WHERE status IN ('pending','retry_after') AND available_at_ms<=?
+      AND kind != 'new_assigned_task'
       AND NOT EXISTS(SELECT 1 FROM leases WHERE key='agent:'||signals.agent_id)
       AND NOT EXISTS(SELECT 1 FROM leases WHERE key='task:'||signals.task_gid)
       GROUP BY agent_id ORDER BY priority DESC,created,agent_id LIMIT ?`).all(now,limit).map(row=>row.agent_id);

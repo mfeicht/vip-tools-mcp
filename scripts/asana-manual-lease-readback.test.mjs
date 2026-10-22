@@ -67,7 +67,7 @@ test("read-only driver takes two native and scoped Asana reads before deciding",
 test("system stories may have no author but comments require attributable authors", async () => {
   let comment=false;
   const client={callTool:async({arguments:args})=>({content:[{type:"text",text:JSON.stringify({response:
-    args.path.endsWith("/stories") ? {data:[{gid:"story-1",created_at:"2026-10-21T08:00:00Z",
+    args.path.endsWith("/stories") ? {data:[{gid:"333",created_at:"2026-10-21T08:00:00Z",
       resource_subtype:comment?"comment_added":"task_due_time_approaching_story",created_by:null}],next_page:null} :
       {data:{gid:"123",completed:false,modified_at:"2026-10-21T08:00:00Z"}}})}]})};
   assert.equal((await readManualAsanaTask(run,run.tasks[0],client)).stories.length,1);
@@ -79,4 +79,16 @@ test("pending native tool items cannot attest a terminal run", async () => {
   await assert.rejects(readManualNative(run,rpc({call:async(method)=>method==="thread/items/list"?
     {data:[{item:{id:"unfinished",type:"commandExecution",status:"inProgress"}}],nextCursor:null}:
     rpc().call(method)})),/activity items incomplete/);
+});
+
+
+test("dispatch answer comes only from final native assistant item with exact schema",async()=>{
+  const {dispatchAnswerFromItems}=await import("./asana-manual-lease-readback.mjs");
+  const answer={outcome:"progress",summary:"Ergebnisstory 222",next_step:"Nächster geprüfter Schritt",
+    linked_task_gid:null,evidence_story_gid:"222"};
+  const item={type:"agentMessage",phase:"final_answer",text:JSON.stringify(answer)};
+  assert.deepEqual(dispatchAnswerFromItems([{item}]),answer);
+  for(const patch of [{phase:"commentary"},{type:"userMessage"},{text:"Kein JSON"},
+    {text:JSON.stringify({...answer,evidence_story_gid:222})},{text:JSON.stringify({...answer,extra:true})}])
+    assert.equal(dispatchAnswerFromItems([{item:{...item,...patch}}]),null);
 });

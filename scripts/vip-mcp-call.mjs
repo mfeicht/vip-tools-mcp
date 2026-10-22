@@ -228,7 +228,7 @@ function httpStatus(error) {
 
 function safeErrorText(error) {
   const message = errorText(error);
-  if (/Just a moment|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
+  if (/Just a moment|Cloudflare managed challenge|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
     return "Cloudflare managed challenge on the canonical MCP endpoint";
   }
   const status = httpStatus(error);
@@ -238,7 +238,7 @@ function safeErrorText(error) {
 export function classifyConnectionError(error) {
   const message = errorText(error);
   if (error?.code === "VIP_MCP_COORDINATION_TIMEOUT") return "mcp_coordination_timeout";
-  if (/Just a moment|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
+  if (/Just a moment|Cloudflare managed challenge|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
     return "cloudflare_managed_challenge";
   }
   const status = httpStatus(error);
@@ -249,7 +249,7 @@ export function classifyConnectionError(error) {
   if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(message)) return "dns_resolution_error";
   if (/\b(401|403)\b/.test(message)) return "remote_auth_or_permission_error";
   if (/\b(502|503|504)\b/.test(message)) return "remote_mcp_transient_error";
-  if (/ECONNRESET|ECONNREFUSED|ETIMEDOUT|fetch failed|timeout after/i.test(message)) {
+  if (/ECONNRESET|ECONNREFUSED|ETIMEDOUT|fetch failed|timeout|timed out/i.test(message)) {
     return "network_transport_error";
   }
   return "mcp_connection_error";

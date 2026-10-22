@@ -9,6 +9,7 @@ import { connectMcpClient, storiesForTask, tool } from "./asana-dispatch-poller.
 import { dueIsReady, signalId, storyMentionsUser } from "./asana-dispatch-signals.mjs";
 import { archiveCompletedThread } from "./codex-app-rpc.mjs";
 import { resolveCodexBinary } from "./codex-binary.mjs";
+import { classifyConnectionError } from "./vip-mcp-call.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
 const RESULT_SCHEMA = path.join(import.meta.dirname, "asana-dispatch-result.schema.json");
@@ -83,7 +84,9 @@ export function cleanNoWriteFinishedRun({ claim, before, after, afterStories,
 
 export function cleanNoWriteDueTask(input) {
   return cleanNoWriteFinishedRun(input) &&
-    input.claim.signals.every((signal) => signal.kind === "due_task" && !signal.story_gid);
+    input.claim.signals.some(signal => signal.kind === "due_task") &&
+    input.claim.signals.every((signal) => !signal.story_gid &&
+      ["due_task","new_assigned_task"].includes(signal.kind));
 }
 
 export function documentedDependencyNoWrite({ claim, before, after, beforeStories, afterStories,
@@ -95,10 +98,11 @@ export function documentedDependencyNoWrite({ claim, before, after, beforeStorie
   if (!/^\d+$/.test(linkedGid) || !/^\d+$/.test(evidenceGid) ||
       linkedGid === String(before.gid) || linkedTask?.completed !== false ||
       String(linkedTask.gid) !== linkedGid ||
-      !Number.isFinite(Date.parse(linkedTask.modified_at || "")) ||
-      Date.parse(linkedTask.modified_at) >= startedAt) return false;
+      !Number.isFinite(Date.parse(linkedTask.modified_at || ""))) return false;
   const evidence = beforeStories.find((story) => String(story.gid) === evidenceGid);
-  return Boolean(evidence && afterStories.some((story) => String(story.gid) === evidenceGid) &&
+  return Boolean(evidence && afterStories.some((story) => String(story.gid) === evidenceGid &&
+      story.text === evidence.text && story.created_at === evidence.created_at &&
+      story.created_by?.gid === evidence.created_by?.gid) &&
     evidence.resource_subtype === "comment_added" &&
     typeof evidence.text === "string" && evidence.text.includes(linkedGid) &&
     Number.isFinite(Date.parse(evidence.created_at || "")) &&
@@ -107,12 +111,39 @@ export function documentedDependencyNoWrite({ claim, before, after, beforeStorie
 
 export function noWriteDisposition(input) {
   if (!cleanNoWriteFinishedRun(input)) return null;
-  return documentedDependencyNoWrite(input) ? "acknowledged" : "dead_letter";
+  return documentedDependencyNoWrite(input) || documentedHumanWaitNoWrite(input)
+    ? "acknowledged" : "dead_letter";
+}
+
+export function documentedHumanWaitNoWrite(input) {
+  const { answer, ownGid, beforeStories, afterStories, startedAt } = input;
+  if (!cleanNoWriteDueTask(input) || answer.outcome !== "blocked" ||
+      answer.linked_task_gid !== null || !/^\d+$/.test(answer.evidence_story_gid || "") ||
+      !/(wart|freigab|antwort|entscheid|rückmeld|blockiert)/i.test(answer.summary)) return false;
+  const evidence = beforeStories.find(story => story.gid === answer.evidence_story_gid);
+  if (!evidence || evidence.resource_subtype !== "comment_added" ||
+      evidence.created_by?.gid !== ownGid || typeof evidence.text !== "string" ||
+      !/(bitte|benötig|freigab|frage|entscheid|antwort|wart|rückmeld|\?)/i.test(evidence.text) ||
+      !Number.isFinite(Date.parse(evidence.created_at)) || Date.parse(evidence.created_at) >= startedAt ||
+      !afterStories.some(story => story.gid === evidence.gid && story.text === evidence.text &&
+        story.created_at === evidence.created_at && story.created_by?.gid === ownGid)) return false;
+  return !afterStories.some(story => story.resource_subtype === "comment_added" &&
+    story.created_by?.gid !== ownGid && (Date.parse(story.created_at) > Date.parse(evidence.created_at) ||
+      (Date.parse(story.created_at) === Date.parse(evidence.created_at) &&
+        /^\d+$/.test(story.gid || "") && BigInt(story.gid) > BigInt(evidence.gid))));
+}
+
+export function transientPreStartFailure(error) {
+  // Reuse the canonical classifier; no additional connection/retry loop.
+  return ["remote_mcp_transient_error", "network_transport_error", "dns_resolution_error",
+    "remote_rate_limited", "cloudflare_managed_challenge", "mcp_coordination_timeout"]
+    .includes(classifyConnectionError(error));
 }
 
 export function noStorySignalsDeferredByDue(claim, task, now = new Date()) {
-  return Boolean(claim?.signals?.length &&
-    claim.signals.every((signal) => !signal.story_gid &&
+  const active = claim?.signals?.filter(signal => signal.kind !== "new_assigned_task") || [];
+  return Boolean(active.length &&
+    active.every((signal) => !signal.story_gid &&
       ["due_task", "continuation", "dependency_ready"].includes(signal.kind)) &&
     !dueIsReady(task, now));
 }
@@ -153,9 +184,10 @@ export function promptFor(claim, task, route) {
     `Wenn Moritz eine Entscheidung treffen muss, formuliere eine knappe konkrete Bitte mit Kontext. ` +
     `Wenn die Aufgabe zu gross ist, schliesse sie nicht voreilig ab; liefere echten Fortschritt und einen naechsten Schritt. ` +
     `Bei einem reinen Due-Signal, dessen einziger offener Schritt bereits in einer bestehenden Asana-Story als Abhaengigkeit von einem anderen offenen Task belegt ist, vermeide einen doppelten Kommentar. Melde blocked/no_action und setze linked_task_gid und evidence_story_gid auf die direkt nachgelesenen GIDs. Ohne diesen Beleg dokumentiere den Blocker im aktuellen Task; ein stiller No-Write-Ausgang wird zur Operations-Pruefung eskaliert. ` +
+    `Wenn bei einem reinen Due-Signal ausschließlich eine bereits im selben Task dokumentierte menschliche Antwort aussteht, melde blocked, linked_task_gid=null und die unverändert nachgelesene eigene Rückfrage als evidence_story_gid. Das gilt nur ohne neue fremde Antwort und ohne neue Schreibwirkung. ` +
     `Plane diesen Lauf auf hoechstens etwa 25 Minuten fachliche Arbeit; bei mehr Umfang dokumentiere einen verifizierbaren Zwischenstand und setze spaeter fort. ` +
     `Kein Subagent, keine weitere Aufgabe ausser notwendigem, vertraglich erlaubtem Handoff. ` +
-    `Antworte am Ende ausschliesslich im vorgegebenen JSON-Schema. Setze linked_task_gid und evidence_story_gid ausserhalb eines belegten Abhaengigkeitsfalls auf null. Setze next_step bei progress auf den konkreten nächsten Schritt, sonst null. outcome=progress nur bei nachprüfbarem Fortschritt, ` +
+    `Antworte am Ende ausschließlich im vorgegebenen JSON-Schema. Setze linked_task_gid außerhalb einer belegten Task-Abhängigkeit auf null. Setze evidence_story_gid auf die verifizierte eigene Ergebnisstory oder die belegte Warte-/Abhängigkeitsstory; sonst null. Nenne bei progress/blocked mit neuem Kommentar dessen exakte Story-GID zusätzlich in summary. Setze next_step bei progress auf den konkreten nächsten Schritt, sonst null. outcome=progress nur bei nachprüfbarem Fortschritt, ` +
     `blocked bei echtem externem Hindernis, no_action nur wenn keine Handlung mehr noetig ist. ` +
     `outcome=completed nur bei per Readback abgeschlossener Asana-Aufgabe. Ist deine Arbeit belegt an einen anderen zuständigen Assignee übergeben und bleibt der Task offen, nutze handed_off; dokumentiere den Handoff im Task und verifiziere die neue Zuweisung.\n`;
 }
@@ -313,8 +345,10 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
       const disposition = noWriteDisposition({ claim, before, after,
         beforeStories, afterStories, linkedTask, answer: codex.answer, codex,
         ownGid, startedAt });
-      const dependencyVerified = disposition === "acknowledged";
-      const reviewNote = dependencyVerified ? null :
+      const dependencyVerified = documentedDependencyNoWrite({ claim, before, after, beforeStories,
+        afterStories, linkedTask, answer: codex.answer, codex, ownGid, startedAt });
+      const humanWaitVerified = !dependencyVerified && disposition === "acknowledged";
+      const reviewNote = humanWaitVerified ? `awaiting_human_reply:${codex.answer.evidence_story_gid}` : dependencyVerified ? null :
         `Clean ${codex.answer.outcome} without a verified dependency; Operations review required${linkedReadError ? `: ${linkedReadError}` : ""}`;
       store.settle(claim, { outcome: disposition, error: reviewNote,
         dependencyWatch: dependencyVerified ? {
@@ -327,7 +361,8 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
       let archived = false;
       try { archived = await archiveCompletedThread(codex.threadId); }
       catch { /* Daily native audit is fallback. */ }
-      return { status: dependencyVerified ? "blocked_dependency_acknowledged" : "no_write_review",
+      return { status: dependencyVerified ? "blocked_dependency_acknowledged" :
+        humanWaitVerified ? "blocked_human_wait_acknowledged" : "no_write_review",
         run_id: runId, agent_id: agentId, task_gid: taskGid,
         linked_task_gid: dependencyVerified ? linkedTask.gid : null, archived };
     }
@@ -361,7 +396,8 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
       run_id: runId, agent_id: agentId, task_gid: taskGid, model: route.model, archived };
   } catch (error) {
     if (!codexStarted) {
-      store.settle(claim, { outcome: "retry_after", error });
+      store.settle(claim, { outcome: "retry_after", error,
+        transientPreflight: transientPreStartFailure(error) });
       store.recordRun(claim, { state: "completed", error });
       return { status: "retry_after", run_id: runId, agent_id: agentId,
         task_gid: taskGid, error: String(error?.message || error).slice(0, 500) };

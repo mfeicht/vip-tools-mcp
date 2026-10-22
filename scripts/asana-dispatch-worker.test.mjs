@@ -7,7 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
 import { assertCodexOutputSchema, cleanNoWriteDueTask, documentedDependencyNoWrite, promptFor,
-  noStorySignalsDeferredByDue, noWriteDisposition, verifiedOpenTaskHandoff } from "./asana-dispatch-worker.mjs";
+  noStorySignalsDeferredByDue, noWriteDisposition, verifiedOpenTaskHandoff, documentedHumanWaitNoWrite, transientPreStartFailure } from "./asana-dispatch-worker.mjs";
 
 test("all agent dispatch prompts bind the same no-Render and safe-retry contract", () => {
   for (const agent of ["vip-ai-social-media", "vip-ai-finance", "vip-ai-communication", "vip-ai-operations"]) {
@@ -112,7 +112,7 @@ test("documented due-task dependency qualifies for a no-write acknowledgement", 
   assert.equal(documentedDependencyNoWrite({ ...input,
     linkedTask: { ...input.linkedTask, completed: true } }), false);
   assert.equal(documentedDependencyNoWrite({ ...input,
-    linkedTask: { ...input.linkedTask, modified_at: "2026-09-22T05:39:00Z" } }), false);
+    linkedTask: { ...input.linkedTask, modified_at: "2026-09-22T05:39:00Z" } }), true);
   assert.equal(documentedDependencyNoWrite({ ...input,
     answer: { ...input.answer, evidence_story_gid: "999002" } }), false);
   assert.equal(noWriteDisposition({ ...input,
@@ -162,4 +162,61 @@ test("documented open-task handoff acknowledges worker work, never Asana complet
     {codex:{...input.codex,exitCode:1}},
     {answer:{...input.answer,outcome:"failed"}}
   ])assert.equal(verifiedOpenTaskHandoff({...input,...patch}),false,JSON.stringify(patch));
+});
+
+
+test("human wait acknowledges only unchanged own question without newer replies", () => {
+  const story={gid:"222",resource_subtype:"comment_added",created_by:{gid:"111"},
+    created_at:"2026-10-21T10:00:00Z",text:"Bitte entscheide über den Vorschlag; ich warte auf deine Antwort."};
+  const before={gid:"123",completed:false,assignee:{gid:"111"},modified_at:"2026-10-21T10:01:00Z"};
+  const input={claim:{signals:[{kind:"due_task",story_gid:null}]},before,after:{...before},
+    beforeStories:[story],afterStories:[story],answer:{outcome:"blocked",summary:"Ich warte auf die bereits angefragte menschliche Entscheidung.",
+      linked_task_gid:null,evidence_story_gid:"222"},codex:{exitCode:0,timedOut:false,threadId:"thread"},
+    ownGid:"111",startedAt:Date.parse("2026-10-22T10:00:00Z")};
+  assert.equal(documentedHumanWaitNoWrite(input),true);
+  assert.equal(noWriteDisposition(input),"acknowledged");
+  for(const patch of [
+    {answer:{...input.answer,outcome:"no_action"}},
+    {answer:{...input.answer,linked_task_gid:"333"}},
+    {claim:{signals:[{kind:"human_comment",story_gid:"222"}]}},
+    {afterStories:[{...story,text:"Editiert"}]},
+    {beforeStories:[{...story,created_by:{gid:"333"}}]},
+    {after:{...before,modified_at:"2026-10-22T10:02:00Z"}},
+    {afterStories:[story,{...story,gid:"223",created_by:{gid:"333"},created_at:"2026-10-21T12:00:00+02:00"}]}
+  ]) assert.equal(documentedHumanWaitNoWrite({...input,...patch}),false,JSON.stringify(patch));
+});
+
+test("prestart classifier preserves permission errors and uses canonical transport categories",()=>{
+  for(const e of [new Error("HTTP 503"),new Error("fetch failed"),Object.assign(new Error("gateway"),{code:502}),
+    new Error("Cloudflare managed challenge on the canonical MCP endpoint")])
+    assert.equal(transientPreStartFailure(e),true,String(e));
+  for(const e of [new Error("HTTP 403"),new Error("Invalid output schema"),
+    Object.assign(new Error("gateway 503"),{code:403})]) assert.equal(transientPreStartFailure(e),false);
+});
+
+test("repeated preflight outages do not exhaust task attempts or retain leases",async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),"dispatch-outage-"));
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const db=path.join(dir,"store.sqlite");
+  const store=new AsanaDispatchStore(db); t.after(()=>store.close());
+  store.enqueue({id:"due",agent_id:"vip-ai-research",task_gid:"123",source_version:"due",kind:"due_task",priority:60});
+  for(let i=0;i<7;i++){
+    store.db.prepare("UPDATE signals SET available_at_ms=0 WHERE id='due'").run();
+    const start=Date.now();
+    await workOnce({db,resolveBinary:()=>process.execPath,connect:async()=>{throw new Error("HTTP 503 fixture");}});
+    const signal=store.db.prepare("SELECT * FROM signals WHERE id='due'").get();
+    assert.equal(signal.status,"retry_after");assert.equal(signal.attempts,0);
+    assert.ok(signal.available_at_ms>=start+900000);assert.deepEqual(store.activeLeases(),[]);
+  }
+  store.db.prepare("UPDATE signals SET available_at_ms=0,attempts=4 WHERE id='due'").run();
+  await workOnce({db,resolveBinary:()=>process.execPath,connect:async()=>{throw new Error("HTTP 403 fixture");}});
+  assert.deepEqual(store.counts(),{dead_letter:1});
+});
+
+test("preflight deferral cannot release a launched claim",t=>{
+  const store=new AsanaDispatchStore(":memory:");t.after(()=>store.close());
+  store.enqueue({id:"due",agent_id:"vip-ai-research",task_gid:"123",source_version:"due",kind:"due_task",priority:60});
+  const claim=store.claimNext("run-1");assert.equal(store.beginCodexLaunch(claim),true);
+  assert.throws(()=>store.settle(claim,{outcome:"retry_after",transientPreflight:true}),/unlaunched/);
+  assert.deepEqual(store.counts(),{leased:1});assert.equal(store.activeLeases().length,2);
 });

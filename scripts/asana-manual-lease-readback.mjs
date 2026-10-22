@@ -8,6 +8,22 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const timestamp = (value) => Number.isFinite(value) && value > 0
   ? Math.round(value < 1_000_000_000_000 ? value * 1000 : value) : null;
 
+export function dispatchAnswerFromItems(entries) {
+  // Native pages are newest first. Only a final assistant message is evidence.
+  const item = entries.find(entry => entry.item?.type === "agentMessage" &&
+    entry.item.phase === "final_answer")?.item;
+  let answer;
+  try { answer = JSON.parse(item?.text || ""); } catch { return null; }
+  if (!answer || Array.isArray(answer) || Object.keys(answer).sort().join(",") !==
+      "evidence_story_gid,linked_task_gid,next_step,outcome,summary" ||
+      !["completed","progress","blocked","no_action","failed","handed_off"].includes(answer.outcome) ||
+      typeof answer.summary !== "string" || !answer.summary.trim() || answer.summary.length > 1200 ||
+      (answer.next_step !== null && (typeof answer.next_step !== "string" || answer.next_step.length > 1200)) ||
+      [answer.linked_task_gid,answer.evidence_story_gid].some(gid => gid !== null &&
+        (typeof gid !== "string" || !/^\d+$/.test(gid)))) return null;
+  return answer;
+}
+
 export function boundedReadClients(rpc, client, now = () => Date.now()) {
   const deadline=now()+120000;
   const remaining=()=>{
@@ -85,7 +101,8 @@ async function readNative(run, rpc, mode) {
     turn_id: turn.id, turn_status: turn.status,
     started_at_ms: timestamp(turn.startedAt), completed_at_ms: timestamp(turn.completedAt),
     activity_digest: digest(entries.map((entry) => entry.item)),
-    activity_item_count: entries.length, activity_last_item_id: entries[0].item.id
+    activity_item_count: entries.length, activity_last_item_id: entries[0].item.id,
+    ...(mode === "dispatch" ? { answer: dispatchAnswerFromItems(entries) } : {})
   };
 }
 
