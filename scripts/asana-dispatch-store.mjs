@@ -30,6 +30,11 @@ export class AsanaDispatchStore {
     if (filename !== ":memory:") fs.chmodSync(filename, 0o600);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS dispatch_maintenance (
+        id INTEGER PRIMARY KEY CHECK(id=1), run_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL, expires_at_ms INTEGER NOT NULL,
+        created_at_ms INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS signals (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
@@ -759,12 +764,46 @@ export class AsanaDispatchStore {
       .run(lease.key, lease.run_id, lease.token, lease.fence).changes === 1;
   }
 
+  dispatchMaintenance(now=Date.now()) {
+    assertTime(now,'now');
+    return this.db.prepare(`SELECT m.* FROM dispatch_maintenance m
+      JOIN manual_runs r ON r.run_id=m.run_id AND r.thread_id=m.thread_id
+      JOIN leases l ON l.run_id=r.run_id AND l.key='agent:vip-ai-operations' AND l.fence=r.agent_fence
+      WHERE m.id=1 AND r.state='active' AND r.agent_id='vip-ai-operations'
+        AND m.expires_at_ms>? AND l.expires_at_ms>?`).get(now,now) || null;
+  }
+
+  setDispatchMaintenance(runId,context,{pause=true,now=Date.now()}={}) {
+    assertTime(now,'now');
+    return this.transaction(()=>{
+      const run=this.manualRun(runId);
+      if(!run)throw new Error('Existing Operations run required');
+      const owner=this.assertManualOwner(run,context);
+      if(owner.expires_at_ms<=now)throw new Error('Fresh Operations lease required');
+      if(run.agent_id!=='vip-ai-operations' || !this.leasesForRun(runId).some(l=>
+        l.key.startsWith('task:')&&l.expires_at_ms>now)) throw new Error('Operations task lease required');
+      const active=this.dispatchMaintenance(now);
+      if(active&&active.run_id!==runId) throw new Error('Different maintenance owner');
+      if(pause) this.db.prepare(`INSERT INTO dispatch_maintenance VALUES (1,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET run_id=excluded.run_id,thread_id=excluded.thread_id,
+        expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms`)
+        .run(runId,context.threadId,now+15*60_000,now);
+      else this.db.prepare('DELETE FROM dispatch_maintenance WHERE id=1 AND run_id=?').run(runId);
+      const result={paused:pause,expires_at_ms:pause?now+15*60_000:null,
+        running_workers_untouched:true,polling_unchanged:true};
+      this.db.prepare('INSERT INTO recovery_events(run_id,observed_at_ms,kind,evidence_json) VALUES (?,?,?,?)')
+        .run(runId,now,'dispatch_maintenance',JSON.stringify({...result,thread_id:context.threadId}));
+      return result;
+    });
+  }
+
   claimNext(runId, { now = Date.now(), ttlMs = 20 * 60_000, agentId = null, maxActiveAgents = null } = {}) {
     assertId(runId, "run_id");
     if (agentId) assertId(agentId, "agent_id");
     if(maxActiveAgents !== null && (!Number.isSafeInteger(maxActiveAgents) || maxActiveAgents<1 || maxActiveAgents>2))
       throw new Error("Invalid worker capacity");
     return this.transaction(() => {
+      if(this.dispatchMaintenance(now)) return null;
       if(maxActiveAgents !== null && this.db.prepare("SELECT COUNT(*) AS n FROM leases WHERE key LIKE 'agent:%'").get().n>=maxActiveAgents)
         return null;
       this.normalizeContinuations(now);

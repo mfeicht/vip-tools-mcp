@@ -19,6 +19,7 @@ async function saveHealth(health) {
 
 async function launchWorkers(store, maximum = 2) {
   if (!Number.isSafeInteger(maximum) || maximum < 0 || maximum > 2) throw new Error("Invalid worker limit");
+  if (store.dispatchMaintenance()) return 0;
   const active = store.activeLeases().filter((lease) =>
     lease.key.startsWith("agent:"));
   const slots = Math.max(0, maximum - active.length);
@@ -64,6 +65,7 @@ export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
     health.errors.push(...health.manual_reconciliation.errors.map(error =>
       ({ source: "manual_reconciliation", ...error })));
     health.ready = store.readyCount();
+    health.dispatch_maintenance = store.dispatchMaintenance();
     health.counts = store.counts();
     health.active_agents = store.activeLeases().filter((lease) =>
       lease.key.startsWith("agent:") && lease.expires_at_ms > Date.now()).length;
