@@ -75,3 +75,27 @@ test("a database error rolls signal and lease changes back together",t=>{
   assert.equal(f.store.activeLeases().length,2);
   assert.deepEqual(f.store.counts(),{leased:1});
 });
+
+test("missing end time only frees the agent after 30s stable native and process proofs",t=>{
+  const f=fixture(t);
+  f.proof.native.forEach((row,index)=>{
+    row.completed_at_ms=null; row.observed_at_ms=f.now-40000+index*31000;
+  });
+  f.proof.processes=f.proof.native.map(row=>({...f.scan,observed_at_ms:row.observed_at_ms+100}));
+  for(const mutate of [
+    p=>{p.native[1].observed_at_ms=p.native[0].observed_at_ms+2000;},
+    p=>{p.processes[0].matching_processes=[{pid:42}];},
+    p=>{p.processes[1].scan_succeeded=false;},
+    p=>{p.processes[0].thread_id="another-thread";},
+    p=>{p.native[1].activity_digest="c".repeat(64);}
+  ]) {
+    const proof=structuredClone(f.proof);mutate(proof);
+    assert.equal(decideDispatchRecovery(f.snapshot,proof,f.scan,f.now).action,"hold");
+  }
+  assert.equal(applyDispatchRecovery(f.store,f.snapshot,f.proof,{scan:()=>f.scan,now:f.now}).action,"quarantine");
+  assert.deepEqual(f.store.activeLeases().map(row=>row.key),["task:123456"]);
+  assert.deepEqual(f.store.counts(),{leased:1});
+  assert.equal(f.store.db.prepare("SELECT state FROM runs").get().state,"needs_reconciliation");
+  const later=dispatchRecoverySnapshot(f.store,"run-1");
+  assert.equal(decideDispatchRecovery(later,f.proof,f.scan,f.now).action,"hold");
+});

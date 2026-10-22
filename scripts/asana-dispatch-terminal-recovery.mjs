@@ -15,16 +15,18 @@ export function dispatchRecoverySnapshot(store, runId) {
 }
 
 export async function readDispatchRecovery(snapshot, { rpc, client,
-  readNative = readDispatchNative, readTask = readManualAsanaTask, wait = delay } = {}) {
+  readNative = readDispatchNative, readTask = readManualAsanaTask, wait = delay,
+  scan = collectWorkerProcessReadback } = {}) {
   const { run } = snapshot;
   ({rpc,client}=boundedReadClients(rpc,client));
-  const native = [], asana = [];
+  const native = [], asana = [], processes = [];
   for (let pass = 0; pass < 2; pass++) {
-    if (pass) await wait(1100);
+    if (pass) await wait(native[0].completed_at_ms === null ? 30000 : 1100);
     native.push(await readNative(run, rpc));
+    processes.push(scan(run));
     asana.push(await readTask(run, { task_gid: run.task_gid }, client));
   }
-  return { native, asana };
+  return { native, asana, processes };
 }
 
 export function decideDispatchRecovery(snapshot, proof, scan, now = Date.now()) {
@@ -49,14 +51,27 @@ export function decideDispatchRecovery(snapshot, proof, scan, now = Date.now()) 
     !["completed", "failed", "interrupted"].includes(row.turn_status) || !row.turn_id ||
     (run.turn_id && row.turn_id !== run.turn_id) ||
     !Number.isSafeInteger(row.started_at_ms) || row.started_at_ms < run.started_at_ms - 2000 ||
-    // No general adoption of the narrow legacy exception for missing end/event times.
-    !Number.isSafeInteger(row.completed_at_ms) || row.completed_at_ms < row.started_at_ms ||
-    row.completed_at_ms > row.observed_at_ms ||
+    row.started_at_ms > row.observed_at_ms ||
+    (row.completed_at_ms !== null && (!Number.isSafeInteger(row.completed_at_ms) ||
+      row.completed_at_ms < row.started_at_ms || row.completed_at_ms > row.observed_at_ms)) ||
     !Number.isSafeInteger(row.activity_item_count) || row.activity_item_count < 1 ||
     !row.activity_last_item_id || !/^[a-f0-9]{64}$/.test(row.activity_digest || "")) ||
     native[1].observed_at_ms - native[0].observed_at_ms < 1000 ||
     !same({...native[0], observed_at_ms:null}, {...native[1], observed_at_ms:null})) {
     return hold("native_terminal_unverified");
+  }
+  // A missing terminal timestamp can only free the agent, never acknowledge or
+  // replay the task. Require a longer stable native interval and two independent
+  // process scans in addition to the fresh scan at the fenced transaction.
+  const missingEnd = native[1].completed_at_ms === null;
+  if (missingEnd && (!agent || native[1].observed_at_ms-native[0].observed_at_ms < 30000 ||
+      !Array.isArray(proof.processes) || proof.processes.length !== 2 ||
+      proof.processes.some((row,index) => !fresh(row) || !row.scan_succeeded ||
+        row.observed_at_ms < native[index].observed_at_ms ||
+        Object.entries(processScanBinding(run)).some(([key,value]) => !same(row[key],value)) ||
+        !/^[a-f0-9]{64}$/.test(row.raw_sha256 || "") ||
+        !Array.isArray(row.matching_processes) || row.matching_processes.length))) {
+    return hold("missing_end_agent_quarantine_unverified");
   }
   if (!fresh(scan) || !scan.scan_succeeded ||
     Object.entries(processScanBinding(run)).some(([key,value]) => !same(scan[key],value)) ||
@@ -73,7 +88,8 @@ export function decideDispatchRecovery(snapshot, proof, scan, now = Date.now()) 
     !same({...asana[0], observed_at_ms:null}, {...asana[1], observed_at_ms:null})) {
     return hold("asana_readback_unverified");
   }
-  return { action: asana[1].task.completed ? "acknowledge" : "quarantine",
+  return { action: !missingEnd && asana[1].task.completed ? "acknowledge" : "quarantine",
+    reason: missingEnd ? "missing_end_agent_only_quarantine" : "terminal_verified",
     release_agent: Boolean(agent), turn_id: native[1].turn_id };
 }
 
