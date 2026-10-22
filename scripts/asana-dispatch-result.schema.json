@@ -17,7 +17,8 @@
         "progress",
         "blocked",
         "no_action",
-        "failed"
+        "failed",
+        "handed_off"
       ]
     },
     "summary": {
