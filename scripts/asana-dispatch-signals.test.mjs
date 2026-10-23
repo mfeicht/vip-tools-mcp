@@ -44,3 +44,16 @@ test("same-time comments use numeric GID order and equivalent timezones",()=>{
   assert.equal(newCommentSignals("vip-ai-research",{gid:"123"},stories,{...options,
     observation:{latest_story_at:"2026-10-22T10:00:00Z",latest_story_gid:"10"}}).signals.length,0);
 });
+
+test('other-agent handoffs require an exact target and GID mention and remain lower-priority queue work',()=>{
+  const options={observation:null,userGid:'456',allAgentUserGids:new Set(['456','789']),owned:true,now:new Date('2026-10-23T12:00:00Z')};
+  const story={gid:'101',created_at:'2026-10-23T11:00:00Z',resource_subtype:'comment_added',created_by:{gid:'789'},target:{gid:'123'},html_text:'<a data-asana-gid="456">Agent</a>'};
+  const run=s=>newCommentSignals('vip-ai-test',{gid:'123'},[s],options).signals;
+  assert.equal(run(story)[0].kind,'agent_handoff');assert.equal(run(story)[0].priority,50);
+  assert.deepEqual(run({...story,target:{gid:'999'}}),[]);
+  assert.deepEqual(run({...story,target:null}),[]);
+  assert.deepEqual(run({...story,html_text:'@Agent'}),[]);
+  assert.deepEqual(run({...story,created_by:{gid:'456'}}),[]);
+  assert.equal(run({...story,created_by:{gid:'900'}})[0].kind,'human_comment');
+  assert.deepEqual(newCommentSignals('vip-ai-test',{gid:'123'},[story],{...options,observation:{latest_story_at:story.created_at,latest_story_gid:story.gid}}).signals,[]);
+});

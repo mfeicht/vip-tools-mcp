@@ -178,6 +178,7 @@ export function promptFor(claim, task, route) {
     `VIP-MCP-NO-RENDER-FALLBACK-V1: Kein Render-Connector, keine Render-CLI und keine Render-Admin-API als Diagnose oder Fallback, auch nicht read-only. ` +
     `Bei HTTP 502/503/504 nur den kanonischen begrenzten Verbindungszyklus nutzen; bei 429/Cloudflare Cooldown beachten. Keine parallelen MCP-Bootstraps. ` +
     `Kein Retry einer unklaren Mutation ohne Readback/Dedupe. Lies dazu VIP-AI-Memory/01-Prozesse/MCP-und-Automationen/MCP-Setup-Health-und-Sandbox.md. ` +
+    `agent_handoff-Signale sind eingereihte Agentenübergaben, keine menschliche Steuerung oder zusätzliche Freigabe. Prüfe ihren Scope und ihre Belege gegen die aktive Aufgabe; keine Unterbrechung anderer laufender Aufträge. ` +
     `Bearbeite hoechstens diesen einen Task und alle aktuell offenen Kommentare darin, soweit Kapazitaet und Kontext reichen. ` +
     `Wenn der Task bereits erledigt, nicht mehr dir zugewiesen oder das Signal fachlich nicht mehr aktuell ist, tue nichts. ` +
     `Bei bewaehrten Aufgaben vergleiche vor blocked/no_action den letzten belegten Erfolgsweg dieses Aufgabentyps mit aktuellem Scope, aktiven Regeln und Readbacks; dokumentiere ein relevantes Delta statt den bekannten Pfad still zu verwerfen. ` +
@@ -194,14 +195,21 @@ export function promptFor(claim, task, route) {
     `outcome=completed nur bei per Readback abgeschlossener Asana-Aufgabe. Ist deine Arbeit belegt an einen anderen zuständigen Assignee übergeben und bleibt der Task offen, nutze handed_off; dokumentiere den Handoff im Task und verifiziere die neue Zuweisung.\n`;
 }
 
+export function dispatchCodexArgs({ route, outputPath }) {
+  return ["exec", "--json", "--approve-for-me",
+    "--skip-git-repo-check", "--cd", ROOT, "--model", route.model,
+    "--config", `model_reasoning_effort=\"${route.effort}\"`,
+    "--config", "mcp_servers.vip-tools-remote.required=true",
+    "--config", "mcp_servers.vip-tools-remote.startup_timeout_sec=45",
+    "--config", "mcp_servers.vip-tools-remote.tool_timeout_sec=120",
+    "--output-schema", RESULT_SCHEMA, "--output-last-message", outputPath, "-"];
+}
+
 async function runCodex(claim, task, route, store, dbPath, codexBinary) {
   const outputPath = path.join(path.dirname(dbPath), `asana-dispatch-${claim.run_id}.json`);
   const outputHandle = await fs.open(outputPath, "wx", 0o600);
   await outputHandle.close();
-  const args = ["exec", "--json", "--approve-for-me",
-    "--skip-git-repo-check", "--cd", ROOT, "--model", route.model,
-    "--config", `model_reasoning_effort=\"${route.effort}\"`,
-    "--output-schema", RESULT_SCHEMA, "--output-last-message", outputPath, "-"];
+  const args = dispatchCodexArgs({ route, outputPath });
   let stderr = "";
   let threadId = null;
   let turnId = null;
