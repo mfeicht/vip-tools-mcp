@@ -5,7 +5,7 @@ import { AsanaDispatchStore, DEFAULT_DB_PATH } from "./asana-dispatch-store.mjs"
 import { dependencyReadySignal, newCommentSignals, taskSignal } from "./asana-dispatch-signals.mjs";
 
 const TASK_FIELDS = "gid,name,completed,created_by.gid,assignee.gid,due_on,due_at,modified_at,permalink_url,tags.name,followers.gid";
-const STORY_FIELDS = "gid,created_at,created_by.gid,resource_subtype,type,text,html_text";
+const STORY_FIELDS = "gid,created_at,created_by.gid,resource_subtype,type,text,html_text,target.gid,assignee.gid";
 
 function options(argv) {
   const opts = { write: false, agentIds: null, db: DEFAULT_DB_PATH };
