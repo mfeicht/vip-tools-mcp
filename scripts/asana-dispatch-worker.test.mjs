@@ -220,3 +220,14 @@ test("preflight deferral cannot release a launched claim",t=>{
   assert.throws(()=>store.settle(claim,{outcome:"retry_after",transientPreflight:true}),/unlaunched/);
   assert.deepEqual(store.counts(),{leased:1});assert.equal(store.activeLeases().length,2);
 });
+
+test('dispatch requires canonical MCP startup and preserves model and approval policy', async()=>{
+  const {dispatchCodexArgs}=await import('./asana-dispatch-worker.mjs');
+  const args=dispatchCodexArgs({route:{model:'gpt-6-sol',effort:'ultra'},outputPath:'/tmp/result.json'});
+  assert.equal(args[args.indexOf('--model')+1],'gpt-6-sol');
+  assert.ok(args.includes('model_reasoning_effort="ultra"'));
+  assert.ok(args.includes('mcp_servers.vip-tools-remote.required=true'));
+  assert.ok(args.includes('mcp_servers.vip-tools-remote.startup_timeout_sec=45'));
+  assert.ok(args.includes('--approve-for-me'));
+  assert.equal(args.some(arg=>/approval_mode|dangerously|bearer|http_headers|service_tier/.test(arg)),false);
+});

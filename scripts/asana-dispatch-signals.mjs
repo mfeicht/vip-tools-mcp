@@ -112,17 +112,22 @@ export function newCommentSignals(agentId, task, stories, {
         (storyTime === Date.parse(ownReply.created_at) &&
           compareStoryGids(story.gid, ownReply.gid) <= 0))) continue;
     const author = String(story.created_by?.gid || "");
-    if (!author || allAgentUserGids.has(author)) continue;
-    if (!owned && !storyMentionsUser(story, userGid)) continue;
+    if (!author || author === String(userGid)) continue;
+    const mentioned = storyMentionsUser(story, userGid);
+    const agentHandoff = allAgentUserGids.has(author);
+    // Other agents never become human steering. Only an explicit, target-bound
+    // GID mention enters the same durable queue under the normal task leases.
+    if (agentHandoff && (!mentioned || String(story.target?.gid || "") !== String(task.gid))) continue;
+    if (!owned && !mentioned) continue;
     const storyGid = String(story.gid);
     const historical = storyTime < now.getTime() - 24 * 60 * 60_000;
     signals.push({
       id: signalId(agentId, String(task.gid), "comment", storyGid),
       agent_id: agentId, task_gid: String(task.gid), story_gid: storyGid,
       source_version: signalId(agentId, String(task.gid), "story", storyGid),
-      kind: historical ? "historical_comment" :
+      kind: agentHandoff ? "agent_handoff" : historical ? "historical_comment" :
         (owned ? "human_comment" : "direct_mention"),
-      priority: historical ? 45 : owned ? 85 : 95
+      priority: agentHandoff ? 50 : historical ? 45 : owned ? 85 : 95
     });
   }
   return {
