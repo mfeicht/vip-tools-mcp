@@ -194,3 +194,42 @@ test("handoff requires exact result, own assignment, current target and no later
   }
   assert.equal(f.store.activeLeases().length,2);
 });
+
+function capacityFixture(t) {
+  const f=fixture(t);f.proof.ownGid='111';
+  f.proof.native.forEach((r,i)=>{r.capacity_failed_without_work=true;r.answer=null;
+    r.observed_at_ms=f.now-40000+i*31000;r.completed_at_ms=f.now-50000;});
+  f.proof.asana.forEach(r=>{r.task={...r.task,completed:false,assignee:{gid:'111'},
+    modified_at:new Date(f.snapshot.run.started_at_ms-1000).toISOString()};});
+  return f;
+}
+
+test('terminal capacity refusal without work retries once with delay and unchanged attempt count',t=>{
+  const f=capacityFixture(t);
+  const attempts=f.snapshot.signals[0].attempts;
+  const result=applyDispatchRecovery(f.store,f.snapshot,f.proof,{scan:()=>f.scan,now:f.now});
+  assert.equal(result.action,'retry_after');assert.equal(result.preserve_attempts,true);
+  assert.deepEqual(f.store.activeLeases(),[]);assert.deepEqual(f.store.counts(),{retry_after:1});
+  const s=f.store.db.prepare('SELECT * FROM signals').get();
+  assert.equal(s.attempts,attempts);assert.equal(s.available_at_ms,f.now+900000);
+  assert.equal(s.run_id,null);assert.equal(f.store.claimNext('early',{now:f.now}),null);
+  assert.equal(applyDispatchRecovery(f.store,f.snapshot,f.proof,{scan:()=>f.scan,now:f.now}).reason,'recovery_fence_changed');
+  assert.equal(f.proof.asana[1].task.completed,false);
+});
+
+test('capacity retry rejects executable activity, incomplete terminal proof or changed owner',t=>{
+  const f=capacityFixture(t);
+  for(const mutate of [
+    p=>{p.native.forEach(r=>r.capacity_failed_without_work=false);},
+    p=>{p.native.forEach(r=>r.answer={outcome:'blocked'});},
+    p=>{p.native[1].observed_at_ms=p.native[0].observed_at_ms+2000;},
+    p=>{p.asana.forEach(r=>r.task.assignee.gid='333');},
+    p=>{p.ownGid=null;},
+    p=>{p.asana.forEach(r=>r.task.modified_at=new Date(f.now).toISOString());},
+    p=>{p.asana.forEach(r=>r.stories=[{gid:'222',created_at:new Date(f.now).toISOString()}]);}
+  ]) {
+    const p=structuredClone(f.proof);mutate(p);
+    assert.equal(decideDispatchRecovery(f.snapshot,p,f.scan,f.now).action,'quarantine');
+  }
+  assert.equal(f.store.activeLeases().length,2);
+});
