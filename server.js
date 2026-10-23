@@ -5723,7 +5723,8 @@ async function runImapFetchUnseenRaw(config, {
   fetchAllMatching = false,
   specificUid,
   afterUid,
-  inboxOrder = "newest_first"
+  inboxOrder = "newest_first",
+  headerFallbackForOversize = false
 }) {
   const socket = await openImapSocket(config);
   socket.setEncoding("binary");
@@ -5801,6 +5802,27 @@ async function runImapFetchUnseenRaw(config, {
     for (let index = 0; index < selectedUids.length; index += batchSize) {
       const batchUids = selectedUids.slice(index, index + batchSize);
       for (const uid of batchUids) {
+        let learningHeaderRaw = null;
+        if (headerFallbackForOversize) {
+          const metadataResponse = await command(
+            `UID FETCH ${uid} (RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES AUTO-SUBMITTED PRECEDENCE LIST-ID DELIVERED-TO X-ORIGINAL-TO ENVELOPE-TO X-ENVELOPE-TO)])`
+          );
+          const declaredBytes = parseImapRfc822Size(metadataResponse);
+          const headerRaw = extractFirstImapLiteral(metadataResponse);
+          if (declaredBytes === null || !headerRaw || Buffer.byteLength(headerRaw, "binary") > 64 * 1024) {
+            messages.push({ uid, parse_error: "message_headers_unavailable" });
+            continue;
+          }
+          learningHeaderRaw = headerRaw;
+          if (declaredBytes > maxEmailBytes) {
+            messages.push({
+              ...await parseRawEmail(headerRaw, uid),
+              header_only: true,
+              body_unavailable_reason: "message_too_large"
+            });
+            continue;
+          }
+        }
         const fetchResponse = await command(`UID FETCH ${uid} (BODY.PEEK[])`);
         const raw = extractImapLiteral(fetchResponse);
         if (!raw) {
@@ -5808,7 +5830,13 @@ async function runImapFetchUnseenRaw(config, {
           continue;
         }
         if (Buffer.byteLength(raw, "binary") > maxEmailBytes) {
-          messages.push({ uid, parse_error: "message_too_large" });
+          messages.push(learningHeaderRaw
+            ? {
+                ...await parseRawEmail(learningHeaderRaw, uid),
+                header_only: true,
+                body_unavailable_reason: "message_too_large"
+              }
+            : { uid, parse_error: "message_too_large" });
           continue;
         }
         messages.push(await parseRawEmail(raw, uid));
@@ -5956,8 +5984,21 @@ function classifyBccDelivery(message, mailboxAddress) {
 
 export function publicBccLearningMessage(message, mailboxAddress, maxBodyChars) {
   if (message.parse_error) return message;
-  const body = emailLearningBodyText(message.text_parts, maxBodyChars);
+  const body = message.header_only
+    ? { text: null, source: "headers_only", truncated: false }
+    : emailLearningBodyText(message.text_parts, maxBodyChars);
   const bcc = classifyBccDelivery(message, mailboxAddress);
+  const automatedSignals = {
+    auto_submitted: message.auto_submitted || null,
+    precedence: message.precedence || null,
+    list_id_present: Boolean(message.list_id)
+  };
+  const senderClass = (automatedSignals.auto_submitted &&
+    automatedSignals.auto_submitted.toLowerCase() !== "no") ||
+    /^(bulk|junk|list)$/i.test(automatedSignals.precedence || "") ||
+    automatedSignals.list_id_present
+    ? "automated"
+    : "undetermined";
   const references = uniqueValues(
     [...String(message.references || "").matchAll(/<[^>]+>/g)].map((match) =>
       createHash("sha256").update(match[0]).digest("hex")
@@ -5980,14 +6021,13 @@ export function publicBccLearningMessage(message, mailboxAddress, maxBodyChars) 
     bcc_reason: bcc.reason,
     mailbox_visible_in_to_or_cc: bcc.mailbox_visible_in_to_or_cc,
     mailbox_visible_in_cc: extractEmailAddresses(message.cc).includes(extractEmailAddress(mailboxAddress)),
+    sender_class: senderClass,
+    content_scope: message.header_only ? "headers_only" : "body",
+    body_unavailable_reason: message.body_unavailable_reason || null,
     visible_to_count: extractEmailAddresses(message.to).length,
     visible_cc_count: extractEmailAddresses(message.cc).length,
     delivery_header_names: bcc.delivery_header_names,
-    automated_message_signals: {
-      auto_submitted: message.auto_submitted || null,
-      precedence: message.precedence || null,
-      list_id_present: Boolean(message.list_id)
-    },
+    automated_message_signals: automatedSignals,
     body_text: body.text,
     body_text_source: body.source,
     body_text_truncated: body.truncated
@@ -23502,7 +23542,8 @@ function createServer() {
         mailSearchMode: "inbox_all",
         fetchAllMatching: false,
         afterUid: after_uid,
-        inboxOrder: "oldest_first"
+        inboxOrder: "oldest_first",
+        headerFallbackForOversize: true
       });
       const messages = result.messages.map((message) =>
         publicBccLearningMessage(message, summary.from, max_body_chars)
