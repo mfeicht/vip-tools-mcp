@@ -39,9 +39,9 @@ export function documentedOpenRecovery(run, proof) {
   const native = proof.native[1], current = proof.asana[1];
   const answer = native.answer;
   if(native.turn_status !== "completed" || native.completed_at_ms === null ||
-      !["blocked","progress"].includes(answer?.outcome) ||
+      !["blocked","progress","handed_off"].includes(answer?.outcome) ||
       !/^\d+$/.test(proof.ownGid || "") || current.task.completed !== false ||
-      current.task.assignee?.gid !== proof.ownGid ||
+      (answer.outcome !== "handed_off" && current.task.assignee?.gid !== proof.ownGid) ||
       (answer.outcome === "progress" &&
         (typeof answer.next_step !== "string" || answer.next_step.trim().length < 12))) return null;
   const eligible = current.stories.filter(story => story.resource_subtype === "comment_added" &&
@@ -56,6 +56,27 @@ export function documentedOpenRecovery(run, proof) {
   // A later response requires fresh work rather than settlement of the old run.
   if(current.stories.some(other => other.resource_subtype === "comment_added" &&
       other.created_by?.gid !== proof.ownGid && Date.parse(other.created_at) >= Date.parse(story.created_at))) return null;
+  if (answer.outcome === "handed_off") {
+    // An open reassigned task is not a completed task. Bind the exact own
+    // result and assignment story to this terminal turn and current assignee.
+    // A later reassignment, even back to the same owner, invalidates this proof.
+    const assignee = current.task.assignee?.gid;
+    if (!/^\d+$/.test(assignee || "") || assignee === proof.ownGid ||
+        answer.evidence_story_gid !== story.gid || answer.linked_task_gid !== null ||
+        answer.next_step !== null) return null;
+    const assignments = current.stories.filter(row =>
+      ["assigned", "unassigned"].includes(row.resource_subtype) &&
+      Date.parse(row.created_at) >= run.started_at_ms);
+    if (assignments.length !== 1) return null;
+    const assigned = assignments[0];
+    if (!/^\d+$/.test(assigned.gid || "") || assigned.resource_subtype !== "assigned" ||
+        assigned.created_by?.gid !== proof.ownGid || assigned.target?.gid !== run.task_gid ||
+        assigned.assignee?.gid !== assignee ||
+        Date.parse(assigned.created_at) < Date.parse(story.created_at) ||
+        Date.parse(assigned.created_at) > native.completed_at_ms) return null;
+    return {outcome: "handed_off", evidence_story_gid: story.gid,
+      assignment_story_gid: assigned.gid, assignee_gid: assignee, next_step: null};
+  }
   return {outcome:answer.outcome,evidence_story_gid:story.gid,next_step:answer.next_step};
 }
 

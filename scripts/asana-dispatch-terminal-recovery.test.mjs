@@ -146,3 +146,51 @@ test("missing or contradictory open-task evidence never releases the task",t=>{
     assert.equal(decideDispatchRecovery(f.snapshot,proof,f.scan,f.now).action,"quarantine");
   }
 });
+
+function handoffFixture(t) {
+  const f=openFixture(t,"handed_off");
+  f.proof.asana.forEach(row=>{
+    row.task.assignee={gid:"333"};
+    row.stories.push({gid:"224",resource_subtype:"assigned",created_by:{gid:"111"},
+      target:{gid:"123456"},assignee:{gid:"333"},created_at:new Date(f.now-15000).toISOString()});
+  });
+  return f;
+}
+
+test("verified terminal handoff settles only the old claim and creates no continuation",t=>{
+  const f=handoffFixture(t);
+  const decision=applyDispatchRecovery(f.store,f.snapshot,f.proof,{scan:()=>f.scan,now:f.now});
+  assert.equal(decision.action,"acknowledge");
+  assert.equal(decision.open.outcome,"handed_off");
+  assert.equal(decision.open.assignment_story_gid,"224");
+  assert.equal(decision.open.assignee_gid,"333");
+  assert.deepEqual(f.store.counts(),{acknowledged:1});
+  assert.deepEqual(f.store.activeLeases(),[]);
+  assert.equal(f.proof.asana[1].task.completed,false);
+});
+
+test("handoff requires exact result, own assignment, current target and no later ownership change",t=>{
+  const f=handoffFixture(t);
+  const mutations=[
+    p=>{p.asana.forEach(r=>r.stories.pop());},
+    p=>{p.asana.forEach(r=>r.task.assignee=null);},
+    p=>{p.asana.forEach(r=>r.task.assignee.gid="111");},
+    p=>{p.asana.forEach(r=>r.task.assignee.gid="444");},
+    p=>{p.asana.forEach(r=>r.stories[1].assignee.gid="444");},
+    p=>{p.asana.forEach(r=>r.stories[1].target.gid="999");},
+    p=>{p.asana.forEach(r=>r.stories[1].created_by.gid="333");},
+    p=>{p.asana.forEach(r=>r.stories[1].created_at=new Date(f.now-5000).toISOString());},
+    p=>{p.asana.forEach(r=>r.stories[1].created_at=new Date(f.now-25000).toISOString());},
+    p=>{p.asana.forEach(r=>r.stories.push({...r.stories[1],gid:"225"}));},
+    p=>{p.asana.forEach(r=>r.stories.push({...r.stories[1],gid:"225",resource_subtype:"unassigned"}));},
+    p=>{p.native.forEach(r=>r.answer.evidence_story_gid=null);},
+    p=>{p.native.forEach(r=>r.answer.next_step="Start another worker");},
+    p=>{p.native.forEach(r=>r.answer.linked_task_gid="999");},
+    p=>{p.native.forEach(r=>r.turn_status="failed");}
+  ];
+  for(const mutate of mutations) {
+    const proof=structuredClone(f.proof);mutate(proof);
+    assert.equal(decideDispatchRecovery(f.snapshot,proof,f.scan,f.now).action,"quarantine");
+  }
+  assert.equal(f.store.activeLeases().length,2);
+});
