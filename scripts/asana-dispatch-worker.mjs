@@ -9,11 +9,12 @@ import { connectMcpClient, storiesForTask, tool } from "./asana-dispatch-poller.
 import { dueIsReady, signalId, storyMentionsUser } from "./asana-dispatch-signals.mjs";
 import { archiveCompletedThread } from "./codex-app-rpc.mjs";
 import { resolveCodexBinary } from "./codex-binary.mjs";
-import { classifyConnectionError } from "./vip-mcp-call.mjs";
+import { classifyConnectionError, readMaterialCommentStoreHealth } from "./vip-mcp-call.mjs";
+import { needsMaterialCommentStorePreflight } from "./asana-dispatch-coordination.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
 const RESULT_SCHEMA = path.join(import.meta.dirname, "asana-dispatch-result.schema.json");
-const TASK_FIELDS = "gid,name,completed,assignee.gid,created_by.gid,due_on,due_at,modified_at,permalink_url";
+const TASK_FIELDS = "gid,name,completed,assignee.gid,created_by.gid,due_on,due_at,modified_at,permalink_url,tags.name";
 const RUN_LIMIT_MS = 45 * 60_000;
 
 export async function assertCodexOutputSchema(filename = RESULT_SCHEMA) {
@@ -181,6 +182,7 @@ export function promptFor(claim, task, route) {
     `Wenn der Task bereits erledigt, nicht mehr dir zugewiesen oder das Signal fachlich nicht mehr aktuell ist, tue nichts. ` +
     `Bei bewaehrten Aufgaben vergleiche vor blocked/no_action den letzten belegten Erfolgsweg dieses Aufgabentyps mit aktuellem Scope, aktiven Regeln und Readbacks; dokumentiere ein relevantes Delta statt den bekannten Pfad still zu verwerfen. ` +
     `Bei echter Arbeit dokumentiere Ergebnis oder Mehr-Run-Checkpoint in Asana; ein stiller Abschluss ohne verifizierbares Task-/Story-Readback zaehlt nicht. ` +
+    `Bei Routinen gilt: fachlichen Scope und Follow-up-Entscheid belegen, nach Fälligkeit asana_complete_task unter den bestehenden Gates ausführen, Abschluss lesen und erst danach asana_verify_next_routine_instance nutzen. source_not_completed ist vor Abschluss kein Blocker; die Generierungsfrist beginnt erst nach Abschluss. Keine Folgeaufgabe als Ersatz erzeugen. ` +
     `Wenn Moritz eine Entscheidung treffen muss, formuliere eine knappe konkrete Bitte mit Kontext. ` +
     `Wenn die Aufgabe zu gross ist, schliesse sie nicht voreilig ab; liefere echten Fortschritt und einen naechsten Schritt. ` +
     `Bei einem reinen Due-Signal, dessen einziger offener Schritt bereits in einer bestehenden Asana-Story als Abhaengigkeit von einem anderen offenen Task belegt ist, vermeide einen doppelten Kommentar. Melde blocked/no_action und setze linked_task_gid und evidence_story_gid auf die direkt nachgelesenen GIDs. Ohne diesen Beleg dokumentiere den Blocker im aktuellen Task; ein stiller No-Write-Ausgang wird zur Operations-Pruefung eskaliert. ` +
@@ -277,14 +279,15 @@ async function runCodex(claim, task, route, store, dbPath, codexBinary) {
 }
 
 export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
-  resolveBinary = resolveCodexBinary, connect = connectMcpClient } = {}) {
+  resolveBinary = resolveCodexBinary, connect = connectMcpClient,
+  coordinationReady = true, readHealth = readMaterialCommentStoreHealth } = {}) {
   // A missing application bundle must not claim a task or create a stale lease.
   let codexBinary;
   try { codexBinary = resolveBinary(); }
   catch (error) { return { status: "preflight_blocked", reason: String(error.message || error) }; }
   const store = new AsanaDispatchStore(db);
   const runId = randomUUID().replaceAll("-", "");
-  const claim = store.claimNext(runId, { agentId: selectedAgentId, maxActiveAgents: 2 });
+  const claim = store.claimNext(runId, { agentId: selectedAgentId, maxActiveAgents: 2, coordinationReady });
   if (!claim) { store.close(); return { status: "idle" }; }
   const agentId = claim.signals[0].agent_id;
   const taskGid = claim.signals[0].task_gid;
@@ -312,6 +315,16 @@ export async function workOnce({ db = DEFAULT_DB_PATH, selectedAgentId = null,
       store.settle(claim, { outcome: "acknowledged" });
       store.recordRun(claim, { state: "completed" });
       return { status: "stale_acknowledged", run_id: runId, agent_id: agentId, task_gid: taskGid };
+    }
+    if (needsMaterialCommentStorePreflight(relevantSignals, before)) {
+      let health;
+      try { health = await readHealth(); } catch { health = { ready: false }; }
+      if (health?.ready !== true) {
+        const reason = "Material-comment store unavailable before model start";
+        store.settle(claim, { outcome: "retry_after", error: reason, coordinationPreflight: true });
+        return { status: "coordination_retry_after", run_id: runId, agent_id: agentId,
+          task_gid: taskGid, model_started: false };
+      }
     }
     claim.resume_context = resumeContextForClaim(store, claim);
     const route = await selectModel(agentId, before);
@@ -416,6 +429,7 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
   const dbArg = process.argv.slice(2).find((arg) => arg.startsWith("--db="));
   const agentArg = process.argv.slice(2).find((arg) => arg.startsWith("--agent="));
   workOnce({ db: dbArg ? dbArg.slice(5) : DEFAULT_DB_PATH,
+    coordinationReady: !process.argv.includes("--coordination-unavailable"),
     selectedAgentId: agentArg ? agentArg.slice(8) : null })
     .then((result) => { console.log(JSON.stringify(result)); if (result.status === "needs_reconciliation") process.exitCode = 2; })
     .catch((error) => { console.error(error); process.exitCode = 1; });

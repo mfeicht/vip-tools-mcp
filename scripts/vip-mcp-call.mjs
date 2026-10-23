@@ -412,6 +412,49 @@ async function recordToolTransportFailure(error, tool) {
   }
 }
 
+// Fixed public readiness endpoint, sharing the MCP mutex and cooldown. A poll
+// defers during cooldown instead of introducing another connection/retry tier.
+export async function readMaterialCommentStoreHealth({ request = fetch } = {}) {
+  const lock = await acquireConnectLock();
+  try {
+    const current = await readJson(TRANSPORT_STATE_PATH, {});
+    if (Date.parse(current.cooldownUntil || "") > Date.now())
+      return { ready: false, reason: "shared_cooldown", cooldown_until: current.cooldownUntil };
+    await waitForSharedTransportWindow();
+    await recordTransportState({ lastConnectAttemptAt: new Date().toISOString() });
+    let response;
+    try {
+      response = await request("https://vip-tools-mcp.onrender.com/material-comment-store/health", {
+        method: "GET", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(38_000)
+      });
+      const reader = response.body.getReader();
+      let size = 0;
+      const chunks = [];
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > 32768) throw new Error("Health response exceeds limit");
+          chunks.push(Buffer.from(value));
+        }
+      } finally { await reader.cancel().catch(() => {}); }
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (response.status === 429 || response.headers.get("cf-mitigated") === "challenge" ||
+          /just a moment|managed challenge/i.test(body)) {
+        await recordTransportState({ cooldownUntil: new Date(Date.now() + RATE_LIMIT_COOLDOWN_MS).toISOString() });
+        return { ready: false, reason: "shared_cooldown", status: response.status };
+      }
+      if (!response.ok) return { ready: false, reason: "http_error", status: response.status };
+      const data = JSON.parse(body);
+      return { ready: data?.ready === true, reason: data?.ready === true ? "ready" : "store_not_ready",
+        status: response.status };
+    } catch {
+      return { ready: false, reason: "health_read_failed", status: response?.status ?? null };
+    }
+  } finally { await releaseConnectLock(lock); }
+}
+
 export async function callToolOnce(client, tool, args, timeoutMs, recordFailure = recordToolTransportFailure) {
   try {
     const result = await withTimeout(client.callTool({ name: tool, arguments: args }, undefined,

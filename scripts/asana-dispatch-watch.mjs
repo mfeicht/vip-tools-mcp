@@ -6,6 +6,7 @@ import { AsanaDispatchStore, DEFAULT_DB_PATH } from "./asana-dispatch-store.mjs"
 import { poll } from "./asana-dispatch-poller.mjs";
 import { reconcileCompletedRuns } from "./asana-dispatch-reconcile.mjs";
 import { reconcileManualLeases } from "./asana-manual-lease-reconcile.mjs";
+import { readMaterialCommentStoreHealth } from "./vip-mcp-call.mjs";
 
 const HEALTH_PATH = path.join(path.dirname(DEFAULT_DB_PATH), "Asana-Dispatch-Health.json");
 const LOG_PATH = path.join(path.dirname(DEFAULT_DB_PATH), "Asana-Dispatch-Workers.log");
@@ -17,20 +18,21 @@ async function saveHealth(health) {
   await fs.rename(temporary, HEALTH_PATH);
 }
 
-async function launchWorkers(store, maximum = 2) {
+async function launchWorkers(store, maximum = 2, coordinationReady = true) {
   if (!Number.isSafeInteger(maximum) || maximum < 0 || maximum > 2) throw new Error("Invalid worker limit");
   if (store.dispatchMaintenance()) return 0;
   const active = store.activeLeases().filter((lease) =>
     lease.key.startsWith("agent:"));
   const slots = Math.max(0, maximum - active.length);
   store.transaction(()=>store.normalizeContinuations());
-  const agents = store.readyAgentIds(Date.now(),slots);
+  const agents = store.readyAgentIds(Date.now(),slots,coordinationReady);
   const count = agents.length;
   if (count === 0) return 0;
   const log = await fs.open(LOG_PATH, "a", 0o600);
   try {
     for (const agent of agents) {
-      const child = spawn(NODE, [path.join(import.meta.dirname, "asana-dispatch-worker.mjs"),`--agent=${agent}`], {
+      const child = spawn(NODE, [path.join(import.meta.dirname, "asana-dispatch-worker.mjs"),`--agent=${agent}`,
+        ...(coordinationReady ? [] : ["--coordination-unavailable"])], {
         cwd: path.resolve(import.meta.dirname, ".."),
         detached: true, stdio: ["ignore", log.fd, log.fd], env: { ...process.env }
       });
@@ -40,6 +42,16 @@ async function launchWorkers(store, maximum = 2) {
     await log.close();
   }
   return count;
+}
+
+export async function coordinationPrestartGate(store, readHealth = readMaterialCommentStoreHealth) {
+  const candidates = store.coordinationBlockedCount();
+  if (!candidates) return { ready: true, checked: false, blocked_signals: 0 };
+  let health;
+  try { health = await readHealth(); }
+  catch { health = { ready: false, reason: "health_read_failed" }; }
+  return { ...health, ready: health?.ready === true, checked: true,
+    blocked_signals: health?.ready === true ? 0 : candidates };
 }
 
 export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
@@ -75,7 +87,8 @@ export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
         (SELECT 1 FROM leases a WHERE a.run_id=t.run_id AND a.key LIKE 'agent:%')`).get().n;
     health.stalled_runs = store.stalledRuns().length;
     if (dispatch && pollHealthy && !health.errors.length) {
-      health.workers_started = await launchWorkers(store, maxWorkers);
+      health.coordination_prestart = await coordinationPrestartGate(store);
+      health.workers_started = await launchWorkers(store, maxWorkers, health.coordination_prestart.ready);
     }
   } catch (error) {
     health.errors.push({ source: "dispatch", error: String(error?.message || error).slice(0, 500) });
@@ -85,7 +98,8 @@ export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
   health.finished_at = new Date().toISOString();
   health.duration_ms = Date.now() - start;
   health.status = health.errors.length ? "degraded" :
-    health.stale_leases || health.stalled_runs || health.counts.dead_letter ? "attention" : "ok";
+    health.stale_leases || health.stalled_runs || health.counts.dead_letter ||
+      health.coordination_prestart?.ready === false ? "attention" : "ok";
   let metricsStore;
   try {
     metricsStore = new AsanaDispatchStore();

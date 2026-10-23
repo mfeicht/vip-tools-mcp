@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { collectWorkerProcessReadback } from "./asana-worker-process-readback.mjs";
 import { decideManualLeaseReconciliation } from "./asana-manual-lease-decision.mjs";
+import { coordinationSelectionSql } from "./asana-dispatch-coordination.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
 export const DEFAULT_DB_PATH = path.join(
@@ -184,7 +185,7 @@ export class AsanaDispatchStore {
     }
     for (const [table, column] of [["runs", "last_reconcile_check_at_ms"], ["manual_runs", "agent_released_at_ms"],
       ["manual_run_tasks", "resolved_at_ms"], ["task_observations", "stories_checked_at_ms"],
-      ["task_observations", "history_checked_at_ms"]]) {
+      ["task_observations", "history_checked_at_ms"], ["signals", "requires_coordination"]]) {
       if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === column))
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} INTEGER`);
     }
@@ -217,11 +218,17 @@ export class AsanaDispatchStore {
     const availableAt = assertTime(signal.available_at_ms ?? now, "signal.available_at_ms");
     const priority = Number(signal.priority ?? 0);
     if (!Number.isSafeInteger(priority) || priority < 0 || priority > 100) throw new Error("signal.priority is invalid");
-    return this.db.prepare(`
+    const inserted = this.db.prepare(`
       INSERT OR IGNORE INTO signals
         (id,agent_id,task_gid,story_gid,source_version,kind,priority,available_at_ms,status,created_at_ms,updated_at_ms)
       VALUES (?,?,?,?,?,?,?,?, 'pending',?,?)
     `).run(id, agentId, taskGid, storyGid, sourceVersion, kind, priority, availableAt, now, now).changes === 1;
+    if (typeof signal.requires_coordination === "boolean") {
+      this.db.prepare(`UPDATE signals SET requires_coordination=? WHERE id=? AND agent_id=?
+        AND task_gid=? AND source_version=? AND kind=? AND status IN ('pending','retry_after')`)
+        .run(Number(signal.requires_coordination), id, agentId, taskGid, sourceVersion, kind);
+    }
+    return inserted;
   }
 
   observation(agentId, taskGid) {
@@ -797,7 +804,8 @@ export class AsanaDispatchStore {
     });
   }
 
-  claimNext(runId, { now = Date.now(), ttlMs = 20 * 60_000, agentId = null, maxActiveAgents = null } = {}) {
+  claimNext(runId, { now = Date.now(), ttlMs = 20 * 60_000, agentId = null, maxActiveAgents = null,
+    coordinationReady = true } = {}) {
     assertId(runId, "run_id");
     if (agentId) assertId(agentId, "agent_id");
     if(maxActiveAgents !== null && (!Number.isSafeInteger(maxActiveAgents) || maxActiveAgents<1 || maxActiveAgents>2))
@@ -808,13 +816,14 @@ export class AsanaDispatchStore {
         return null;
       this.normalizeContinuations(now);
       const candidates = this.db.prepare(`
-        SELECT * FROM signals WHERE status IN ('pending','retry_after') AND available_at_ms <= ?
+        SELECT * FROM signals WHERE status IN ('pending','retry_after') AND available_at_ms <= :now
           AND kind != 'new_assigned_task'
-          AND (? IS NULL OR agent_id = ?)
+          AND (:agentId IS NULL OR agent_id = :agentId)
+          AND (:coordinationReady=1 OR (${coordinationSelectionSql}))
           AND NOT EXISTS (SELECT 1 FROM leases WHERE key='agent:'||signals.agent_id)
           AND NOT EXISTS (SELECT 1 FROM leases WHERE key='task:'||signals.task_gid)
         ORDER BY priority DESC, available_at_ms, created_at_ms LIMIT 100
-      `).all(now, agentId, agentId);
+      `).all({ now, agentId, coordinationReady: Number(coordinationReady === true) });
       for (const candidate of candidates) {
         const agentLease = this.acquireLeaseInTransaction(`agent:${candidate.agent_id}`, runId, ttlMs, now);
         if (!agentLease) continue;
@@ -845,12 +854,14 @@ export class AsanaDispatchStore {
   }
 
   settle(claim, { outcome, error = null, now = Date.now(), maxAttempts = 5,
-    dependencyWatch = null, continuation = null, transientPreflight = false } = {}) {
+    dependencyWatch = null, continuation = null, transientPreflight = false,
+    coordinationPreflight = false } = {}) {
     if (!claim?.signals?.length || !["acknowledged", "retry_after", "dead_letter"].includes(outcome)) {
       throw new Error("invalid settlement");
     }
     return this.transaction(() => {
-      if (transientPreflight) {
+      const preflightDeferral = transientPreflight || coordinationPreflight;
+      if (preflightDeferral) {
         const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(claim.run_id);
         if (outcome !== "retry_after" || run?.state !== "claimed" ||
             run.launch_phase !== "preflight" || run.thread_id || run.turn_id) {
@@ -874,13 +885,13 @@ export class AsanaDispatchStore {
             current.lease_token !== claim.task_lease.token || current.lease_fence !== claim.task_lease.fence) {
           throw new Error("signal claim changed");
         }
-        const next = outcome === "retry_after" && !transientPreflight && current.attempts >= maxAttempts ? "dead_letter" : outcome;
-        const delay = transientPreflight ? 15 * 60_000 : Math.min(60 * 60_000, 60_000 * (2 ** Math.max(0, current.attempts - 1)));
+        const next = outcome === "retry_after" && !preflightDeferral && current.attempts >= maxAttempts ? "dead_letter" : outcome;
+        const delay = coordinationPreflight ? 5 * 60_000 : transientPreflight ? 15 * 60_000 : Math.min(60 * 60_000, 60_000 * (2 ** Math.max(0, current.attempts - 1)));
         const availableAt = next === "retry_after" ? now + delay : now;
         this.db.prepare(`UPDATE signals SET status=?, available_at_ms=?, run_id=NULL,
           lease_token=NULL, lease_fence=NULL, updated_at_ms=?, last_error=?, attempts=? WHERE id=?`)
           .run(next, availableAt, now, error ? String(error).slice(0, 500) : null,
-            transientPreflight ? Math.max(0,current.attempts-1) : current.attempts, signal.id);
+            preflightDeferral ? Math.max(0,current.attempts-1) : current.attempts, signal.id);
       }
       if (dependencyWatch) {
         if (outcome !== "acknowledged" ||
@@ -1122,14 +1133,25 @@ export class AsanaDispatchStore {
     this.normalizeContinuations(now);
   }
 
-  readyAgentIds(now = Date.now(), limit = 2) {
+  coordinationBlockedCount(now = Date.now()) {
+    return this.db.prepare(`SELECT COUNT(*) AS n FROM signals
+      WHERE status IN ('pending','retry_after') AND available_at_ms<=:now
+      AND kind!='new_assigned_task' AND NOT (${coordinationSelectionSql})
+      AND NOT EXISTS(SELECT 1 FROM leases WHERE key='agent:'||signals.agent_id)
+      AND NOT EXISTS(SELECT 1 FROM leases WHERE key='task:'||signals.task_gid)`)
+      .get({now}).n;
+  }
+
+  readyAgentIds(now = Date.now(), limit = 2, coordinationReady = true) {
     if(!Number.isSafeInteger(limit)||limit<0||limit>2) throw new Error("Worker limit must be zero to two");
     return this.db.prepare(`SELECT agent_id,MAX(priority) AS priority,MIN(created_at_ms) AS created
-      FROM signals WHERE status IN ('pending','retry_after') AND available_at_ms<=?
+      FROM signals WHERE status IN ('pending','retry_after') AND available_at_ms<=:now
+      AND (:coordinationReady=1 OR (${coordinationSelectionSql}))
       AND kind != 'new_assigned_task'
       AND NOT EXISTS(SELECT 1 FROM leases WHERE key='agent:'||signals.agent_id)
       AND NOT EXISTS(SELECT 1 FROM leases WHERE key='task:'||signals.task_gid)
-      GROUP BY agent_id ORDER BY priority DESC,created,agent_id LIMIT ?`).all(now,limit).map(row=>row.agent_id);
+      GROUP BY agent_id ORDER BY priority DESC,created,agent_id LIMIT :limit`)
+      .all({now,limit,coordinationReady:Number(coordinationReady === true)}).map(row=>row.agent_id);
   }
 
   claimForRun(runId) {
