@@ -14704,6 +14704,7 @@ function createServer() {
                   `Routine-Kommentar-Idempotenz blockiert (${routine_material_comment_idempotency.status}). Nutze den bereits vorhandenen Evidenzkommentar ${routine_material_comment_idempotency.prior_material_story_gids.join(
                     ", "
                   ) || "-"} als final_comment_story_gid. Nur eine echte Korrektur darf mit supersedes_story_gid auf genau diesen Kommentar verweisen.`
+                  + (routineNoFollowUpStatus ? " Dieser Status enthält zusätzlich Ergebnis-/Readback-Sprache. Wenn ausschließlich der sichtbare Follow-up-Entscheid fehlt: comment_kind=status, Titel Follow-up-Entscheid, ein Absatz 'Keine gesonderte Folgeaufgabe oder Nacharbeit erforderlich.'; vorhandene Ergebnisstory und aktuelle Entscheidungsbelege ausschließlich im evidence-Block referenzieren. Keine Ergebniswiederholung, keine Erfolgssprache und keine Mention im Statuskörper. Danach die neue Status-GID als final_comment_story_gid verwenden. Nur bei tatsächlich fehlender Nacharbeit; bestehender sichtbarer Entscheid und echte offene Arbeit bleiben gesperrt." : "")
                 );
               }
             }
