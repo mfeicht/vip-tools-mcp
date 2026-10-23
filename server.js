@@ -15514,7 +15514,7 @@ function createServer() {
 
   server.tool(
     "asana_verify_next_routine_instance",
-    "Verifiziert read-only nach einem Routine-Abschluss, ob Asana eine passende naechste offene Routine-Instanz erzeugt hat. Nutze dieses Tool, bevor ein Agent behauptet, Wiederholung/Fortsetzung sei korrekt. Fehlender Default-Supervisor/Moritz auf Routine-Folgeinstanzen wird standardmaessig als moeglicher do_not_readd-Fall nur gewarnt.",
+    "Verifiziert read-only NACH einem Routine-Abschluss die native Folgeinstanz. Vor Abschluss liefert source_not_completed nur die falsche Aufrufreihenfolge: keine abgelaufene Generierungsfrist und kein Abschlussblocker. Erst den fachlich fertigen Quelltask unter seinen Gates abschließen, dann dieses Tool aufrufen. Kein manueller Ersatztask. Fehlender Default-Supervisor/Moritz wird als möglicher do_not_readd-Fall nur gewarnt.",
     {
       agent_id: agentIdSchema,
       source_task_gid: z.string(),
@@ -15579,6 +15579,31 @@ function createServer() {
         params: { opt_fields: ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS }
       });
       const source_task = sourceRes.data.data;
+      if (String(source_task?.gid || "") !== source_task_gid ||
+          typeof source_task.completed !== "boolean") {
+        throw new Error("Ungültiger Quelltask-Readback für die Folgeinstanz-Prüfung.");
+      }
+      if (source_task.completed === false) {
+        return out({
+          agent_id, source_task_gid, source_task,
+          verification_status: "source_not_completed",
+          incident_classification: "pre_completion_check_not_applicable",
+          verification_phase: "before_source_completion",
+          search_attempt_count: 0, candidate_search_performed: false,
+          candidate_count: null, exact_match_count: null, acceptable_match_count: null,
+          candidates: [], recheck_used: false, generation_grace_active: false,
+          generation_grace_started: false, source_completed_at: null,
+          source_completion_age_seconds: null, next_recheck_after_seconds: null,
+          alert_task_creation_allowed: false, production_ready_claim_allowed: false,
+          source_completion_blocked_by_this_check: false,
+          next_action: "complete_source_under_existing_gates_then_verify_next_instance",
+          note: "Der Quelltask ist noch offen. Die native Folgeinstanz entsteht erst durch seinen Abschluss; " +
+            "die Generierungsfrist hat noch nicht begonnen. Das ist kein fehlender Nachfolger und kein Abschlussblocker. " +
+            "Nur wenn der fachliche Scope vollständig belegt ist: Due-, Lock-, Evidenz- und Follow-up-Gates prüfen, " +
+            "asana_complete_task ausführen, Abschluss readback-prüfen und DANACH die Folgeinstanz verifizieren. " +
+            "Keine Ersatzaufgabe, keinen Fehlalarm und keine wiederholten Vorabschluss-Suchen erzeugen."
+        });
+      }
       const projectGids = getAsanaTaskProjectGids(source_task);
       const selectedProjectGid = expected_project_gid || projectGids[0];
       if (!selectedProjectGid) {
@@ -15724,7 +15749,9 @@ function createServer() {
                 ? "Die belastbare Zweitsuche ist technisch nicht verfuegbar. Keinen Fehlalarm oder Orchestrierungstask erzeugen; spaeter erneut pruefen."
                 : candidateContractRecheckRequired
                   ? "Eine Folgeinstanz existiert, aber der erwartete Vertrag passt nicht. Erst mit den realen Kandidatenwerten erneut pruefen; nicht als fehlende Folgeinstanz melden."
-                  : "Nach abgelaufener Asana-Generierungsfrist und belastbarer Projekt-/Workspace-Suche fehlt weiterhin eine passende Folgeinstanz. Ein deduplizierter Orchestrierungsalarm ist jetzt erlaubt."
+                  : alertTaskCreationAllowed
+                    ? "Nach abgelaufener Asana-Generierungsfrist und belastbarer Projekt-/Workspace-Suche fehlt weiterhin eine passende Folgeinstanz. Ein deduplizierter Orchestrierungsalarm ist jetzt erlaubt."
+                    : "Die Folgeinstanz-Prüfung ist nicht eindeutig. Vorhandene Kandidaten und Vertrag prüfen; kein Fehlalarm für einen angeblich fehlenden Nachfolger und keine Ersatzaufgabe."
       });
     }
   );

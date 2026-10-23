@@ -40,7 +40,7 @@ export function taskSignal(agentId, task, { firstSeen, now = new Date() } = {}) 
   return {
     id: signalId(agentId, String(task.gid), kind, version), agent_id: agentId,
     task_gid: String(task.gid), source_version: signalId(agentId, String(task.gid), "version", version),
-    kind, priority: due ? 60 : 45
+    kind, priority: due ? 60 : 45, requires_coordination: due && routine
   };
 }
 
