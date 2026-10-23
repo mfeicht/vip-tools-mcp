@@ -92,3 +92,20 @@ test("dispatch answer comes only from final native assistant item with exact sch
     {text:JSON.stringify({...answer,evidence_story_gid:222})},{text:JSON.stringify({...answer,extra:true})}])
     assert.equal(dispatchAnswerFromItems([{item:{...item,...patch}}]),null);
 });
+
+test("capacity refusal is resumable only with one user input and zero executable activity",async()=>{
+  const {capacityFailedWithoutWork}=await import('./asana-manual-lease-readback.mjs');
+  const turn={status:'failed',completedAt:1792738322,
+    error:{message:'Selected model is at capacity. Please try a different model.'}};
+  const entries=[{item:{type:'userMessage',id:'u'}},{item:{type:'reasoning',id:'r'}},
+    {item:{type:'agentMessage',id:'a',phase:'commentary'}}];
+  assert.equal(capacityFailedWithoutWork(turn,entries),true);
+  for(const item of [{type:'commandExecution',status:'completed',exitCode:0},
+    {type:'mcpToolCall',status:'completed'},{type:'fileChange'},
+    {type:'agentMessage',phase:'final_answer'},{type:'unknownTool'},{type:'userMessage'}])
+    assert.equal(capacityFailedWithoutWork(turn,[...entries,{item}]),false);
+  for(const patch of [{status:'completed'},{completedAt:null},{error:{message:'network failure'}}])
+    assert.equal(capacityFailedWithoutWork({...turn,...patch},entries),false);
+  assert.equal(capacityFailedWithoutWork(turn,[]),false);
+  assert.equal(capacityFailedWithoutWork(turn,entries.slice(1)),false);
+});

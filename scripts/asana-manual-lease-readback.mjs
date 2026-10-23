@@ -24,6 +24,21 @@ export function dispatchAnswerFromItems(entries) {
   return answer;
 }
 
+export function capacityFailedWithoutWork(turn, entries) {
+  if (turn?.status !== "failed" || timestamp(turn.completedAt) === null ||
+      turn.error?.message !== "Selected model is at capacity. Please try a different model." ||
+      !Array.isArray(entries) || !entries.length) return false;
+  let users = 0;
+  for (const {item} of entries) {
+    if (item?.type === "userMessage") { users++; continue; }
+    if (item?.type === "reasoning") continue;
+    if (item?.type === "agentMessage" && item.phase === "commentary") continue;
+    // Unknown items and even read-only commands/tools fail closed here.
+    return false;
+  }
+  return users === 1;
+}
+
 export function boundedReadClients(rpc, client, now = () => Date.now()) {
   const deadline=now()+120000;
   const remaining=()=>{
@@ -102,7 +117,8 @@ async function readNative(run, rpc, mode) {
     started_at_ms: timestamp(turn.startedAt), completed_at_ms: timestamp(turn.completedAt),
     activity_digest: digest(entries.map((entry) => entry.item)),
     activity_item_count: entries.length, activity_last_item_id: entries[0].item.id,
-    ...(mode === "dispatch" ? { answer: dispatchAnswerFromItems(entries) } : {})
+    ...(mode === "dispatch" ? { answer: dispatchAnswerFromItems(entries),
+      capacity_failed_without_work: capacityFailedWithoutWork(turn, entries) } : {})
   };
 }
 

@@ -27,7 +27,8 @@ export async function readDispatchRecovery(snapshot, { rpc, client,
   if(!/^\d+$/.test(ownGid || "")) throw new Error("Recovery owner identity unavailable");
   const native = [], asana = [], processes = [];
   for (let pass = 0; pass < 2; pass++) {
-    if (pass) await wait(native[0].completed_at_ms === null ? 30000 : 1100);
+    if (pass) await wait(native[0].completed_at_ms === null ||
+      native[0].capacity_failed_without_work === true ? 30000 : 1100);
     native.push(await readNative(run, rpc));
     processes.push(scan(run));
     asana.push(await readTask(run, { task_gid: run.task_gid }, client));
@@ -140,6 +141,16 @@ export function decideDispatchRecovery(snapshot, proof, scan, now = Date.now()) 
     return hold("asana_readback_unverified");
   }
   const open = !missingEnd ? documentedOpenRecovery(run,proof) : null;
+  const noWorkCapacity = !missingEnd && native[1].turn_status === "failed" &&
+    native[1].capacity_failed_without_work === true && native[1].answer === null &&
+    native[1].observed_at_ms - native[0].observed_at_ms >= 30000 &&
+    /^\d+$/.test(proof.ownGid || "") && asana[1].task.completed === false &&
+    asana[1].task.assignee?.gid === proof.ownGid &&
+    Date.parse(asana[1].task.modified_at) <= run.started_at_ms &&
+    !asana[1].stories.some(story => Date.parse(story.created_at) >= run.started_at_ms);
+  if (noWorkCapacity) return {action: "retry_after", reason: "capacity_failed_without_work",
+    delay_ms: 900000, preserve_attempts: true, task_completed: false,
+    release_agent: Boolean(agent), turn_id: native[1].turn_id};
   return { action: !missingEnd && (asana[1].task.completed || open) ? "acknowledge" : "quarantine",
     reason: open ? "documented_open_task" : missingEnd ? "missing_end_agent_only_quarantine" : "terminal_verified",
     open,
@@ -158,7 +169,14 @@ export function applyDispatchRecovery(store, snapshot, proof, {
     const decision = decideDispatchRecovery(snapshot, proof, processReadback, now);
     if (decision.action === "hold") return decision;
     const { run, leases, signals } = snapshot;
-    if (decision.action === "acknowledge") {
+    if (decision.action === "retry_after") {
+      // Only a fully observed terminal capacity refusal with no work can enter
+      // this path. Do not consume another attempt or replay a possible write.
+      for (const signal of signals) store.db.prepare(`UPDATE signals SET status='retry_after',
+        available_at_ms=?,run_id=NULL,lease_token=NULL,lease_fence=NULL,updated_at_ms=?,last_error=? WHERE id=?`)
+        .run(now+decision.delay_ms,now,`Native capacity refusal before any work; proof=${digest(proof)}`,signal.id);
+      for (const lease of leases) if (!store.releaseLease(lease)) throw new Error("Recovery lease changed");
+    } else if (decision.action === "acknowledge") {
       for (const signal of signals) store.db.prepare(`UPDATE signals SET status='acknowledged',
         run_id=NULL,lease_token=NULL,lease_fence=NULL,updated_at_ms=?,last_error=? WHERE id=?`)
         .run(now, `Stable native terminal and ${decision.open ? "documented open-task result" : "Asana completion"}; proof=${digest(proof)}`, signal.id);
@@ -173,7 +191,7 @@ export function applyDispatchRecovery(store, snapshot, proof, {
       if (agent && !store.releaseLease(agent)) throw new Error("Recovery agent changed");
     }
     store.db.prepare(`UPDATE runs SET state=?,turn_id=?,updated_at_ms=?,last_error=?,last_reconcile_check_at_ms=? WHERE run_id=?`)
-      .run(decision.action === "acknowledge" ? "completed" : "needs_reconciliation",
+      .run(decision.action !== "quarantine" ? "completed" : "needs_reconciliation",
         decision.turn_id, now, `Terminal recovery ${decision.action}; proof=${digest(proof)}`, now, run.run_id);
     store.db.prepare("INSERT INTO recovery_events(run_id,observed_at_ms,kind,evidence_json) VALUES (?,?,?,?)")
       .run(run.run_id,now,"dispatch",JSON.stringify({snapshot,proof,processReadback,decision}));

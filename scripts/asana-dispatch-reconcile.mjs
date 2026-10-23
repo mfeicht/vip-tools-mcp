@@ -66,7 +66,7 @@ export async function reconcileCompletedRuns(store, {
     .sort((a,b) => (a.last_reconcile_check_at_ms ?? a.started_at_ms) -
       (b.last_reconcile_check_at_ms ?? b.started_at_ms)).slice(0,limit);
   const result = { checked:0, acknowledged:0, still_open:0, held:0,
-    preflight_retried:0, preflight_unverified:0, archived:0, errors:[], blocked_runs:[] };
+    preflight_retried:0, preflight_unverified:0, capacity_retried:0, archived:0, errors:[], blocked_runs:[] };
   const pending = [];
   for (const run of runs) {
     if (run.state !== "claimed" && !run.thread_id) {
@@ -101,6 +101,7 @@ export async function reconcileCompletedRuns(store, {
         const proof = await read(snapshot, {rpc,client});
         const decision = apply(store,snapshot,proof,{now:now()});
         if (decision.action === "acknowledge") result.acknowledged++;
+        else if (decision.action === "retry_after") result.capacity_retried++;
         else if (decision.action === "quarantine") result.still_open++;
         else {result.held++;result.blocked_runs.push({run_id:selected.run_id,reason:decision.reason});}
       } catch(error) {
