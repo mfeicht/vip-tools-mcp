@@ -215,6 +215,30 @@ const communicationNoFollowUpStory = {
   created_by: { gid: "1214979008900132" },
   text: "Keine separate fachliche Folgeaufgabe oder Nacharbeit ist nötig.\nEvidenz / Verifikation\nBCC-Cursor und Profil zurückgelesen."
 };
+// Communication routine 1219805658467580: the first decision carried an
+// evidence gap, then story 1219859533177568 corrected the classification.
+// That correction must be usable as the final story without a second status.
+const communicationCorrectedDecision = {
+  gid: "1219859533177568",
+  created_by: { gid: "1214979008900132" },
+  text: "Korrektur zur Follow-up-Klassifizierung\nEs wurde keine Live-E-Mail begonnen; keine gesonderte aktive Folgeaufgabe oder Nacharbeit außerhalb dieser Routineinstanz ist erforderlich.\nKorrektur zur bisherigen Story\nErsetzt Story 1219831707595226. Sachlicher Grund: Die nächste Asana-Routineinstanz ist der native Wiederholungsmechanismus dieser Routine und keine separate Follow-up-Aufgabe; eine künstliche Ersatzaufgabe ist gemäß aktuellem Aufgabenvertrag nicht zulässig.\nBisheriger Claim: Es wurde keine Live-E-Mail begonnen; die nächste native Tagesinstanz führt die Prüfung fort.\nKorrigierter Claim: Es wurde keine Live-E-Mail begonnen; keine gesonderte aktive Folgeaufgabe oder Nacharbeit außerhalb dieser Routineinstanz ist erforderlich.\nEvidenz / Verifikation\nKeine Live-E-Mail wurde begonnen; der begrenzte Tagesumfang ist belegt."
+};
+assert.equal(hasRoutineNoFollowUpDecision(communicationCorrectedDecision.text), true);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: communicationCorrectedDecision, hasFollowUpTask: false
+}).ok, true);
+assert.equal(validateRoutineVisibleFollowUpStatus({
+  finalComment: { html_text: `<body><p>${communicationCorrectedDecision.text}</p></body>` },
+  hasFollowUpTask: false
+}).ok, true);
+assert.equal(inspectRoutineNoFollowUpStatusIdempotency({
+  stories: [communicationCorrectedDecision],
+  agentUserGid: "1214979008900132",
+  proposedText: "Follow-up-Entscheid\nKeine gesonderte Folgeaufgabe oder Nacharbeit erforderlich."
+}).allowed, false);
+assert.equal(detectRoutineFollowUpSignals({
+  finalComment: { text: `${communicationCorrectedDecision.text}\nDie technische Nacharbeit bleibt offen.` }
+}).blocked_without_follow_up_task, true);
 assert.equal(hasRoutineNoFollowUpDecision(communicationNoFollowUpStory.text), true);
 assert.equal(detectRoutineFollowUpSignals({ finalComment: communicationNoFollowUpStory }).no_follow_up_claim, true);
 assert.equal(validateRoutineVisibleFollowUpStatus({
