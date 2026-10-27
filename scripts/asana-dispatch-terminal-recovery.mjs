@@ -50,8 +50,11 @@ export function documentedOpenRecovery(run, proof) {
     typeof story.text === "string" && story.text.trim().length >= 20 &&
     Date.parse(story.created_at) >= run.started_at_ms &&
     Date.parse(story.created_at) <= native.completed_at_ms &&
-    (answer.evidence_story_gid === story.gid ||
-      new RegExp(`(^|\\D)${story.gid}(\\D|$)`).test(answer.summary)));
+    // A structured selection is authoritative; prose may also cite its
+    // predecessor. Never fall back from an invalid explicit selection.
+    (answer.evidence_story_gid != null
+      ? answer.evidence_story_gid === story.gid
+      : new RegExp(`(^|\\D)${story.gid}(\\D|$)`).test(answer.summary)));
   if(eligible.length !== 1) return null;
   const story=eligible[0];
   // A later response requires fresh work rather than settlement of the old run.
