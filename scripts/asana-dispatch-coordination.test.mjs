@@ -104,7 +104,7 @@ test('worker outage end-to-end stops before launch with complete task/story pref
   } finally {read.close();}
 });
 
-for(const scenario of ['ready','not-ready','503','challenge','oversize','invalid-json','cooldown']) {
+for(const scenario of ['ready','not-ready','503','suspended','challenge','oversize','invalid-json','cooldown']) {
   test(`public health ${scenario}: fixed GET, no retry, shared mutex/cooldown`,t=>{
     const dir=fs.mkdtempSync(path.join(os.tmpdir(),'vip-health-'));
     t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
@@ -117,12 +117,14 @@ for(const scenario of ['ready','not-ready','503','challenge','oversize','invalid
         calls++;assert.equal(url,'https://vip-tools-mcp.onrender.com/material-comment-store/health');
         assert.equal(options.method,'GET');assert.equal(options.redirect,'error');assert.equal(options.headers,undefined);
         if(scenario==='503')return new Response('unavailable',{status:503});
+        if(scenario==='suspended')return new Response('<title>Service Suspended</title> This service has been suspended by its owner.',{status:503});
         if(scenario==='challenge')return new Response('Just a moment',{status:403});
         if(scenario==='oversize')return new Response('x'.repeat(32769));
         if(scenario==='invalid-json')return new Response('not json');
         return new Response(JSON.stringify({ready:scenario==='ready'}));
       }});
-      assert.equal(calls,scenario==='cooldown'?0:1);assert.equal(result.ready,scenario==='ready');`;
+      assert.equal(calls,scenario==='cooldown'?0:1);assert.equal(result.ready,scenario==='ready');
+      if(scenario==='suspended')assert.equal(result.reason,'remote_service_suspended');`;
     const child=spawnSync(process.execPath,['--input-type=module','-'],{input:code,encoding:'utf8',timeout:10000,
       env:{...process.env,VIP_MCP_COORDINATION_DIR:dir}});
     assert.equal(child.status,0,child.stderr);

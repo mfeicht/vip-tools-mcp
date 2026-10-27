@@ -194,7 +194,7 @@ export async function scanSnapshots(client, store, snapshots, agentUserGids, sca
     catch(error) {
       result.errors.push({agent_id:snapshot.agent_id,error:String(error?.message || error).slice(0,500)});
       // Stop this tick after transport failure. The next scheduled tick owns recovery.
-      if(["remote_rate_limited","cloudflare_managed_challenge","remote_mcp_transient_error",
+      if(["remote_rate_limited","cloudflare_managed_challenge","remote_mcp_transient_error","remote_service_suspended",
           "network_transport_error","dns_resolution_error","mcp_coordination_timeout"]
           .includes(classifyConnectionError(error))) break;
     }

@@ -8,6 +8,47 @@ import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamable
 import { parseArgs, classifyConnectionError, isTransientConnectionError,
   connectLockReclaimable, callToolOnce } from "./vip-mcp-call.mjs";
 
+const suspensionPage = '<title>Service Suspended</title><body>This service has been suspended by its owner.</body>';
+
+test("explicit 503 suspension is not retried, while generic 503 and authorization retain their meaning", () => {
+  for (const error of [new StreamableHTTPError(503, suspensionPage),
+    new Error(`mcp_connect: ${suspensionPage} (HTTP 503)`)]) {
+    assert.equal(classifyConnectionError(error), "remote_service_suspended");
+    assert.equal(isTransientConnectionError(error), false);
+  }
+  for (const body of ['Service Suspended', '<title>Service Suspended</title>',
+    'This service has been suspended by its owner.', 'temporarily unavailable']) {
+    assert.equal(isTransientConnectionError(new StreamableHTTPError(503, body)), true);
+  }
+  assert.equal(classifyConnectionError(new StreamableHTTPError(403, suspensionPage)), "remote_auth_or_permission_error");
+  assert.equal(classifyConnectionError(new StreamableHTTPError(429, suspensionPage)), "remote_rate_limited");
+  assert.notEqual(classifyConnectionError(new Error(suspensionPage)), "remote_service_suspended");
+});
+
+test("canonical suspension cycle attempts once, records a clear error and releases its mutex", t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vip-mcp-suspension-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const code = `
+    import assert from 'node:assert/strict';
+    import {connectWithRetry} from ${JSON.stringify(new URL('./vip-mcp-call.mjs', import.meta.url).href)};
+    let calls = 0;
+    await assert.rejects(connectWithRetry({attempts:3,delayMs:1,connectTimeoutMs:100}, async () => {
+      calls++; throw Object.assign(new Error(${JSON.stringify(suspensionPage)}), {code:503});
+    }));
+    assert.equal(calls, 1);
+  `;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-'], {
+    input:code, encoding:'utf8', timeout:10000,
+    env:{...process.env, VIP_MCP_COORDINATION_DIR:directory}
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(directory, 'state.json'), 'utf8'));
+  assert.equal(state.lastErrorClass, 'remote_service_suspended');
+  assert.match(state.lastError, /service restoration required/);
+  assert.doesNotMatch(state.lastError, /<title>/);
+  assert.equal(fs.existsSync(path.join(directory, 'connect.lock')), false);
+});
+
 test("CLI cannot expand the canonical retry budget or accept malformed numbers", () => {
   for (const value of ["4", "999", "3junk", "1.5", "Infinity", "0"]) {
     assert.throws(() => parseArgs(["--list-tools", "--attempts", value]));

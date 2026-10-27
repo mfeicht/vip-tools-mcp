@@ -135,8 +135,9 @@ export function documentedHumanWaitNoWrite(input) {
 }
 
 export function transientPreStartFailure(error) {
-  // Reuse the canonical classifier; no additional connection/retry loop.
-  return ["remote_mcp_transient_error", "network_transport_error", "dns_resolution_error",
+  // Infrastructure failures before launch defer the task without consuming its
+  // attempt budget. Suspension must not retry inside the connection cycle.
+  return ["remote_mcp_transient_error", "remote_service_suspended", "network_transport_error", "dns_resolution_error",
     "remote_rate_limited", "cloudflare_managed_challenge", "mcp_coordination_timeout"]
     .includes(classifyConnectionError(error));
 }
