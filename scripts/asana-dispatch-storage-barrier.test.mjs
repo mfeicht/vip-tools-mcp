@@ -29,6 +29,20 @@ test('maintenance appearing during connection open closes it before caller write
   finally{check.close();}
 });
 
+test('a connection delayed across the entire maintenance window is rejected',t=>{
+  const f=fixture(t);let connection;
+  fs.writeFileSync(f.barrier+'.epoch','before');
+  assert.throws(()=>openDispatchDatabase(f.database,{}, {...f,connect:(filename,options)=>{
+    connection=new DatabaseSync(filename,options);
+    fs.writeFileSync(f.barrier,'maintenance');
+    fs.writeFileSync(f.barrier+'.epoch','after');
+    fs.unlinkSync(f.barrier);
+    return connection;
+  }}),{code:'ASANA_DISPATCH_STORAGE_CHANGED'});
+  assert.throws(()=>connection.exec('CREATE TABLE forbidden (n INTEGER)'));
+  assert.equal(fs.existsSync(f.barrier),false);
+});
+
 test('recovery connections resolve aliases to the same WAL and fence',t=>{
   const f=fixture(t),alias=path.join(f.root,'alias.sqlite');
   const a=openDispatchDatabase(f.database,{},f);fs.symlinkSync(f.database,alias);

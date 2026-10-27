@@ -24,16 +24,27 @@ export function assertDispatchStorageAvailable(barrier = DISPATCH_STORAGE_BARRIE
   throw error;
 }
 
+export function dispatchStorageEpoch(barrier = DISPATCH_STORAGE_BARRIER) {
+  try { return fs.readFileSync(barrier + ".epoch", "utf8"); }
+  catch (error) { if (error.code === "ENOENT") return ""; throw error; }
+}
+
 export function openDispatchDatabase(filename, options = {}, {
   barrier = DISPATCH_STORAGE_BARRIER,
   connect = (resolved, opts) => new DatabaseSync(resolved, opts),
 } = {}) {
   assertDispatchStorageAvailable(barrier);
+  const epoch = dispatchStorageEpoch(barrier);
   const db = connect(localDatabasePath(filename), options);
   try {
     // Close the check/open race: a caller that passed the first check but was
     // delayed before open cannot initialize or mutate an obsolete database.
     assertDispatchStorageAvailable(barrier);
+    if (dispatchStorageEpoch(barrier) !== epoch) {
+      const error = new Error("Dispatch storage changed during connection open; retry through the canonical path");
+      error.code = "ASANA_DISPATCH_STORAGE_CHANGED";
+      throw error;
+    }
     return db;
   } catch (error) {
     db.close();
@@ -72,7 +83,6 @@ function assertTime(value, label) {
 
 export class AsanaDispatchStore {
   constructor(filename = DEFAULT_DB_PATH) {
-    filename = localDatabasePath(filename);
     fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
     this.db = openDispatchDatabase(filename);
     if (filename !== ":memory:") fs.chmodSync(filename, 0o600);
