@@ -10,6 +10,8 @@ import {AsanaDispatchStore} from './asana-dispatch-store.mjs';
 import {dispatchRecoverySnapshot} from './asana-dispatch-terminal-recovery.mjs';
 import {processScanBinding} from './asana-worker-process-readback.mjs';
 import {REVIEWED_INTAKES,intakeNativeObservation,decideReviewedIntake,applyReviewedIntake} from './asana-reviewed-intake-resume.mjs';
+// Full historical business payloads for the later incidents stay in local audit storage.
+const FIXTURE_CASES=REVIEWED_INTAKES.filter(t=>['regime','sales','crossdesk','sector'].includes(t.key));
 const fixtureData=t=>JSON.parse(fs.readFileSync(new URL('./fixtures/'+t.key+'-reviewed-intake-20261027.json',import.meta.url)));
 function fixture(ctx,t=REVIEWED_INTAKES[0]) {
  const now=Date.now(),store=new AsanaDispatchStore(':memory:');ctx.after(()=>store.close());
@@ -32,7 +34,7 @@ function fixture(ctx,t=REVIEWED_INTAKES[0]) {
  store.acquireManualAgent('vip-ai-operations','operator',context,now);store.acquireManualTask('operator',operator.task_gid,context,now);
  return {store,snapshot,proof,operator,now,scan,t,options:{operator,scan:()=>scan,now,verifyArtifacts:()=>{}}};
 }
-for(const t of REVIEWED_INTAKES)test(t.key+': exact historical fixture resumes only its signal, preserves attempts and owner work',ctx=>{
+for(const t of FIXTURE_CASES)test(t.key+': exact historical fixture resumes only its signal, preserves attempts and owner work',ctx=>{
  const f=fixture(ctx,t);assert.equal(applyReviewedIntake(f.store,f.snapshot,f.proof,f.options).action,'retry_after');
  assert.deepEqual(dispatchRecoverySnapshot(f.store,t.run_id),f.snapshot);
  const result=applyReviewedIntake(f.store,f.snapshot,f.proof,{...f.options,apply:true});
@@ -48,7 +50,7 @@ for(const t of REVIEWED_INTAKES)test(t.key+': exact historical fixture resumes o
   let checked=false;
   const context=resumeContextForClaim(f.store,{signals:f.snapshot.signals},{verifyPartial:(a,o)=>{assert.deepEqual(a,t.artifacts);assert.equal(o.includeOriginals,false);checked=true;}});
   assert.equal(checked,true);assert.match(resumePrompt(context),/Kein No-Effect-/);
-  assert.equal(context.artifacts.length,t.key==='sector'?4:3);
+  assert.equal(context.artifacts.length,t.artifacts.length);
  }
  assert.equal(applyReviewedIntake(f.store,f.snapshot,f.proof,{...f.options,apply:true}).reason,'recovery_fence_changed');
 });
@@ -125,14 +127,14 @@ test('unrelated remote work may progress while incident-bound coordination still
  }
 });
 
-for(const target of REVIEWED_INTAKES.filter(t=>t.partial)){
+for(const target of FIXTURE_CASES.filter(t=>t.partial)){
  test(target.key+': changed evidence receipt, signal binding or context blocks replacement worker',ctx=>{
   const f=fixture(ctx,target);applyReviewedIntake(f.store,f.snapshot,f.proof,{...f.options,apply:true});
   const original={...f.store.db.prepare('SELECT * FROM task_quarantine_resumptions').get()};
   const accepted=f.store.db.prepare('SELECT evidence_json FROM recovery_events').get().evidence_json;
   const claim={signals:f.snapshot.signals},opts={verifyPartial:()=>{}};
   for(const mutate of [c=>c.artifacts.pop(),c=>c.artifacts[0].path='/tmp/other',c=>c.artifacts[0].sha256='b'.repeat(64),
-   c=>c.next_step='changed',c=>c.agent_id='vip-ai-sales',c=>c.no_effect_claim=true,c=>c.old_run_id='unknown']){
+   c=>c.next_step='changed',c=>c.agent_id='invalid-agent',c=>c.no_effect_claim=true,c=>c.old_run_id='unknown']){
    const c=JSON.parse(original.context_json);mutate(c);
    f.store.db.prepare('UPDATE task_quarantine_resumptions SET context_json=?').run(JSON.stringify(c));
    assert.throws(()=>resumeContextForClaim(f.store,claim,opts));
@@ -171,5 +173,19 @@ test('reviewed registry rejects altered context even when receipt is altered con
  const c=reviewedPartialContext(t,record.evidence_sha256);verifyReviewedPartialContext(c,record,{verify:()=>{}});
  for(const edit of [x=>x.next_step='override',x=>x.artifacts=[],x=>x.disposition='completed',x=>x.schema='unknown']){
   const altered=structuredClone(c);edit(altered);assert.throws(()=>verifyReviewedPartialContext(altered,record,{verify:()=>{}}));
+ }
+});
+
+test('interrupted display cannot release an unreviewed claim',ctx=>{
+ const f=fixture(ctx);for(const n of f.proof.native){n.turn_status='interrupted';n.completed_at=null;n.error=null;}
+ assert.equal(decideReviewedIntake(f.snapshot,f.proof,f.scan,f.now).action,'hold');
+});
+for(const t of REVIEWED_INTAKES.filter(t=>['watcher','content','sales_umzug'].includes(t.key)))test(t.key+': only the pinned checkpoint context reaches its owner',()=>{
+ const record={old_run_id:t.run_id,task_gid:t.task_gid,agent_id:t.agent_id,evidence_sha256:'e'.repeat(64)};
+ const context=reviewedPartialContext(t,record.evidence_sha256);let count=0;
+ verifyReviewedPartialContext(context,record,{verify:(a,o)=>{assert.deepEqual(a,t.artifacts);assert.equal(o.includeOriginals,false);count++;}});
+ assert.equal(count,1);assert.equal(context.task_completed,false);assert.equal(context.no_effect_claim,false);
+ for(const change of [c=>c.next_step='unreviewed',c=>c.artifacts=[],c=>c.agent_id='wrong-owner',c=>c.old_run_id='another-run']){
+  const c=structuredClone(context);change(c);assert.throws(()=>verifyReviewedPartialContext(c,record,{verify:()=>{}}));
  }
 });
