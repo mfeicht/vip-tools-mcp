@@ -93,3 +93,21 @@ test('evaluation clock follows process observation',ctx=>{
  const f=fixture(ctx);let clock=f.now;ctx.mock.method(Date,'now',()=>clock);const {now,...options}=f.options;
  assert.equal(applyReviewedIntake(f.store,f.snapshot,f.proof,{...options,scan:()=>{clock+=40;return {...f.scan,observed_at_ms:clock};}}).action,'retry_after');
 });
+
+test('unrelated remote work may progress while incident-bound coordination still holds',ctx=>{
+ const f=fixture(ctx,REVIEWED_INTAKES[1]);
+ const foreign={key:'task:999',scope:'task',task_gid:'999',agent_id:'vip-ai-finance',run_id:'foreign',seconds_remaining:90};
+ f.proof.remote[0].active_locks=[foreign];f.proof.remote[1].active_locks=[{...foreign,seconds_remaining:50}];
+ assert.equal(decideReviewedIntake(f.snapshot,f.proof,f.scan,f.now).action,'retry_after');
+ for(const lock of [
+  {...foreign,run_id:f.t.run_id},
+  {...foreign,key:'task:'+f.t.task_gid,task_gid:f.t.task_gid},
+  {...foreign,key:'resource:'+f.t.resource_key,scope:'resource',task_gid:null,resource_key:f.t.resource_key},
+  {...foreign,scope:'unknown'},
+  {...foreign,key:'task:inconsistent'},
+  {...foreign,key:'resource:x',scope:'resource',resource_key:'y'}
+ ]){
+  const p=structuredClone(f.proof);p.remote[1].active_locks=[lock];
+  assert.equal(decideReviewedIntake(f.snapshot,p,f.scan,f.now).action,'hold');
+ }
+});
