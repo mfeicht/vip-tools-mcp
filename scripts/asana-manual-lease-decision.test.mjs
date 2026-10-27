@@ -88,3 +88,16 @@ test("terminal turn without a task binding can release only the agent", () => {
     { action: "release", reason: "terminal_without_tasks", release_agent: true,
       release_tasks: [], quarantine_tasks: [] });
 });
+
+
+test("stable interrupted projections without an end time never release an active compacting chat", () => {
+  for (const status of ["completed", "failed", "interrupted"]) {
+    for (const completed_at_ms of [null, undefined, NaN, "9000000"]) {
+      const projection = native.map(row => ({...row, runtime_status: "notLoaded",
+        turn_status: status, completed_at_ms}));
+      assert.equal(decide({...args, nativeReadbacks: projection}).reason, "native_terminal_unverified");
+      assert.equal(decide({...args, run: {...run, tasks: []}, taskReadbacks: [],
+        nativeReadbacks: projection}).action, "hold");
+    }
+  }
+});

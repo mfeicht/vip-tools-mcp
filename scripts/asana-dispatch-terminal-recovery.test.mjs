@@ -76,7 +76,7 @@ test("a database error rolls signal and lease changes back together",t=>{
   assert.deepEqual(f.store.counts(),{leased:1});
 });
 
-test("missing end time only frees the agent after 30s stable native and process proofs",t=>{
+test("missing end time keeps agent and task even after stable native and process proofs",t=>{
   const f=fixture(t);
   f.proof.native.forEach((row,index)=>{
     row.completed_at_ms=null; row.observed_at_ms=f.now-40000+index*31000;
@@ -92,8 +92,8 @@ test("missing end time only frees the agent after 30s stable native and process 
     const proof=structuredClone(f.proof);mutate(proof);
     assert.equal(decideDispatchRecovery(f.snapshot,proof,f.scan,f.now).action,"hold");
   }
-  assert.equal(applyDispatchRecovery(f.store,f.snapshot,f.proof,{scan:()=>f.scan,now:f.now}).action,"quarantine");
-  assert.deepEqual(f.store.activeLeases().map(row=>row.key),["task:123456"]);
+  assert.equal(applyDispatchRecovery(f.store,f.snapshot,f.proof,{scan:()=>f.scan,now:f.now}).action,"hold");
+  assert.deepEqual(f.store.activeLeases().map(row=>row.key).sort(),["agent:vip-ai-test","task:123456"]);
   assert.deepEqual(f.store.counts(),{leased:1});
   assert.equal(f.store.db.prepare("SELECT state FROM runs").get().state,"needs_reconciliation");
   const later=dispatchRecoverySnapshot(f.store,"run-1");

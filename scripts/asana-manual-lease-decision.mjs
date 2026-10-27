@@ -41,11 +41,10 @@ export function decideManualLeaseReconciliation({ run, nativeReadbacks, processR
         !Number.isSafeInteger(row.started_at_ms) ||
         row.started_at_ms > row.observed_at_ms ||
         row.started_at_ms > run.acquired_at_ms + 2_000 ||
-        (row.completed_at_ms != null &&
-          (!Number.isSafeInteger(row.completed_at_ms) ||
+        (!Number.isSafeInteger(row.completed_at_ms) ||
             row.completed_at_ms < Math.max(run.acquired_at_ms,
               ...run.tasks.map((task) => task.acquired_at_ms)) ||
-            row.completed_at_ms > row.observed_at_ms + 1_000))) ||
+            row.completed_at_ms > row.observed_at_ms + 1_000)) ||
       nativeReadbacks[1].observed_at_ms - nativeReadbacks[0].observed_at_ms < 1_000 ||
       !same({ ...nativeReadbacks[0], observed_at_ms: null },
         { ...nativeReadbacks[1], observed_at_ms: null })) {
