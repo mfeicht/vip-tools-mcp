@@ -35,17 +35,25 @@ export function dispatchOpenProcesses(source) {
 }
 
 export async function migrateDispatchStorage({source,destination,backupPath,barrier=DISPATCH_STORAGE_BARRIER,
-  inspectOpenFiles=dispatchOpenProcesses,timeoutMs=30000}) {
+  inspectOpenFiles=dispatchOpenProcesses,timeoutMs=30000,publicationPath=source,publicationKind='symlink'}) {
   if(![source,destination,backupPath,barrier].every(path.isAbsolute)||new Set([source,destination,backupPath,barrier]).size!==4)throw new Error('Distinct absolute paths required');
+  if(!path.isAbsolute(publicationPath)||!["symlink","file"].includes(publicationKind)||[destination,backupPath,barrier].includes(publicationPath))throw new Error('Invalid publication path or kind');
   const initial=fs.lstatSync(source);
   if(!initial.isFile()||initial.nlink!==1||initial.size===0||initial.blocks===0||fs.realpathSync(source)!==source)throw new Error('Materialized canonical regular source required');
   for(const p of [destination,backupPath]) {
     if(exists(p)||fs.realpathSync(path.dirname(p))!==path.dirname(p))throw new Error('New destination and backup in existing physical directories required');
   }
+  const publication=fs.lstatSync(publicationPath);
+  if(publicationPath!==source&&(!publication.isSymbolicLink()||fs.realpathSync(publicationPath)!==source))throw new Error('Publication alias must reference the current source');
   const marker=JSON.stringify({pid:process.pid,id:randomUUID(),source,destination,created_at:new Date().toISOString()});
   fs.writeFileSync(barrier,marker,{flag:'wx',mode:0o600});sync(barrier);sync(path.dirname(barrier),true);
   let sourceDb,check,published=false,verified=false,temporary;
   try {
+    // Persist the epoch beyond barrier removal. A process delayed across the
+    // entire maintenance interval must still reject its obsolete connection.
+    const epochTemporary=barrier+'.epoch-'+randomUUID();
+    fs.writeFileSync(epochTemporary,randomUUID(),{flag:'wx',mode:0o600});sync(epochTemporary);
+    fs.renameSync(epochTemporary,barrier+'.epoch');sync(path.dirname(barrier),true);
     const until=Date.now()+timeoutMs;
     while(inspectOpenFiles(source).length) {
       if(Date.now()>=until)throw new Error('Existing dispatch connections did not drain');
@@ -78,14 +86,21 @@ export async function migrateDispatchStorage({source,destination,backupPath,barr
     if(fs.readFileSync(barrier,'utf8')!==marker)throw new Error('Storage barrier changed');
     const last=fs.lstatSync(source);
     if(last.dev!==initial.dev||last.ino!==initial.ino)throw new Error('Source identity changed');
-    temporary=source+'.migration-'+randomUUID();fs.symlinkSync(destination,temporary);
-    fs.renameSync(temporary,source);temporary=null;published=true;sync(path.dirname(source),true);
-    if(fs.realpathSync(source)!==destination)throw new Error('Published alias mismatch');
-    check=new DatabaseSync(destination,{readOnly:true});
+    const lastPublication=fs.lstatSync(publicationPath);
+    if(lastPublication.dev!==publication.dev||lastPublication.ino!==publication.ino)throw new Error('Publication path changed');
+    if(publicationKind==='file')fs.renameSync(destination,publicationPath);
+    else {
+      temporary=publicationPath+'.migration-'+randomUUID();fs.symlinkSync(destination,temporary);
+      fs.renameSync(temporary,publicationPath);temporary=null;
+    }
+    published=true;sync(path.dirname(publicationPath),true);
+    const active=publicationKind==='file'?publicationPath:destination;
+    if(fs.realpathSync(publicationPath)!==active)throw new Error('Published path mismatch');
+    check=new DatabaseSync(active,{readOnly:true});
     const after=dispatchStorageSnapshot(check);check.close();check=null;
     if(after.sha256!==before.sha256)throw new Error('Published database differs');
     verified=true;
-    return {status:'verified',source,destination,backup:backupPath,before,after,backup_sha256:sha(fs.readFileSync(backupPath)),
+    return {status:'verified',source,destination:active,publication_path:publicationPath,publication_kind:publicationKind,backup:backupPath,before,after,backup_sha256:sha(fs.readFileSync(backupPath)),
       checkpoint,barrier_released:true,logical_rows_changed:false,completed_at:new Date().toISOString()};
   } finally {
     sourceDb?.close();check?.close();if(temporary&&exists(temporary))fs.unlinkSync(temporary);

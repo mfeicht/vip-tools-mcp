@@ -64,3 +64,20 @@ test('opening after cutover uses the published store and intact values',async t=
   try{assert.equal(reopened.prepare('SELECT value FROM values_kept').get().value,'unchanged');}
   finally{reopened.close();}
 });
+
+test('controlled restore publishes a regular workspace file and preserves newer writes',async t=>{
+  const f=fixture(t),db=new DatabaseSync(f.source);
+  db.exec('CREATE TABLE values_kept(value TEXT); INSERT INTO values_kept VALUES(\'before\')');db.close();
+  await migrateDispatchStorage(f);
+  const epoch=fs.readFileSync(f.barrier+'.epoch','utf8');
+  const newer=openDispatchDatabase(f.source,{},f);
+  newer.exec('INSERT INTO values_kept VALUES(\'after-first-cutover\')');newer.close();
+  const restored=await migrateDispatchStorage({...f,source:f.destination,publicationPath:f.source,publicationKind:'file',
+    destination:f.source+'.restore-stage',backupPath:f.backupPath+'.restore'});
+  assert.equal(restored.destination,f.source);assert.equal(restored.publication_kind,'file');
+  assert.equal(fs.lstatSync(f.source).isFile(),true);assert.equal(fs.existsSync(f.source+'.restore-stage'),false);
+  assert.notEqual(fs.readFileSync(f.barrier+'.epoch','utf8'),epoch);assert.equal(fs.existsSync(f.barrier),false);
+  const check=openDispatchDatabase(f.source,{},f);
+  try{assert.deepEqual(check.prepare('SELECT value FROM values_kept ORDER BY value').all().map(r=>r.value),['after-first-cutover','before']);}
+  finally{check.close();}
+});
