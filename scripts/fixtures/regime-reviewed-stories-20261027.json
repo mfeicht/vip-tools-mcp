@@ -1,0 +1,38 @@
+{
+  "data": [
+    {
+      "gid": "1219713608197464",
+      "created_at": "2026-10-20T22:42:34.336Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance added this task to Routine",
+      "resource_subtype": "added_to_tag"
+    },
+    {
+      "gid": "1219713608197470",
+      "created_at": "2026-10-20T22:42:34.489Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance duplicated task from ✓ R: Market Regime & Strategy Allocator",
+      "resource_subtype": "duplicated"
+    },
+    {
+      "gid": "1219713974704271",
+      "created_at": "2026-10-20T22:43:11.530Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance changed the due date to Oct 21, 9:45am",
+      "resource_subtype": "due_date_changed"
+    },
+    {
+      "gid": "1219721052949223",
+      "created_at": "2026-10-21T07:15:00.345Z",
+      "created_by": null,
+      "resource_subtype": "task_due_time_approaching_story"
+    }
+  ],
+  "next_page": null
+}

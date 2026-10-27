@@ -1,0 +1,38 @@
+{
+  "data": [
+    {
+      "gid": "1219607013733598",
+      "created_at": "2026-10-18T07:12:21.886Z",
+      "created_by": {
+        "gid": "1214338261069890"
+      },
+      "text": "VIP AI-Sales added this task to Routine",
+      "resource_subtype": "added_to_tag"
+    },
+    {
+      "gid": "1219607013733605",
+      "created_at": "2026-10-18T07:12:22.114Z",
+      "created_by": {
+        "gid": "1214338261069890"
+      },
+      "text": "VIP AI-Sales duplicated task from ✓ R: Lead-Adressen hinzufügen (Autoankauf für App.Goklever)",
+      "resource_subtype": "duplicated"
+    },
+    {
+      "gid": "1219635329205079",
+      "created_at": "2026-10-19T06:30:00.453Z",
+      "created_by": null,
+      "resource_subtype": "task_due_time_approaching_story"
+    },
+    {
+      "gid": "1219657915652807",
+      "created_at": "2026-10-19T18:19:49.743Z",
+      "created_by": {
+        "gid": "1214338261069890"
+      },
+      "text": "Technischer Zwischenstand\nDie Recovery-Recherche wurde nach dem verpflichtenden Sheet- und Partnergate vor dem Schreiben gestoppt: Der vollständige Akquise-Readback ist zwar abgerufen, kann in diesem Lauf wegen der Antwortkürzung nicht sicher pro Kandidat gegen die autoritative E-Mail-Ausschlussliste geprüft werden. Es wurden keine Leads geschrieben, nicht dedupliziert, nicht importiert und keine CSV erstellt.\n\nVier neue Discovery-Pfade lieferten nur Kandidatenhinweise; keine Adresse wird ohne vollständigen exakten Akquise-/Partner-Abgleich übernommen.\n\nEvidenz / Verifikation\nAktueller read-only Akquise-Readback und vier rotierte Discovery-Pfade; keine produktive Mutation.\n\n    Quelle/Readback: Google Sheets Readback: Übersicht Partner / Akquise!A1:F5000, 2026-10-19\n    Quelle/Readback: Primärquellen-Discovery: auto-gluecksrad.de, autohausahlum.de, european-trade.de, autohausdoehren.de\n    Verifiziert: Remote-Task-Lock für diese Routine war aktiv.\n    Verifiziert: Es wurden keine Sheet-, Dedupe-, CSV-, WordPress- oder Asana-Completion-Mutationen durchgeführt.\n\nOffene Evidenzluecken\n    Exakter Vollabgleich der Kandidaten gegen die gesamte Akquise-Ausschlussliste und den Partner-Tab ist in diesem Lauf nicht prüfbar.\n\n",
+      "resource_subtype": "comment_added"
+    }
+  ],
+  "next_page": null
+}
