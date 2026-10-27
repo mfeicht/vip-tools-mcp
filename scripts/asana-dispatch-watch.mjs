@@ -54,21 +54,23 @@ export async function coordinationPrestartGate(store, readHealth = readMaterialC
     blocked_signals: health?.ready === true ? 0 : candidates };
 }
 
-export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
+export async function watch({ dispatch = false, maxWorkers = 2,
+  runPoll = poll, makeStore = () => new AsanaDispatchStore(), writeHealth = saveHealth } = {}) {
   const start = Date.now();
   const health = { started_at: new Date(start).toISOString(), dispatch_enabled: dispatch,
     poll: null, workers_started: 0, ready: 0, active_agents: 0, stale_leases: 0,
     counts: {}, errors: [], status: "starting", stalled_runs: 0, reconciliation: null };
   let pollHealthy = false;
   try {
-    health.poll = await poll({ write: true });
+    health.poll = await runPoll({ write: true });
     health.errors.push(...health.poll.errors.map((error) => ({ source: "poll_agent", ...error })));
     pollHealthy = health.poll.errors.length === 0;
   } catch (error) {
     health.errors.push({ source: "poll", error: String(error?.message || error).slice(0, 500) });
   }
-  const store = new AsanaDispatchStore();
+  let store;
   try {
+    store = makeStore();
     health.reconciliation = await reconcileCompletedRuns(store, { remoteEnabled: pollHealthy });
     health.errors.push(...health.reconciliation.errors.map((error) => ({ source: "reconciliation", ...error })));
     health.manual_reconciliation = pollHealthy && !health.reconciliation.errors.length
@@ -93,7 +95,7 @@ export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
   } catch (error) {
     health.errors.push({ source: "dispatch", error: String(error?.message || error).slice(0, 500) });
   } finally {
-    store.close();
+    store?.close();
   }
   health.finished_at = new Date().toISOString();
   health.duration_ms = Date.now() - start;
@@ -102,7 +104,7 @@ export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
       health.coordination_prestart?.ready === false ? "attention" : "ok";
   let metricsStore;
   try {
-    metricsStore = new AsanaDispatchStore();
+    metricsStore = makeStore();
     metricsStore.recordPollRun(health);
     health.history_24h = metricsStore.pollStats(start - 24 * 60 * 60_000);
   } catch (error) {
@@ -111,7 +113,7 @@ export async function watch({ dispatch = false, maxWorkers = 2 } = {}) {
   } finally {
     metricsStore?.close();
   }
-  await saveHealth(health);
+  await writeHealth(health);
   return health;
 }
 
