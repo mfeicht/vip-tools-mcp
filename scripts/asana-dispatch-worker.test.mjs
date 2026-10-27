@@ -203,7 +203,9 @@ test("repeated preflight outages do not exhaust task attempts or retain leases",
   for(let i=0;i<7;i++){
     store.db.prepare("UPDATE signals SET available_at_ms=0 WHERE id='due'").run();
     const start=Date.now();
-    await workOnce({db,resolveBinary:()=>process.execPath,connect:async()=>{throw new Error("HTTP 503 fixture");}});
+    await workOnce({db,resolveBinary:()=>process.execPath,connect:async()=>{throw new Error(i % 2
+      ? "HTTP 503 <title>Service Suspended</title> This service has been suspended by its owner."
+      : "HTTP 503 fixture");}});
     const signal=store.db.prepare("SELECT * FROM signals WHERE id='due'").get();
     assert.equal(signal.status,"retry_after");assert.equal(signal.attempts,0);
     assert.ok(signal.available_at_ms>=start+900000);assert.deepEqual(store.activeLeases(),[]);

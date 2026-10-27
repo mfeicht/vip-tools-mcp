@@ -229,6 +229,9 @@ function httpStatus(error) {
 
 function safeErrorText(error) {
   const message = errorText(error);
+  if (classifyConnectionError(error) === "remote_service_suspended") {
+    return "HTTP 503: Canonical MCP endpoint reports Service Suspended; service restoration required";
+  }
   if (/Just a moment|Cloudflare managed challenge|challenges\.cloudflare\.com|cf_chl_|Enable JavaScript and cookies/i.test(message)) {
     return "Cloudflare managed challenge on the canonical MCP endpoint";
   }
@@ -245,6 +248,13 @@ export function classifyConnectionError(error) {
   const status = httpStatus(error);
   if (status === 429) return "remote_rate_limited";
   if (status === 401 || status === 403) return "remote_auth_or_permission_error";
+  // Explicit provider suspension is not a transient gateway failure. Require
+  // both the 503 context and the exact suspension page, not task prose.
+  if ((status === 503 || (status === null && /\b(?:HTTP\s+)?503\b/.test(message))) &&
+      /<title>\s*Service Suspended\s*<\/title>/i.test(message) &&
+      /This service has been suspended by its owner\./i.test(message)) {
+    return "remote_service_suspended";
+  }
   if ([502, 503, 504].includes(status)) return "remote_mcp_transient_error";
   if (/\b429\b|too many requests|rate.?limit/i.test(message)) return "remote_rate_limited";
   if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(message)) return "dns_resolution_error";
@@ -329,7 +339,7 @@ async function connectOnce(opts, attempt) {
   }
 }
 
-async function connectWithRetry(opts) {
+export async function connectWithRetry(opts, connect = connectOnce) {
   const lock = await acquireConnectLock();
   let lastError;
   try {
@@ -340,7 +350,7 @@ async function connectWithRetry(opts) {
         lastConnectAttemptPid: process.pid
       });
       try {
-        const client = await connectOnce(opts, attempt);
+        const client = await connect(opts, attempt);
         await recordTransportState({
           lastConnectSuccessAt: new Date().toISOString(),
           lastErrorClass: null,
@@ -445,7 +455,11 @@ export async function readMaterialCommentStoreHealth({ request = fetch } = {}) {
         await recordTransportState({ cooldownUntil: new Date(Date.now() + RATE_LIMIT_COOLDOWN_MS).toISOString() });
         return { ready: false, reason: "shared_cooldown", status: response.status };
       }
-      if (!response.ok) return { ready: false, reason: "http_error", status: response.status };
+      if (!response.ok) {
+        const error = Object.assign(new Error(body), { status: response.status });
+        return { ready: false, reason: classifyConnectionError(error) === "remote_service_suspended"
+          ? "remote_service_suspended" : "http_error", status: response.status };
+      }
       const data = JSON.parse(body);
       return { ready: data?.ready === true, reason: data?.ready === true ? "ready" : "store_not_ready",
         status: response.status };

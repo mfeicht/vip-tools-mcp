@@ -193,7 +193,7 @@ test("failed cyclic audit never advances observation or poll cursor",async()=>{
 
 test("one transport failure stops later agent scans while a scoped permission error stays isolated",async()=>{
   const {scanSnapshots}=await import("./asana-dispatch-poller.mjs");
-  for(const message of ["HTTP 503","HTTP 429","Cloudflare managed challenge on the canonical MCP endpoint","Request timed out","HTTP 403"]){
+  for(const message of ["HTTP 503","HTTP 503 <title>Service Suspended</title> This service has been suspended by its owner.","HTTP 429","Cloudflare managed challenge on the canonical MCP endpoint","Request timed out","HTTP 403"]){
     const seen=[];
     const result=await scanSnapshots(null,null,[{agent_id:"a"},{agent_id:"b"},{agent_id:"c"}],new Set(),new Date(),false,
       async(_client,_store,snapshot)=>{seen.push(snapshot.agent_id);if(snapshot.agent_id==="b")throw new Error(message);return {agent_id:snapshot.agent_id};});
