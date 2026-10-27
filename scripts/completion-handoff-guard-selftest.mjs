@@ -1025,6 +1025,34 @@ for (const story of financeCompletionStories) {
 // Content Research 9202 has a visible closed decision in its existing status
 // story. Completion and comment dedupe must agree on that exact wording.
 const research9202Story = JSON.parse(readFileSync(new URL("./fixtures/research-9202-story-1219009500823711.json", import.meta.url), "utf8"));
+const originalOctoberStories = JSON.parse(readFileSync(new URL("./fixtures/operations-original-completion-stories-20261027.json", import.meta.url), "utf8"));
+for (const story of originalOctoberStories) {
+  assert.equal(validateRoutineVisibleFollowUpStatus({finalComment:story,hasFollowUpTask:false}).ok,true,story.gid);
+  assert.equal(hasRoutineNoFollowUpDecision(story.text),true,story.gid);
+  assert.equal(inspectRoutineNoFollowUpStatusIdempotency({stories:[story],agentUserGid:story.created_by.gid,
+    proposedText:"Keine weitere Folgeaufgabe erforderlich."}).status,"blocked_duplicate_no_follow_up_status",story.gid);
+  for (const remaining of ["Die Nacharbeit bleibt offen.","Die Freigabe ist noch offen.",
+    "Die nächste Routine übernimmt die weitere Bearbeitung.","Bitte die Folgeaufgabe bearbeiten."]) {
+    assert.equal(validateRoutineVisibleFollowUpStatus({finalComment:{text:story.text+"\n"+remaining},hasFollowUpTask:false}).ok,false,story.gid+remaining);
+  }
+  assert.equal(validateRoutineVisibleFollowUpStatus({finalComment:{...story,html_text:'<body><a data-asana-gid="1108801330389276"/></body>'},hasFollowUpTask:false}).ok,false,story.gid);
+}
+for (const text of [
+  "Keine aktive Nacharbeit oder separate Folgeaufgabe ist für diese Log-Instanz möglicherweise erforderlich.",
+  "Keine aktive Nacharbeit oder separate Folgeaufgabe ist für diesen Scanner-Scope nicht erforderlich.",
+  "Keine aktive Nacharbeit oder separate Folgeaufgabe ist für diesen eventuell-Scope erforderlich.",
+  "Keine aktive Nacharbeit oder separate Folgeaufgabe ist für diesen Scanner-Scope angelegt.",
+  "Eine aktive Nacharbeit oder separate Folgeaufgabe ist für diesen Scanner-Scope erforderlich.",
+  "Keine weitere Folgeaufgabe und keine aktive Nacharbeit durch eine andere Person möglicherweise nötig.",
+  "Keine weitere Folgeaufgabe und keine aktive Nacharbeit durch eine andere Person nicht nötig.",
+  "Kein neuer aktiver Folgeauftrag angelegt.","Kein neuer aktiver Folgeauftrag möglicherweise nötig.",
+  "Kein neuer aktiver Folgeauftrag?",
+  "Vielleicht keine aktive Nacharbeit oder separate Folgeaufgabe ist für diesen Scanner-Scope erforderlich.",
+  "Wenn keine aktive Nacharbeit oder separate Folgeaufgabe ist für diesen Scanner-Scope erforderlich.",
+  "Keine aktive Nacharbeit oder separate Folgeaufgabe ist für diese Log-Instanz erforderlich?",
+  "Kein neuer aktiver Folgeauftrag, aber die Nacharbeit ist noch offen.",
+  "Kein neuer aktiver Folgeauftrag. Die Freigabe ist noch offen."
+]) assert.equal(validateRoutineVisibleFollowUpStatus({finalComment:{text},hasFollowUpTask:false}).ok,false,text);
 assert.equal(research9202Story.gid, "1219009500823711");
 const research9202Signals = detectRoutineFollowUpSignals({ finalComment: research9202Story });
 assert.equal(research9202Signals.no_follow_up_claim, true);
