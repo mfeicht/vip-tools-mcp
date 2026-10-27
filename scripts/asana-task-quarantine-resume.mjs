@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import {verifyReviewedPartialContext} from "./asana-reviewed-partial-context.mjs";
 import { createHash } from "node:crypto";
 import { validateQuarantineEvidence } from "./asana-terminal-quarantine.mjs";
 import { collectWorkerProcessReadback } from "./asana-worker-process-readback.mjs";
@@ -13,7 +14,7 @@ export const TARGET = Object.freeze({
 const digest = raw => createHash("sha256").update(raw).digest("hex");
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const rows = values => values.map(x => ({ ...x }));
-const schema = `CREATE TABLE IF NOT EXISTS task_quarantine_resumptions (
+export const resumptionSchema = `CREATE TABLE IF NOT EXISTS task_quarantine_resumptions (
   old_run_id TEXT PRIMARY KEY,
   task_gid TEXT NOT NULL,
   agent_id TEXT NOT NULL,
@@ -108,7 +109,7 @@ export function resumeTaskQuarantine(store, evidence, {
       signal_count: signals.length, evidence_sha256: evidenceDigest,
     };
     if (!apply) return result;
-    store.db.exec(schema);
+    store.db.exec(resumptionSchema);
     store.db.prepare(`INSERT INTO task_quarantine_resumptions
       VALUES (?,?,?,?,?,?,?,?)`).run(run.run_id, run.task_gid, run.agent_id,
       evidenceDigest, now, resumeAt, JSON.stringify(signals.map(x => x.id)), JSON.stringify(context));
@@ -133,7 +134,7 @@ export function resumeTaskQuarantine(store, evidence, {
 }
 
 // The dispatcher must bind these artifacts before starting the replacement model.
-export function resumeContextForClaim(store, claim) {
+export function resumeContextForClaim(store, claim, {verifyPartial} = {}) {
   if (!store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
     .get("task_quarantine_resumptions")) return null;
   const records = store.db.prepare("SELECT * FROM task_quarantine_resumptions WHERE task_gid=? AND agent_id=?")
@@ -143,9 +144,17 @@ export function resumeContextForClaim(store, claim) {
   if (matching.length !== 1) throw new Error("Ambiguous resume receipt");
   const context = JSON.parse(matching[0].context_json);
   if (context.task_gid !== claim.signals[0].task_gid || context.agent_id !== claim.signals[0].agent_id ||
-      context.old_run_id !== TARGET.run_id || context.task_completed !== false ||
+      context.old_run_id !== matching[0].old_run_id || context.task_completed !== false ||
       context.no_effect_claim !== false || context.evidence_sha256 !== matching[0].evidence_sha256) {
     throw new Error("Invalid resume context");
+  }
+  if(context.old_run_id!==TARGET.run_id){
+    const events=store.db.prepare("SELECT evidence_json FROM recovery_events WHERE run_id=? AND kind='reviewed_intake_resume'").all(context.old_run_id);
+    if(events.length!==1)throw new Error("Missing or ambiguous partial acceptance");
+    const accepted=JSON.parse(events[0].evidence_json);
+    if(!same(accepted.context,context)||digest(JSON.stringify(accepted.proof))!==context.evidence_sha256||
+      !same(JSON.parse(matching[0].signal_ids_json),accepted.snapshot.signals.map(s=>s.id)))throw new Error("Partial acceptance receipt changed");
+    return verifyReviewedPartialContext(context,matching[0],verifyPartial?{verify:verifyPartial}:{});
   }
   verifyArtifacts(context.artifacts);
   return context;
