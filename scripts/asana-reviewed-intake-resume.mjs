@@ -61,8 +61,19 @@ export function decideReviewedIntake(snapshot,proof,scan,now=Date.now()) {
   :['1219713608197464','1219713608197470','1219713974704271','1219721052949223'];
  if(as.some(a=>!same(a.stories.map(s=>s.gid),expectedStories)))return hold('reviewed_story_inventory_changed');
  const remote=proof.remote;
- if(!pair(remote)||remote.some(r=>r.agent_id!=='vip-ai-operations'||r.include_all!==true||
-  !Array.isArray(r.active_locks)||r.active_locks.length!==0))return hold('remote_coordination_not_clear');
+ // Independent agents may hold unrelated remote locks. Bind the complete fresh
+ // inventory, but require quiescence only for this incident's run/task/resource.
+ // Remaining TTL and unrelated work can change between the two observations.
+ if(!Array.isArray(remote)||remote.length!==2||remote.some(r=>!fresh(r)||
+  r.agent_id!=='vip-ai-operations'||r.include_all!==true||!Array.isArray(r.active_locks)||
+  r.active_locks.some(l=>!l||typeof l.key!=='string'||typeof l.run_id!=='string'||!l.run_id||
+   typeof l.agent_id!=='string'||!l.agent_id||!['agent','task','resource'].includes(l.scope)||
+   (l.scope==='task'&&(!/^\d+$/.test(l.task_gid||'')||l.key!=='task:'+l.task_gid))||
+   (l.scope==='agent'&&l.key!=='agent:'+l.agent_id)||
+   (l.scope==='resource'&&(typeof l.resource_key!=='string'||!l.resource_key||l.key!=='resource:'+l.resource_key))||
+   l.run_id===t.run_id||l.task_gid===t.task_gid||l.key==='task:'+t.task_gid||
+   (t.resource_key&&l.resource_key===t.resource_key)))||
+  remote[1].observed_at_ms-remote[0].observed_at_ms<30000)return hold('remote_coordination_not_clear');
  const scans=[...(proof.processes||[]),scan];
  if(scans.length!==3||scans.some(r=>!fresh(r)||!r.scan_succeeded||
    Object.entries(processScanBinding(run)).some(([k,v])=>!same(r[k],v))||
