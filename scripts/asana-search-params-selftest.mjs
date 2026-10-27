@@ -5,6 +5,24 @@ const passed = [];
 async function test(name, run) { await run(); passed.push(name); }
 const cursor = "2026-09-15T00:00:00.000Z";
 const plan = (options = {}) => buildAsanaTaskSearchPlan({ involved: "7", meGid: "7", modifiedSince: cursor, ...options });
+await test("invalid sort values fail before direct or involved search requests", async () => {
+  for (const involved of [undefined, "7"]) {
+    for (const sortBy of ["due_at", "due_on", "unknown", "", null, {}, "toString"]) {
+      assert.throws(() => buildAsanaTaskSearchPlan({ involved, sortBy, meGid: "7" }), /Für Fälligkeit due_date/);
+    }
+  }
+});
+await test("valid direct search sorts and default retain their exact meaning", async () => {
+  for (const sortBy of ["due_date", "created_at", "completed_at", "likes", "modified_at", "relevance"]) {
+    const p = buildAsanaTaskSearchPlan({ sortBy, sortAscending: true, completed: false });
+    assert.equal(p.params.sort_by, sortBy);
+    assert.equal(p.params.sort_ascending, true);
+    assert.equal(p.params.completed, false);
+  }
+  assert.equal(buildAsanaTaskSearchPlan({}).params.sort_by, "modified_at");
+  assert.equal(plan({sortBy:"due_date"}).params.sort_by,"due_date");
+  assert.throws(() => plan({sortBy:"relevance"}), /nicht vergleichbar/);
+});
 const task = (gid, role = "assignee", createdSecond = 0, modifiedSecond = createdSecond) => ({
   gid: String(gid), created_at: new Date(Date.UTC(2026, 8, 16, 0, 0, createdSecond)).toISOString(),
   modified_at: new Date(Date.UTC(2026, 8, 16, 1, 0, modifiedSecond)).toISOString(),
