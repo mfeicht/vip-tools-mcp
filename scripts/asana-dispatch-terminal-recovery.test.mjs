@@ -233,3 +233,44 @@ test('capacity retry rejects executable activity, incomplete terminal proof or c
   }
   assert.equal(f.store.activeLeases().length,2);
 });
+
+// A correction may cite its predecessor; the dedicated evidence field selects
+// one story while every existing owner, time, stability and fence gate remains.
+test("explicit corrected story disambiguates predecessor references",t=>{
+  const f=openFixture(t,"blocked");
+  f.proof.native.forEach(row=>row.answer.summary="Ergebnisstory 223, Korrekturstory 222 verifiziert.");
+  f.proof.asana.forEach(row=>row.stories.unshift({...row.stories[0],gid:"223",
+    created_at:new Date(f.now-25000).toISOString()}));
+  const decision=applyDispatchRecovery(f.store,f.snapshot,f.proof,{scan:()=>f.scan,now:f.now});
+  assert.equal(decision.action,"acknowledge");
+  assert.equal(decision.open.evidence_story_gid,"222");
+  assert.deepEqual(f.store.activeLeases(),[]);
+  assert.equal(f.proof.asana[1].task.completed,false);
+});
+
+test("explicit invalid or ineligible evidence never falls back to prose",t=>{
+  const f=openFixture(t,"blocked");
+  for(const id of ["999","malformed",""]){
+    const proof=structuredClone(f.proof);
+    proof.native.forEach(row=>row.answer.evidence_story_gid=id);
+    assert.equal(decideDispatchRecovery(f.snapshot,proof,f.scan,f.now).action,"quarantine");
+  }
+  for(const mutate of [
+    p=>p.asana.forEach(row=>row.stories[0].created_by.gid="333"),
+    p=>p.asana.forEach(row=>row.stories[0].created_at=new Date(f.now-5000).toISOString()),
+    p=>p.asana.forEach(row=>row.stories.push({...row.stories[0]}))
+  ]) {
+    const proof=structuredClone(f.proof);mutate(proof);
+    assert.equal(decideDispatchRecovery(f.snapshot,proof,f.scan,f.now).action,"quarantine");
+  }
+  assert.equal(f.store.activeLeases().length,2);
+});
+
+test("legacy prose-only proof accepts one story but holds ambiguous references",t=>{
+  const f=openFixture(t,"blocked");
+  f.proof.native.forEach(row=>row.answer.evidence_story_gid=null);
+  assert.equal(decideDispatchRecovery(f.snapshot,f.proof,f.scan,f.now).action,"acknowledge");
+  f.proof.native.forEach(row=>row.answer.summary="Ergebnisstory 222 und Korrekturstory 223.");
+  f.proof.asana.forEach(row=>row.stories.push({...row.stories[0],gid:"223"}));
+  assert.equal(decideDispatchRecovery(f.snapshot,f.proof,f.scan,f.now).action,"quarantine");
+});
