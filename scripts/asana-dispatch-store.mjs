@@ -12,6 +12,23 @@ export const DEFAULT_DB_PATH = path.join(
   "VIP-AI-Workspace/10-Agenten/VIP-AI-Operations/run_state/Asana-Dispatch.sqlite"
 );
 
+// Cloud placeholders can retain a nonzero logical size while having no local
+// blocks. Do not let SQLite initialize or change journal mode on that path.
+// Resolve aliases so all connections use the same physical WAL/SHM location.
+export function localDatabasePath(filename) {
+  if (filename === ":memory:") return filename;
+  try { fs.lstatSync(filename); }
+  catch (error) { if (error.code === "ENOENT") return filename; throw error; }
+  const resolved = fs.realpathSync(filename);
+  const info = fs.statSync(resolved);
+  if (!info.isFile() || (info.size > 0 && info.blocks === 0)) {
+    const error = new Error("Dispatch database is not a locally materialized regular file; preserve it and restore local availability before retrying");
+    error.code = "ASANA_DISPATCH_STORE_UNAVAILABLE";
+    throw error;
+  }
+  return resolved;
+}
+
 function assertId(value, label) {
   if (typeof value !== "string" || !/^[a-zA-Z0-9:_-]{2,180}$/.test(value)) {
     throw new Error(`${label} is invalid`);
@@ -26,6 +43,7 @@ function assertTime(value, label) {
 
 export class AsanaDispatchStore {
   constructor(filename = DEFAULT_DB_PATH) {
+    filename = localDatabasePath(filename);
     fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(filename);
     if (filename !== ":memory:") fs.chmodSync(filename, 0o600);
