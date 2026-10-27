@@ -1,4 +1,6 @@
 import {createHash} from 'node:crypto';
+import {REVIEWED_PARTIALS,reviewedPartialContext,verifyPartialArtifacts} from './asana-reviewed-partial-context.mjs';
+import {resumptionSchema} from './asana-task-quarantine-resume.mjs';
 import {dispatchRecoverySnapshot} from './asana-dispatch-terminal-recovery.mjs';
 import {followupNativeObservation} from './asana-completed-followup-recovery.mjs';
 import {collectWorkerProcessReadback,processScanBinding} from './asana-worker-process-readback.mjs';
@@ -22,7 +24,8 @@ export const REVIEWED_INTAKES=Object.freeze([
   activity_sha256:'c1d645ddcd3068a47e85ac8ea8df99fef96ed5a06efd1f2ecb6d80a7243fddc2',
   modified_at:'2026-10-20T18:22:23.340Z',run_started_at_ms:1792393383246,
   stories_sha256:'291c1959c24c753e32ab50a1d9432db6dbc704eede26504ea83cb435f8de8f87',
-  resource_key:'google-sheets:17nJW06-FijgWeqUDdv6TtRaZ7BBcBiQj0fziNMUxDWM:Akquise'})
+  resource_key:'google-sheets:17nJW06-FijgWeqUDdv6TtRaZ7BBcBiQj0fziNMUxDWM:Akquise'}),
+ ...REVIEWED_PARTIALS
 ]);
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
@@ -46,20 +49,14 @@ export function decideReviewedIntake(snapshot,proof,scan,now=Date.now()) {
   same({...rows[0],observed_at_ms:null},{...rows[1],observed_at_ms:null});
  const ns=proof?.native;
  if(!pair(ns)||ns.some(n=>n.source!=='codex_app.read_thread'||n.host_id!=='local'||
-  !['idle','notLoaded'].includes(n.runtime_status)||n.turn_status!=='failed'||
-  n.error?.message!=='Selected model is at capacity. Please try a different model.'||
+  !['idle','notLoaded'].includes(n.runtime_status)||n.turn_status!==(t.turn_status||'failed')||
+  (n.error?.message??null)!==(t.partial?t.error_message:'Selected model is at capacity. Please try a different model.')||
   ['thread_id','turn_id','started_at','completed_at','activity_count','activity_sha256'].some(k=>n[k]!==t[k])||
   n.completed_at*1000>n.observed_at_ms))return hold('complete_reviewed_native_activity_required');
  const as=proof.asana;
  if(!pair(as)||as.some(a=>a.agent_id!=='vip-ai-operations'||a.task?.gid!==t.task_gid||
   a.task.completed!==false||a.task.assignee?.gid!==t.assignee||a.task.modified_at!==t.modified_at||
   !Array.isArray(a.stories)||hash(a.stories)!==t.stories_sha256||a.next_page!==null))return hold('stable_operations_task_readback_required');
- // Sales has a later no-write checkpoint. Preserve it for the owner's fresh
- // intake; never mistake the old failed turn for a completed business task.
- const expectedStories=t.key==='sales'
-  ?['1219607013733598','1219607013733605','1219635329205079','1219657915652807']
-  :['1219713608197464','1219713608197470','1219713974704271','1219721052949223'];
- if(as.some(a=>!same(a.stories.map(s=>s.gid),expectedStories)))return hold('reviewed_story_inventory_changed');
  const remote=proof.remote;
  // Independent agents may hold unrelated remote locks. Bind the complete fresh
  // inventory, but require quiescence only for this incident's run/task/resource.
@@ -80,11 +77,12 @@ export function decideReviewedIntake(snapshot,proof,scan,now=Date.now()) {
    !/^[a-f0-9]{64}$/.test(r.raw_sha256||'')||!Array.isArray(r.matching_processes)||r.matching_processes.length)||
    scans[0].observed_at_ms<ns[0].observed_at_ms||scans[1].observed_at_ms<ns[1].observed_at_ms)
   return hold('worker_inactivity_unverified');
- return {action:'retry_after',reason:'reviewed_intake_without_business_writes',delay_ms:900000,
+ return {action:'retry_after',reason:t.partial?'reviewed_partial_work_preserved':'reviewed_intake_without_business_writes',delay_ms:900000,
+  ...(t.partial?{old_run_completed:false,no_effect_claim:false}:{}),
   task_completed:false,preserve_attempts:true,owner_fresh_readback_required:true};
 }
 export function applyReviewedIntake(store,snapshot,proof,{operator,apply=false,
- scan=collectWorkerProcessReadback,now=null}={}) {
+ scan=collectWorkerProcessReadback,verifyArtifacts=verifyPartialArtifacts,now=null}={}) {
  const processReadback=scan(snapshot.run);now??=Date.now();
  return store.transaction(()=>{
   if(!same(dispatchRecoverySnapshot(store,snapshot.run.run_id),snapshot))return {action:'hold',reason:'recovery_fence_changed'};
@@ -98,8 +96,18 @@ export function applyReviewedIntake(store,snapshot,proof,{operator,apply=false,
   if(lease&&store.db.prepare('SELECT last_fence FROM lease_fences WHERE key=?').get(lease.key)?.last_fence!==lease.fence)
    return {action:'hold',reason:'lease_fence_history_changed'};
   const decision=decideReviewedIntake(snapshot,proof,processReadback,now);
-  if(decision.action!=='retry_after'||!apply)return {...decision,dry_run:!apply};
-  const note='Reviewed intake without business writes; task open; fresh owner readback required; proof='+hash(proof);
+  if(decision.action!=='retry_after')return {...decision,dry_run:!apply};
+  const target=REVIEWED_INTAKES.find(t=>t.run_id===snapshot.run.run_id);
+  if(target.partial)verifyArtifacts(target.artifacts);
+  if(!apply)return {...decision,dry_run:true};
+  const context=target.partial?reviewedPartialContext(target,hash(proof)):null;
+  if(context){
+   store.db.exec(resumptionSchema);
+   store.db.prepare('INSERT INTO task_quarantine_resumptions VALUES (?,?,?,?,?,?,?,?)').run(
+    target.run_id,target.task_gid,target.agent_id,hash(proof),now,now+decision.delay_ms,
+    JSON.stringify(snapshot.signals.map(s=>s.id)),JSON.stringify(context));
+  }
+  const note=(context?'Preserved partial work; task open; resume receipt ':'Reviewed intake without business writes; task open; fresh owner readback required; proof=')+hash(proof);
   for(const s of snapshot.signals) {
    const changes=store.db.prepare(`UPDATE signals SET status='retry_after',available_at_ms=?,run_id=NULL,
     lease_token=NULL,lease_fence=NULL,updated_at_ms=?,last_error=? WHERE id=? AND status='leased'
@@ -108,9 +116,9 @@ export function applyReviewedIntake(store,snapshot,proof,{operator,apply=false,
    if(changes!==1)throw new Error('Signal fence changed');
   }
   if(!store.releaseLease(lease))throw new Error('Task fence changed');
-  store.db.prepare("UPDATE runs SET state='completed',updated_at_ms=?,last_error=? WHERE run_id=?").run(now,note,snapshot.run.run_id);
+  store.db.prepare("UPDATE runs SET state=?,updated_at_ms=?,last_error=? WHERE run_id=?").run(context?'needs_reconciliation':'completed',now,note,snapshot.run.run_id);
   store.db.prepare('INSERT INTO recovery_events(run_id,observed_at_ms,kind,evidence_json) VALUES (?,?,?,?)')
-   .run(snapshot.run.run_id,now,'reviewed_intake_resume',JSON.stringify({snapshot,proof,operator,processReadback,decision}));
+   .run(snapshot.run.run_id,now,'reviewed_intake_resume',JSON.stringify({snapshot,proof,operator,processReadback,decision,...(context?{context}:{})}));
   return {...decision,dry_run:false};
  });
 }

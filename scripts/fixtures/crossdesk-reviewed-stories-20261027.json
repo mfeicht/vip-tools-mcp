@@ -1,0 +1,29 @@
+{
+  "data": [
+    {
+      "gid": "1219511201467972",
+      "created_at": "2026-10-14T18:36:17.804Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance added this task to Routine",
+      "resource_subtype": "added_to_tag"
+    },
+    {
+      "gid": "1219511201467978",
+      "created_at": "2026-10-14T18:36:17.973Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance duplicated task from ✓ R: Cross-Desk Analyst Synthesis & Opportunity Board",
+      "resource_subtype": "duplicated"
+    },
+    {
+      "gid": "1219531932735588",
+      "created_at": "2026-10-15T10:55:00.298Z",
+      "created_by": null,
+      "resource_subtype": "task_due_time_approaching_story"
+    }
+  ],
+  "next_page": null
+}

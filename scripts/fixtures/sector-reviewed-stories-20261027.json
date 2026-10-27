@@ -1,0 +1,56 @@
+{
+  "data": [
+    {
+      "gid": "1219713797423113",
+      "created_at": "2026-10-20T22:32:58.698Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance added this task to Routine",
+      "resource_subtype": "added_to_tag"
+    },
+    {
+      "gid": "1219713797423119",
+      "created_at": "2026-10-20T22:32:58.894Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance duplicated task from ✓ R: Sector Rotation & Relative Strength Radar",
+      "resource_subtype": "duplicated"
+    },
+    {
+      "gid": "1219713781476914",
+      "created_at": "2026-10-20T22:33:45.249Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance changed the due date to Oct 21, 9:15am",
+      "resource_subtype": "due_date_changed"
+    },
+    {
+      "gid": "1219717454812011",
+      "created_at": "2026-10-21T03:52:10.402Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance mentioned this task in another task: ✓ R: Deep Research Industrials, Automobile & Robotics",
+      "resource_subtype": "mentioned"
+    },
+    {
+      "gid": "1219720190277681",
+      "created_at": "2026-10-21T06:45:00.335Z",
+      "created_by": null,
+      "resource_subtype": "task_due_time_approaching_story"
+    },
+    {
+      "gid": "1219948948818550",
+      "created_at": "2026-10-27T19:12:04.677Z",
+      "created_by": {
+        "gid": "1215003777954631"
+      },
+      "text": "VIP AI-Finance mentioned this task in another task: ✓ R: Deep Research Industrials, Automobile & Robotics",
+      "resource_subtype": "mentioned"
+    }
+  ],
+  "next_page": null
+}

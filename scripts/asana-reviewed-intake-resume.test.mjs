@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+import {verifyPartialArtifacts,verifyReviewedPartialContext,reviewedPartialContext} from './asana-reviewed-partial-context.mjs';
+import {resumeContextForClaim,resumePrompt} from './asana-task-quarantine-resume.mjs';
 import {AsanaDispatchStore} from './asana-dispatch-store.mjs';
 import {dispatchRecoverySnapshot} from './asana-dispatch-terminal-recovery.mjs';
 import {processScanBinding} from './asana-worker-process-readback.mjs';
@@ -25,7 +30,7 @@ function fixture(ctx,t=REVIEWED_INTAKES[0]) {
  const operator={run_id:'operator',thread_id:'12345678-1234-1234-1234-123456789012',task_gid:'1218924687084315'};
  const context={threadId:operator.thread_id,source:'CODEX_THREAD_ID'};
  store.acquireManualAgent('vip-ai-operations','operator',context,now);store.acquireManualTask('operator',operator.task_gid,context,now);
- return {store,snapshot,proof,operator,now,scan,t,options:{operator,scan:()=>scan,now}};
+ return {store,snapshot,proof,operator,now,scan,t,options:{operator,scan:()=>scan,now,verifyArtifacts:()=>{}}};
 }
 for(const t of REVIEWED_INTAKES)test(t.key+': exact historical fixture resumes only its signal, preserves attempts and owner work',ctx=>{
  const f=fixture(ctx,t);assert.equal(applyReviewedIntake(f.store,f.snapshot,f.proof,f.options).action,'retry_after');
@@ -37,6 +42,14 @@ for(const t of REVIEWED_INTAKES)test(t.key+': exact historical fixture resumes o
  assert.equal(s.available_at_ms,f.now+900000);assert.equal(s.run_id,null);
  assert.equal(f.store.leasesForRun(t.run_id).length,0);assert.equal(f.store.leasesForRun('operator').length,2);
  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM recovery_events').get().n,1);
+ if(t.partial){
+  assert.equal(result.old_run_completed,false);assert.equal(result.no_effect_claim,false);
+  assert.equal(f.store.db.prepare('SELECT state FROM runs WHERE run_id=?').get(t.run_id).state,'needs_reconciliation');
+  let checked=false;
+  const context=resumeContextForClaim(f.store,{signals:f.snapshot.signals},{verifyPartial:(a,o)=>{assert.deepEqual(a,t.artifacts);assert.equal(o.includeOriginals,false);checked=true;}});
+  assert.equal(checked,true);assert.match(resumePrompt(context),/Kein No-Effect-/);
+  assert.equal(context.artifacts.length,t.key==='sector'?4:3);
+ }
  assert.equal(applyReviewedIntake(f.store,f.snapshot,f.proof,{...f.options,apply:true}).reason,'recovery_fence_changed');
 });
 test('changed command, tool arguments, local write, final answer and omitted activity fail even with a recomputed hash',ctx=>{
@@ -109,5 +122,54 @@ test('unrelated remote work may progress while incident-bound coordination still
  ]){
   const p=structuredClone(f.proof);p.remote[1].active_locks=[lock];
   assert.equal(decideReviewedIntake(f.snapshot,p,f.scan,f.now).action,'hold');
+ }
+});
+
+for(const target of REVIEWED_INTAKES.filter(t=>t.partial)){
+ test(target.key+': changed evidence receipt, signal binding or context blocks replacement worker',ctx=>{
+  const f=fixture(ctx,target);applyReviewedIntake(f.store,f.snapshot,f.proof,{...f.options,apply:true});
+  const original={...f.store.db.prepare('SELECT * FROM task_quarantine_resumptions').get()};
+  const accepted=f.store.db.prepare('SELECT evidence_json FROM recovery_events').get().evidence_json;
+  const claim={signals:f.snapshot.signals},opts={verifyPartial:()=>{}};
+  for(const mutate of [c=>c.artifacts.pop(),c=>c.artifacts[0].path='/tmp/other',c=>c.artifacts[0].sha256='b'.repeat(64),
+   c=>c.next_step='changed',c=>c.agent_id='vip-ai-sales',c=>c.no_effect_claim=true,c=>c.old_run_id='unknown']){
+   const c=JSON.parse(original.context_json);mutate(c);
+   f.store.db.prepare('UPDATE task_quarantine_resumptions SET context_json=?').run(JSON.stringify(c));
+   assert.throws(()=>resumeContextForClaim(f.store,claim,opts));
+  }
+  f.store.db.prepare('UPDATE task_quarantine_resumptions SET context_json=?,evidence_sha256=?').run(original.context_json,'c'.repeat(64));
+  assert.throws(()=>resumeContextForClaim(f.store,claim,opts));
+  f.store.db.prepare('UPDATE task_quarantine_resumptions SET evidence_sha256=?').run(original.evidence_sha256);
+  f.store.db.prepare('UPDATE recovery_events SET evidence_json=?').run(JSON.stringify({...JSON.parse(accepted),proof:{changed:true}}));
+  assert.throws(()=>resumeContextForClaim(f.store,claim,opts),/receipt changed/);
+  f.store.db.prepare('UPDATE recovery_events SET evidence_json=?').run(accepted);
+  f.store.db.prepare('UPDATE task_quarantine_resumptions SET signal_ids_json=?').run(JSON.stringify(['signal','unreviewed']));
+  assert.throws(()=>resumeContextForClaim(f.store,claim,opts),/receipt changed/);
+ });
+ test(target.key+': missing files and audit failure preserve claim and omit resume receipt',ctx=>{
+  const f=fixture(ctx,target);
+  assert.throws(()=>applyReviewedIntake(f.store,f.snapshot,f.proof,{...f.options,apply:true,verifyArtifacts:()=>{throw new Error('missing artifact');}}),/missing artifact/);
+  assert.deepEqual(dispatchRecoverySnapshot(f.store,target.run_id),f.snapshot);
+  f.store.db.exec("CREATE TRIGGER abort_audit BEFORE INSERT ON recovery_events BEGIN SELECT RAISE(ABORT,'audit refused'); END");
+  assert.throws(()=>applyReviewedIntake(f.store,f.snapshot,f.proof,{...f.options,apply:true}),/audit refused/);
+  assert.deepEqual(dispatchRecoverySnapshot(f.store,target.run_id),f.snapshot);
+  assert.equal(f.store.db.prepare("SELECT name FROM sqlite_master WHERE name='task_quarantine_resumptions'").get(),undefined);
+ });
+}
+test('artifact bytes, original provenance, size and symlinks are checked independently',ctx=>{
+ const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'vip-partial-')));ctx.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const a={original_path:path.join(dir,'original'),path:path.join(dir,'preserved'),bytes:4,sha256:createHash('sha256').update('data').digest('hex')};
+ for(const p of [a.original_path,a.path])fs.writeFileSync(p,'data');
+ verifyPartialArtifacts([a]);fs.writeFileSync(a.original_path,'fail');assert.throws(()=>verifyPartialArtifacts([a]));
+ verifyPartialArtifacts([a],{includeOriginals:false});fs.writeFileSync(a.original_path,'data');
+ fs.writeFileSync(a.path,'fail');assert.throws(()=>verifyPartialArtifacts([a]));
+ fs.unlinkSync(a.path);fs.symlinkSync(a.original_path,a.path);assert.throws(()=>verifyPartialArtifacts([a]));
+ fs.unlinkSync(a.path);assert.throws(()=>verifyPartialArtifacts([a]));
+});
+test('reviewed registry rejects altered context even when receipt is altered consistently',()=>{
+ const t=REVIEWED_INTAKES.find(t=>t.partial),record={old_run_id:t.run_id,task_gid:t.task_gid,agent_id:t.agent_id,evidence_sha256:'d'.repeat(64)};
+ const c=reviewedPartialContext(t,record.evidence_sha256);verifyReviewedPartialContext(c,record,{verify:()=>{}});
+ for(const edit of [x=>x.next_step='override',x=>x.artifacts=[],x=>x.disposition='completed',x=>x.schema='unknown']){
+  const altered=structuredClone(c);edit(altered);assert.throws(()=>verifyReviewedPartialContext(altered,record,{verify:()=>{}}));
  }
 });
