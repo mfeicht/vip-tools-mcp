@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { collectWorkerProcessReadback } from "./asana-worker-process-readback.mjs";
@@ -11,6 +12,34 @@ export const DEFAULT_DB_PATH = path.join(
   ROOT,
   "VIP-AI-Workspace/10-Agenten/VIP-AI-Operations/run_state/Asana-Dispatch.sqlite"
 );
+// A short, explicit Operations storage cutover must fence every new database
+// connection. Existing connections are drained separately before any path swap.
+export const DISPATCH_STORAGE_BARRIER = path.join(os.tmpdir(), `vip-asana-dispatch-storage-${process.getuid?.() ?? "user"}.barrier`);
+
+export function assertDispatchStorageAvailable(barrier = DISPATCH_STORAGE_BARRIER) {
+  try { fs.lstatSync(barrier); }
+  catch (error) { if (error.code === "ENOENT") return; throw error; }
+  const error = new Error("Dispatch storage maintenance is active; preserve leases and retry after the verified cutover");
+  error.code = "ASANA_DISPATCH_STORAGE_MAINTENANCE";
+  throw error;
+}
+
+export function openDispatchDatabase(filename, options = {}, {
+  barrier = DISPATCH_STORAGE_BARRIER,
+  connect = (resolved, opts) => new DatabaseSync(resolved, opts),
+} = {}) {
+  assertDispatchStorageAvailable(barrier);
+  const db = connect(localDatabasePath(filename), options);
+  try {
+    // Close the check/open race: a caller that passed the first check but was
+    // delayed before open cannot initialize or mutate an obsolete database.
+    assertDispatchStorageAvailable(barrier);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
 
 // Cloud placeholders can retain a nonzero logical size while having no local
 // blocks. Do not let SQLite initialize or change journal mode on that path.
@@ -45,7 +74,7 @@ export class AsanaDispatchStore {
   constructor(filename = DEFAULT_DB_PATH) {
     filename = localDatabasePath(filename);
     fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(filename);
+    this.db = openDispatchDatabase(filename);
     if (filename !== ":memory:") fs.chmodSync(filename, 0o600);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
     this.db.exec(`

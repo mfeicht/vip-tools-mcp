@@ -3,7 +3,7 @@ import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {createHash} from 'node:crypto';
 import {DatabaseSync,backup} from 'node:sqlite';
-import {AsanaDispatchStore,DEFAULT_DB_PATH} from './asana-dispatch-store.mjs';
+import {AsanaDispatchStore,DEFAULT_DB_PATH,openDispatchDatabase} from './asana-dispatch-store.mjs';
 import {resumeTaskQuarantine} from './asana-task-quarantine-resume.mjs';
 const sha=p=>createHash('sha256').update(fs.readFileSync(p)).digest('hex');
 export function parseResumeArguments(args) {
@@ -30,7 +30,7 @@ export async function runResumeCli(args) {
   if(sha(worker)!==evidence.worker_sha256||sha(resolver)!==evidence.resolver_sha256||
      !source.includes('resumeContextForClaim(store, claim)')||!source.includes('resumePrompt(claim.resume_context)'))throw new Error('Reviewed replacement worker and resolver binding required');
   if(!fs.existsSync(DEFAULT_DB_PATH))throw new Error('Existing canonical dispatcher database required');
-  const store=Object.create(AsanaDispatchStore.prototype);store.db=new DatabaseSync(DEFAULT_DB_PATH);
+  const store=Object.create(AsanaDispatchStore.prototype);store.db=openDispatchDatabase(DEFAULT_DB_PATH);
   store.db.exec('PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL');
   try {
     const dry=resumeTaskQuarantine(store,evidence);

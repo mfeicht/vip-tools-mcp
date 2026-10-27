@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {DatabaseSync,backup} from 'node:sqlite';
-import {AsanaDispatchStore,DEFAULT_DB_PATH} from './asana-dispatch-store.mjs';
+import {AsanaDispatchStore,DEFAULT_DB_PATH,openDispatchDatabase} from './asana-dispatch-store.mjs';
 import {failedSpawnResumeSnapshot,applyFailedSpawnResume} from './asana-failed-spawn-resume.mjs';
 import {collectFailedSpawnProcessReadback} from './asana-worker-process-readback.mjs';
 import {connectMcpClient} from './asana-dispatch-poller.mjs';
@@ -45,7 +45,7 @@ export async function runFailedSpawnResume(args) {
   const backupPath=opts.apply?newExport(opts.backup,'.sqlite'):null;
   if(!fs.existsSync(DEFAULT_DB_PATH))throw new Error('Existing canonical database required');
   const store=Object.create(AsanaDispatchStore.prototype);
-  store.db=new DatabaseSync(DEFAULT_DB_PATH);store.db.exec('PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL');
+  store.db=openDispatchDatabase(DEFAULT_DB_PATH);store.db.exec('PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL');
   let client;
   try {
     const snapshot=failedSpawnResumeSnapshot(store,opts.run);
