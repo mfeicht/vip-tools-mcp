@@ -43,6 +43,12 @@ export function decideReviewedIntake(snapshot,proof,scan,now=Date.now()) {
   !signals.length||signals.some(s=>s.status!=='leased'||s.run_id!==t.run_id||s.task_gid!==t.task_gid||
    s.agent_id!==t.agent_id||s.lease_token!==leases[0].token||s.lease_fence!==leases[0].fence))
   return hold('reviewed_isolated_claim_required');
+ return validateReviewedObservations(t,run,proof,scan,now);
+}
+
+// Shared proof checks; callers retain their distinct dispatch/manual transactions.
+export function validateReviewedObservations(t,run,proof,scan,now=Date.now()) {
+ const hold=reason=>({action:'hold',reason});
  const fresh=r=>Number.isSafeInteger(r?.observed_at_ms)&&r.observed_at_ms<=now&&now-r.observed_at_ms<=300000;
  const pair=rows=>Array.isArray(rows)&&rows.length===2&&rows.every(fresh)&&
   rows[1].observed_at_ms-rows[0].observed_at_ms>=30000&&
