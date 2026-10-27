@@ -98,7 +98,7 @@ import {
 import { assertRoutineCatchupOnCadence, assertRoutineDueCanBeCleared, routineFutureRescheduleRequiresCadence } from "./lib/asana-routine-cadence.js";
 import { MAILPOET_SEGMENT24_GRANT, inspectMailpoetSegment24StandingGrant } from "./lib/mailpoet-segment24-standing-grant.js";
 import { isRoutineTaskCreationIntent } from "./lib/asana-routine-intent.js";
-import { buildAsanaTaskSearchPlan, executeAsanaInvolvedSearch } from "./lib/asana-search-params.js";
+import { ASANA_SEARCH_SORT_VALUES, buildAsanaTaskSearchPlan, executeAsanaInvolvedSearch } from "./lib/asana-search-params.js";
 import { readAsanaResourceEvents } from "./lib/asana-events.js";
 import {
   extractAccountingInvoice as extractAccountingInvoiceV2,
@@ -13716,7 +13716,8 @@ function createServer() {
       text: z.string().min(1).max(512).optional(),
       completed: z.boolean().optional(),
       modified_since: z.string().optional(),
-      sort_by: z.string().optional().default("modified_at"),
+      sort_by: z.enum(ASANA_SEARCH_SORT_VALUES).optional().default("modified_at")
+        .describe("Asana-Sortierschlüssel. Für Fälligkeit due_date verwenden; due_at und due_on sind keine Sortierwerte."),
       sort_ascending: z.boolean().optional(),
       limit: z.number().int().min(1).max(100).optional().default(20),
       opt_fields: z
