@@ -129,8 +129,29 @@ export async function reconcileCompletedRuns(store, {
   return result;
 }
 
+export function validateReconciliationArgs(args) {
+  const allowed = new Set(["db", "run", "inspect-run", "outcome", "evidence",
+    "dead-letter-task", "dead-letter-agent", "dead-letter-signals", "dead-letter-outcome"]);
+  const seen = new Set();
+  for (const arg of args) {
+    const match = /^--([a-z-]+)=(.+)$/s.exec(arg);
+    if (!match || !allowed.has(match[1]) || seen.has(match[1])) {
+      throw new Error(`Unsupported, empty or duplicate reconciliation argument: ${arg}. No recovery started.`);
+    }
+    seen.add(match[1]);
+  }
+  const modes = [seen.has("inspect-run"),
+    ["run", "outcome"].some(key => seen.has(key)),
+    [...seen].some(key => key.startsWith("dead-letter-"))];
+  if (modes.filter(Boolean).length > 1 || (seen.has("inspect-run") && seen.has("evidence"))) {
+    throw new Error("Conflicting reconciliation modes. No recovery started.");
+  }
+}
+
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
   const args = process.argv.slice(2);
+  // Validate before opening SQLite or taking the automatic mutation path.
+  validateReconciliationArgs(args);
   const value = (name) => args.find((arg) => arg.startsWith(`--${name}=`))?.slice(name.length + 3);
   const dbPath = value("db") || DEFAULT_DB_PATH;
   const runId = value("run");

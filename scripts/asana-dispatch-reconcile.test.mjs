@@ -3,9 +3,36 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { AsanaDispatchStore } from "./asana-dispatch-store.mjs";
 import { inspectReconciliationRun, reconcileCompletedRuns, resolveDeadLetters,
-  resolveReconciliationRun } from "./asana-dispatch-reconcile.mjs";
+  resolveReconciliationRun, validateReconciliationArgs } from "./asana-dispatch-reconcile.mjs";
+
+test("recovery CLI rejects unsupported dry-run and mixed modes before opening SQLite", t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),"recovery-cli-guard-"));
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const db=path.join(dir,"must-not-exist.sqlite");
+  const script=fileURLToPath(new URL("./asana-dispatch-reconcile.mjs",import.meta.url));
+  for(const args of [["--dry-run"],["--reconcile-open-run=run-1"],["--inspect-run="],
+    ["--inspect-run=run-1","--dead-letter-task=123"],
+    ["--inspect-run=run-1","--inspect-run=run-2"],["--inspect-run","run-1"]]) {
+    const result=spawnSync(process.execPath,[script,`--db=${db}`,...args],
+      {encoding:"utf8",timeout:5000});
+    assert.equal(result.status,1);assert.equal(result.error,undefined);
+    assert.match(result.stderr,/No recovery started/);
+    assert.equal(fs.existsSync(db),false);
+  }
+});
+
+test("recovery CLI preserves supported automatic, inspection and scoped review arguments",()=>{
+  for(const args of [[],["--db=/tmp/test.sqlite"],["--inspect-run=run-1"],
+    ["--run=run-1","--outcome=acknowledged","--evidence=review"],
+    ["--dead-letter-task=123","--dead-letter-agent=vip-ai-test",
+      "--dead-letter-signals=one,two","--dead-letter-outcome=acknowledged","--evidence=review"]]) {
+    assert.doesNotThrow(()=>validateReconciliationArgs(args));
+  }
+});
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asana-dispatch-reconcile-"));
