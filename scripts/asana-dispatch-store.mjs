@@ -676,8 +676,21 @@ export class AsanaDispatchStore {
         if (this.leasesForRun(runId).length) throw new Error("Released run unexpectedly owns leases");
         return 0;
       }
-      this.assertManualOwner(run, context);
       const leases = this.leasesForRun(runId);
+      if (command === "release" && run.state === "active" &&
+          Number.isSafeInteger(run.agent_released_at_ms) &&
+          run.agent_released_at_ms >= run.created_at_ms && run.agent_released_at_ms <= now) {
+        // The original bound chat may close its own remaining task claims after
+        // reconciliation released the agent. Never adopt or release a successor.
+        const bindings = this.db.prepare(
+          "SELECT * FROM manual_run_tasks WHERE run_id=? AND resolved_at_ms IS NULL").all(runId);
+        if (leases.some(lease => !bindings.some(binding =>
+            lease.key === `task:${binding.task_gid}` && lease.fence === binding.lease_fence)) ||
+            bindings.some(binding => !leases.some(lease =>
+              lease.key === `task:${binding.task_gid}` && lease.fence === binding.lease_fence))) {
+          throw new Error("Remaining manual task lease binding changed");
+        }
+      } else this.assertManualOwner(run, context);
       for (const lease of leases) {
         if (command === "release") {
           if (!this.releaseLease(lease)) throw new Error("Lease release fence changed");

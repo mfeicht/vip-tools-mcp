@@ -138,3 +138,59 @@ test("unbound extra lease prevents a partial manual transition", t => {
   assert.equal(apply(db,run,evidence(run)).reason,"unbound_manual_lease");
   assert.equal(db.activeLeases().length,3);
 });
+
+
+test("stable interrupted projection without completion does not mutate manual claims", t => {
+  const {db,run}=fixture(t); const proof=evidence(run);
+  proof.nativeReadbacks.forEach(row=>{row.turn_status="interrupted";
+    row.completed_at_ms=null; row.runtime_status="notLoaded";});
+  const before=db.activeLeases();
+  assert.equal(apply(db,run,proof).reason,"native_terminal_unverified");
+  assert.deepEqual(db.activeLeases(),before);
+  assert.equal(db.db.prepare("SELECT COUNT(*) n FROM recovery_events").get().n,0);
+});
+
+function partialFixture(t) {
+  const f=fixture(t);
+  assert.equal(apply(f.db,f.run,evidence(f.run,{unstable:["123"]})).decision.action,"partial_quarantine");
+  return f;
+}
+
+test("original chat can release remaining fenced tasks without touching a successor agent", t => {
+  const {db,run}=partialFixture(t);
+  db.acquireManualAgent(agent,"successor",context);
+  const successor=db.leasesForRun("successor");
+  assert.equal(db.finishManualLeaseCommand(run.run_id,"release",context),1);
+  assert.deepEqual(db.leasesForRun(run.run_id),[]);
+  assert.deepEqual(db.leasesForRun("successor"),successor);
+  assert.equal(db.manualRun(run.run_id).state,"released");
+  assert.equal(db.finishManualLeaseCommand(run.run_id,"release",context),0);
+});
+
+test("remaining-task release rejects a different thread and does not permit renewal", t => {
+  const {db,run}=partialFixture(t); const before=db.activeLeases();
+  assert.throws(()=>db.finishManualLeaseCommand(run.run_id,"release",
+    {...context,threadId:"11111111-1111-1111-1111-111111111111"}),/another thread/);
+  assert.throws(()=>db.finishManualLeaseCommand(run.run_id,"renew",context),/fence changed/);
+  assert.deepEqual(db.activeLeases(),before);
+});
+
+test("remaining-task release rejects missing reconciliation, changed fences and extra leases", t => {
+  for(const mutate of [
+    db=>db.db.prepare("UPDATE manual_runs SET agent_released_at_ms=NULL WHERE run_id=?").run("manual-run"),
+    db=>db.db.prepare("UPDATE leases SET fence=fence+1 WHERE key=?").run("task:123"),
+    db=>db.acquireLease("task:999","manual-run",60000),
+    db=>db.releaseLease(db.leasesForRun("manual-run")[0])
+  ]) {
+    const {db,run}=partialFixture(t);mutate(db);const before=db.activeLeases();
+    assert.throws(()=>db.finishManualLeaseCommand(run.run_id,"release",context),/changed/);
+    assert.deepEqual(db.activeLeases(),before);
+  }
+});
+
+test("remaining-task release rolls back on storage failure", t => {
+  const {db,run}=partialFixture(t);const before=db.activeLeases();
+  db.db.exec("CREATE TRIGGER fail_close BEFORE UPDATE ON manual_runs BEGIN SELECT RAISE(ABORT,'failure'); END");
+  assert.throws(()=>db.finishManualLeaseCommand(run.run_id,"release",context),/failure/);
+  assert.deepEqual(db.activeLeases(),before);
+});

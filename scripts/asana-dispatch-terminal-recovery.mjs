@@ -107,27 +107,16 @@ export function decideDispatchRecovery(snapshot, proof, scan, now = Date.now()) 
     (run.turn_id && row.turn_id !== run.turn_id) ||
     !Number.isSafeInteger(row.started_at_ms) || row.started_at_ms < run.started_at_ms - 2000 ||
     row.started_at_ms > row.observed_at_ms ||
-    (row.completed_at_ms !== null && (!Number.isSafeInteger(row.completed_at_ms) ||
-      row.completed_at_ms < row.started_at_ms || row.completed_at_ms > row.observed_at_ms)) ||
+    (!Number.isSafeInteger(row.completed_at_ms) ||
+      row.completed_at_ms < row.started_at_ms || row.completed_at_ms > row.observed_at_ms) ||
     !Number.isSafeInteger(row.activity_item_count) || row.activity_item_count < 1 ||
     !row.activity_last_item_id || !/^[a-f0-9]{64}$/.test(row.activity_digest || "")) ||
     native[1].observed_at_ms - native[0].observed_at_ms < 1000 ||
     !same({...native[0], observed_at_ms:null}, {...native[1], observed_at_ms:null})) {
     return hold("native_terminal_unverified");
   }
-  // A missing terminal timestamp can only free the agent, never acknowledge or
-  // replay the task. Require a longer stable native interval and two independent
-  // process scans in addition to the fresh scan at the fenced transaction.
-  const missingEnd = native[1].completed_at_ms === null;
-  if (missingEnd && (!agent || native[1].observed_at_ms-native[0].observed_at_ms < 30000 ||
-      !Array.isArray(proof.processes) || proof.processes.length !== 2 ||
-      proof.processes.some((row,index) => !fresh(row) || !row.scan_succeeded ||
-        row.observed_at_ms < native[index].observed_at_ms ||
-        Object.entries(processScanBinding(run)).some(([key,value]) => !same(row[key],value)) ||
-        !/^[a-f0-9]{64}$/.test(row.raw_sha256 || "") ||
-        !Array.isArray(row.matching_processes) || row.matching_processes.length))) {
-    return hold("missing_end_agent_quarantine_unverified");
-  }
+  // A sidecar may project an active compacting turn as interrupted without an
+  // end timestamp. Stable pages and an empty process scan do not prove it ended.
   if (!fresh(scan) || !scan.scan_succeeded ||
     Object.entries(processScanBinding(run)).some(([key,value]) => !same(scan[key],value)) ||
     !/^[a-f0-9]{64}$/.test(scan.raw_sha256 || "") ||
@@ -143,8 +132,8 @@ export function decideDispatchRecovery(snapshot, proof, scan, now = Date.now()) 
     !same({...asana[0], observed_at_ms:null}, {...asana[1], observed_at_ms:null})) {
     return hold("asana_readback_unverified");
   }
-  const open = !missingEnd ? documentedOpenRecovery(run,proof) : null;
-  const noWorkCapacity = !missingEnd && native[1].turn_status === "failed" &&
+  const open = documentedOpenRecovery(run,proof);
+  const noWorkCapacity = native[1].turn_status === "failed" &&
     native[1].capacity_failed_without_work === true && native[1].answer === null &&
     native[1].observed_at_ms - native[0].observed_at_ms >= 30000 &&
     /^\d+$/.test(proof.ownGid || "") && asana[1].task.completed === false &&
@@ -154,8 +143,8 @@ export function decideDispatchRecovery(snapshot, proof, scan, now = Date.now()) 
   if (noWorkCapacity) return {action: "retry_after", reason: "capacity_failed_without_work",
     delay_ms: 900000, preserve_attempts: true, task_completed: false,
     release_agent: Boolean(agent), turn_id: native[1].turn_id};
-  return { action: !missingEnd && (asana[1].task.completed || open) ? "acknowledge" : "quarantine",
-    reason: open ? "documented_open_task" : missingEnd ? "missing_end_agent_only_quarantine" : "terminal_verified",
+  return { action: (asana[1].task.completed || open) ? "acknowledge" : "quarantine",
+    reason: open ? "documented_open_task" : "terminal_verified",
     open,
     release_agent: Boolean(agent), turn_id: native[1].turn_id };
 }
