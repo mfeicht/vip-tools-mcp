@@ -836,9 +836,14 @@ export class AsanaDispatchStore {
     // Expiry alone is not proof that a Codex turn stopped. Stale leases fail closed.
     if (current && current.run_id !== runId) return null;
     if (current) {
+      // A wall-clock rollback must not move a live owner's heartbeat or expiry
+      // into the past. Preserve already recorded bounds; never infer release or
+      // grant a different owner from expiry. Forward-time renewal is unchanged.
+      const updatedAt = Math.max(current.updated_at_ms, now);
+      const expiresAt = Math.max(current.expires_at_ms, now + ttlMs);
       this.db.prepare("UPDATE leases SET expires_at_ms = ?, updated_at_ms = ? WHERE key = ?")
-        .run(now + ttlMs, now, key);
-      return { key, run_id: runId, token: current.token, fence: current.fence, expires_at_ms: now + ttlMs };
+        .run(expiresAt, updatedAt, key);
+      return { key, run_id: runId, token: current.token, fence: current.fence, expires_at_ms: expiresAt };
     }
     const last = this.db.prepare("SELECT last_fence FROM lease_fences WHERE key = ?").get(key);
     const fence = Number(last?.last_fence || 0) + 1;
