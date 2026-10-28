@@ -93,17 +93,25 @@ export function applyReviewedIntake(store,snapshot,proof,{operator,apply=false,
  return store.transaction(()=>{
   if(!same(dispatchRecoverySnapshot(store,snapshot.run.run_id),snapshot))return {action:'hold',reason:'recovery_fence_changed'};
   const own=store.manualRun(operator?.run_id),held=own?store.leasesForRun(own.run_id):[];
+  const target=REVIEWED_INTAKES.find(t=>t.run_id===snapshot.run.run_id);
+  // The reviewed weekly-health incident holds the usual Operations task itself.
+  // Its recovery must be authorized by the distinct watcher task, never by taking
+  // over the quarantined lease. Other historical incidents retain their gate.
+  const authorizationTask=target?.key==='weekly_health'?'1218693508638175':'1218924687084315';
+  const taskLease=held.find(l=>l.key==='task:'+authorizationTask);
+  const binding=own&&store.db.prepare('SELECT * FROM manual_run_tasks WHERE run_id=? AND task_gid=?').get(own.run_id,authorizationTask);
   if(own?.state!=='active'||own.agent_id!=='vip-ai-operations'||own.thread_id!==operator?.thread_id||
-   !operator.thread_id||operator.task_gid!=='1218924687084315'||
+   !operator.thread_id||operator.task_gid!==authorizationTask||
    !held.some(l=>l.key==='agent:vip-ai-operations'&&l.fence===own.agent_fence&&l.expires_at_ms>now)||
-   !held.some(l=>l.key==='task:'+operator.task_gid&&l.expires_at_ms>now))
+   !taskLease||taskLease.expires_at_ms<=now||binding?.lease_fence!==taskLease.fence||binding.resolved_at_ms!==null||
+   store.db.prepare('SELECT last_fence FROM lease_fences WHERE key=?').get(taskLease.key)?.last_fence!==taskLease.fence||
+   store.db.prepare('SELECT last_fence FROM lease_fences WHERE key=?').get('agent:vip-ai-operations')?.last_fence!==own.agent_fence)
    return {action:'hold',reason:'current_operations_lease_required'};
   const lease=snapshot.leases[0];
   if(lease&&store.db.prepare('SELECT last_fence FROM lease_fences WHERE key=?').get(lease.key)?.last_fence!==lease.fence)
    return {action:'hold',reason:'lease_fence_history_changed'};
   const decision=decideReviewedIntake(snapshot,proof,processReadback,now);
   if(decision.action!=='retry_after')return {...decision,dry_run:!apply};
-  const target=REVIEWED_INTAKES.find(t=>t.run_id===snapshot.run.run_id);
   if(target.partial)verifyArtifacts(target.artifacts);
   if(!apply)return {...decision,dry_run:true};
   const context=target.partial?reviewedPartialContext(target,hash(proof)):null;

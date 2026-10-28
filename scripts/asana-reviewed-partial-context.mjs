@@ -2,6 +2,40 @@ import fs from 'node:fs';
 import {createHash} from 'node:crypto';
 // Individually reviewed historical cases, not a general partial-work detector.
 const cases = [
+{
+  "key": "weekly_health",
+  "partial": true,
+  "run_id": "9f9a0cd63f99437db654821972e2bf27",
+  "agent_id": "vip-ai-operations",
+  "task_gid": "1218924687084315",
+  "assignee": "1214979008788676",
+  "thread_id": "01a18115-7177-72b3-98da-a9dcfbbe5388",
+  "turn_id": "01a18115-8dda-7821-8d8b-13efb06e5234",
+  "run_started_at_ms": 1793167005211,
+  "turn_status": "failed",
+  "error_message": "Selected model is at capacity. Please try a different model.",
+  "started_at": 1793167035,
+  "completed_at": 1793167415,
+  "activity_count": 91,
+  "activity_sha256": "14e8eba5e31255a5a95743a2f373980a4d312f1d26836b60dda7162b38648af7",
+  "stories_sha256": "8689d3c07db046aa027efa70e72e3f9751bb13c42c992f451fea6ff4153489a4",
+  "modified_at": "2026-10-28T06:03:03.675Z",
+  "artifacts": [
+    {
+      "original_path": "/Users/moritzfeichtmeyer/Documents/Codex/VIP-Studios/VIP-AI-Workspace/10-Agenten/VIP-AI-Operations/run_state/2026-10-28__asana-1218924687084315__weekly-health__run-9f9a0cd6.json",
+      "path": "/Users/moritzfeichtmeyer/Documents/Codex/VIP-Studios/VIP-AI-Workspace/10-Agenten/VIP-AI-Operations/run_state/recovery-artifacts/9f9a0cd63f99437db654821972e2bf27/2026-10-28__asana-1218924687084315__weekly-health__run-9f9a0cd6.json",
+      "sha256": "7db43ceb39ea55e0b3785816d28c8f83fa3de2dc3fe35bdf15981ade1b3dae37",
+      "bytes": 4188
+    },
+    {
+      "original_path": "/Users/moritzfeichtmeyer/Documents/Codex/VIP-Studios/VIP-AI-Workspace/10-Agenten/VIP-AI-Operations/exports/2026-10-28__weekly-recovery/asana-reviewed.json",
+      "path": "/Users/moritzfeichtmeyer/Documents/Codex/VIP-Studios/VIP-AI-Workspace/10-Agenten/VIP-AI-Operations/run_state/recovery-artifacts/9f9a0cd63f99437db654821972e2bf27/asana-reviewed.json",
+      "sha256": "496c33558273c4dc71c5f2b26ce825550aaf8f5bab4a394c9229cda54889f663",
+      "bytes": 146979
+    }
+  ],
+  "next_step": "Lies den gesicherten Wochen-Checkpoint und Story 1219958682155894, dann den aktuellen Operations-Stand. Der Statuskommentar wurde bereits erfolgreich gespeichert; nicht nochmals posten. Die Zeitzonen-Korrektur ist inzwischen im Standardlauf erledigt und darf nicht anhand des historischen Checkpoints wiederholt werden. Prüfe aktuelle Restbefunde und natürliche Folgeinstanzen unter eigenen Task-Leases. Kein Gesamtabschluss aus der technischen Wiederaufnahme."
+},
   {
     "key": "crossdesk",
     "partial": true,
