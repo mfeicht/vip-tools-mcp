@@ -637,6 +637,10 @@ const ASANA_ROUTINE_CADENCE_RULE_SCHEMA = z.object({
   anchor_due_on: z.string(),
   weekdays: z.array(z.number().int().min(1).max(7)).min(1).max(7).optional()
     .describe("Optional ISO weekdays (1=Monday, 7=Sunday), only with unit=day and interval=1. Must come from the documented schedule contract."),
+  time_berlin: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).optional()
+    .describe("Optional explicit current contract time in Europe/Berlin. Requires time_basis; unresolved schedule conflicts must first be resolved by Operations. Omit to retain the source task time."),
+  time_basis: z.string().trim().min(1).max(2000).optional()
+    .describe("Specific authoritative schedule source and, for a conflict, Operations resolution supporting time_berlin. Evidence only, not new authorization; never infer the time from an isolated instance."),
   short_month: z.enum(["skip", "last_day"]).optional()
 });
 const ASANA_TASK_SCHEDULE_VERIFY_OPT_FIELDS =
