@@ -1015,7 +1015,7 @@ export class AsanaDispatchStore {
   }
 
   reviewDeadLetters({ signalIds, agentId, taskGid, outcome = "acknowledged",
-    evidence, now = Date.now() } = {}) {
+    evidence, operator = null, now = Date.now() } = {}) {
     if (!Array.isArray(signalIds) || signalIds.length === 0 || signalIds.length > 20 ||
         new Set(signalIds).size !== signalIds.length) {
       throw new Error("dead-letter review requires one to twenty unique signal IDs");
@@ -1031,11 +1031,30 @@ export class AsanaDispatchStore {
       throw new Error("dead-letter review requires concrete evidence");
     }
     return this.transaction(() => {
-      const activeAgentLease = this.db.prepare("SELECT run_id FROM leases WHERE key=?")
+      const activeAgentLease = this.db.prepare("SELECT * FROM leases WHERE key=?")
         .get(`agent:${agentId}`);
-      const activeTaskLease = this.db.prepare("SELECT run_id FROM leases WHERE key=?")
+      const activeTaskLease = this.db.prepare("SELECT * FROM leases WHERE key=?")
         .get(`task:${taskGid}`);
-      if (activeAgentLease || activeTaskLease) {
+      // A reviewer must not drop its own task lease to satisfy the recovery
+      // gate. Accept only a live, thread-bound Operations run and both exact
+      // manual fences. Other agents and other Operations runs remain blocked.
+      if (operator !== null) {
+        const run = this.manualRun(operator.runId);
+        if (!run || run.agent_id !== "vip-ai-operations") {
+          throw new Error("Dead-letter review requires a bound Operations operator");
+        }
+        const ownAgent = this.assertManualOwner(run, operator.context);
+        const binding = this.db.prepare("SELECT lease_fence FROM manual_run_tasks WHERE run_id=? AND task_gid=?")
+          .get(run.run_id, taskGid);
+        if (ownAgent.expires_at_ms <= now || !activeTaskLease ||
+            activeTaskLease.run_id !== run.run_id || activeTaskLease.expires_at_ms <= now ||
+            activeTaskLease.fence !== binding?.lease_fence ||
+            this.db.prepare("SELECT last_fence FROM lease_fences WHERE key=?").get(ownAgent.key)?.last_fence !== ownAgent.fence ||
+            this.db.prepare("SELECT last_fence FROM lease_fences WHERE key=?").get(activeTaskLease.key)?.last_fence !== activeTaskLease.fence ||
+            (activeAgentLease && activeAgentLease.run_id !== run.run_id)) {
+          throw new Error("Dead-letter review blocked by missing, stale or foreign operator leases");
+        }
+      } else if (activeAgentLease || activeTaskLease) {
         throw new Error("dead-letter review blocked by an active agent or task lease");
       }
       const rows = signalIds.map((id) => this.db.prepare("SELECT * FROM signals WHERE id=?").get(id));
@@ -1052,6 +1071,14 @@ export class AsanaDispatchStore {
         if (update.run(outcome, availableAt, now, note, id).changes !== 1) {
           throw new Error("dead-letter signal changed during review");
         }
+      }
+      if (operator !== null) {
+        this.db.prepare("INSERT INTO recovery_events(run_id,observed_at_ms,kind,evidence_json) VALUES (?,?,?,?)")
+          .run(operator.runId, now, "dead_letter_operator_review", JSON.stringify({
+            thread_id: operator.context.threadId, agent_id: agentId, task_gid: taskGid,
+            signal_ids: signalIds, outcome, evidence: evidence.trim(),
+            task_fence: activeTaskLease.fence
+          }));
       }
       return { agent_id: agentId, task_gid: taskGid, outcome,
         signals_resolved: signalIds.length, signal_ids: [...signalIds] };
