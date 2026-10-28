@@ -18,16 +18,22 @@ async function saveHealth(health) {
   await fs.rename(temporary, HEALTH_PATH);
 }
 
-async function launchWorkers(store, maximum = 2, coordinationReady = true) {
+export function workerCapacity(store, maximum = 2, coordinationReady = true, now = Date.now()) {
   if (!Number.isSafeInteger(maximum) || maximum < 0 || maximum > 2) throw new Error("Invalid worker limit");
-  if (store.dispatchMaintenance()) return 0;
-  const active = store.activeLeases().filter((lease) =>
-    lease.key.startsWith("agent:"));
+  if (store.dispatchMaintenance()) return { started: 0, claimableAgents: null, slots: null, agents: [] };
+  const active = store.activeLeases().filter(lease => lease.key.startsWith("agent:"));
   const slots = Math.max(0, maximum - active.length);
-  store.transaction(()=>store.normalizeContinuations());
-  const agents = store.readyAgentIds(Date.now(),slots,coordinationReady);
-  const count = agents.length;
-  if (count === 0) return 0;
+  const candidates = store.readyAgentCandidates(now, coordinationReady);
+  return { started: 0, claimableAgents: candidates.length, slots, agents: candidates.slice(0, slots) };
+}
+
+async function launchWorkers(store, maximum = 2, coordinationReady = true) {
+  const capacity = store.transaction(() => {
+    if (!store.dispatchMaintenance()) store.normalizeContinuations();
+    return workerCapacity(store, maximum, coordinationReady);
+  });
+  const agents = capacity.agents;
+  if (!agents.length) return capacity;
   const log = await fs.open(LOG_PATH, "a", 0o600);
   try {
     for (const agent of agents) {
@@ -41,7 +47,7 @@ async function launchWorkers(store, maximum = 2, coordinationReady = true) {
   } finally {
     await log.close();
   }
-  return count;
+  return { ...capacity, started: agents.length };
 }
 
 export async function coordinationPrestartGate(store, readHealth = readMaterialCommentStoreHealth) {
@@ -59,6 +65,7 @@ export async function watch({ dispatch = false, maxWorkers = 2,
   const start = Date.now();
   const health = { started_at: new Date(start).toISOString(), dispatch_enabled: dispatch,
     poll: null, workers_started: 0, ready: 0, active_agents: 0, stale_leases: 0,
+    claimable_agents: null, available_worker_slots: null,
     counts: {}, errors: [], status: "starting", stalled_runs: 0, reconciliation: null };
   let pollHealthy = false;
   try {
@@ -90,7 +97,10 @@ export async function watch({ dispatch = false, maxWorkers = 2,
     health.stalled_runs = store.stalledRuns().length;
     if (dispatch && pollHealthy && !health.errors.length) {
       health.coordination_prestart = await coordinationPrestartGate(store);
-      health.workers_started = await launchWorkers(store, maxWorkers, health.coordination_prestart.ready);
+      const capacity = await launchWorkers(store, maxWorkers, health.coordination_prestart.ready);
+      health.workers_started = capacity.started;
+      health.claimable_agents = capacity.claimableAgents;
+      health.available_worker_slots = capacity.slots;
     }
   } catch (error) {
     health.errors.push({ source: "dispatch", error: String(error?.message || error).slice(0, 500) });
