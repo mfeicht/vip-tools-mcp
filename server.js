@@ -13,6 +13,7 @@ import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { promisify } from "util";
 import { PDFParse } from "pdf-parse";
 import { z } from "zod";
+import { readSpreadsheetMetadata } from "./lib/google-sheets-metadata.js";
 import { assertLinkedGoogleDocScope, linkedGoogleDocReadback } from "./lib/google-docs-linked-reader.js";
 import { asanaDriveInstructionText, assertInstructionReferencesDriveIds, assertRecoverableTrashTarget, assertWritableSharedFolder, resolveCopyDestination } from "./lib/google-drive-write-policy.mjs";
 import { XLSX_MAX_BYTES, XLSX_MIME, copyXlsxWithValues, inspectXlsxValueTemplate, sha256 as xlsxSha256, verifyXlsxValueCopy } from "./lib/xlsx-value-copy.js";
@@ -22873,6 +22874,19 @@ function createServer() {
       const values = await getSheetValues(spreadsheet_id, a1Range, value_render_option, { agent_id });
       return out({ agent_id, spreadsheet_id, sheet_name, range, values });
     }
+  );
+
+  server.tool(
+    "google_sheets_metadata",
+    "Liest Titel, IDs und grundlegende Eigenschaften aller Tabs eines explizit bekannten Google Sheets. Read-only, ohne Zellinhalte; nutzt die bestehende Google-Identität des Agenten. Keine Drive-Suche und keine Aussage über Dateien außerhalb dieses Spreadsheets.",
+    {
+      agent_id: z.enum(Object.keys(ASANA_TOKEN_ENVS)),
+      spreadsheet_id: z.string().regex(/^[A-Za-z0-9_-]{1,256}$/)
+    },
+    TOOL_READ_ONLY,
+    async ({ agent_id, spreadsheet_id }) => out(await readSpreadsheetMetadata({
+      spreadsheetId: spreadsheet_id, agentId: agent_id, request: googleRequest
+    }))
   );
 
   server.tool(

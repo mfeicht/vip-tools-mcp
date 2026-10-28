@@ -56,7 +56,8 @@
     "test:templated-preview": "node --test lib/templated-render-preview.test.mjs lib/templated-internal-id.test.mjs lib/generated-image-handoff.test.mjs",
     "test:gemini-image-mcp": "node scripts/gemini-image-mcp-selftest.mjs",
     "test:mcp-lifecycle": "node scripts/mcp-request-lifecycle-selftest.mjs",
-    "mcp:call": "node scripts/vip-mcp-call.mjs"
+    "mcp:call": "node scripts/vip-mcp-call.mjs",
+    "test:google-sheets-metadata": "node --test lib/google-sheets-metadata.test.mjs"
   },
   "keywords": [],
   "author": "",
