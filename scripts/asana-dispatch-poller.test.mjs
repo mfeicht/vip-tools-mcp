@@ -16,7 +16,7 @@ function fakeClient({ searchTasks = [], stories = [], searchComplete = true,
           result_truncated: !searchComplete, tasks: searchTasks }
         : args.path === `/tasks/${linkedTask?.gid}`
           ? { response: { data: linkedTask } }
-          : { response: { data: stories, next_page: null } };
+          : { response: { data: stories.map(story => ({target: {gid: args.path.split("/")[2]}, ...story})), next_page: null } };
       return { content: [{ type: "text", text: JSON.stringify(data) }] };
     }
   };
@@ -26,7 +26,7 @@ test("assigned due task and new human comment enqueue once across polls", async 
   const store = new AsanaDispatchStore(":memory:");
   try {
     const now = new Date("2026-09-21T10:00:00Z");
-    const task = { gid: "123", name: "Investigate", completed: false,
+    const task = { due_at: null, due_on: null, tags: [], gid: "123", name: "Investigate", completed: false,
       assignee: { gid: "456" }, due_on: "2020-01-01", modified_at: "2026-09-21T09:00:00Z" };
     const client = fakeClient({ stories: [{ gid: "789", type: "comment", resource_subtype: "comment_added",
       created_at: "2026-09-21T09:30:00Z", created_by: { gid: "900" }, html_text: "Please check" }] });
@@ -47,8 +47,8 @@ test("completed linked task wakes the source once without rerunning while depend
   const store = new AsanaDispatchStore(":memory:");
   try {
     const start = Date.parse("2026-09-21T10:00:00Z");
-    const task = { gid: "123", name: "Source task", completed: false,
-      assignee: { gid: "sales-user" }, due_on: "2026-09-20",
+    const task = { due_at: null, due_on: null, tags: [], gid: "123", name: "Source task", completed: false,
+      assignee: { gid: "4560" }, due_on: "2026-09-20",
       modified_at: "2026-09-21T09:00:00Z" };
     store.enqueue({ ...taskSignal("vip-ai-sales", task, { now: new Date(start) }),
       available_at_ms: start }, start);
@@ -56,12 +56,12 @@ test("completed linked task wakes the source once without rerunning while depend
     store.settle(claim, { outcome: "acknowledged", now: start, dependencyWatch: {
       agent_id: "vip-ai-sales", task_gid: "123", linked_task_gid: "456",
       evidence_story_gid: "789" } });
-    const snapshot = { agent_id: "vip-ai-sales", ok: true, user_gid: "sales-user",
+    const snapshot = { agent_id: "vip-ai-sales", ok: true, user_gid: "4560",
       workspace_gid: "111", tasks: [task], truncated: false };
     const linkedTask = { gid: "456", completed: false,
       modified_at: "2026-09-21T09:30:00Z" };
     const client = fakeClient({ linkedTask });
-    const agents = new Set(["sales-user"]);
+    const agents = new Set(["4560"]);
     const early = await scanAgent(client, store, snapshot, agents,
       new Date(start + 5 * 60_000), true);
     assert.equal(early.dependencies_checked, 0);
@@ -85,7 +85,7 @@ test("completed linked task wakes the source once without rerunning while depend
 test("creator who is not assignee needs a direct mention", async () => {
   const store = new AsanaDispatchStore(":memory:");
   try {
-    const task = { gid: "123", name: "Someone else's task", completed: false,
+    const task = { due_at: null, due_on: null, tags: [], gid: "123", name: "Someone else's task", completed: false,
       created_by: { gid: "456" }, assignee: { gid: "999" }, modified_at: "2026-09-21T09:30:00Z" };
     const story = { gid: "789", type: "comment", created_at: "2026-09-21T09:45:00Z",
       created_by: { gid: "900" }, html_text: "Please check" };
@@ -158,7 +158,7 @@ test("cyclic audit discovers comments without modified_at changes and backfills 
   const store=new AsanaDispatchStore(":memory:");
   try{
     const now=new Date("2026-10-22T10:00:00Z");
-    const task={gid:"123",name:"Task",completed:false,assignee:{gid:"456"},modified_at:"2026-10-20T10:00:00Z"};
+    const task={due_at:null,due_on:null,tags:[],gid:"123",name:"Task",completed:false,assignee:{gid:"456"},modified_at:"2026-10-20T10:00:00Z"};
     store.observeTask({agent_id:"vip-ai-research",task_gid:"123",modified_at:task.modified_at,
       latest_story_at:"2026-10-21T10:00:00Z",latest_story_gid:"888"},now.getTime()-3600000);
     const stories=[{gid:"777",resource_subtype:"comment_added",created_by:{gid:"900"},
@@ -179,7 +179,7 @@ test("cyclic audit discovers comments without modified_at changes and backfills 
 test("failed cyclic audit never advances observation or poll cursor",async()=>{
   const store=new AsanaDispatchStore(":memory:");
   try{
-    const task={gid:"123",name:"Task",completed:false,assignee:{gid:"456"},modified_at:"2026-10-20T10:00:00Z"};
+    const task={due_at:null,due_on:null,tags:[],gid:"123",name:"Task",completed:false,assignee:{gid:"456"},modified_at:"2026-10-20T10:00:00Z"};
     store.observeTask({agent_id:"vip-ai-research",task_gid:"123",modified_at:task.modified_at},1000);
     const before=store.observation("vip-ai-research","123");
     const story={gid:"777",created_at:"2026-10-20T11:00:00Z",type:"comment",created_by:{gid:"900"}};

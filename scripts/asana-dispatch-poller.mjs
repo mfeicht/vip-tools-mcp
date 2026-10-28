@@ -7,6 +7,48 @@ import { dependencyReadySignal, newCommentSignals, taskSignal } from "./asana-di
 const TASK_FIELDS = "gid,name,completed,created_by.gid,assignee.gid,due_on,due_at,modified_at,permalink_url,tags.name,followers.gid";
 const STORY_FIELDS = "gid,created_at,created_by.gid,resource_subtype,type,text,html_text,target.gid,assignee.gid";
 
+const isGid = value => typeof value === "string" && /^\d+$/.test(value);
+const isTimestamp = value => typeof value === "string" &&
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
+  Number.isFinite(Date.parse(value));
+
+export function assertSnapshotIdentities(snapshots, expectedAgentIds) {
+  const expected = new Set(expectedAgentIds);
+  const seen = new Set();
+  if (!expected.size || expected.size !== expectedAgentIds.length ||
+      !Array.isArray(snapshots?.agents) || snapshots.agents.length !== expected.size) {
+    throw new Error("Agent identity snapshot incomplete: invalid cardinality");
+  }
+  for (const row of snapshots.agents) {
+    if (!expected.has(row?.agent_id) || seen.has(row.agent_id) || row.ok !== true ||
+        row.truncated !== false || !isGid(row.user_gid) || !isGid(row.workspace_gid) ||
+        !Array.isArray(row.tasks)) {
+      throw new Error("Agent identity snapshot incomplete: unexpected, duplicate or invalid agent");
+    }
+    seen.add(row.agent_id);
+  }
+}
+
+export function assertTaskRows(tasks, source) {
+  const seen = new Set();
+  if (!Array.isArray(tasks)) throw new Error(`Invalid task list in ${source}`);
+  for (const task of tasks) {
+    if (!isGid(task?.gid) || seen.has(task.gid) || typeof task.name !== "string" ||
+        typeof task.completed !== "boolean" || !isTimestamp(task.modified_at) ||
+        !(task.assignee === null || isGid(task.assignee?.gid)) ||
+        !Object.hasOwn(task, "due_on") || !Object.hasOwn(task, "due_at") ||
+        !(task.due_on === null || (typeof task.due_on === "string" &&
+          /^\d{4}-\d{2}-\d{2}$/.test(task.due_on) &&
+          Number.isFinite(Date.parse(task.due_on)) &&
+          new Date(task.due_on).toISOString().slice(0, 10) === task.due_on)) ||
+        !(task.due_at === null || isTimestamp(task.due_at)) ||
+        !Array.isArray(task.tags) || task.tags.some(tag => typeof tag?.name !== "string")) {
+      throw new Error(`Invalid or duplicate task in ${source}`);
+    }
+    seen.add(task.gid);
+  }
+}
+
 function options(argv) {
   const opts = { write: false, agentIds: null, db: DEFAULT_DB_PATH };
   for (const arg of argv) {
@@ -70,6 +112,7 @@ export async function storiesForTask(client, agentId, taskGid) {
       if(!/^\d+$/.test(story?.gid || "") || seenStories.has(story.gid) ||
           !Number.isFinite(Date.parse(story.created_at))) throw new Error(`Invalid or duplicate story on ${taskGid}`);
       seenStories.add(story.gid);
+      if (story.target?.gid !== taskGid) throw new Error(`Story target mismatch on ${taskGid}`);
     }
     stories.push(...result.response.data);
     offset = result.response?.next_page?.offset || null;
@@ -101,6 +144,10 @@ export async function scanAgent(client, store, snapshot, agentUserGids, scanStar
     max_pages_per_branch: 10, limit: 100, opt_fields: TASK_FIELDS
   });
   assertSearchComplete(search, agentId);
+  // Validate both complete sources before any observation/cursor write. A row
+  // silently dropped here would otherwise disappear behind the next cursor.
+  assertTaskRows(snapshot.tasks, `${agentId} assigned snapshot`);
+  assertTaskRows(search.tasks, `${agentId} involved search`);
 
   const tasks = new Map();
   for (const task of search.tasks) if (task?.gid) tasks.set(String(task.gid), task);
@@ -218,17 +265,7 @@ export async function poll({ write = false, agentIds = null, db = DEFAULT_DB_PAT
     const snapshots = await tool(client, "asana_agents_open_task_snapshot", {
       agent_ids: expectedAgentIds, limit: 100, max_pages: 10, concurrency: 4
     });
-    if (!Array.isArray(snapshots.agents) || snapshots.agents.length === 0) {
-      throw new Error("No agent snapshots returned");
-    }
-    const incomplete = snapshots.agents.filter((item) =>
-      !item.ok || item.truncated || !item.user_gid || !item.workspace_gid);
-    const seenAgentIds = new Set(snapshots.agents.map((item) => item.agent_id));
-    const missing = expectedAgentIds.filter((agentId) => !seenAgentIds.has(agentId));
-    if (incomplete.length || missing.length) {
-      throw new Error(`Agent identity snapshot incomplete: ${[
-        ...incomplete.map((item) => item.agent_id), ...missing].join(",")}`);
-    }
+    assertSnapshotIdentities(snapshots, expectedAgentIds);
     const agentUserGids = new Set(snapshots.agents.filter((item) => item.ok).map((item) => String(item.user_gid)));
     Object.assign(result,await scanSnapshots(client,store,snapshots.agents,agentUserGids,scanStartedAt,write));
     result.counts = store.counts();

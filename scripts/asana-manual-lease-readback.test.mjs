@@ -67,7 +67,7 @@ test("read-only driver takes two native and scoped Asana reads before deciding",
 test("system stories may have no author but comments require attributable authors", async () => {
   let comment=false;
   const client={callTool:async({arguments:args})=>({content:[{type:"text",text:JSON.stringify({response:
-    args.path.endsWith("/stories") ? {data:[{gid:"333",created_at:"2026-10-21T08:00:00Z",
+    args.path.endsWith("/stories") ? {data:[{gid:"333",target:{gid:"123"},created_at:"2026-10-21T08:00:00Z",
       resource_subtype:comment?"comment_added":"task_due_time_approaching_story",created_by:null}],next_page:null} :
       {data:{gid:"123",completed:false,modified_at:"2026-10-21T08:00:00Z"}}})}]})};
   assert.equal((await readManualAsanaTask(run,run.tasks[0],client)).stories.length,1);
