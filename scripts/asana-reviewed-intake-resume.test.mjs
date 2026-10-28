@@ -180,7 +180,7 @@ test('interrupted display cannot release an unreviewed claim',ctx=>{
  const f=fixture(ctx);for(const n of f.proof.native){n.turn_status='interrupted';n.completed_at=null;n.error=null;}
  assert.equal(decideReviewedIntake(f.snapshot,f.proof,f.scan,f.now).action,'hold');
 });
-for(const t of REVIEWED_INTAKES.filter(t=>['watcher','content','sales_umzug'].includes(t.key)))test(t.key+': only the pinned checkpoint context reaches its owner',()=>{
+for(const t of REVIEWED_INTAKES.filter(t=>['watcher','content','sales_umzug','weekly_health'].includes(t.key)))test(t.key+': only the pinned checkpoint context reaches its owner',()=>{
  const record={old_run_id:t.run_id,task_gid:t.task_gid,agent_id:t.agent_id,evidence_sha256:'e'.repeat(64)};
  const context=reviewedPartialContext(t,record.evidence_sha256);let count=0;
  verifyReviewedPartialContext(context,record,{verify:(a,o)=>{assert.deepEqual(a,t.artifacts);assert.equal(o.includeOriginals,false);count++;}});
@@ -188,4 +188,18 @@ for(const t of REVIEWED_INTAKES.filter(t=>['watcher','content','sales_umzug'].in
  for(const change of [c=>c.next_step='unreviewed',c=>c.artifacts=[],c=>c.agent_id='wrong-owner',c=>c.old_run_id='another-run']){
   const c=structuredClone(context);change(c);assert.throws(()=>verifyReviewedPartialContext(c,record,{verify:()=>{}}));
  }
+});
+
+for(const change of ['missing-binding','changed-binding','resolved-binding','task-history','agent-history','expired-task','foreign-thread'])test('operator authorization rejects '+change,ctx=>{
+ const f=fixture(ctx);
+ if(change==='missing-binding')f.store.db.prepare('DELETE FROM manual_run_tasks WHERE run_id=?').run('operator');
+ if(change==='changed-binding')f.store.db.prepare('UPDATE manual_run_tasks SET lease_fence=lease_fence+1 WHERE run_id=?').run('operator');
+ if(change==='resolved-binding')f.store.db.prepare('UPDATE manual_run_tasks SET resolved_at_ms=? WHERE run_id=?').run(f.now,'operator');
+ if(change==='task-history')f.store.db.prepare('UPDATE lease_fences SET last_fence=last_fence+1 WHERE key=?').run('task:'+f.operator.task_gid);
+ if(change==='agent-history')f.store.db.prepare('UPDATE lease_fences SET last_fence=last_fence+1 WHERE key=?').run('agent:vip-ai-operations');
+ if(change==='expired-task')f.store.db.prepare('UPDATE leases SET expires_at_ms=? WHERE key=?').run(f.now,'task:'+f.operator.task_gid);
+ if(change==='foreign-thread')f.options.operator={...f.operator,thread_id:'other'};
+ assert.equal(applyReviewedIntake(f.store,f.snapshot,f.proof,{...f.options,apply:true}).reason,'current_operations_lease_required');
+ assert.deepEqual(dispatchRecoverySnapshot(f.store,f.t.run_id),f.snapshot);
+ assert.equal(f.store.db.prepare('SELECT count(*) n FROM recovery_events').get().n,0);
 });
