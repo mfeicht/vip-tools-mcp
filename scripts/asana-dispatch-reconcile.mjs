@@ -51,8 +51,8 @@ export async function resolveReconciliationRun() {
 }
 
 export function resolveDeadLetters(store, { signalIds, agentId, taskGid, outcome,
-  evidence, now = Date.now() } = {}) {
-  return store.reviewDeadLetters({ signalIds, agentId, taskGid, outcome, evidence, now });
+  evidence, operator = null, now = Date.now() } = {}) {
+  return store.reviewDeadLetters({ signalIds, agentId, taskGid, outcome, evidence, operator, now });
 }
 
 export async function reconcileCompletedRuns(store, {
