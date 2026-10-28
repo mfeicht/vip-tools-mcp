@@ -178,6 +178,8 @@ export class AsanaDispatchStore {
         signals_inserted INTEGER NOT NULL,
         errors_count INTEGER NOT NULL,
         workers_started INTEGER NOT NULL,
+        claimable_agents INTEGER,
+        available_worker_slots INTEGER,
         ready INTEGER NOT NULL,
         active_agents INTEGER NOT NULL,
         stale_leases INTEGER NOT NULL,
@@ -245,6 +247,19 @@ export class AsanaDispatchStore {
       ["task_observations", "history_checked_at_ms"], ["signals", "requires_coordination"]]) {
       if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === column))
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} INTEGER`);
+    }
+
+    // Unknown historical samples stay NULL; never reconstruct past capacity.
+    const capacityColumns = ["claimable_agents", "available_worker_slots"];
+    const pollColumns = () => new Set(this.db.prepare("PRAGMA table_info(poll_runs)").all()
+      .map(column => column.name));
+    if (capacityColumns.some(column => !pollColumns().has(column))) {
+      this.transaction(() => {
+        const existing = pollColumns();
+        for (const column of capacityColumns) {
+          if (!existing.has(column)) this.db.exec(`ALTER TABLE poll_runs ADD COLUMN ${column} INTEGER`);
+        }
+      });
     }
 
   }
@@ -1066,6 +1081,14 @@ export class AsanaDispatchStore {
       if (!Number.isSafeInteger(number) || number < 0) throw new Error(`${label} is invalid`);
       return number;
     };
+    const capacity = (value, label) => {
+      if (value == null) return null;
+      if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${label} is invalid`);
+      return value;
+    };
+    if ((health.claimable_agents == null) !== (health.available_worker_slots == null)) {
+      throw new Error("poll run capacity sample is incomplete");
+    }
     const agents = Array.isArray(health.poll?.agents) ? health.poll.agents : [];
     const sumAgent = (field) => agents.reduce((total, agent) => total + count(agent?.[field], field), 0);
     const counts = health.counts || {};
@@ -1081,6 +1104,8 @@ export class AsanaDispatchStore {
       count(health.duration_ms, "duration_ms"), agents.length,
       sumAgent("tasks_scanned"), sumAgent("stories_read"), sumAgent("signals_inserted"),
       count(health.errors?.length, "errors_count"), count(health.workers_started, "workers_started"),
+      capacity(health.claimable_agents, "claimable_agents"),
+      capacity(health.available_worker_slots, "available_worker_slots"),
       count(health.ready, "ready"), count(health.active_agents, "active_agents"),
       count(health.stale_leases, "stale_leases"), count(health.stalled_runs, "stalled_runs"),
       count(counts.acknowledged, "queue_acknowledged"), count(counts.pending, "queue_pending"),
@@ -1090,16 +1115,18 @@ export class AsanaDispatchStore {
     return this.transaction(() => {
       this.db.prepare(`INSERT INTO poll_runs
         (started_at_ms,finished_at_ms,status,dispatch_enabled,duration_ms,agent_count,
-         tasks_scanned,stories_read,signals_inserted,errors_count,workers_started,ready,
+         tasks_scanned,stories_read,signals_inserted,errors_count,workers_started,
+         claimable_agents,available_worker_slots,ready,
          active_agents,stale_leases,stalled_runs,queue_acknowledged,queue_pending,
          queue_leased,queue_retry_after,queue_dead_letter)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(started_at_ms) DO UPDATE SET
           finished_at_ms=excluded.finished_at_ms,status=excluded.status,
           dispatch_enabled=excluded.dispatch_enabled,duration_ms=excluded.duration_ms,
           agent_count=excluded.agent_count,tasks_scanned=excluded.tasks_scanned,
           stories_read=excluded.stories_read,signals_inserted=excluded.signals_inserted,
           errors_count=excluded.errors_count,workers_started=excluded.workers_started,
+          claimable_agents=excluded.claimable_agents,available_worker_slots=excluded.available_worker_slots,
           ready=excluded.ready,active_agents=excluded.active_agents,
           stale_leases=excluded.stale_leases,stalled_runs=excluded.stalled_runs,
           queue_acknowledged=excluded.queue_acknowledged,queue_pending=excluded.queue_pending,
@@ -1126,6 +1153,11 @@ export class AsanaDispatchStore {
       COALESCE(SUM(status='degraded'),0) AS degraded,
       COALESCE(SUM(errors_count),0) AS errors,
       COALESCE(SUM(workers_started),0) AS workers_started,
+      COALESCE(SUM(dispatch_enabled=1 AND claimable_agents IS NOT NULL
+        AND available_worker_slots IS NOT NULL),0) AS capacity_samples,
+      COALESCE(SUM(dispatch_enabled=1 AND errors_count=0 AND ready>0
+        AND claimable_agents=0 AND available_worker_slots>0 AND workers_started=0),0)
+        AS idle_no_claim_polls,
       ROUND(COALESCE(AVG(duration_ms),0)) AS average_duration_ms,
       COALESCE(MAX(duration_ms),0) AS maximum_duration_ms,
       COALESCE(MAX(queue_pending),0) AS maximum_pending,
@@ -1214,14 +1246,18 @@ export class AsanaDispatchStore {
 
   readyAgentIds(now = Date.now(), limit = 2, coordinationReady = true) {
     if(!Number.isSafeInteger(limit)||limit<0||limit>2) throw new Error("Worker limit must be zero to two");
+    return this.readyAgentCandidates(now, coordinationReady).slice(0, limit);
+  }
+
+  readyAgentCandidates(now = Date.now(), coordinationReady = true) {
     return this.db.prepare(`SELECT agent_id,MAX(priority) AS priority,MIN(created_at_ms) AS created
       FROM signals WHERE status IN ('pending','retry_after') AND available_at_ms<=:now
       AND (:coordinationReady=1 OR (${coordinationSelectionSql}))
       AND kind != 'new_assigned_task'
       AND NOT EXISTS(SELECT 1 FROM leases WHERE key='agent:'||signals.agent_id)
       AND NOT EXISTS(SELECT 1 FROM leases WHERE key='task:'||signals.task_gid)
-      GROUP BY agent_id ORDER BY priority DESC,created,agent_id LIMIT :limit`)
-      .all({now,limit,coordinationReady:Number(coordinationReady === true)}).map(row=>row.agent_id);
+      GROUP BY agent_id ORDER BY priority DESC,created,agent_id`)
+      .all({now,coordinationReady:Number(coordinationReady === true)}).map(row=>row.agent_id);
   }
 
   claimForRun(runId) {
