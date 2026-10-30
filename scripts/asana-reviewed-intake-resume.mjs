@@ -25,6 +25,40 @@ export const REVIEWED_INTAKES=Object.freeze([
   modified_at:'2026-10-20T18:22:23.340Z',run_started_at_ms:1792393383246,
   stories_sha256:'291c1959c24c753e32ab50a1d9432db6dbc704eede26504ea83cb435f8de8f87',
   resource_key:'google-sheets:17nJW06-FijgWeqUDdv6TtRaZ7BBcBiQj0fziNMUxDWM:Akquise'}),
+ // Reviewed 30 October: only local/Asana reads and remote task acquisition.
+ // Full native activity and paginated story evidence remain in Operations audit storage.
+ Object.freeze({
+  key:"watcher_intake_20261030",
+  run_id:"963b0ca66a2f4fb9a92a6b2ac904492e",
+  agent_id:"vip-ai-operations",
+  task_gid:"1218693508638175",
+  assignee:"1214979008788676",
+  thread_id:"01a1859b-9ffd-7ba2-9664-79a253bbd2dd",
+  turn_id:"01a1859b-b76d-7ec2-829d-fa980ed326ac",
+  started_at:1793242937,
+  completed_at:1793243062,
+  activity_count:31,
+  activity_sha256:"82575bec868ce6984b61822f239ec439f3f62df00e419367a95d4a6ed7a81bfb",
+  modified_at:"2026-10-28T17:06:46.535Z",
+  run_started_at_ms:1793242914441,
+  stories_sha256:"fb14972114c3d0f56618e3976cac4a56d79d4dcaca262315a1a08d933c124c8f"
+ }),
+ Object.freeze({
+  key:"developer_intake_20261030",
+  run_id:"5168a231b70648a1b266b9b1bb0cbea0",
+  agent_id:"vip-ai-developer",
+  task_gid:"1219803770002945",
+  assignee:"1214338261069878",
+  thread_id:"01a18c57-7926-7e40-b9e0-33b514b715d8",
+  turn_id:"01a18c57-ba7b-7752-b960-b0659372becc",
+  started_at:1793355922,
+  completed_at:1793356042,
+  activity_count:48,
+  activity_sha256:"de2b9ad039781c18eaadf2f207d0a75a81247952445a61d49cab0314045cdba2",
+  modified_at:"2026-10-30T08:30:01.050Z",
+  run_started_at_ms:1793355887589,
+  stories_sha256:"3dba7f23cbb22a449698d640defb748d625e87ef6dcbb05cc46351aebfe87c3a"
+ }),
  ...REVIEWED_PARTIALS
 ]);
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
