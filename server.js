@@ -21,6 +21,7 @@ import { selectBoundedEmailText } from "./lib/email-uid-text.js";
 import { assertBufferEditDueAtReadback, bufferEditScheduleFields } from "./lib/buffer-edit-schedule.js";
 import { findTemplatedTemplateByInternalId } from "./lib/templated-internal-id.js";
 import { buildTemplatedRenderPreview } from "./lib/templated-render-preview.js";
+import { findTemplatedRenderByExternalId } from "./lib/templated-render-lookup.js";
 import {
   appendGeneralInformationQualification,
   validateGeneralInformationReply
@@ -19408,6 +19409,36 @@ function createServer() {
         lookup_mode: "unfiltered_internal_id",
         ...result
       });
+    }
+  );
+
+  server.tool(
+    "templated_find_render_by_external_id",
+    "Sucht Templated-Render einer internen Vorlage read-only nach exakter external_id. Vollständige Pagination; unklare oder doppelte Treffer liefern keinen Nullbefund.",
+    {
+      agent_id: agentIdSchema,
+      template_id: z.string().uuid(),
+      external_id: z.string().min(1).max(200)
+    },
+    TOOL_EXTERNAL_READ,
+    async ({ agent_id, template_id, external_id }) => {
+      const result = await findTemplatedRenderByExternalId({
+        templateId: template_id,
+        externalId: external_id,
+        fetchPage: async ({ templateId, externalId, page, limit }) => {
+          const response = await templatedRequest(agent_id, {
+            path: `/v1/template/${encodeURIComponent(templateId)}/renders`,
+            params: { page, limit, externalId }
+          });
+          if (!response.ok) throw new Error(`templated_render_page_request_failed:${response.status}`);
+          const data = response.data;
+          const renders = Array.isArray(data) ? data :
+            [data?.data, data?.renders, data?.items, data?.results].find(Array.isArray);
+          if (!renders) throw new Error("templated_render_page_shape_unknown");
+          return renders;
+        }
+      });
+      return out({ agent_id, ...result });
     }
   );
 
