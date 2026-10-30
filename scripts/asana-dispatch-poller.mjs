@@ -83,15 +83,58 @@ export async function connectMcpClient(connect = connectCanonicalMcp) {
   catch (error) { throw new Error(`mcp_connect: ${formatToolError(error)}`); }
 }
 
-export async function tool(client, name, args) {
+export async function tool(client, name, args, { timeoutMs = 45_000, deadlineAtMs } = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 45_000)
+    throw new Error("Invalid bounded tool timeout");
+  if (deadlineAtMs !== undefined && (!Number.isSafeInteger(deadlineAtMs) || deadlineAtMs < 1))
+    throw new Error("Invalid tool deadline");
   try {
     const result = await client.callTool({ name, arguments: args }, undefined,
-      { timeout: 45_000, maxTotalTimeout: 45_000 });
+      { timeout: timeoutMs, maxTotalTimeout: timeoutMs,
+        ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
     if (result?.isError) throw new Error(result.content?.map((item) => item.text).join("\n") || `${name} failed`);
     const payload = result.content?.find((item) => item.type === "text")?.text;
     if (!payload) throw new Error(`${name} returned no JSON`);
     return JSON.parse(payload);
   } catch (error) { throw new Error(`${name}: ${formatToolError(error)}`); }
+}
+
+// Keep the existing per-call ceiling while bounding the complete identity read.
+// No retries and no partial scan/queue progress before every batch is validated.
+export async function readAgentSnapshots(client, expectedAgentIds, { clock = () => performance.now() } = {}) {
+  if (!Array.isArray(expectedAgentIds) || !expectedAgentIds.length || expectedAgentIds.length > 25 ||
+      new Set(expectedAgentIds).size !== expectedAgentIds.length ||
+      expectedAgentIds.some(id => typeof id !== "string" || !/^(?:vip|rs)-ai-[a-z-]+$/.test(id)))
+    throw new Error("Invalid snapshot agent inventory");
+  const started = clock();
+  if (!Number.isFinite(started)) throw new Error("Invalid snapshot clock");
+  // The canonical transport checks this after the shared cooldown, so an
+  // expired read cannot send another request when that cooldown ends.
+  const deadlineAtMs = Date.now() + 120_000;
+  let previous = started;
+  const agents = [], batches = [];
+  for (let offset = 0; offset < expectedAgentIds.length; offset += 4) {
+    const current = clock();
+    if (!Number.isFinite(current) || current < previous) throw new Error("Invalid snapshot clock");
+    previous = current;
+    const remaining = Math.floor(120_000 - (current - started));
+    if (remaining < 1) throw new Error("asana_agents_open_task_snapshot: total read budget timed out");
+    const ids = expectedAgentIds.slice(offset, offset + 4);
+    const snapshot = await tool(client, "asana_agents_open_task_snapshot", {
+      agent_ids: ids, limit: 100, max_pages: 10, concurrency: 4
+    }, { timeoutMs: Math.min(45_000, remaining), deadlineAtMs });
+    const finished = clock();
+    if (!Number.isFinite(finished) || finished < previous) throw new Error("Invalid snapshot clock");
+    if (finished - started > 120_000) throw new Error("asana_agents_open_task_snapshot: total read budget timed out");
+    previous = finished;
+    assertSnapshotIdentities(snapshot, ids);
+    agents.push(...snapshot.agents);
+    batches.push({ agent_count: ids.length, elapsed_ms: Math.round(finished - current) });
+  }
+  const result = { agents, agents_checked: agents.length, agents_succeeded: agents.length,
+    agents_failed: 0, batches };
+  assertSnapshotIdentities(result, expectedAgentIds);
+  return result;
 }
 
 export async function storiesForTask(client, agentId, taskGid) {
@@ -262,9 +305,8 @@ export async function poll({ write = false, agentIds = null, db = DEFAULT_DB_PAT
     agents: [], errors: [], counts: {} };
   try {
     client = await connectMcpClient();
-    const snapshots = await tool(client, "asana_agents_open_task_snapshot", {
-      agent_ids: expectedAgentIds, limit: 100, max_pages: 10, concurrency: 4
-    });
+    const snapshots = await readAgentSnapshots(client, expectedAgentIds);
+    result.identity_snapshot_batches = snapshots.batches;
     assertSnapshotIdentities(snapshots, expectedAgentIds);
     const agentUserGids = new Set(snapshots.agents.filter((item) => item.ok).map((item) => String(item.user_gid)));
     Object.assign(result,await scanSnapshots(client,store,snapshots.agents,agentUserGids,scanStartedAt,write));
